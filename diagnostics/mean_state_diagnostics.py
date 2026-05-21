@@ -1,0 +1,2111 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+import os, glob, sys, numbers
+sys.path.append("../../")
+
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+from scipy.interpolate import griddata, RegularGridInterpolator
+import pygeode as pyg
+from jfunctions import *
+import scipy.interpolate as intp
+from scipy.ndimage import uniform_filter1d
+import xarray as xr
+from wavenumber_frequency_functions import *
+from matplotlib import colors
+from tropopause import *
+from diagnostic_helpers import *
+
+save = True
+save_loc = '/home/cwp29/tmp/mpas/crf_on/mean_state/'
+
+# Set to [] or None to run all figures. Otherwise list numbered figures.
+#
+# Figure numbers:
+#   1:  rain_stats
+#   2:  profiles
+#   3:  temp_relhum
+#   4:  eddy_fluxes
+#   5:  pr_dist
+#   6:  duration_dist
+#   7:  spectra
+#   8:  hovmoller
+#   9:  zgrid_horizontal_variation
+#   10: cldfrac_latheight
+#   11: vorticity_latheight
+#   12: olrtoa_maps
+#   13: ke_latheight
+#   14: eke_latpres
+#   15: global_energy_budget
+#   16: temperature_wind_latheight
+#   17: mslp_maps
+#   18: scalar_constituents_latheight
+figures_to_run = [14, 15, 16, 17, 18]
+figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
+
+
+def should_run_figure(number):
+    return figure_should_run(figures_to_run, number)
+
+
+def should_run_any(numbers):
+    return figure_should_run_any(figures_to_run, numbers)
+
+
+def run_all_figures():
+    return all_figures_requested(figures_to_run)
+
+
+spectrum_period_reference_days = [3.0, 6.0, 30.0]
+
+
+def add_period_reference_lines_frequency(ax, periods=spectrum_period_reference_days):
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    ymin, ymax = sorted((y0, y1))
+    for period in periods:
+        freq = 1.0 / period
+        if ymin <= freq <= ymax:
+            ax.axhline(freq, color="0.25", lw=0.8, ls=":", alpha=0.8)
+            ax.text(x1, freq, f"{period:g} d", ha="right", va="bottom",
+                    fontsize=7, color="0.25")
+
+
+LV = 2.5e6
+
+ENERGY_BUDGET_TERMS = {
+    "net_toa": r"Net TOA/system",
+    "net_surface_rad": r"Net surface radiation",
+    "atm_rad": r"Atmospheric radiation",
+    "surface_turbulent": r"LH + SH",
+    "atm_column_input": r"Atmospheric net",
+    "surface_net_input": r"Surface/SST net",
+    "precip_latent_heating": r"$L_v P$",
+}
+
+ENERGY_BUDGET_ORDER = list(ENERGY_BUDGET_TERMS)
+
+
+def global_area_mean(da, lat_dim="latitude", lon_dim="longitude"):
+    dims = [dim for dim in (lat_dim, lon_dim) if dim in da.dims]
+    if lat_dim not in da.dims:
+        raise ValueError(f"Cannot area-average {da.name}: missing {lat_dim!r} dimension")
+    weights = np.cos(np.deg2rad(da[lat_dim]))
+    return da.weighted(weights).mean(dim=dims, skipna=True)
+
+
+def time_days_since_start(da, origin=None):
+    times = da.Time.values
+    if np.issubdtype(times.dtype, np.number):
+        days = np.asarray(times, dtype=float) * dt / 24.0
+        origin_day = float(origin) * dt / 24.0 if origin is not None else days[0]
+    elif np.issubdtype(times.dtype, np.datetime64):
+        origin_time = origin if origin is not None else times[0]
+        days = (times - origin_time) / np.timedelta64(1, "D")
+        days = np.asarray(days, dtype=float)
+        origin_day = 0.0
+    else:
+        times = pd.to_datetime(times)
+        origin_time = pd.to_datetime(origin) if origin is not None else times[0]
+        days = np.asarray((times - origin_time) / pd.Timedelta(days=1), dtype=float)
+        origin_day = 0.0
+    return days - origin_day
+
+
+def cumulative_energy_mj_m2(ts, origin=None):
+    t_days = time_days_since_start(ts, origin=origin)
+    flux = np.asarray(ts.values, dtype=float)
+    cumulative = np.zeros_like(flux, dtype=float)
+    if flux.size > 1:
+        increments = 0.5 * (flux[1:] + flux[:-1]) * np.diff(t_days) * 86400.0 / 1e6
+        cumulative[1:] = np.cumsum(increments)
+    return t_days, cumulative
+
+
+def isobaric_eddy_kinetic_energy(ds):
+    missing = [v for v in ("uzonal_isobaric", "umeridional_isobaric") if v not in ds.data_vars]
+    if missing:
+        raise ValueError(f"Missing isobaric wind variables for EKE: {missing}")
+
+    u = finite_or_nan(ds.uzonal_isobaric)
+    v = finite_or_nan(ds.umeridional_isobaric)
+    eddy_dims = [dim for dim in ("Time", "longitude") if dim in u.dims]
+    ua = u - u.mean(dim=eddy_dims, skipna=True)
+    va = v - v.mean(dim=eddy_dims, skipna=True)
+    eke = 0.5 * (ua * ua + va * va).mean(dim=eddy_dims, skipna=True)
+    eke.name = "eke_isobaric"
+    eke.attrs.update(units="m2 s-2", long_name="isobaric eddy kinetic energy")
+    return eke.transpose("pres", "latitude")
+
+
+def positive_contour_levels(fields, n=21, fallback=1.0):
+    vmax = np.nanmax([np.nanmax(field.values) for field in fields])
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = fallback
+    return np.linspace(0.0, vmax, n)
+
+
+def symmetric_contour_levels(fields, ndiv=11, fallback=1.0):
+    vmax = np.nanmax([np.nanmax(np.abs(field.values)) for field in fields])
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = fallback
+    return symmetric_levels(vmax, ndiv=ndiv)
+
+
+def global_energy_budget_fields(ds):
+    """
+    Return 2-D energy-budget terms in W m-2.
+
+    Positive TOA and surface radiative terms are downward.  Surface turbulent
+    fluxes are positive upward into the atmosphere, so atmospheric net is
+    atmospheric radiation plus LH+SH, and surface net is surface radiation
+    minus LH+SH.
+    """
+    required = ["swdnt", "swupt", "lwdnt", "lwupt", "swdnb", "swupb", "lwdnb", "lwupb"]
+    missing = [v for v in required if v not in ds.data_vars]
+    if missing:
+        raise ValueError(f"Missing radiation variables for global energy budget: {missing}")
+
+    net_toa_sw = finite_or_nan(ds.swdnt) - finite_or_nan(ds.swupt)
+    net_toa_lw = finite_or_nan(ds.lwdnt) - finite_or_nan(ds.lwupt)
+    net_sfc_sw = finite_or_nan(ds.swdnb) - finite_or_nan(ds.swupb)
+    net_sfc_lw = finite_or_nan(ds.lwdnb) - finite_or_nan(ds.lwupb)
+
+    net_toa = net_toa_sw + net_toa_lw
+    net_surface_rad = net_sfc_sw + net_sfc_lw
+    atm_rad = net_toa - net_surface_rad
+
+    if all(v in ds.data_vars for v in ("lh", "hfx")):
+        surface_turbulent = finite_or_nan(ds.lh) + finite_or_nan(ds.hfx)
+    else:
+        surface_turbulent = xr.zeros_like(atm_rad)
+        surface_turbulent.attrs["note"] = "lh/hfx missing; set to zero"
+
+    precip = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
+    precip_latent_heating = finite_or_nan(precip) * LV / 86400.0
+
+    fields = {
+        "net_toa": net_toa,
+        "net_surface_rad": net_surface_rad,
+        "atm_rad": atm_rad,
+        "surface_turbulent": surface_turbulent,
+        "atm_column_input": atm_rad + surface_turbulent,
+        "surface_net_input": net_surface_rad - surface_turbulent,
+        "precip_latent_heating": precip_latent_heating,
+    }
+
+    for name, field in fields.items():
+        field.name = name
+        field.attrs["units"] = "W m-2"
+
+    return fields
+
+
+def latlon_time_mean_field(ds, candidates, level_index=0, scale=1.0, name=None):
+    for candidate in candidates:
+        if candidate not in ds.data_vars:
+            continue
+
+        da = finite_or_nan(ds[candidate])
+        if any(dim in da.dims for dim in ("z", "nVertLevels", "nVertLevelsP1")):
+            da = da.isel({vertical_dim(da): level_index}, drop=True)
+
+        extra_dims = [dim for dim in da.dims if dim not in ("Time", "latitude", "longitude")]
+        if extra_dims:
+            raise ValueError(f"{candidate} has unsupported dimensions for a lat/lon map: {da.dims}")
+
+        if "Time" in da.dims:
+            da = da.mean(dim="Time", skipna=True)
+
+        da = (da * scale).transpose("latitude", "longitude").load()
+        da.name = name or candidate
+        return da
+
+    raise ValueError(f"None of {candidates} found")
+
+
+def latheight_time_mean_field(zds, spec):
+    if spec.get("derived") == "temperature":
+        missing = [v for v in ("theta", "pressure") if v not in zds.data_vars]
+        if missing:
+            raise ValueError(f"Missing variables for temperature: {missing}")
+        theta = finite_or_nan(zds.theta)
+        pressure = finite_or_nan(zds.pressure)
+        da = theta * (pressure / 100000.0) ** (287.0 / 1004.0)
+    else:
+        for candidate in spec["candidates"]:
+            if candidate in zds.data_vars:
+                da = finite_or_nan(zds[candidate])
+                break
+        else:
+            raise ValueError(f"None of {spec['candidates']} found")
+
+    if "Time" in da.dims:
+        da = da.mean(dim="Time", skipna=True)
+
+    da = model_lat_field(da).load()
+    da.name = spec["label"]
+    return da
+
+
+def safe_nanpercentile(values, q, default=1.0):
+    vals = np.asarray(values)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return default
+    out = np.nanpercentile(vals, q)
+    if not np.isfinite(out) or out == 0:
+        return default
+    return out
+
+
+def ensure_z_index_coord(da):
+    if "z" in da.dims and "z" not in da.coords:
+        da = da.assign_coords(z=np.arange(da.sizes["z"]))
+    return da
+
+
+def scalar_constituent_latheight(ds, spec, zmid=None):
+    varname = spec["var"]
+    if varname not in ds.data_vars:
+        raise ValueError(f"{varname} not found")
+
+    da = finite_or_nan(ds[varname])
+    mean_dims = [dim for dim in ("Time", "longitude") if dim in da.dims]
+    if mean_dims:
+        da = da.mean(dim=mean_dims, skipna=True)
+
+    da = model_lat_field(da) * spec.get("scale", 1.0)
+    da = ensure_z_index_coord(da).load()
+    da.name = spec["label"]
+    if zmid is None:
+        zmid = midlevel_height_from_latlon(ds)
+    return lat_height_mesh(da, zmid, ds.latitude.values)
+
+
+def positive_percentile_levels(fields, percentile=99.5, n=21, fallback=1.0):
+    vmax = np.nanmax([
+        safe_nanpercentile(field.values, percentile, default=fallback)
+        for field in fields
+    ])
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = fallback
+    return np.linspace(0.0, vmax, n)
+
+
+def symmetric_percentile_levels(fields, percentile=99.0, ndiv=10, fallback=1.0):
+    vmax = np.nanmax([
+        safe_nanpercentile(np.abs(field.values), percentile, default=fallback)
+        for field in fields
+    ])
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = fallback
+    return symmetric_levels(vmax, ndiv=ndiv)
+
+
+def latlon_contour_levels(fields, symmetric=False, n=21, fallback=1.0):
+    if symmetric:
+        return symmetric_contour_levels(fields, ndiv=n-1, fallback=fallback)
+
+    values = [np.asarray(field.values, dtype=float) for field in fields]
+    vmin = np.nanmin([np.nanmin(value) for value in values])
+    vmax = np.nanmax([np.nanmax(value) for value in values])
+
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        vmin, vmax = 0.0, fallback
+    elif np.isclose(vmin, vmax):
+        half_width = abs(vmin) * 0.01 if vmin else fallback
+        vmin -= half_width
+        vmax += half_width
+
+    return np.linspace(vmin, vmax, n)
+
+
+LATHEIGHT_MEAN_STATE_SPECS = [
+    {
+        "label": "Temperature",
+        "derived": "temperature",
+        "units": "K",
+        "cmap": "coolwarm",
+        "raw_symmetric": False,
+        "raw_fallback": 300.0,
+        "diff_fallback": 2.0,
+    },
+    {
+        "label": "Zonal wind",
+        "candidates": ("uReconstructZonal",),
+        "units": r"m s$^{-1}$",
+        "cmap": "seismic",
+        "raw_symmetric": True,
+        "raw_fallback": 10.0,
+        "diff_fallback": 2.0,
+    },
+    {
+        "label": "Meridional wind",
+        "candidates": ("uReconstructMeridional",),
+        "units": r"m s$^{-1}$",
+        "cmap": "seismic",
+        "raw_symmetric": True,
+        "raw_fallback": 10.0,
+        "diff_fallback": 2.0,
+    },
+]
+
+MSLP_LATLON_SPEC = {
+    "label": "MSLP",
+    "candidates": ("mslp",),
+    "units": "hPa",
+    "scale": 0.01,
+    "cmap": "viridis",
+    "raw_symmetric": False,
+    "raw_fallback": 1010.0,
+    "diff_fallback": 2.0,
+}
+
+SCALAR_CONSTITUENT_GROUPS = [
+    {
+        "name": "vapour",
+        "title": "Water vapour",
+        "fields": [
+            {
+                "var": "qv",
+                "label": "Water vapour",
+                "symbol": r"$q_v$",
+                "units": r"g kg$^{-1}$",
+                "scale": 1000.0,
+                "cmap": "YlGnBu",
+                "raw_fallback": 20.0,
+                "diff_fallback": 1.0,
+            },
+        ],
+    },
+    {
+        "name": "liquid_hydrometeors",
+        "title": "Liquid-phase hydrometeors",
+        "fields": [
+            {
+                "var": "qc",
+                "label": "Cloud liquid",
+                "symbol": r"$q_c$",
+                "units": r"g kg$^{-1}$",
+                "scale": 1000.0,
+                "cmap": "YlGnBu",
+                "raw_fallback": 0.1,
+                "diff_fallback": 0.02,
+            },
+            {
+                "var": "qr",
+                "label": "Rain",
+                "symbol": r"$q_r$",
+                "units": r"g kg$^{-1}$",
+                "scale": 1000.0,
+                "cmap": "YlGnBu",
+                "raw_fallback": 0.1,
+                "diff_fallback": 0.02,
+            },
+        ],
+    },
+    {
+        "name": "ice_hydrometeors",
+        "title": "Ice-phase hydrometeors",
+        "fields": [
+            {
+                "var": "qi",
+                "label": "Cloud ice",
+                "symbol": r"$q_i$",
+                "units": r"g kg$^{-1}$",
+                "scale": 1000.0,
+                "cmap": "PuBu",
+                "raw_fallback": 0.05,
+                "diff_fallback": 0.01,
+            },
+            {
+                "var": "qs",
+                "label": "Snow",
+                "symbol": r"$q_s$",
+                "units": r"g kg$^{-1}$",
+                "scale": 1000.0,
+                "cmap": "PuBu",
+                "raw_fallback": 0.05,
+                "diff_fallback": 0.01,
+            },
+            {
+                "var": "qg",
+                "label": "Graupel",
+                "symbol": r"$q_g$",
+                "units": r"g kg$^{-1}$",
+                "scale": 1000.0,
+                "cmap": "PuBu",
+                "raw_fallback": 0.05,
+                "diff_fallback": 0.01,
+            },
+        ],
+    },
+]
+
+# In[2]:
+
+##### config_microp_re on/off test #####
+#root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/'
+#data_locs = ['spinup/latlon_05deg.nc', 'microp_re_test/latlon_regridded_05deg.nc']
+#sim_names = ['default', 'microp_re']
+
+##### CRF on/off test #####
+#root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/qu_120km/'
+#data_locs = ['control', 'crf_test']
+#latlon_file = ['', 'latlon_spinup.nc']
+#sim_names = ['crf on', 'crf off']
+
+root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
+data_locs = ['control', 'u_nudge', 'T_nudge']
+latlon_file = ['latlon.2000-*.nc', 'latlon.2000-*.nc', 'latlon.2000-*.nc']
+zm_latlon_file = ['zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc']
+sim_names = ['control', 'nudged u', 'nudged T']
+
+cols = ['k', 'b', 'r']
+
+# Use ndays of data ending at a fixed analysis date
+ndays = 200
+dt = 6
+analysis_end_date = '2000-11-21'
+
+time_format = 'time' #or 'int'
+
+dss = []
+dss_zm = []
+
+needed_vars = [
+    "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw",
+    "qv", "qc", "qr", "qi", "qs", "qg",
+    "mslp",
+    "uzonal_isobaric", "umeridional_isobaric", "omg_isobaric",
+    "rh_isobaric", "t_isobaric", "qv_isobaric", "theta",
+    "uReconstructZonal", "uReconstructMeridional",
+    "cldfrac", "olrtoa", "zgrid", "pressure", "vorticity", "ke",
+    "lwdnt", "lwdnb", "lwupb", "lwupt", "swdnt", "swdnb", "swupb", "swupt",
+    "lh", "hfx"
+]
+
+check_vars = ['t_isobaric']
+
+latlon_chunks = {"Time": 8, "latitude": 60, "longitude": 120}
+zm_chunks = {"Time": -1}
+
+
+for i, d in enumerate(data_locs):
+    """
+    if i == 0:
+        dsd = xr.open_dataset(os.path.join(root_dir, 'control/latlon_diag.nc'), chunks={'Time': 4})
+        dsh = xr.open_dataset(os.path.join(root_dir, 'control/latlon_hist.nc'), chunks={'Time': 4})
+        #print(dsd)
+        #print(dsh)
+
+        # keep only times present in the 6h dataset
+        if time_format == 'int':
+            dsd_6h = dsd.isel(Time=slice(0, None, 2))
+        else:
+            dsd_6h = dsd.sel(Time=dsh.Time)
+
+        # merge variables into one dataset
+        ds = xr.merge([dsh, dsd_6h], join="exact")
+
+    else:
+        ds = xr.open_dataset(os.path.join(root_dir, d), chunks={'Time': 4})
+
+    # Dataset before time restriction
+    print(ds.data_vars)
+
+    if time_format == 'int':
+        ds = ds.sel(Time=slice(-1-ndays*int(24/dt), -1))
+    else:
+        # Restrict time
+        t_end = pd.to_datetime(ds.Time.max().item())
+        t_start = t_end - pd.Timedelta(days=ndays)
+        print(t_start, t_end)
+        ds = ds.sel(Time=slice(t_start, t_end))
+    """
+    ds = load_latlon_dataset(
+        os.path.join(root_dir, d),
+        latlon_pattern=latlon_file[i],
+        time_format=time_format,
+        ndays=ndays,
+        end_date=analysis_end_date,
+        chunks=latlon_chunks
+    )
+    ds = standardize_latlon_dataset(ds, needed_vars)
+
+    zds = load_latlon_dataset(
+        os.path.join(root_dir, d),
+        latlon_pattern=zm_latlon_file[i],
+        time_format=time_format,
+        ndays=ndays,
+        end_date=analysis_end_date,
+        chunks=zm_chunks,
+        prefer_pattern=True,
+        add_cldfrac_file=False
+    )
+    zds = standardize_latlon_dataset(zds, needed_vars)
+
+    # cheaper if data are exactly 6-hourly and aligned
+    #ds = ds.coarsen(Time=4, boundary="trim").mean()
+    #zds = zds.coarsen(Time=4, boundary="trim").mean()
+
+    print(ds)
+    print(zds)
+    dss.append(ds)
+    dss_zm.append(zds)
+
+if should_run_figure(1):
+    # rainc, rainnc contain accumulated rainfall from simulation start to given timestep
+    fig, ax = plt.subplots(2, 1, figsize=(8, 4.5), constrained_layout=True)
+
+    for i, ds in enumerate(dss):
+        precip = (
+            ds["rainnc"] + ds["i_rainnc"] * 100.0
+            + ds["rainc"] + ds["i_rainc"] * 100.0
+        )
+
+        precip_mean = lat_mean(precip.mean(dim="longitude"))
+        precip_water = lat_mean(ds.precipw.mean(dim="longitude"))
+
+        # Use this dataset's own time coordinate
+        t_pw = get_time_values(precip_water, dt=dt)
+
+        # Rainfall rate has one fewer Time point, so use diff() and its own Time coord
+        if issubclass(precip_mean.Time.values.dtype.type, numbers.Integral):
+            precip_rate = precip_mean.diff("Time") / (dt / 24.0)
+        else:
+            dt_days = precip_mean.Time.diff("Time") / np.timedelta64(1, "D")
+            precip_rate = precip_mean.diff("Time") / dt_days
+
+        t_rate = get_time_values(precip_rate, dt=dt)
+
+        ax[0].plot(t_pw, precip_water.values, color=cols[i], label=sim_names[i])
+        ax[1].plot(t_rate, precip_rate.values, color=cols[i])
+
+    ax[0].set_ylim(18, 23)
+    ax[0].set_ylabel(r"Precipitable water (mm)")
+
+    ax[1].set_ylim(2, 4)
+    ax[1].set_ylabel(r"Rainfall rate (mm day$^{-1}$)")
+
+    ax[1].set_xlabel('Time (days)')
+
+    fig.legend(loc='outside lower center', ncol=4)
+
+    figsave.save(fig, "rain_stats", number=1)
+    print("Done with figure: comp_rain_stats")
+
+# In[7]:
+
+if should_run_figure(2):
+    # Vertical profiles of tropical-mean potential temperature (theta) and zonal-mean wind (uReconstructZonal)
+
+    fig, ax = plt.subplots(1, 4, figsize=(8, 4), sharey=True, constrained_layout=True)
+
+    for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
+        theta = zds.theta.sel(latitude=slice(-10, 10)).mean(dim=("Time", "latitude"))
+        pressure = zds.pressure.sel(latitude=slice(-10, 10)).mean(dim=("Time", "latitude"))
+        u = zds.uReconstructZonal.sel(latitude=slice(-10, 10)).mean(dim=("Time", "latitude"))
+
+        T = theta * (pressure / 100000.)**(287.0 / 1004.0)
+
+        z = height_from_zm_latlon(zds).values
+
+        # Brunt-Väisälä frequency squared: N^2 = (g/theta) dtheta/dz
+        g = 9.80665
+        dtheta_dz = np.gradient(theta.values, z)
+        N2 = g / theta.values * dtheta_dz
+
+        print(z, pressure.values)
+        ttp, ptp, ztp, _ = tropopause_profile_single(T.values, pressure.values, z)
+        print(ttp, ptp, ztp)
+
+        for a in ax:
+            a.axhline(ztp/1000., color=cols[i], ls=':')
+
+        ax[0].plot(theta.values, z/1000., color=cols[i], label=sim_names[i])
+        ax[1].plot(T.values, z/1000., color=cols[i])
+        ax[2].plot(u.values, z/1000., color=cols[i])
+        ax[3].plot(N2 * 1e4, z/1000., color=cols[i])
+
+    ax[0].set_xlabel(r'Potential temperature $\theta$ (K)')
+    ax[1].set_xlabel(r'Temperature $T$ (K)')
+    ax[1].set_xlim(150, 300)
+    ax[2].set_xlabel(r'Zonal mean wind $u$ (m s$^{-1}$)')
+    ax[3].set_xlabel(r'$N^2$ ($10^{-4}$ s$^{-2}$)')
+    ax[3].axvline(0, color='grey', lw=0.5, ls='--')
+    ax[0].set_ylabel('Height (km)')
+
+    fig.legend(loc='outside lower center', ncol=len(dss))
+
+    figsave.save(fig, "profiles", number=2)
+    print("Done with figure: comp_profiles")
+
+# In[8]:
+
+# pre-compute CPTs for plotting
+
+CPTs = None
+if should_run_any([3, 10, 11, 13, 14, 16, 18]):
+    CPTs = []
+
+    for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
+        theta = zds.theta.mean(dim="Time")
+        pressure = zds.pressure.mean(dim="Time")
+
+        T = theta * (pressure / 100000.)**(287.0 / 1004.0)
+        T = model_lat_field(T)
+        pressure = model_lat_field(pressure)
+        z = height_from_zm_latlon(zds).values
+
+        ztps = []
+        ptps = []
+        for j in range(len(zds.latitude.values)):
+            ttp, ptp, ztp, _ = tropopause_profile(T.values[:, j], pressure.values[:, j], z)
+            ztps.append(ztp)
+            ptps.append(ptp)
+            print(ztp)
+
+        CPTs.append([ztps, ptps])
+
+    CPTs = np.array(CPTs)
+
+# In[ ]:
+
+if should_run_figure(3):
+    fig, ax = plt.subplots(len(dss), 2, figsize=(8, 3.0*len(dss)), sharey=True, constrained_layout=True)
+    fig2, ax2 = plt.subplots(len(dss), 5, figsize=(10, 3.0*len(dss)), sharey=True, constrained_layout=True)
+
+    if len(dss) == 1:
+        ax = np.array([ax])
+        ax2 = np.array([ax2])
+
+    control_data = {}
+    T_im2 = u_im2 = v_im2 = rh_im2 = omg_im2 = None
+    Tdiff_im = udiff_im = vdiff_im = rhdiff_im = omgdiff_im = None
+
+    for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
+        ubar_da = isobaric_lat_mean(zds.uzonal_isobaric)
+        vbar_da = isobaric_lat_mean(zds.umeridional_isobaric)
+        omgbar_da = isobaric_lat_mean(zds.omg_isobaric)
+        Tbar_da = isobaric_lat_mean(zds.t_isobaric)
+        rhbar_da = isobaric_lat_mean(zds.rh_isobaric)
+
+        ubar = ubar_da.values
+        vbar = vbar_da.values
+        omgbar = omgbar_da.values
+        Tbar = Tbar_da.values
+        rhbar = rhbar_da.values
+
+        if i == 0:
+            control_data = {
+                'ubar': ubar_da, 'vbar': vbar_da, 'omgbar': omgbar_da,
+                'Tbar': Tbar_da, 'rhbar': rhbar_da,
+            }
+
+        T_im, _, _, _ = plot_Tu_latpres(ax[i, 0], zds.latitude.values, zds.pres.values, Tbar, ubar)
+        rh_im, _ = plot_rhv_latpres(ax[i, 1], zds.latitude.values, zds.pres.values, rhbar, vbar, omgbar)
+
+        if i == 0:
+            T_im2 = ax2[i, 0].contourf(zds.latitude.values, zds.pres.values, Tbar, levels=np.arange(190, 305, 5), extend='both', cmap='coolwarm')
+            u_im2 = ax2[i, 1].contourf(zds.latitude.values, zds.pres.values, ubar, levels=np.arange(-20, 25, 5), extend='both', cmap='seismic')
+            v_im2 = ax2[i, 2].contourf(zds.latitude.values, zds.pres.values, vbar, levels=np.arange(-20, 25, 5), extend='both', cmap='seismic')
+            rh_im2 = ax2[i, 3].contourf(zds.latitude.values, zds.pres.values, rhbar, levels=np.arange(0, 105, 5), extend='both', cmap='BrBG')
+            omg_im2 = ax2[i, 4].contourf(zds.latitude.values, zds.pres.values, omgbar, levels=np.arange(-5, 6, 1), extend='both', cmap='seismic')
+        else:
+            cT = interp_like_control(Tbar_da, control_data['Tbar'])
+            cu = interp_like_control(ubar_da, control_data['ubar'])
+            cv = interp_like_control(vbar_da, control_data['vbar'])
+            crh = interp_like_control(rhbar_da, control_data['rhbar'])
+            comg = interp_like_control(omgbar_da, control_data['omgbar'])
+
+            Tdiff_levels = symmetric_levels(10.0, ndiv=11)
+            udiff_levels = symmetric_levels(5.0, ndiv=11)
+            rhdiff_levels = symmetric_levels(10.0, ndiv=11)
+            omgdiff_levels = symmetric_levels(1.0, ndiv=11)
+
+            Tdiff_im = ax2[i, 0].contourf(zds.latitude.values, zds.pres.values, (Tbar_da - cT).values, levels=Tdiff_levels, extend='both', cmap='bwr')
+            udiff_im = ax2[i, 1].contourf(zds.latitude.values, zds.pres.values, (ubar_da - cu).values, levels=udiff_levels, extend='both', cmap='bwr')
+            vdiff_im = ax2[i, 2].contourf(zds.latitude.values, zds.pres.values, (vbar_da - cv).values, levels=udiff_levels, extend='both', cmap='bwr')
+            rhdiff_im = ax2[i, 3].contourf(zds.latitude.values, zds.pres.values, (rhbar_da - crh).values, levels=rhdiff_levels, extend='both', cmap='bwr')
+            omgdiff_im = ax2[i, 4].contourf(zds.latitude.values, zds.pres.values, (omgbar_da - comg).values, levels=omgdiff_levels, extend='both', cmap='bwr')
+
+        annotate_panel_label(ax[i, 0], sim_names[i])
+        annotate_panel_label(ax[i, 1], sim_names[i])
+
+        ax[i, 0].plot(zds.latitude.values, CPTs[i][1]/100., color='k', lw=1, ls=':')
+        ax[i, 1].plot(zds.latitude.values, CPTs[i][1]/100., color='k', lw=1, ls=':')
+
+        for j in range(5):
+            annotate_panel_label(ax2[i, j], control_diff_label(sim_names, i))
+            ax2[i, j].plot(zds.latitude.values, CPTs[i][1]/100., color='k', lw=1, ls=':')
+            if j > 0:
+                ax2[i, j].set_yticklabels([])
+
+    for j in range(ax.shape[0]-1):
+        ax[j, 0].set_xticklabels([])
+        ax[j, 1].set_xticklabels([])
+        for k in range(5):
+            ax2[j, k].set_xticklabels([])
+
+    ax[-1, 0].set_xlabel("Latitude (degrees)")
+    ax[-1, 1].set_xlabel("Latitude (degrees)")
+
+    for k in range(5):
+        ax2[-1, k].set_xlabel("Latitude (degrees)")
+
+    ax2[0, 0].set_title("Temperature")
+    ax2[0, 1].set_title("Zonal wind")
+    ax2[0, 2].set_title("Meridional wind")
+    ax2[0, 3].set_title("Relative humidity")
+    ax2[0, 4].set_title("Omega")
+
+    for j in range(ax.shape[0]):
+        ax[j, 0].set_ylabel("Pressure (hPa)")
+        ax2[j, 0].set_ylabel("Pressure (hPa)")
+
+    for a in ax.ravel():
+        set_latpres_axis(a, xlabel=False, ylabel=False, xlim=(-90, 90))
+    for a in ax2.ravel():
+        set_latpres_axis(a, xlabel=False, ylabel=False, xlim=(-90, 90))
+
+    fig.colorbar(T_im, ax=ax[-1, 0], location='bottom', label="temperature (K)")
+    fig.colorbar(rh_im, ax=ax[-1, 1], location='bottom', label="relative humidity (%)")
+
+    # Absolute/control-row colourbars
+    fig2.colorbar(T_im2,   ax=ax2[0, 0], location='right', label=r"$T$")
+    fig2.colorbar(u_im2,   ax=ax2[0, 1], location='right', label=r"$u$")
+    fig2.colorbar(v_im2,   ax=ax2[0, 2], location='right', label=r"$v$")
+    fig2.colorbar(rh_im2,  ax=ax2[0, 3], location='right', label="RH")
+    fig2.colorbar(omg_im2, ax=ax2[0, 4], location='right', label=r"$\omega$")
+
+    # Difference colourbars for nudged rows
+    if Tdiff_im is not None:
+        add_symmetric_colorbar(fig2, Tdiff_im,   ax2[1:, 0], Tdiff_levels, label=r"$\Delta T$")
+        add_symmetric_colorbar(fig2, udiff_im,   ax2[1:, 1], udiff_levels, label=r"$\Delta u$")
+        add_symmetric_colorbar(fig2, vdiff_im,   ax2[1:, 2], udiff_levels, label=r"$\Delta v$")
+        add_symmetric_colorbar(fig2, rhdiff_im,  ax2[1:, 3], rhdiff_levels, label=r"$\Delta$RH")
+        add_symmetric_colorbar(fig2, omgdiff_im, ax2[1:, 4], omgdiff_levels, label=r"$\Delta\omega$")
+
+    figsave.save(fig, "temp_relhum", number=3)
+    figsave.save(fig2, "temp_relhum_diff", number=3)
+    print("Done with figure: comp_temp_relhum")
+
+    # In[ ]:
+
+if should_run_figure(4):
+    # Meridional eddy fluxes
+
+    fig, ax = plt.subplots(4, 4, figsize=(8, 8), constrained_layout='True')
+
+    for i, ds in enumerate(dss):
+        ua = ds.uzonal_isobaric.sel(pres=[100, 250, 700, 850]) - ds.uzonal_isobaric.sel(pres=[100, 250, 700, 850]).mean(dim=('longitude', 'Time'))
+        va = ds.umeridional_isobaric.sel(pres=[100, 250, 700, 850]) - ds.umeridional_isobaric.sel(pres=[100, 250, 700, 850]).mean(dim=('longitude', 'Time'))
+        Ta = ds.t_isobaric.sel(pres=[100, 250, 700, 850]) - ds.t_isobaric.sel(pres=[100, 250, 700, 850]).mean(dim=('longitude', 'Time'))
+        qva = ds.qv_isobaric.sel(pres=[100, 250, 700, 850]) - ds.qv_isobaric.sel(pres=[100, 250, 700, 850]).mean(dim=('longitude', 'Time'))
+
+        eke = 0.5 * (ua*ua + va*va).mean(dim=('longitude', 'Time'))
+        memf = (ua*va).mean(dim=('longitude', 'Time'))
+        mehf = (va*Ta).mean(dim=('longitude', 'Time'))
+        mewvf = (va*qva).mean(dim=('longitude', 'Time'))
+
+        for j, var in enumerate([eke, memf, mehf, mewvf]):
+            if j == 0:
+                ax[j, 0].plot(ds.latitude.values, var[0], color=cols[i], label=sim_names[i])
+            else:
+                ax[j, 0].plot(ds.latitude.values, var[0], color=cols[i])
+            ax[j, 1].plot(ds.latitude.values, var[1], color=cols[i])
+            ax[j, 2].plot(ds.latitude.values, var[2], color=cols[i])
+            ax[j, 3].plot(ds.latitude.values, var[3], color=cols[i])
+
+    for a in ax.ravel():
+        a.set_xlim(-90, 90)
+
+    ax[0, 0].set_title("100 hPa")
+    ax[0, 1].set_title("250 hPa")
+    ax[0, 2].set_title("700 hPa")
+    ax[0, 3].set_title("850 hPa")
+
+    ax[0, 0].set_ylabel("Eddy kinetic \n energy (m$^2$ s$^{-2}$)")
+    ax[1, 0].set_ylabel("Meridional eddy \n momentum flux (m$^2$ s$^{-2}$)")
+    ax[2, 0].set_ylabel("Meridional heat \n flux (K m s$^{-1}$)")
+    ax[3, 0].set_ylabel("Meridional wv \n flux (g kg$^{-1}$ m s$^{-1}$)")
+
+    fig.legend(loc='outside lower center', ncol=4)
+
+    figsave.save(fig, "eddy_fluxes", number=4)
+    print("Done with figure: comp_eddy_fluxes")
+
+    # In[ ]:
+
+imerg_pr = None
+if should_run_any([5, 6]):
+    imerg_ds = xr.open_mfdataset(list(sorted(glob.glob('/data/phh1-hosted/cwp29/imerg/*3IMERG.*.nc4')))[:300], concat_dim='time', combine='nested', engine="netcdf4")
+
+    imerg_pr = imerg_ds.precipitation.coarsen(lat=5, boundary="trim").mean().coarsen(lon=5, boundary="trim").mean()
+
+    # In[ ]:
+
+if should_run_figure(5):
+    # Normalised rainfall intensity distribution
+    from scipy.ndimage import uniform_filter1d
+
+    fig, ax = plt.subplots(1, 3, figsize=(8, 3), constrained_layout=True, sharey=True)
+
+    h, bins = np.histogram(imerg_pr, bins=300, range=(0, 300))
+    h = uniform_filter1d(h, size=10)
+    ax[0].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color='k', ls=':', label='IMERG (Obs)')
+    ax[0].set_yscale('log')
+
+    for s, ds in enumerate(dss):
+        precip_con = ds.rainc + ds.i_rainc*100.
+        precip_res = ds.rainnc + ds.i_rainnc*100.
+        precip = precip_con + precip_res
+
+        for i, precip_var in enumerate([precip, precip_con, precip_res]):
+            if time_format == 'int':
+                precip_rate = precip_var.diff("Time") / (dt / 24.0)
+            else:
+                dt_days = (
+                    precip_var.Time.diff("Time") / np.timedelta64(1, "D")
+                )
+                precip_rate = precip_var.diff("Time") / dt_days
+            h, bins = np.histogram(precip_rate.values, bins=300, range=(0, 300))
+            h = uniform_filter1d(h, size=10)
+            if i == 0:
+                ax[i].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color=cols[s], label=sim_names[s])
+            else:
+                ax[i].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color=cols[s])
+            ax[i].set_yscale('log')
+
+    fig.legend(loc='outside lower center', ncol=5)
+
+    for a in ax:
+        a.set_xlim(0, 300)
+        a.set_ylim(1e-7, 1)
+        a.set_xlabel("Rainfall rate (mm/day)")
+
+    ax[0].set_title("Total")
+    ax[0].set_ylabel("Normalised frequency")
+    ax[1].set_title("Parameterised")
+    ax[2].set_title("Resolved")
+
+    figsave.save(fig, "pr_dist", number=5)
+    print("Done with figure: comp_pr_dist")
+
+    # In[ ]:
+
+def calculate_rain_durations(pr_var, thresh):
+    pr_thresh = np.where(pr_var > thresh, 1, 0)
+
+    durations = []
+
+    for i in range(pr_thresh.shape[1]):
+        for j in range(pr_thresh.shape[2]):
+            timeseries = pr_thresh[:, i, j]
+
+            count = 0
+            for k in range(pr_thresh.shape[0]):
+                if timeseries[k] > 0:
+                    count += 1
+                else:
+                    if count > 0:
+                        durations.append(count)
+                        count = 0
+
+    return durations
+
+if should_run_figure(6):
+    fig, ax = plt.subplots(1, 3, figsize=(8, 3), constrained_layout=True, sharey=True)
+
+    h, bins = np.histogram(calculate_rain_durations(imerg_pr, 5), bins=59, range=(1, 60))
+    h = uniform_filter1d(h, size=5)
+    ax[0].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color='k', ls=':', label='IMERG (Obs)')
+    ax[0].set_yscale('log')
+
+    for s, ds in enumerate(dss):
+        precip_con = ds.rainc + ds.i_rainc*100.
+        precip_res = ds.rainnc + ds.i_rainnc*100.
+        precip = precip_con + precip_res
+
+        for i, precip_var in enumerate([precip, precip_con, precip_res]):
+            if time_format == 'int':
+                precip_rate = precip_var.diff("Time") / (dt / 24.0)
+            else:
+                dt_days = (
+                    precip_var.Time.diff("Time") / np.timedelta64(1, "D")
+                )
+                precip_rate = precip_var.diff("Time") / dt_days
+            h, bins = np.histogram(calculate_rain_durations(precip_rate.values, 5), bins=59, range=(1, 60))
+            h = uniform_filter1d(h, size=5)
+            if i == 0:
+                ax[i].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color=cols[s], label=sim_names[s])
+            else:
+                ax[i].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color=cols[s])
+            ax[i].set_yscale('log')
+
+    for a in ax:
+        a.set_xlim(1, 60)
+        a.set_xlabel("Duration (days)")
+
+    fig.legend(loc='outside lower center', ncol=5)
+
+    ax[0].set_title("Total")
+    ax[0].set_ylabel("Normalised frequency")
+    ax[1].set_title("Parameterised")
+    ax[2].set_title("Resolved")
+
+    figsave.save(fig, "duration_dist", number=6)
+    print("Done with figure: comp_duration_dist")
+
+    # In[ ]:
+
+if should_run_figure(7):
+    spec_levels = np.linspace(0, 2.5, 26)
+    spec_cmap, spec_norm = make_spectrum_cmap(spec_levels)
+    spec_diff_levels = symmetric_levels(1.0, ndiv=11)
+    spec_diff_norm = make_diff_norm(spec_diff_levels)
+
+    fig, ax = plt.subplots(len(data_locs), 2, figsize=(8, 8), constrained_layout=True)
+    fig2, ax2 = plt.subplots(len(data_locs), 2, figsize=(8, 8), constrained_layout=True)
+
+    if len(data_locs) == 1:
+        ax = np.array([ax])
+        ax2 = np.array([ax2])
+
+    control_sym_spec = None
+    control_asym_spec = None
+    sym_spec_im = asym_spec_im = None
+    sym_diff_im = asym_diff_im = None
+
+    for d, ds in enumerate(dss):
+        precip = ds.rainc + ds.i_rainc*100. + ds.rainnc + ds.i_rainnc*100.
+
+        if time_format == 'int':
+            precip_rate = precip.diff("Time") / (dt / 24.0)
+        else:
+            dt_days = (
+                precip.Time.diff("Time") / np.timedelta64(1, "D")
+            )
+            precip_rate = precip.diff("Time") / dt_days
+
+        pr = precip_rate.rename({'latitude':'lat', 'longitude':'lon'})
+        pr = pr.load()
+        print(pr)
+
+        spd = 4
+
+        raw_spectrum = spacetime_power(pr, lataggreg='mean', latitude_bounds=(-10, 10), dosymmetries=True,
+                                       segsize=96, noverlap=60, spd=spd)
+
+        sym_smooth_spectrum = smooth_wavefreq(raw_spectrum.sel(component='symmetric'), freq_ax = 1)
+        asym_smooth_spectrum = smooth_wavefreq(raw_spectrum.sel(component='antisymmetric'), freq_ax = 1)
+
+        sym_sig_spectrum = raw_spectrum.sel(component='symmetric')/sym_smooth_spectrum
+        asym_sig_spectrum = raw_spectrum.sel(component='antisymmetric')/asym_smooth_spectrum
+
+        wn = sym_sig_spectrum.wavenumber
+        f = sym_sig_spectrum.frequency
+
+        # Use boxes rather than contour shading.  Values <= 1 are white/light, so
+        # the plot emphasizes enhanced spectral power above the background.
+        sym_spec_im = ax[d, 0].pcolormesh(wn, f, sym_sig_spectrum.T, cmap=spec_cmap, norm=spec_norm, shading='auto')
+        asym_spec_im = ax[d, 1].pcolormesh(wn, f, asym_sig_spectrum.T, cmap=spec_cmap, norm=spec_norm, shading='auto')
+
+        # Compare only significant excess power above background.
+        sym_excess = xr.where(sym_sig_spectrum > 1.0, sym_sig_spectrum - 1.0, 0.0)
+        asym_excess = xr.where(asym_sig_spectrum > 1.0, asym_sig_spectrum - 1.0, 0.0)
+
+        if d == 0:
+            control_sym_excess = sym_excess
+            control_asym_excess = asym_excess
+
+            # Top row: show control excess power, not raw normalised power.
+            sym_diff_im = ax2[d, 0].pcolormesh( wn, f, sym_sig_spectrum.T, cmap=spec_cmap, norm=spec_norm, shading='auto' )
+            asym_diff_im = ax2[d, 1].pcolormesh( wn, f, asym_sig_spectrum.T, cmap=spec_cmap, norm=spec_norm, shading='auto'
+            )
+
+        else:
+            c_sym_excess = control_sym_excess.interp( wavenumber=sym_excess.wavenumber, frequency=sym_excess.frequency )
+            c_asym_excess = control_asym_excess.interp( wavenumber=asym_excess.wavenumber, frequency=asym_excess.frequency )
+
+            sym_diff = sym_excess - c_sym_excess
+            asym_diff = asym_excess - c_asym_excess
+
+            sym_diff_im = ax2[d, 0].pcolormesh( wn, f, sym_diff.T, cmap='bwr', norm=spec_diff_norm, shading='auto' )
+            asym_diff_im = ax2[d, 1].pcolormesh( wn, f, asym_diff.T, cmap='bwr', norm=spec_diff_norm, shading='auto' )
+
+        freq, wavenum = genDispersionCurves()
+
+        labels = ['MRG', 'IG', 'EIG', 'Kelvin', 'ER', 'IG']
+
+        for i in range(3):
+            for j in range(3):
+                for axes in (ax, ax2):
+                    axes[d, 1].plot(wavenum[i, j], freq[i, j], color='r', alpha=0.5)
+                    axes[d, 0].plot(wavenum[i+3, j], freq[i+3, j], color='r', alpha=0.5)
+
+        # Decorations
+        for axes in (ax, ax2):
+            for a in axes[d]:
+                a.set_xlim(-15, 15)
+                a.set_ylim(0, 0.5)
+                add_period_reference_lines_frequency(a)
+                if d == len(data_locs)-1:
+                    a.set_xlabel('Zonal wavenumber')
+                else:
+                    a.set_xticklabels([])
+
+            axes[d, 0].set_ylabel('Frequency (day$^{-1}$)')
+            axes[d, 1].set_yticklabels([])
+            axes[d, 0].axvline(0, color='k', ls='--')
+            axes[d, 1].axvline(0, color='k', ls='--')
+            annotate_panel_label(axes[d, 0], sim_names[d])
+            annotate_panel_label(axes[d, 1], sim_names[d])
+
+        if d == 0:
+            for axes in (ax, ax2):
+                axes[d, 0].annotate('ER', (-11, 0.12), bbox=dict(facecolor='w', edgecolor='k', alpha=0.7))
+                axes[d, 0].annotate('Kelvin', (10, 0.4), bbox=dict(facecolor='w', edgecolor='k', alpha=0.7))
+                axes[d, 0].annotate('IG', (-5, 0.4), bbox=dict(facecolor='w', edgecolor='k', alpha=0.7))
+                axes[d, 1].annotate('MRG', (-12, 0.07), bbox=dict(facecolor='w', edgecolor='k', alpha=0.7))
+                axes[d, 1].annotate('IG', (-5, 0.43), bbox=dict(facecolor='w', edgecolor='k', alpha=0.7))
+                axes[d, 1].annotate('EIG', (11, 0.32), bbox=dict(facecolor='w', edgecolor='k', alpha=0.7))
+
+    ax[0, 0].set_title('Symmetric')
+    ax[0, 1].set_title('Anti-symmetric')
+    ax2[0, 0].set_title('Symmetric')
+    ax2[0, 1].set_title('Anti-symmetric')
+
+    fig.colorbar(sym_spec_im, ax=ax[-1], location='bottom', shrink=0.5, label="Normalised power")
+    add_symmetric_colorbar(fig2, sym_diff_im if sym_diff_im is not None else sym_spec_im, ax2[-1], spec_diff_levels, location='bottom', shrink=0.5, label=r"Difference in excess normalised power above 1" )
+
+    figsave.save(fig, "spectra", number=7)
+    figsave.save(fig2, "spectra_diff", number=7)
+    print("Done with figure: comp_spectra")
+
+# Precip colourmap definition
+precip_cols = [
+    [255/255., 255/255., 255/255.], # white
+    [205/255., 236/255., 251/255.], # light blue
+    [157/255., 218/255., 247/255.], # blue
+    [72/255., 142/255., 202/255.], # dark blue
+    [72/255., 158/255., 148/255.], # light green
+    [73/255., 181/255., 70/255.], # green
+    [150/255., 203/255., 80/255.], # green-yellow
+    [250/255., 232/255., 92/255.], # yellow
+    [248/255., 184/255., 73/255.], # dark yellow
+    [245/255., 106/255., 41/255.], # orange
+    [230/255., 74/255., 41/255.], # dark orange
+    [211/255., 31/255., 40/255.], # red
+    [183/255., 27/255., 34/255.], # darker red
+    [146/255., 21/255., 25/255.], #dark red
+    [110/255., 15/255., 15/255.], #dark red
+]
+
+levels = np.linspace(0.01, 25, len(precip_cols))
+
+precip_cmap = colors.LinearSegmentedColormap.from_list(name = "precip_rate", colors=precip_cols, N=len(precip_cols))
+precip_norm = colors.BoundaryNorm(boundaries=levels, ncolors=len(precip_cols)-1)
+
+# In[ ]:
+
+if should_run_figure(8):
+    # Hovmoller diagrams of daily precipitation rate
+
+    fig, ax = plt.subplots(1, len(dss), figsize=(8, 3), constrained_layout=True)
+
+    for d, ds in enumerate(dss):
+        precip = ds.rainc + ds.i_rainc*100. + ds.rainnc + ds.i_rainnc*100.
+        precip = precip.sel(latitude=slice(-10, 10)).mean(dim='latitude')
+
+        if time_format == 'int':
+            pr = precip.diff("Time") / (dt / 24.0)
+        else:
+            dt_days = (
+                precip.Time.diff("Time") / np.timedelta64(1, "D")
+            )
+            pr = precip.diff("Time") / dt_days
+
+        hovmoller_im = ax[d].contourf(precip.longitude, pr.Time, pr.values, levels=levels, norm=precip_norm, cmap=precip_cmap, extend='max')
+
+        annotate_panel_label(ax[d], sim_names[d])
+        if d > 0:
+            ax[d].set_yticklabels([])
+
+    ax[0].set_ylabel("time (days)")
+
+    fig.colorbar(hovmoller_im, ax=ax[-1], location='right', label="Precipitation rate (mm/h)")
+
+    for a in ax:
+        a.set_xlabel("Longitude")
+
+    figsave.save(fig, "hovmoller", number=8)
+    print("Done with figure: comp_hovmoller")
+
+if should_run_figure(9):
+    # Diagnostic: how much does zgrid vary horizontally?
+
+    fig, ax = plt.subplots(len(dss), 2, figsize=(8, 3.2*len(dss)), constrained_layout=True, sharex='col')
+
+    if len(dss) == 1:
+        ax = np.array([ax])
+
+    for i, ds in enumerate(dss):
+        # zgrid: (nVertLevelsP1, latitude, longitude)
+        zgrid = ds.zgrid
+
+        # Midpoint heights from interface heights
+        z_lower = zgrid.isel(nVertLevelsP1=slice(0, -1)).values
+        z_upper = zgrid.isel(nVertLevelsP1=slice(1, None)).values
+        zmid = 0.5 * (z_lower + z_upper)   # (z, latitude, longitude)
+
+        # Horizontal diagnostics
+        zmean = np.nanmean(zmid, axis=(1, 2))         # global mean profile
+        zmin = np.nanmin(zmid, axis=(1, 2))           # global min at each level
+        zmax = np.nanmax(zmid, axis=(1, 2))           # global max at each level
+        zstd = np.nanstd(zmid, axis=(1, 2))           # global std at each level
+
+        # Zonal mean and anomaly from global mean
+        z_zonal = np.nanmean(zmid, axis=2)            # (z, latitude)
+        z_anom = z_zonal - zmean[:, None]
+
+        # ---- left: profile with spread ----
+        ax[i, 0].plot(zmean / 1000., zmean / 1000., color=cols[i], lw=1.5)
+        ax[i, 0].fill_betweenx(zmean / 1000., zmin / 1000., zmax / 1000.,
+                               color=cols[i], alpha=0.15, label='min/max')
+        ax[i, 0].fill_betweenx(zmean / 1000., (zmean - zstd) / 1000., (zmean + zstd) / 1000.,
+                               color=cols[i], alpha=0.3, label=r'$\pm 1\sigma$')
+
+        ax[i, 0].plot(zmean / 1000., zmean / 1000., color=cols[i], lw=1.5, label=sim_names[i])
+        ax[i, 0].set_ylabel("Height (km)")
+        annotate_panel_label(ax[i, 0], sim_names[i])
+        if i == len(dss) - 1:
+            ax[i, 0].set_xlabel("Global-mean height (km)")
+
+        # ---- right: latitude variation ----
+        im = ax[i, 1].contourf(
+            ds.latitude.values,
+            zmean / 1000.,
+            z_anom / 1000.,
+            levels=np.linspace(-1.0, 1.0, 21),
+            cmap='bwr',
+            extend='both'
+        )
+        annotate_panel_label(ax[i, 1], sim_names[i])
+        if i == len(dss) - 1:
+            ax[i, 1].set_xlabel("Latitude (degrees)")
+        ax[i, 1].set_ylabel("Height (km)")
+
+        # optional: print a simple summary
+        print(sim_names[i])
+        print("max |zonal-mean height anomaly| (km):", np.nanmax(np.abs(z_anom)) / 1000.)
+        print("max horizontal range at a level (km):", np.nanmax(zmax - zmin) / 1000.)
+
+    # one colourbar for the anomaly panels
+    add_symmetric_colorbar(fig, im, ax[:, 1], np.linspace(-1.0, 1.0, 21), label='Height anomaly from global mean (km)')
+
+    figsave.save(fig, "zgrid_horizontal_variation", number=9)
+
+    print("Done with figure: check_zgrid_horizontal_variation")
+
+if should_run_figure(10):
+    # Latitude-height section of zonal-mean cloud fraction
+
+    fig, ax = plt.subplots(len(dss), 1, figsize=(8, 3.5*len(dss)), constrained_layout=True, sharex=True)
+    fig2, ax2 = plt.subplots(len(dss), 1, figsize=(8, 3.5*len(dss)), constrained_layout=True, sharex=True)
+
+    if len(dss) == 1:
+        ax = [ax]
+        ax2 = [ax2]
+
+    im = im2 = im3 = None
+    control_cldfrac = None
+
+    def hemispheric_symmetrise_lat(da, lat_dim="latitude"):
+        """
+        Average a latitude field with its hemispherically flipped version.
+
+        Assumes the latitude grid is symmetric and ordered monotonically, e.g.
+        -89.75 ... 89.75. The returned DataArray keeps the original latitude
+        coordinate.
+        """
+        flipped = da.isel({lat_dim: slice(None, None, -1)})
+        flipped = flipped.assign_coords({lat_dim: da[lat_dim].values})
+        return 0.5 * (da + flipped)
+
+    for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
+        if "cldfrac" in zds.data_vars:
+            # Newer zm_latlon files may contain precomputed zonal-mean cloud fraction
+            # with dimensions (Time, z, latitude).
+            cldfrac = zds.cldfrac.mean(dim="Time")
+            zmid = height_from_zm_latlon(zds)
+            cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, zds.latitude.values)
+            lat_for_cpt = zds.latitude.values
+
+        elif "cldfrac" in ds.data_vars:
+            # Older runs have no cldfrac in latlon/zm_latlon, but do have a separate
+            # cldfrac.nc.  That file is attached only to the full latlon dataset, so
+            # compute the zonal mean here.
+            cldfrac = ds.cldfrac.mean(dim=("Time", "longitude"))
+            cldfrac = model_lat_field(cldfrac)
+
+            if i == 0:
+                cldfrac = hemispheric_symmetrise_lat(cldfrac)
+
+            zmid = midlevel_height_from_latlon(ds)
+            cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, ds.latitude.values)
+            lat_for_cpt = ds.latitude.values
+        else:
+            print(f"Skipping cloud-fraction plot for {sim_names[i]}: no cldfrac in zm_latlon, latlon, or cldfrac.nc")
+            continue
+
+        im = ax[i].contourf(lat2d, z2d / 1000.0, cldfrac.values, levels=np.linspace(0, 1, 21), cmap='binary', extend='max')
+        ax[i].plot(lat_for_cpt, CPTs[i][0]/1000., color='k', lw=1, ls=':')
+        annotate_panel_label(ax[i], sim_names[i])
+        set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
+        if i < len(dss)-1:
+            ax[i].set_xticklabels([])
+
+        if i == 0:
+            control_cldfrac = cldfrac.copy()
+
+            im2 = ax2[i].contourf(
+                lat2d, z2d / 1000.0, cldfrac.values,
+                levels=np.linspace(0, 1, 21),
+                cmap='binary',
+                extend='max'
+            )
+        else:
+            # Put control cloud fraction onto this simulation's z/latitude grid
+            c_cldfrac = control_cldfrac.interp(
+                z=cldfrac.z,
+                kwargs={"fill_value": np.nan}
+            )
+
+            # Then subtract arrays
+            cldfrac_diff = cldfrac.values - c_cldfrac.values
+
+            im3 = ax2[i].contourf(
+                lat2d, z2d / 1000.0, cldfrac_diff,
+                levels=symmetric_levels(0.1, ndiv=11),
+                cmap='bwr',
+                extend='both'
+            )
+
+        ax2[i].plot(lat_for_cpt, CPTs[i][0]/1000., color='k', lw=1, ls=':')
+        annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
+        set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
+        if i < len(dss)-1:
+            ax2[i].set_xticklabels([])
+
+    fig.colorbar(im, ax=ax, location='right', label='Cloud fraction')
+    fig2.colorbar(im2, ax=ax2[0], location='right', label='Cloud fraction')
+    if im3 is not None:
+        add_symmetric_colorbar(fig2, im3, ax2[1:], symmetric_levels(0.1, ndiv=11), label='Cloud-fraction difference')
+
+    figsave.save(fig, "cldfrac_latheight", number=10)
+    figsave.save(fig2, "cldfrac_latheight_diff", number=10)
+    print("Done with figure: comp_cldfrac_latheight")
+
+    # In[ ]:
+
+if should_run_figure(11):
+    # Latitude-height section of zonal-mean vorticity
+
+    fig, ax = plt.subplots(len(dss), 1, figsize=(8, 3.5*len(dss)), constrained_layout=True, sharex=True)
+    fig2, ax2 = plt.subplots(len(dss), 1, figsize=(8, 3.5*len(dss)), constrained_layout=True, sharex=True)
+
+    if len(dss) == 1:
+        ax = [ax]
+        ax2 = [ax2]
+
+    im = im2 = im3 = None
+    control_vort = None
+
+    for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
+        if 'vorticity' in zds.data_vars:
+            vort = zds.vorticity.mean(dim="Time")
+            zmid = height_from_zm_latlon(zds)
+            vort, lat2d, z2d = lat_height_mesh(vort, zmid, zds.latitude.values)
+
+            vmax = np.nanmax(np.abs(vort.values))
+            levels = np.linspace(-vmax, vmax, 21)
+
+            im = ax[i].contourf(lat2d, z2d/1000., vort.values, levels=levels, cmap='coolwarm', extend='both')
+            ax[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
+            annotate_panel_label(ax[i], sim_names[i])
+            set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
+            if i < len(dss)-1:
+                ax[i].set_xticklabels([])
+
+            if i == 0:
+                control_vort = vort
+                im2 = ax2[i].contourf(lat2d, z2d/1000., vort.values, levels=levels, cmap='coolwarm', extend='both')
+            else:
+                c_vort = control_vort.interp(z=vort.z, latitude=vort.latitude)
+                diff = vort - c_vort
+                dmax = np.nanmax(np.abs(diff.values))
+                dlevels = symmetric_levels(dmax, ndiv=11)
+                im3 = ax2[i].contourf(lat2d, z2d/1000., diff.values, levels=dlevels, cmap='bwr', extend='both')
+
+            ax2[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
+            annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
+            set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
+            if i < len(dss)-1:
+                ax2[i].set_xticklabels([])
+
+    add_symmetric_colorbar(fig, im, ax, levels, label='Vorticity (s$^{-1}$)')
+    fig2.colorbar(im2, ax=ax2[0], location='right', label='Vorticity (s$^{-1}$)')
+    if im3 is not None:
+        add_symmetric_colorbar(fig2, im3, ax2[1:], dlevels, label='Vorticity difference (s$^{-1}$)')
+
+    figsave.save(fig, "vorticity_latheight", number=11)
+    figsave.save(fig2, "vorticity_latheight_diff", number=11)
+    print("Done with figure: comp_vorticity_latheight")
+
+    # In[ ]:
+
+if should_run_figure(12):
+    # Histogram of OLR and time-mean lat/lon maps
+
+    fig, ax = plt.subplots(1, len(dss), figsize=(10, 3.5), constrained_layout=True)
+    fig2, ax2 = plt.subplots(1, len(dss), figsize=(10, 3.5), constrained_layout=True)
+    fig3, ax3 = plt.subplots(figsize=(8, 3), constrained_layout=True)
+
+    if len(dss) == 1:
+        ax = [ax]
+        ax2 = [ax2]
+
+    olr_cols = cols
+    bins = np.linspace(100, 350, 80)
+    im = im2 = im3 = None
+    control_olr = None
+
+    for i, ds in enumerate(dss):
+        olr = ds.olrtoa
+        olr_mean = olr.mean(dim='Time')
+
+        h, b = np.histogram(olr.values.ravel(), bins=bins)
+        ax3.plot(0.5 * (b[1:] + b[:-1]), h / h.sum(), color=olr_cols[i], label=sim_names[i])
+
+        im = ax[i].contourf(
+            ds.longitude.values,
+            ds.latitude.values,
+            olr_mean.values,
+            levels=np.linspace(200, 300, 151),
+            norm=colors.PowerNorm(gamma=0.5), cmap='Blues',
+            extend='both'
+        )
+        annotate_panel_label(ax[i], sim_names[i])
+        ax[i].set_xlabel('Longitude')
+        if i == 0:
+            ax[i].set_ylabel('Latitude')
+            control_olr = olr_mean
+            im2 = ax2[i].contourf(
+                ds.longitude.values,
+                ds.latitude.values,
+                olr_mean.values,
+                levels=np.linspace(200, 300, 151),
+                norm=colors.PowerNorm(gamma=0.5), cmap='Blues',
+                extend='both'
+            )
+        else:
+            ax[i].set_yticklabels([])
+            control_interp = control_olr.interp(latitude=olr_mean.latitude, longitude=olr_mean.longitude)
+            im3 = ax2[i].contourf(
+                ds.longitude.values,
+                ds.latitude.values,
+                (olr_mean - control_interp).values,
+                levels=symmetric_levels(20.0, ndiv=11),
+                cmap='bwr',
+                extend='both'
+            )
+
+        annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
+        ax2[i].set_xlabel('Longitude')
+        if i == 0:
+            ax2[i].set_ylabel('Latitude')
+        else:
+            ax2[i].set_yticklabels([])
+
+    ax3.set_xlabel(r'OLR (W m$^{-2}$)')
+    ax3.set_ylabel('Normalised frequency')
+    ax3.legend(loc='best')
+
+    fig.colorbar(im, ax=ax[-1], location='right', label=r'OLR (W m$^{-2}$)')
+    fig2.colorbar(im2, ax=ax2[0], location='right', label=r'OLR (W m$^{-2}$)')
+    if im3 is not None:
+        add_symmetric_colorbar(fig2, im3, ax2[1:], symmetric_levels(20.0, ndiv=11), label=r'OLR difference (W m$^{-2}$)')
+
+    figsave.save(fig, "olrtoa_maps", number=12)
+    figsave.save(fig2, "olrtoa_maps_diff", number=12)
+    figsave.save(fig3, "olrtoa_hist", number=12)
+    print("Done with figure: comp_olrtoa_hist_maps")
+
+    # In[ ]:
+
+if should_run_figure(16):
+    # Time-mean latitude-height sections of temperature and reconstructed winds.
+
+    latheight_entries = []
+    for spec in LATHEIGHT_MEAN_STATE_SPECS:
+        fields_by_sim = {}
+        for i, zds in enumerate(dss_zm):
+            try:
+                fields_by_sim[i] = latheight_time_mean_field(zds, spec)
+            except ValueError as e:
+                print(f"Skipping {spec['label']} latitude-height plot for {sim_names[i]}: {e}")
+
+        if 0 not in fields_by_sim:
+            print(f"Skipping {spec['label']} latitude-height plots: control field is missing")
+            continue
+
+        latheight_entries.append((spec, fields_by_sim))
+
+    if latheight_entries:
+        nrows = len(latheight_entries)
+        ncols = len(dss_zm)
+        fig, ax = plt.subplots(
+            nrows, ncols,
+            figsize=(3.7*ncols, 2.8*nrows),
+            constrained_layout=True,
+            squeeze=False,
+            sharex=True,
+            sharey=True,
+        )
+        fig2, ax2 = plt.subplots(
+            nrows, ncols,
+            figsize=(3.7*ncols, 2.8*nrows),
+            constrained_layout=True,
+            squeeze=False,
+            sharex=True,
+            sharey=True,
+        )
+
+        for row, (spec, fields_by_sim) in enumerate(latheight_entries):
+            raw_fields = list(fields_by_sim.values())
+            raw_levels = latlon_contour_levels(
+                raw_fields,
+                symmetric=spec.get("raw_symmetric", False),
+                fallback=spec.get("raw_fallback", 1.0),
+            )
+            control_field = fields_by_sim[0]
+            diff_fields = {}
+            for i, field in fields_by_sim.items():
+                if i == 0:
+                    continue
+                control_interp = control_field.interp(z=field.z, latitude=field.latitude)
+                diff_fields[i] = (field - control_interp).load()
+
+            diff_levels = (
+                symmetric_contour_levels(
+                    list(diff_fields.values()),
+                    ndiv=10,
+                    fallback=spec.get("diff_fallback", 1.0),
+                )
+                if diff_fields
+                else symmetric_levels(spec.get("diff_fallback", 1.0), ndiv=10)
+            )
+
+            raw_im = control_im = diff_im = None
+            for i in range(ncols):
+                field = fields_by_sim.get(i)
+                for axes in (ax[row, i], ax2[row, i]):
+                    set_latheight_labels(axes, xlabel=(row == nrows-1))
+                    if i == 0:
+                        axes.set_ylabel(f"{spec['label']}\nHeight (km)")
+                    else:
+                        axes.tick_params(labelleft=False)
+                    if row < nrows-1:
+                        axes.tick_params(labelbottom=False)
+
+                if field is None:
+                    ax[row, i].set_visible(False)
+                    ax2[row, i].set_visible(False)
+                    continue
+
+                zmid = height_from_zm_latlon(dss_zm[i])
+                field_plot, lat2d, z2d = lat_height_mesh(field, zmid, field.latitude.values)
+                raw_im = ax[row, i].contourf(
+                    lat2d,
+                    z2d / 1000.0,
+                    field_plot.values,
+                    levels=raw_levels,
+                    cmap=spec["cmap"],
+                    extend="both",
+                )
+                ax[row, i].plot(dss_zm[i].latitude.values, CPTs[i][0]/1000.0, color="k", lw=1, ls=":")
+                annotate_panel_label(ax[row, i], sim_names[i])
+
+                if i == 0:
+                    control_im = ax2[row, i].contourf(
+                        lat2d,
+                        z2d / 1000.0,
+                        field_plot.values,
+                        levels=raw_levels,
+                        cmap=spec["cmap"],
+                        extend="both",
+                    )
+                else:
+                    diff = diff_fields[i]
+                    diff_plot, diff_lat2d, diff_z2d = lat_height_mesh(diff, zmid, diff.latitude.values)
+                    diff_im = ax2[row, i].contourf(
+                        diff_lat2d,
+                        diff_z2d / 1000.0,
+                        diff_plot.values,
+                        levels=diff_levels,
+                        cmap="bwr",
+                        extend="both",
+                    )
+                ax2[row, i].plot(dss_zm[i].latitude.values, CPTs[i][0]/1000.0, color="k", lw=1, ls=":")
+                annotate_panel_label(ax2[row, i], control_diff_label(sim_names, i))
+
+            label = f"{spec['label']} ({spec['units']})"
+            if raw_im is not None:
+                fig.colorbar(raw_im, ax=ax[row, :], location="right", label=label)
+            if control_im is not None:
+                fig2.colorbar(control_im, ax=ax2[row, 0], location="right", label=label)
+            if diff_im is not None:
+                add_symmetric_colorbar(
+                    fig2,
+                    diff_im,
+                    ax2[row, 1:],
+                    diff_levels,
+                    label=f"{spec['label']} difference ({spec['units']})",
+                )
+
+        figsave.save(fig, "temperature_wind_latheight", number=16)
+        figsave.save(fig2, "temperature_wind_latheight_diff", number=16)
+        print("Done with figure: comp_temperature_wind_latheight")
+    else:
+        print("Skipping temperature/wind latitude-height plots: no requested fields were available")
+
+    # In[ ]:
+
+if should_run_figure(17):
+    # Time-mean MSLP lat/lon maps, using the same raw/control-difference layout
+    # as the OLR maps.
+
+    spec = MSLP_LATLON_SPEC
+    fields_by_sim = {}
+    for i, ds in enumerate(dss):
+        try:
+            fields_by_sim[i] = latlon_time_mean_field(
+                ds,
+                spec["candidates"],
+                scale=spec.get("scale", 1.0),
+                name=spec["label"],
+            )
+        except ValueError as e:
+            print(f"Skipping {spec['label']} map for {sim_names[i]}: {e}")
+
+    if 0 in fields_by_sim:
+        fig, ax = plt.subplots(1, len(dss), figsize=(10, 3.5), constrained_layout=True, squeeze=False)
+        fig2, ax2 = plt.subplots(1, len(dss), figsize=(10, 3.5), constrained_layout=True, squeeze=False)
+        ax = ax[0]
+        ax2 = ax2[0]
+
+        raw_levels = latlon_contour_levels(
+            list(fields_by_sim.values()),
+            symmetric=spec.get("raw_symmetric", False),
+            fallback=spec.get("raw_fallback", 1.0),
+        )
+        control_field = fields_by_sim[0]
+        diff_fields = {}
+        for i, field in fields_by_sim.items():
+            if i == 0:
+                continue
+            control_interp = control_field.interp(latitude=field.latitude, longitude=field.longitude)
+            diff_fields[i] = (field - control_interp).load()
+
+        diff_levels = (
+            symmetric_contour_levels(
+                list(diff_fields.values()),
+                ndiv=10,
+                fallback=spec.get("diff_fallback", 1.0),
+            )
+            if diff_fields
+            else symmetric_levels(spec.get("diff_fallback", 1.0), ndiv=10)
+        )
+
+        raw_im = control_im = diff_im = None
+        for i in range(len(dss)):
+            field = fields_by_sim.get(i)
+            if field is None:
+                ax[i].set_visible(False)
+                ax2[i].set_visible(False)
+                continue
+
+            raw_im = ax[i].contourf(
+                field.longitude.values,
+                field.latitude.values,
+                field.values,
+                levels=raw_levels,
+                cmap=spec["cmap"],
+                extend="both",
+            )
+            annotate_panel_label(ax[i], sim_names[i])
+            ax[i].set_xlabel("Longitude")
+
+            if i == 0:
+                ax[i].set_ylabel("Latitude")
+                control_im = ax2[i].contourf(
+                    field.longitude.values,
+                    field.latitude.values,
+                    field.values,
+                    levels=raw_levels,
+                    cmap=spec["cmap"],
+                    extend="both",
+                )
+            else:
+                ax[i].tick_params(labelleft=False)
+                diff = diff_fields[i]
+                diff_im = ax2[i].contourf(
+                    diff.longitude.values,
+                    diff.latitude.values,
+                    diff.values,
+                    levels=diff_levels,
+                    cmap="bwr",
+                    extend="both",
+                )
+
+            annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
+            ax2[i].set_xlabel("Longitude")
+            if i == 0:
+                ax2[i].set_ylabel("Latitude")
+            else:
+                ax2[i].tick_params(labelleft=False)
+
+        label = f"{spec['label']} ({spec['units']})"
+        if raw_im is not None:
+            fig.colorbar(raw_im, ax=ax[-1], location="right", label=label)
+        if control_im is not None:
+            fig2.colorbar(control_im, ax=ax2[0], location="right", label=label)
+        if diff_im is not None:
+            add_symmetric_colorbar(
+                fig2,
+                diff_im,
+                ax2[1:],
+                diff_levels,
+                label=f"{spec['label']} difference ({spec['units']})",
+            )
+
+        figsave.save(fig, "mslp_maps", number=17)
+        figsave.save(fig2, "mslp_maps_diff", number=17)
+        print("Done with figure: comp_mslp_maps")
+    else:
+        print("Skipping MSLP lat/lon maps: control field is missing")
+
+    # In[ ]:
+
+if should_run_figure(18):
+    # Time-mean latitude-height sections of MPAS moist scalar constituents.
+    # Grouping follows the usual microphysics taxonomy: vapour, liquid-phase
+    # hydrometeors, and ice-phase hydrometeors.
+
+    zmid_cache = {}
+    for i, ds in enumerate(dss):
+        try:
+            zmid_cache[i] = midlevel_height_from_latlon(ds)
+        except Exception as e:
+            print(f"Skipping scalar constituent height cache for {sim_names[i]}: {e}")
+
+    for group in SCALAR_CONSTITUENT_GROUPS:
+        scalar_entries = []
+        for spec in group["fields"]:
+            fields_by_sim = {}
+            meshes_by_sim = {}
+            for i, ds in enumerate(dss):
+                if i not in zmid_cache:
+                    continue
+                try:
+                    field, lat2d, z2d = scalar_constituent_latheight(ds, spec, zmid=zmid_cache[i])
+                except ValueError as e:
+                    print(f"Skipping {spec['label']} latitude-height plot for {sim_names[i]}: {e}")
+                    continue
+                fields_by_sim[i] = field
+                meshes_by_sim[i] = (lat2d, z2d)
+
+            if 0 not in fields_by_sim:
+                print(f"Skipping {spec['label']} latitude-height plots: control field is missing")
+                continue
+
+            scalar_entries.append((spec, fields_by_sim, meshes_by_sim))
+
+        if not scalar_entries:
+            print(f"Skipping {group['title']} scalar-constituent plots: no requested fields were available")
+            continue
+
+        nrows = len(scalar_entries)
+        ncols = len(dss)
+        fig, ax = plt.subplots(
+            nrows, ncols,
+            figsize=(3.7*ncols, 2.8*nrows),
+            constrained_layout=True,
+            squeeze=False,
+            sharex=True,
+            sharey=True,
+        )
+        fig2, ax2 = plt.subplots(
+            nrows, ncols,
+            figsize=(3.7*ncols, 2.8*nrows),
+            constrained_layout=True,
+            squeeze=False,
+            sharex=True,
+            sharey=True,
+        )
+
+        for row, (spec, fields_by_sim, meshes_by_sim) in enumerate(scalar_entries):
+            raw_levels = positive_percentile_levels(
+                list(fields_by_sim.values()),
+                percentile=99.5,
+                fallback=spec.get("raw_fallback", 1.0),
+            )
+            control_field = fields_by_sim[0]
+            diff_fields = {}
+            for i, field in fields_by_sim.items():
+                if i == 0:
+                    continue
+                control_interp = control_field.interp(
+                    z=field.z,
+                    latitude=field.latitude,
+                    kwargs={"fill_value": np.nan},
+                )
+                diff_fields[i] = (field - control_interp).load()
+
+            diff_levels = (
+                symmetric_percentile_levels(
+                    list(diff_fields.values()),
+                    percentile=99.0,
+                    fallback=spec.get("diff_fallback", 1.0),
+                )
+                if diff_fields
+                else symmetric_levels(spec.get("diff_fallback", 1.0), ndiv=10)
+            )
+
+            raw_im = control_im = diff_im = None
+            for i in range(ncols):
+                field = fields_by_sim.get(i)
+                for axes in (ax[row, i], ax2[row, i]):
+                    set_latheight_labels(axes, xlabel=(row == nrows-1))
+                    if i == 0:
+                        axes.set_ylabel(f"{spec['symbol']}\nHeight (km)")
+                    else:
+                        axes.tick_params(labelleft=False)
+                    if row < nrows-1:
+                        axes.tick_params(labelbottom=False)
+
+                if field is None:
+                    ax[row, i].set_visible(False)
+                    ax2[row, i].set_visible(False)
+                    continue
+
+                lat2d, z2d = meshes_by_sim[i]
+                raw_im = ax[row, i].contourf(
+                    lat2d,
+                    z2d / 1000.0,
+                    field.values,
+                    levels=raw_levels,
+                    cmap=spec["cmap"],
+                    extend="max",
+                )
+                ax[row, i].plot(dss_zm[i].latitude.values, CPTs[i][0]/1000.0, color="k", lw=1, ls=":")
+                annotate_panel_label(ax[row, i], sim_names[i])
+
+                if i == 0:
+                    control_im = ax2[row, i].contourf(
+                        lat2d,
+                        z2d / 1000.0,
+                        field.values,
+                        levels=raw_levels,
+                        cmap=spec["cmap"],
+                        extend="max",
+                    )
+                else:
+                    diff = diff_fields[i]
+                    diff_im = ax2[row, i].contourf(
+                        lat2d,
+                        z2d / 1000.0,
+                        diff.values,
+                        levels=diff_levels,
+                        cmap="bwr",
+                        extend="both",
+                    )
+
+                ax2[row, i].plot(dss_zm[i].latitude.values, CPTs[i][0]/1000.0, color="k", lw=1, ls=":")
+                annotate_panel_label(ax2[row, i], control_diff_label(sim_names, i))
+
+            label = f"{spec['label']} ({spec['units']})"
+            if raw_im is not None:
+                fig.colorbar(raw_im, ax=ax[row, :], location="right", label=label)
+            if control_im is not None:
+                fig2.colorbar(control_im, ax=ax2[row, 0], location="right", label=label)
+            if diff_im is not None:
+                add_symmetric_colorbar(
+                    fig2,
+                    diff_im,
+                    ax2[row, 1:],
+                    diff_levels,
+                    label=f"{spec['label']} difference ({spec['units']})",
+                )
+
+        fig.suptitle(group["title"])
+        fig2.suptitle(f"{group['title']} differences")
+        figsave.save(fig, f"scalar_constituents_{group['name']}_latheight", number=18)
+        figsave.save(fig2, f"scalar_constituents_{group['name']}_latheight_diff", number=18)
+        print(f"Done with figure: comp_scalar_constituents_{group['name']}_latheight")
+
+    # In[ ]:
+
+if should_run_figure(13):
+    # Latitude-height section of zonal-mean kinetic energy
+
+    fig, ax = plt.subplots(len(dss), 1, figsize=(8, 3.5*len(dss)), constrained_layout=True, sharex=True)
+    fig2, ax2 = plt.subplots(len(dss), 1, figsize=(8, 3.5*len(dss)), constrained_layout=True, sharex=True)
+
+    if len(dss) == 1:
+        ax = [ax]
+        ax2 = [ax2]
+
+    im = im2 = im3 = None
+    control_ke = None
+
+    for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
+        if 'ke' in zds.data_vars:
+            ke = zds.ke.mean(dim="Time")
+            zmid = height_from_zm_latlon(zds)
+            ke, lat2d, z2d = lat_height_mesh(ke, zmid, zds.latitude.values)
+
+            im = ax[i].contourf(lat2d, z2d/1000., ke.values, levels=np.linspace(0, np.nanmax(ke.values), 21), cmap='YlGnBu', extend='max')
+            ax[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
+            annotate_panel_label(ax[i], sim_names[i])
+            set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
+            if i < len(dss)-1:
+                ax[i].set_xticklabels([])
+
+            if i == 0:
+                control_ke = ke
+                im2 = ax2[i].contourf(lat2d, z2d/1000., ke.values, levels=np.linspace(0, np.nanmax(ke.values), 21), cmap='YlGnBu', extend='max')
+            else:
+                c_ke = control_ke.interp(z=ke.z, latitude=ke.latitude)
+                im3 = ax2[i].contourf(lat2d, z2d/1000., (ke - c_ke).values, levels=symmetric_levels(100.0, ndiv=11), cmap='bwr', extend='both')
+
+            ax2[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
+            annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
+            set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
+            if i < len(dss)-1:
+                ax2[i].set_xticklabels([])
+
+    fig.colorbar(im, ax=ax, location='right', label=r'Kinetic energy (m$^2$ s$^{-2}$)')
+    fig2.colorbar(im2, ax=ax2[0], location='right', label=r'Kinetic energy (m$^2$ s$^{-2}$)')
+    if im3 is not None:
+        add_symmetric_colorbar(fig2, im3, ax2[1:], symmetric_levels(100.0, ndiv=11), label=r'KE difference (m$^2$ s$^{-2}$)')
+
+    figsave.save(fig, "ke_latheight", number=13)
+    figsave.save(fig2, "ke_latheight_diff", number=13)
+    print("Done with figure: comp_ke_latheight")
+
+    # In[ ]:
+
+# Latitude-pressure section of isobaric eddy kinetic energy
+
+if should_run_figure(14):
+    eke_entries = []
+
+    for i, ds in enumerate(dss):
+        try:
+            eke = isobaric_eddy_kinetic_energy(ds).load()
+        except ValueError as e:
+            print(f"Skipping EKE latitude-pressure plot for {sim_names[i]}: {e}")
+            continue
+        eke_entries.append((i, eke))
+
+    if eke_entries:
+        nrows = len(eke_entries)
+        fig, ax = plt.subplots(nrows, 1, figsize=(8, 3.5*nrows), constrained_layout=True, sharex=True)
+        fig2, ax2 = plt.subplots(nrows, 1, figsize=(8, 3.5*nrows), constrained_layout=True, sharex=True)
+
+        if nrows == 1:
+            ax = [ax]
+            ax2 = [ax2]
+
+        eke_fields = [eke for _, eke in eke_entries]
+        eke_levels = positive_contour_levels(eke_fields)
+        diff_fields = []
+        control_index, control_eke = eke_entries[0]
+
+        for _, eke in eke_entries[1:]:
+            c_eke = control_eke.interp(pres=eke.pres, latitude=eke.latitude)
+            diff_fields.append(eke - c_eke)
+
+        diff_levels = symmetric_contour_levels(diff_fields, ndiv=11) if diff_fields else symmetric_levels(1.0, ndiv=11)
+
+        im = im2 = im3 = None
+
+        for row, (i, eke) in enumerate(eke_entries):
+            im = ax[row].contourf(
+                eke.latitude.values,
+                eke.pres.values,
+                eke.values,
+                levels=eke_levels,
+                cmap="YlGnBu",
+                extend="max"
+            )
+            ax[row].plot(dss[i].latitude.values, CPTs[i][1]/100., color="k", lw=1, ls=":")
+            annotate_panel_label(ax[row], sim_names[i])
+            set_latpres_axis(ax[row], xlabel=(row == nrows-1), ylabel=True, xlim=(-90, 90), ylim=(1000, 50))
+            if row < nrows-1:
+                ax[row].set_xticklabels([])
+
+            if row == 0:
+                im2 = ax2[row].contourf(
+                    eke.latitude.values,
+                    eke.pres.values,
+                    eke.values,
+                    levels=eke_levels,
+                    cmap="YlGnBu",
+                    extend="max"
+                )
+            else:
+                c_eke = control_eke.interp(pres=eke.pres, latitude=eke.latitude)
+                diff = eke - c_eke
+                im3 = ax2[row].contourf(
+                    eke.latitude.values,
+                    eke.pres.values,
+                    diff.values,
+                    levels=diff_levels,
+                    cmap="bwr",
+                    extend="both"
+                )
+
+            ax2[row].plot(dss[i].latitude.values, CPTs[i][1]/100., color="k", lw=1, ls=":")
+            annotate_panel_label(ax2[row], control_diff_label(sim_names, i, control=control_index))
+            set_latpres_axis(ax2[row], xlabel=(row == nrows-1), ylabel=True, xlim=(-90, 90), ylim=(1000, 50))
+            if row < nrows-1:
+                ax2[row].set_xticklabels([])
+
+        fig.colorbar(im, ax=ax, location="right", label=r"Eddy kinetic energy (m$^2$ s$^{-2}$)")
+        fig2.colorbar(im2, ax=ax2[0], location="right", label=r"Eddy kinetic energy (m$^2$ s$^{-2}$)")
+        if im3 is not None:
+            add_symmetric_colorbar(fig2, im3, ax2[1:], diff_levels, label=r"EKE difference (m$^2$ s$^{-2}$)")
+
+        figsave.save(fig, "eke_latpres", number=14)
+        figsave.save(fig2, "eke_latpres_diff", number=14)
+        print("Done with figure: comp_eke_latpres")
+    else:
+        print("Skipping EKE latitude-pressure plot: no simulations had the required winds")
+
+# In[ ]:
+
+# Global energy budget time series from TOA/surface fluxes and surface turbulent fluxes
+
+if should_run_figure(15):
+    budget_entries = []
+    budget_summary_rows = []
+    budget_timeseries_rows = []
+
+    for i, ds in enumerate(dss):
+        try:
+            fields = global_energy_budget_fields(ds)
+        except ValueError as e:
+            print(f"Skipping global energy budget for {sim_names[i]}: {e}")
+            continue
+
+        time_origin = ds.Time.values[0]
+        series = {}
+        cumulative = {}
+        for key in ENERGY_BUDGET_ORDER:
+            ts = global_area_mean(fields[key]).load()
+            t_days, cum = cumulative_energy_mj_m2(ts, origin=time_origin)
+            values = np.asarray(ts.values, dtype=float)
+            series[key] = ts
+            cumulative[key] = cum
+
+            budget_summary_rows.append({
+                "simulation": sim_names[i],
+                "term": key,
+                "label": ENERGY_BUDGET_TERMS[key],
+                "mean_w_m2": float(np.nanmean(values)),
+                "std_w_m2": float(np.nanstd(values)),
+                "final_cumulative_mj_m2": float(cum[-1]) if cum.size else np.nan,
+            })
+
+            for time_index, (time_day, flux, cumulative_energy) in enumerate(zip(t_days, values, cum)):
+                budget_timeseries_rows.append({
+                    "simulation": sim_names[i],
+                    "term": key,
+                    "label": ENERGY_BUDGET_TERMS[key],
+                    "time_index": time_index,
+                    "time_days": float(time_day),
+                    "flux_w_m2": float(flux),
+                    "cumulative_mj_m2": float(cumulative_energy),
+                })
+
+        budget_entries.append((i, series, cumulative, time_origin))
+
+    if budget_entries:
+        budget_df = pd.DataFrame(budget_summary_rows)
+        budget_ts_df = pd.DataFrame(budget_timeseries_rows)
+        if save:
+            budget_df.to_csv(os.path.join(save_loc, "global_energy_budget_summary.csv"), index=False)
+            budget_ts_df.to_csv(os.path.join(save_loc, "global_energy_budget_timeseries.csv"), index=False)
+
+        print("Global energy budget means (W m-2) and cumulative uptake (MJ m-2):")
+        print(budget_df.pivot(index="simulation", columns="term", values="mean_w_m2"))
+
+        nrows = len(budget_entries)
+        fig, ax = plt.subplots(nrows, 3, figsize=(12, 3.1*nrows), constrained_layout=True, sharex="col")
+        if nrows == 1:
+            ax = np.array([ax])
+
+        balance_terms = ["net_toa", "atm_column_input", "surface_net_input"]
+        component_terms = ["atm_rad", "surface_turbulent", "net_surface_rad", "precip_latent_heating"]
+        line_styles = {
+            "net_toa": dict(color="k", lw=1.6, ls="-"),
+            "atm_column_input": dict(color="tab:blue", lw=1.3, ls="-"),
+            "surface_net_input": dict(color="tab:orange", lw=1.3, ls="-"),
+            "atm_rad": dict(color="tab:purple", lw=1.2, ls="-"),
+            "surface_turbulent": dict(color="tab:red", lw=1.2, ls="-"),
+            "net_surface_rad": dict(color="tab:green", lw=1.2, ls="-"),
+            "precip_latent_heating": dict(color="0.45", lw=1.0, ls=":"),
+        }
+
+        for row, (i, series, cumulative, time_origin) in enumerate(budget_entries):
+            annotate_panel_label(ax[row, 0], sim_names[i])
+
+            for key in balance_terms:
+                t_days = time_days_since_start(series[key], origin=time_origin)
+                ax[row, 0].plot(t_days, series[key].values, label=ENERGY_BUDGET_TERMS[key], **line_styles[key])
+                ax[row, 1].plot(t_days, cumulative[key], label=ENERGY_BUDGET_TERMS[key], **line_styles[key])
+
+            for key in component_terms:
+                t_days = time_days_since_start(series[key], origin=time_origin)
+                ax[row, 2].plot(t_days, series[key].values, label=ENERGY_BUDGET_TERMS[key], **line_styles[key])
+
+            for col in range(3):
+                ax[row, col].axhline(0, color="0.35", lw=0.7)
+                if row < nrows - 1:
+                    ax[row, col].set_xticklabels([])
+
+            ax[row, 0].set_ylabel(r"Flux (W m$^{-2}$)")
+            ax[row, 1].set_ylabel(r"Cumulative (MJ m$^{-2}$)")
+            ax[row, 2].set_ylabel(r"Flux (W m$^{-2}$)")
+
+        ax[0, 0].set_title("Global imbalance")
+        ax[0, 1].set_title("Cumulative uptake")
+        ax[0, 2].set_title("Budget components")
+
+        for col in range(3):
+            ax[-1, col].set_xlabel("Time since analysis start (days)")
+            ax[0, col].legend(loc="best", fontsize=7)
+
+        figsave.save(fig, "global_energy_budget_timeseries", number=15)
+        print("Done with figure: comp_global_energy_budget")
+    else:
+        print("Skipping global energy budget: no simulations had the required fluxes")
