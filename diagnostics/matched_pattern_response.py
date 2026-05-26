@@ -6,7 +6,11 @@
 import os
 import sys
 
-sys.path.append("../../")
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+for _rel_path in ("..", "../..", "../../.."):
+    _path = os.path.abspath(os.path.join(_THIS_DIR, _rel_path))
+    if _path not in sys.path:
+        sys.path.append(_path)
 
 import numpy as np
 import pandas as pd

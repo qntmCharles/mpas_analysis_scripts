@@ -117,7 +117,7 @@ eddy_flux_lat_bounds = (-20, 20)
 
 # Analysis wave bands.  Names with suffixes are unique analysis IDs for parity
 # projections of the same underlying k-f filter.
-wave_names = ["Kelvin", "EIG", "IG_sym", "IG_antisym", "AD_sym", "AD_antisym", "ER"]
+wave_names = ["Kelvin", "EIG", "IG_antisym", "AD_sym", "AD_antisym", "ER"]
 
 # Latitude projection by wave.  Choices are:
 #   symmetric:       average over filter_lat_bounds, suitable for even modes
@@ -135,11 +135,9 @@ wave_names = ["Kelvin", "EIG", "IG_sym", "IG_antisym", "AD_sym", "AD_antisym", "
 wave_latitude_projection = {
     "Kelvin": "symmetric",
     "EIG": "antisymmetric",
-    "IG_sym": "symmetric",
     "IG_antisym": "antisymmetric",
-    "AD_sym": "hemispheric_sum",
+    "AD_sym": "symmetric",
     "AD_antisym": "antisymmetric",
-    "AD": "hemispheric_sum",
     "ER": "symmetric",
 }
 
@@ -164,7 +162,7 @@ cldfrac_profile_heights_km = [2, 5, 8, 11, 14, 17]
 
 # Figure 8 keeps latitude resolved, so hemispheric projections such as AD_sym
 # and AD_antisym are not applied there. Use the underlying AD filter once.
-eddy_flux_waves = ["Kelvin", "EIG", "IG_sym", "IG_antisym", "AD", "ER"]
+eddy_flux_waves = ["Kelvin", "EIG", "IG_antisym", "AD_sym", "AD_antisym", "ER"]
 eddy_flux_levels = [100, 250, 850]
 
 spectrum_field = "Precip"
@@ -193,6 +191,12 @@ cache_dir = '/store/atmos-adk33/cwp29/cache/'
 input_cache_dir = os.path.join(cache_dir, "filter_inputs")
 os.makedirs(cache_dir, exist_ok=True)
 os.makedirs(input_cache_dir, exist_ok=True)
+
+# Bump this when the pressure-level source fields or their coordinate handling
+# changes. Existing pressure-level filter inputs/wave caches without this marker
+# are regenerated automatically.
+PRESSURE_FIELD_CACHE_VERSION = "pressure-axis-fixed"
+PRESSURE_FIELD_PREFIXES = ("omega", "u", "v", "T", "qv", "RH")
 
 # Avoid giant chunks when selecting latitude/longitude subsets.
 dask.config.set({"array.slicing.split_large_chunks": True})
@@ -342,7 +346,7 @@ def parse_cldfrac_height_km(field_name):
 
 
 def available_cldfrac_times(cf):
-    """Return times present in the reindexed cloud-fraction file."""
+    """Return times with actual cloud-fraction data after any reindexing."""
     indexers = {dim: 0 for dim in cf.dims if dim != "Time"}
     valid = cf.isel(indexers).notnull().load()
     return valid.Time.values[np.asarray(valid.values, dtype=bool)]
@@ -413,6 +417,20 @@ def get_filter_field(ds, field_name):
     raise ValueError(f"Unrecognised field name: {field_name}")
 
 
+def is_pressure_level_field(field_name):
+    for prefix in PRESSURE_FIELD_PREFIXES:
+        if field_name.startswith(prefix):
+            level_text = field_name[len(prefix):]
+            if not level_text:
+                return False
+            try:
+                float(level_text)
+            except ValueError:
+                return False
+            return True
+    return False
+
+
 def field_units(field_name):
     if field_name == "Precip":
         return "mm day$^{-1}$"
@@ -467,17 +485,36 @@ def to_filter_input_dataset(da, obs_var="x"):
     return x.to_dataset()
 
 
+def filter_input_cache_matches(fname, field_name):
+    if not os.path.exists(fname):
+        return False
+    if not is_pressure_level_field(field_name):
+        return True
+    try:
+        with xr.open_dataset(fname) as cached:
+            return cached.attrs.get("cache_version") == PRESSURE_FIELD_CACHE_VERSION
+    except Exception:
+        return False
+
+
 def write_filter_input_if_needed(ds, sim_index, field_name):
     """Cache a standard NetCDF input for kf_filter."""
     fname = os.path.join(input_cache_dir, f"{safe_name(sim_names[sim_index])}_{safe_name(field_name)}.nc")
-    if os.path.exists(fname):
+    if filter_input_cache_matches(fname, field_name):
         return fname
+    if os.path.exists(fname):
+        print(f"Regenerating stale filter input: {fname}")
 
     print(f"Writing filter input: {fname}")
     da = get_filter_field(ds, field_name)
     fds = to_filter_input_dataset(da, obs_var="x")
+    fds.attrs.update(source_field=field_name, source_simulation=sim_names[sim_index])
+    if is_pressure_level_field(field_name):
+        fds.attrs["cache_version"] = PRESSURE_FIELD_CACHE_VERSION
     encoding = {"x": {"dtype": "float32"}}
-    fds.to_netcdf(fname, encoding=encoding)
+    tmp_fname = fname + ".tmp"
+    fds.to_netcdf(tmp_fname, encoding=encoding)
+    os.replace(tmp_fname, fname)
     return fname
 
 
@@ -557,6 +594,11 @@ def filtered_wave_cache_path(sim_index, field_name, wave_name, lat_bounds, avgLa
 def wave_cache_matches(wave_da, field_name, wave_name, avgLat, lat_bounds, projection):
     avg_attr = wave_da.attrs.get("avgLat", -1)
     filter_name = WAVE_BOXES[wave_name].get("filter_name", wave_name)
+    if (
+        is_pressure_level_field(field_name)
+        and wave_da.attrs.get("cache_version") != PRESSURE_FIELD_CACHE_VERSION
+    ):
+        return False
     return (
         wave_da.attrs.get("field") == field_name
         and wave_da.attrs.get("wave_name") == wave_name
@@ -677,6 +719,8 @@ def direct_filtered_wave(ds, sim_index, field_name, wave_name, avgLat, lat_bound
         avgLat=int(avgLat),
         units=field_units(field_name),
     )
+    if is_pressure_level_field(field_name):
+        wave.attrs["cache_version"] = PRESSURE_FIELD_CACHE_VERSION
     write_wave_cache(wave, cache_path)
     return xr.open_dataset(cache_path)["wave"]
 
@@ -727,6 +771,8 @@ def projected_filtered_wave(ds, sim_index, field_name, wave_name, lat_bounds, pr
         avgLat=1,
         units=field_units(field_name),
     )
+    if is_pressure_level_field(field_name):
+        wave.attrs["cache_version"] = PRESSURE_FIELD_CACHE_VERSION
     write_wave_cache(wave, cache_path)
     return xr.open_dataset(cache_path)["wave"]
 

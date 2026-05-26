@@ -19,6 +19,11 @@ from pathlib import Path
 
 ANALYSIS_DIR = Path(__file__).resolve().parent
 DIAGNOSTICS_DIR = ANALYSIS_DIR / "diagnostics"
+MODULE_SEARCH_DIRS = [
+    DIAGNOSTICS_DIR,
+    ANALYSIS_DIR,
+    ANALYSIS_DIR.parent,
+]
 
 DEFAULT_SCRIPT_ORDER = [
     "mean_state_diagnostics.py",
@@ -121,12 +126,31 @@ def print_script_list(scripts: list[str]) -> None:
         print(f"{index:2d}. {script}")
 
 
+def child_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("MPLCONFIGDIR", str(Path("/tmp") / f"matplotlib-{os.getuid()}"))
+    env.setdefault("XDG_CACHE_HOME", str(Path("/tmp") / f"xdg-cache-{os.getuid()}"))
+
+    Path(env["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
+    Path(env["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
+
+    pythonpath = [str(path) for path in MODULE_SEARCH_DIRS]
+    existing_pythonpath = env.get("PYTHONPATH")
+    if existing_pythonpath:
+        for path in existing_pythonpath.split(os.pathsep):
+            if path and path not in pythonpath:
+                pythonpath.append(path)
+
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    return env
+
+
 def run_script(script: str, args: argparse.Namespace) -> int:
     script_path = DIAGNOSTICS_DIR / script
     command = [args.python, "-u", str(script_path)]
     command_text = shlex.join(command)
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
+    env = child_environment()
 
     start = datetime.now()
     print(f"\n[{start:%Y-%m-%d %H:%M:%S}] Starting {script}", flush=True)

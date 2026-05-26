@@ -16,6 +16,43 @@ ISOBARIC_DIM_LEVEL_VAR = {
 }
 
 
+def standardize_cldfrac_vertical_coordinate(ds):
+    """Give cldfrac a geometric-height z coordinate regardless of its source."""
+    if "cldfrac" not in ds.data_vars:
+        return ds
+
+    cldfrac = ds["cldfrac"]
+    if "nVertLevels" in cldfrac.dims:
+        cldfrac = cldfrac.rename({"nVertLevels": "z"})
+    elif "nVertLevelsP1" in cldfrac.dims:
+        raise ValueError("cldfrac appears to be on interface levels, not mid-levels")
+    elif "z" not in cldfrac.dims:
+        raise ValueError(f"Could not find vertical dimension in cldfrac dims {cldfrac.dims}")
+
+    if "z" in cldfrac.coords:
+        zvals = np.asarray(cldfrac["z"].values)
+        if zvals.size == cldfrac.sizes["z"] and np.nanmax(zvals) > 100.0:
+            return ds.assign(cldfrac=cldfrac)
+
+    if "zgrid" not in ds.data_vars:
+        raise ValueError("Cannot assign geometric z coordinate to cldfrac: zgrid is missing")
+
+    zgrid_mean = ds.zgrid.mean(dim=("latitude", "longitude"))
+    zmid = 0.5 * (
+        zgrid_mean.isel(nVertLevelsP1=slice(0, -1)).values
+        + zgrid_mean.isel(nVertLevelsP1=slice(1, None)).values
+    )
+    if cldfrac.sizes["z"] != zmid.size:
+        raise ValueError(
+            f"cldfrac has {cldfrac.sizes['z']} vertical levels, "
+            f"but zgrid implies {zmid.size} mid-levels"
+        )
+    cldfrac = cldfrac.assign_coords(z=("z", zmid))
+    cldfrac["z"].attrs["units"] = "m"
+    cldfrac["z"].attrs["long_name"] = "geometric height of layer midpoints"
+    return ds.assign(cldfrac=cldfrac)
+
+
 def load_latlon_dataset(
     data_dir,
     latlon_pattern="latlon.2000-*.nc",
@@ -64,29 +101,9 @@ def load_latlon_dataset(
         ds_cld = xr.open_dataset(cldfrac_path, chunks={})
         if "cldfrac" in ds_cld:
             cldfrac = ds_cld["cldfrac"].reindex(Time=ds.Time)
-            if "nVertLevels" in cldfrac.dims:
-                cldfrac = cldfrac.rename({"nVertLevels": "z"})
-            elif "nVertLevelsP1" in cldfrac.dims:
-                raise ValueError("cldfrac appears to be on interface levels, not mid-levels")
-            elif "z" not in cldfrac.dims:
-                raise ValueError(f"Could not find vertical dimension in cldfrac dims {cldfrac.dims}")
-            if "zgrid" not in ds.data_vars:
-                raise ValueError("Cannot assign geometric z coordinate to cldfrac: zgrid is missing")
-
-            zgrid_mean = ds.zgrid.mean(dim=("latitude", "longitude"))
-            zmid = 0.5 * (
-                zgrid_mean.isel(nVertLevelsP1=slice(0, -1)).values
-                + zgrid_mean.isel(nVertLevelsP1=slice(1, None)).values
-            )
-            if cldfrac.sizes["z"] != zmid.size:
-                raise ValueError(
-                    f"cldfrac has {cldfrac.sizes['z']} vertical levels, "
-                    f"but zgrid implies {zmid.size} mid-levels"
-                )
-            cldfrac = cldfrac.assign_coords(z=("z", zmid))
-            cldfrac["z"].attrs["units"] = "m"
-            cldfrac["z"].attrs["long_name"] = "geometric height of layer midpoints"
             ds = ds.assign(cldfrac=cldfrac)
+
+    ds = standardize_cldfrac_vertical_coordinate(ds)
 
     return ds.chunk(chunks) if chunks is not None else ds
 
