@@ -67,7 +67,7 @@ except ModuleNotFoundError:
 # -----------------------------------------------------------------------------
 
 save = True
-save_loc = "/home/cwp29/tmp/mpas/crf_on/waves/"
+save_loc = "/home/cwp29/tmp/mpas/crf_on/final/waves/"
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -82,7 +82,9 @@ save_loc = "/home/cwp29/tmp/mpas/crf_on/waves/"
 #   8:  wave_filtered_eddy_fluxes_HEAVY
 #   9:  symmetric_antisymmetric_wave_spectra
 #       plus period-axis and wavenumber-phase-speed variants
-figures_to_run = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+#   10: kelvin_cloud_decomposition
+#   11: compact_wave_attribution_metrics
+figures_to_run = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 # Figure 8 is deliberately excluded from the default list because it filters
@@ -111,6 +113,57 @@ obs_per_day = int(round(24 / dt))
 # larger absolute latitude bound below.
 filter_lat_bounds = (-10, 10)
 filter_avg_lat = True
+
+TROPICAL_LAT_BOUNDS = (-20.0, 20.0)
+
+# Kelvin-conditioned high-cloud decomposition thresholds.  These mirror the
+# definitions in convective_pathway_diagnostics.py so the cloud categories mean
+# the same thing across the two analyses.
+Z_HIGH_KM = 12.0
+LOW_CLOUD_ZMIN_KM = 2.0
+LOW_CLOUD_ZMAX_KM = 5.0
+MID_CLOUD_ZMIN_KM = 5.0
+MID_CLOUD_ZMAX_KM = 10.0
+UPPER_CLOUD_ZMIN_KM = 10.0
+MAX_CLEAR_GAP_KM = 3.0
+
+CLOUD_FRAC_THRESH = 0.05
+PRECIP_DEEP_THRESH_MM_DAY = 5.0
+PRECIP_WEAK_THRESH_MM_DAY = 1.0
+
+ANVIL_RADIUS_DEG = 5.0
+ANVIL_TIME_STEPS = 1
+ACTIVE_KELVIN_AMP_THRESH = 1.0
+KELVIN_CLOUD_FIGURE_NUMBER = 10
+WAVE_ATTRIBUTION_FIGURE_NUMBER = 11
+ATTRIBUTION_EPS = 1.0e-12
+
+KELVIN_CLOUD_CONDITIONS = ("all", "active_kelvin", "positive_phase", "negative_phase")
+KELVIN_CLOUD_CONDITION_LABELS = {
+    "all": "All times",
+    "active_kelvin": "Active Kelvin",
+    "positive_phase": "Positive Kelvin",
+    "negative_phase": "Negative Kelvin",
+}
+
+KELVIN_CLOUD_CATEGORIES = (
+    ("total_high_cloud", "Total high cloud", "high_cloud_mask"),
+    ("deep_convective_high_cloud", "Deep convective", "deep_convective_high_cloud_mask"),
+    ("anvil_high_cloud", "Anvil", "anvil_high_cloud_mask"),
+    ("detached_cirrus_like_high_cloud", "Detached cirrus-like", "cirrus_like_high_cloud_mask"),
+    ("unclassified_high_cloud", "Unclassified", "unclassified_high_cloud_mask"),
+)
+KELVIN_CLOUD_PLOT_CATEGORIES = (
+    "deep_convective_high_cloud",
+    "anvil_high_cloud",
+    "detached_cirrus_like_high_cloud",
+)
+KELVIN_CLOUD_CONTRIBUTION_CATEGORIES = (
+    "deep_convective_high_cloud",
+    "anvil_high_cloud",
+    "detached_cirrus_like_high_cloud",
+    "unclassified_high_cloud",
+)
 
 # Heavier latitude-resolved filtering in figure 8 can use its own wider band.
 eddy_flux_lat_bounds = (-20, 20)
@@ -226,6 +279,13 @@ def should_run_any(numbers):
 
 def run_all_figures():
     return all_figures_requested(figures_to_run)
+
+
+def save_figure(number, fig, stem):
+    """Save both numbered project-style figures and exact task filenames."""
+    figsave.save(fig, stem, number=number)
+    if save and should_run_figure(number):
+        fig.savefig(os.path.join(save_loc, f"{stem}.png"), dpi=figsave.dpi)
 
 
 # -----------------------------------------------------------------------------
@@ -378,6 +438,158 @@ def get_cldfrac_field(ds, field_name):
     out.name = field_name
     out.attrs["selected_height_km"] = height_km
     return out.sel(Time=available_cldfrac_times(cf))
+
+
+def z_km_from_cldfrac(cldfrac):
+    if "z" not in cldfrac.coords:
+        raise ValueError("cldfrac has no geometric-height z coordinate")
+    zvals = np.asarray(cldfrac.z.values, dtype=float)
+    zvals = zvals / 1000.0 if np.nanmax(np.abs(zvals)) > 100.0 else zvals
+    return xr.DataArray(zvals, dims=("z",), coords={"z": cldfrac.z}, name="z_km")
+
+
+def any_cloud_in_layer(cloudy, z_km, zmin, zmax):
+    return cloudy.where((z_km >= zmin) & (z_km < zmax), drop=True).any(dim="z")
+
+
+def rolling_or_dilated_max(
+    mask,
+    lat_radius=ANVIL_RADIUS_DEG,
+    lon_radius=ANVIL_RADIUS_DEG,
+    time_radius=ANVIL_TIME_STEPS,
+):
+    """Centred time/lat/lon dilation matching convective_pathway_diagnostics.py."""
+    x = mask.astype(np.int8)
+    rolling_kwargs = {}
+    if "Time" in x.dims and time_radius > 0:
+        rolling_kwargs["Time"] = 2 * int(time_radius) + 1
+    if "latitude" in x.dims and lat_radius > 0 and x.sizes.get("latitude", 0) > 1:
+        dlat = float(np.nanmedian(np.abs(np.diff(x.latitude.values))))
+        rolling_kwargs["latitude"] = 2 * int(np.ceil(lat_radius / dlat)) + 1
+    if "longitude" in x.dims and lon_radius > 0 and x.sizes.get("longitude", 0) > 1:
+        dlon = float(np.nanmedian(np.abs(np.diff(x.longitude.values))))
+        rolling_kwargs["longitude"] = 2 * int(np.ceil(lon_radius / dlon)) + 1
+
+    if not rolling_kwargs:
+        return mask
+    return x.rolling(**rolling_kwargs, center=True, min_periods=1).max() >= 1
+
+
+def classify_high_cloud_like_convective_pathway(
+    cldfrac,
+    precip,
+    cf_thresh=CLOUD_FRAC_THRESH,
+    z_high=Z_HIGH_KM,
+    z_low_min=LOW_CLOUD_ZMIN_KM,
+    z_low_max=LOW_CLOUD_ZMAX_KM,
+    z_mid_min=MID_CLOUD_ZMIN_KM,
+    z_mid_max=MID_CLOUD_ZMAX_KM,
+    z_upper_min=UPPER_CLOUD_ZMIN_KM,
+    p_deep=PRECIP_DEEP_THRESH_MM_DAY,
+    p_weak=PRECIP_WEAK_THRESH_MM_DAY,
+    max_clear_gap=MAX_CLEAR_GAP_KM,
+    anvil_radius_deg=ANVIL_RADIUS_DEG,
+    anvil_time_steps=ANVIL_TIME_STEPS,
+):
+    """
+    Classify high cloud using the same definitions as convective_pathway_diagnostics.
+
+    The physical categories are built from raw cldfrac and precipitation first;
+    Kelvin-filtered precipitation is used only later as a conditioning variable.
+    """
+    cf = finite_or_nan(cldfrac)
+    zdim = vertical_dim(cf)
+    if zdim != "z":
+        cf = cf.rename({zdim: "z"})
+    if "Time" in cf.dims:
+        cf = cf.sel(Time=available_cldfrac_times(cf))
+    cf, pr = xr.align(cf, precip, join="inner")
+    z_km = z_km_from_cldfrac(cf)
+
+    cloudy = cf >= cf_thresh
+    cloud_top_height = z_km.where(cloudy).max(dim="z", skipna=True)
+    cloud_top_height.name = "cloud_top_height"
+    cloud_top_height.attrs["units"] = "km"
+
+    high_cloud_fraction = cf.where(z_km >= z_high).mean(dim="z", skipna=True)
+    high_cloud_fraction.name = "high_cloud_fraction"
+    high_cloud_mask = ((cloud_top_height >= z_high) | (high_cloud_fraction >= cf_thresh)).fillna(False)
+    high_cloud_mask.name = "high_cloud_mask"
+
+    low_cloud = any_cloud_in_layer(cloudy, z_km, z_low_min, z_low_max)
+    mid_cloud = any_cloud_in_layer(cloudy, z_km, z_mid_min, z_mid_max)
+    upper_cloud = any_cloud_in_layer(cloudy, z_km, z_upper_min, max(float(z_km.max()), z_high + 0.1))
+
+    gap_ok = xr.ones_like(high_cloud_mask, dtype=bool)
+    if max_clear_gap is not None and max_clear_gap > 0:
+        slab_starts = np.arange(z_low_min, z_high, max_clear_gap)
+        for z0 in slab_starts:
+            z1 = min(z0 + max_clear_gap, max(float(z_km.max()), z_high))
+            if z1 <= z0:
+                continue
+            gap_ok = gap_ok & any_cloud_in_layer(cloudy, z_km, z0, z1 + 1.0e-6)
+
+    column_connected_mask = (
+        high_cloud_mask & low_cloud & mid_cloud & upper_cloud & gap_ok
+    ).fillna(False)
+    column_connected_mask.name = "column_connected_high_cloud_mask"
+
+    deep_convective_high_cloud_mask = (
+        high_cloud_mask & column_connected_mask & (pr >= p_deep)
+    ).fillna(False)
+    deep_convective_high_cloud_mask.name = "deep_convective_high_cloud_mask"
+
+    near_deep_core = rolling_or_dilated_max(
+        deep_convective_high_cloud_mask,
+        lat_radius=anvil_radius_deg,
+        lon_radius=anvil_radius_deg,
+        time_radius=anvil_time_steps,
+    ).fillna(False)
+    near_deep_core.name = "near_deep_core"
+
+    anvil_high_cloud_mask = (
+        high_cloud_mask & ~deep_convective_high_cloud_mask & near_deep_core
+    ).fillna(False)
+    anvil_high_cloud_mask.name = "anvil_high_cloud_mask"
+
+    cirrus_like_high_cloud_mask = (
+        high_cloud_mask & ~column_connected_mask & ~near_deep_core & (pr <= p_weak)
+    ).fillna(False)
+    cirrus_like_high_cloud_mask.name = "cirrus_like_high_cloud_mask"
+
+    unclassified_high_cloud_mask = (
+        high_cloud_mask
+        & ~(
+            deep_convective_high_cloud_mask
+            | anvil_high_cloud_mask
+            | cirrus_like_high_cloud_mask
+        )
+    ).fillna(False)
+    unclassified_high_cloud_mask.name = "unclassified_high_cloud_mask"
+
+    nonprecipitating_high_cloud = (high_cloud_mask & (pr <= p_weak)).fillna(False)
+    nonprecipitating_high_cloud.name = "nonprecipitating_high_cloud_mask"
+
+    return {
+        "cloud_top_height": cloud_top_height,
+        "high_cloud_fraction": high_cloud_fraction,
+        "high_cloud_mask": high_cloud_mask,
+        "column_connected_mask": column_connected_mask,
+        "deep_convective_high_cloud_mask": deep_convective_high_cloud_mask,
+        "near_deep_core": near_deep_core,
+        "anvil_high_cloud_mask": anvil_high_cloud_mask,
+        "cirrus_like_high_cloud_mask": cirrus_like_high_cloud_mask,
+        "unclassified_high_cloud_mask": unclassified_high_cloud_mask,
+        "nonprecipitating_high_cloud_mask": nonprecipitating_high_cloud,
+    }
+
+
+def get_high_cloud_classification(ds, precip=None):
+    if "cldfrac" not in ds.data_vars:
+        raise ValueError("cldfrac is not available for Kelvin cloud decomposition")
+    if precip is None:
+        precip = precip_rate(ds)
+    return classify_high_cloud_like_convective_pathway(ds.cldfrac, precip)
 
 
 def get_filter_field(ds, field_name):
@@ -919,6 +1131,705 @@ def binned_mean_1d(x, y, bins, min_count=10):
     return xc, mean, p25, p75, count
 
 
+def subset_latitude(da, lat_bounds):
+    if lat_bounds is None or "latitude" not in da.dims:
+        return da
+    lo, hi = normalise_lat_bounds(lat_bounds)
+    return da.sel(latitude=slice(lo, hi))
+
+
+def weighted_area_time_fraction(da, condition=None, lat_bounds=TROPICAL_LAT_BOUNDS):
+    x = subset_latitude(da.astype(float), lat_bounds)
+    if condition is not None:
+        x, cond = xr.align(x, condition, join="inner")
+        x = x.where(cond)
+    dims = [d for d in ("Time", "latitude", "longitude") if d in x.dims]
+    if "latitude" in x.dims:
+        weights = np.cos(np.deg2rad(x.latitude))
+        return float(x.weighted(weights).mean(dim=dims, skipna=True).values)
+    return float(x.mean(dim=dims, skipna=True).values)
+
+
+def latitude_profile_fraction(da, condition=None, lat_bounds=TROPICAL_LAT_BOUNDS):
+    x = subset_latitude(da.astype(float), lat_bounds)
+    if condition is not None:
+        x, cond = xr.align(x, condition, join="inner")
+        x = x.where(cond)
+    dims = [d for d in ("Time", "longitude") if d in x.dims]
+    out = x.mean(dim=dims, skipna=True)
+    out.name = "fraction"
+    return out
+
+
+def latitude_mean_lon_time(da, lat_bounds=filter_lat_bounds):
+    x = subset_latitude(da.astype(float), lat_bounds)
+    if "latitude" not in x.dims:
+        return x
+    weights = np.cos(np.deg2rad(x.latitude))
+    return x.weighted(weights).mean(dim="latitude", skipna=True)
+
+
+def kelvin_precip_anomaly(ds, sim_index):
+    return get_filtered_wave(
+        ds,
+        sim_index,
+        "Precip",
+        "Kelvin",
+        avgLat=True,
+        lat_bounds=filter_lat_bounds,
+        projection=lat_projection_for_wave("Kelvin"),
+    )
+
+
+def kelvin_condition_masks(kelvin_wave):
+    dims = [d for d in ("Time", "longitude") if d in kelvin_wave.dims]
+    sigma = float(kelvin_wave.std(dim=dims, skipna=True).values)
+    if not np.isfinite(sigma) or sigma <= 0:
+        sigma = np.nan
+    amp = np.abs(kelvin_wave) / sigma
+    amp.name = "kelvin_precip_amplitude_sigma"
+    masks = {
+        "all": xr.ones_like(kelvin_wave, dtype=bool),
+        "active_kelvin": amp >= ACTIVE_KELVIN_AMP_THRESH,
+        "positive_phase": kelvin_wave > 0,
+        "negative_phase": kelvin_wave < 0,
+    }
+    return masks, amp, sigma
+
+
+def category_info(category):
+    for key, label, mask_name in KELVIN_CLOUD_CATEGORIES:
+        if key == category:
+            return label, mask_name
+    raise KeyError(category)
+
+
+def compute_kelvin_cloud_decomposition():
+    scalar_rows = []
+    profile_rows = []
+    phase_rows = []
+    classifications = {}
+    kelvin_waves = {}
+    kelvin_conditions = {}
+    phase_bins = np.linspace(-3.0, 3.0, 25)
+
+    for i, ds in enumerate(dss):
+        sim = sim_names[i]
+        try:
+            pr = precip_rate(ds)
+            classif = get_high_cloud_classification(ds, precip=pr)
+            kelvin = kelvin_precip_anomaly(ds, i)
+            masks, amp, sigma = kelvin_condition_masks(kelvin)
+            classifications[sim] = classif
+            kelvin_waves[sim] = kelvin
+            kelvin_conditions[sim] = masks
+
+            for category, label, mask_name in KELVIN_CLOUD_CATEGORIES:
+                da = classif[mask_name].astype(float)
+                for condition in KELVIN_CLOUD_CONDITIONS:
+                    cond = None if condition == "all" else masks[condition]
+                    fraction = weighted_area_time_fraction(
+                        da,
+                        condition=cond,
+                        lat_bounds=TROPICAL_LAT_BOUNDS,
+                    )
+                    scalar_rows.append(
+                        dict(
+                            simulation=sim,
+                            simulation_index=i,
+                            condition=condition,
+                            condition_label=KELVIN_CLOUD_CONDITION_LABELS[condition],
+                            category=category,
+                            category_label=label,
+                            fraction=fraction,
+                            kelvin_sigma_mm_day=sigma,
+                        )
+                    )
+
+                    profile = latitude_profile_fraction(
+                        da,
+                        condition=cond,
+                        lat_bounds=TROPICAL_LAT_BOUNDS,
+                    ).load()
+                    for lat, val in zip(profile.latitude.values, profile.values):
+                        profile_rows.append(
+                            dict(
+                                simulation=sim,
+                                simulation_index=i,
+                                condition=condition,
+                                condition_label=KELVIN_CLOUD_CONDITION_LABELS[condition],
+                                category=category,
+                                category_label=label,
+                                latitude=float(lat),
+                                fraction=float(val),
+                            )
+                        )
+
+            # Signed Kelvin precipitation bins are robust and avoid depending on
+            # a fragile phase estimate. Cloud categories remain raw-mask means.
+            x = kelvin / sigma
+            composite_fields = [
+                ("Precip", "Precip", "Precipitation", field_units("Precip")),
+                ("OLR", "OLR", "OLR", field_units("OLR")),
+                ("PW", "PW", "PW", field_units("PW")),
+            ]
+            for field_name, source, label, units in composite_fields:
+                try:
+                    y = latitude_mean_lon_time(get_filter_field(ds, source), lat_bounds=filter_lat_bounds)
+                    x_aligned, y = xr.align(x, y, join="inner")
+                    xc, ym, y25, y75, count = binned_mean_1d(
+                        x_aligned.values,
+                        y.values,
+                        phase_bins,
+                        min_count=20,
+                    )
+                    for xx, yy, lo, hi, cnum in zip(xc, ym, y25, y75, count):
+                        phase_rows.append(
+                            dict(
+                                simulation=sim,
+                                simulation_index=i,
+                                variable=field_name,
+                                variable_label=label,
+                                units=units,
+                                signed_kelvin_sigma_bin=xx,
+                                mean=yy,
+                                p25=lo,
+                                p75=hi,
+                                count=cnum,
+                            )
+                        )
+                except Exception as exc:
+                    print(f"Skipping Kelvin phase composite for {sim} {field_name}: {exc}")
+
+            for category, label, mask_name in KELVIN_CLOUD_CATEGORIES[:4]:
+                y = latitude_mean_lon_time(classif[mask_name].astype(float), lat_bounds=filter_lat_bounds)
+                x_aligned, y = xr.align(x, y, join="inner")
+                xc, ym, y25, y75, count = binned_mean_1d(
+                    x_aligned.values,
+                    y.values,
+                    phase_bins,
+                    min_count=20,
+                )
+                for xx, yy, lo, hi, cnum in zip(xc, ym, y25, y75, count):
+                    phase_rows.append(
+                        dict(
+                            simulation=sim,
+                            simulation_index=i,
+                            variable=category,
+                            variable_label=label,
+                            units="fraction",
+                            signed_kelvin_sigma_bin=xx,
+                            mean=yy,
+                            p25=lo,
+                            p75=hi,
+                            count=cnum,
+                        )
+                    )
+        except Exception as exc:
+            print(f"Skipping Kelvin cloud decomposition for {sim}: {exc}")
+
+    scalar = pd.DataFrame(scalar_rows)
+    profiles = pd.DataFrame(profile_rows)
+    phase = pd.DataFrame(phase_rows)
+
+    if save and len(scalar) > 0:
+        scalar.to_csv(os.path.join(save_loc, "kelvin_cloud_decomposition_summary.csv"), index=False)
+        if len(profiles) > 0:
+            profiles.to_csv(os.path.join(save_loc, "kelvin_cloud_decomposition_latitude_profiles.csv"), index=False)
+        if len(phase) > 0:
+            phase.to_csv(os.path.join(save_loc, "kelvin_cloud_decomposition_phase_composites.csv"), index=False)
+        try:
+            summary_pieces = [
+                xr.Dataset.from_dataframe(
+                    scalar.set_index(["simulation", "condition", "category"])[["fraction"]]
+                ).rename({"fraction": "tropical_mean_fraction"})
+            ]
+            if len(profiles) > 0:
+                summary_pieces.append(
+                    xr.Dataset.from_dataframe(
+                        profiles.set_index(["simulation", "condition", "category", "latitude"])[["fraction"]]
+                    ).rename({"fraction": "latitude_profile_fraction"})
+                )
+            summary_ds = xr.merge(summary_pieces, compat="override")
+            summary_ds.attrs.update(
+                description="Kelvin-conditioned cloud categories using raw cldfrac/precip classification",
+                classification_reference="diagnostics/convective_pathway_diagnostics.py",
+                active_kelvin_amp_threshold_sigma=ACTIVE_KELVIN_AMP_THRESH,
+            )
+            summary_ds.to_netcdf(os.path.join(save_loc, "kelvin_cloud_decomposition_summary.nc"))
+        except Exception as exc:
+            print(f"Could not save Kelvin cloud NetCDF summary: {exc}")
+
+    return {
+        "scalar": scalar,
+        "profiles": profiles,
+        "phase": phase,
+        "classifications": classifications,
+        "kelvin_waves": kelvin_waves,
+        "conditions": kelvin_conditions,
+    }
+
+
+def compute_intense_precip_wave_attribution(percentile=95.0):
+    attribution_rows = []
+    for i, ds in enumerate(dss):
+        try:
+            pr = latmean_for_filter_field(ds, "Precip", lat_bounds=filter_lat_bounds, projection="direct")
+            pr_vals = np.asarray(pr.values)
+            threshold = np.nanpercentile(pr_vals, percentile)
+            events = pr >= threshold
+            norm_waves = {}
+            for wname in wave_names:
+                wav = get_filtered_wave(ds, i, "Precip", wname, avgLat=True).sel(Time=pr.Time)
+                std = float(wav.std(dim=("Time", "longitude"), skipna=True).values)
+                norm_waves[wname] = np.abs(wav / std) if std > 0 else xr.zeros_like(wav)
+            stack = xr.concat([norm_waves[w] for w in wave_names], dim=xr.DataArray(wave_names, dims="wave", name="wave"))
+            winner_index = stack.argmax(dim="wave")
+            winner = xr.DataArray(
+                np.array(wave_names, dtype=object)[winner_index.values],
+                dims=winner_index.dims,
+                coords=winner_index.coords,
+            )
+            event_count = float(events.sum().values)
+            for wname in wave_names:
+                projection = lat_projection_for_wave(wname)
+                frac = float(((winner == wname).where(events)).sum().values / event_count) if event_count > 0 else np.nan
+                mean_amp = float(norm_waves[wname].where(events).mean().values)
+                attribution_rows.append(
+                    dict(
+                        simulation=sim_names[i],
+                        simulation_index=i,
+                        wave=wname,
+                        wave_label=wave_label(wname),
+                        latitude_projection=projection,
+                        intense_event_fraction=frac,
+                        mean_normalised_amplitude_at_events=mean_amp,
+                        precip_percentile=percentile,
+                        precip_threshold=threshold,
+                    )
+                )
+        except Exception as exc:
+            print(f"Skipping event attribution for {sim_names[i]}: {exc}")
+    return pd.DataFrame(attribution_rows)
+
+
+def plot_kelvin_cloud_decomposition_latitude(summary):
+    profiles = summary["profiles"]
+    if len(profiles) == 0:
+        return
+    condition = "active_kelvin"
+    category_labels = dict((key, label) for key, label, _ in KELVIN_CLOUD_CATEGORIES)
+    fig, ax = plt.subplots(
+        len(KELVIN_CLOUD_PLOT_CATEGORIES),
+        2,
+        figsize=(10.5, 2.8 * len(KELVIN_CLOUD_PLOT_CATEGORIES)),
+        constrained_layout=True,
+        sharex=True,
+    )
+    if len(KELVIN_CLOUD_PLOT_CATEGORIES) == 1:
+        ax = ax[None, :]
+
+    for r, category in enumerate(KELVIN_CLOUD_PLOT_CATEGORIES):
+        sub = profiles[(profiles.condition == condition) & (profiles.category == category)]
+        for i, sim in enumerate(sim_names):
+            s = sub[sub.simulation == sim].sort_values("latitude")
+            if len(s) == 0:
+                continue
+            ax[r, 0].plot(s.latitude, s.fraction, color=cols[i], lw=1.8, label=sim if r == 0 else None)
+
+        wide = sub.pivot_table(index="latitude", columns="simulation", values="fraction", aggfunc="mean").sort_index()
+        if all(sim in wide.columns for sim in sim_names):
+            du = wide[sim_names[1]] - wide[sim_names[0]]
+            dT = wide[sim_names[2]] - wide[sim_names[0]]
+            residual = du - dT
+            ax[r, 1].plot(wide.index, du, color=cols[1], lw=1.8, label="nudged u - control" if r == 0 else None)
+            ax[r, 1].plot(wide.index, dT, color=cols[2], lw=1.8, label="nudged T - control" if r == 0 else None)
+            ax[r, 1].plot(wide.index, residual, color="0.15", lw=1.4, ls="--",
+                          label="(nudged u - control) - (nudged T - control)" if r == 0 else None)
+
+        ax[r, 0].set_ylabel(category_labels[category])
+        ax[r, 1].axhline(0, color="0.65", lw=0.7)
+        ax[r, 0].grid(alpha=0.2)
+        ax[r, 1].grid(alpha=0.2)
+
+    ax[0, 0].set_title("Active Kelvin cloud-category fraction")
+    ax[0, 1].set_title("Active Kelvin differences")
+    ax[-1, 0].set_xlabel("Latitude")
+    ax[-1, 1].set_xlabel("Latitude")
+    ax[0, 0].legend(loc="best")
+    ax[0, 1].legend(loc="best", fontsize=8)
+    fig.suptitle("Kelvin-conditioned high-cloud decomposition by latitude")
+    save_figure(KELVIN_CLOUD_FIGURE_NUMBER, fig, "kelvin_cloud_decomposition_latitude")
+
+
+def plot_kelvin_cloud_decomposition_bars(summary):
+    scalar = summary["scalar"]
+    if len(scalar) == 0:
+        return
+    categories = (
+        "total_high_cloud",
+        "deep_convective_high_cloud",
+        "anvil_high_cloud",
+        "detached_cirrus_like_high_cloud",
+    )
+    category_labels = dict((key, label) for key, label, _ in KELVIN_CLOUD_CATEGORIES)
+    fig, ax = plt.subplots(1, len(KELVIN_CLOUD_CONDITIONS), figsize=(4.0 * len(KELVIN_CLOUD_CONDITIONS), 4.0),
+                           constrained_layout=True, sharey=True)
+    if len(KELVIN_CLOUD_CONDITIONS) == 1:
+        ax = [ax]
+    x = np.arange(len(categories))
+    width = 0.8 / len(sim_names)
+    for cj, condition in enumerate(KELVIN_CLOUD_CONDITIONS):
+        sub = scalar[scalar.condition == condition]
+        for i, sim in enumerate(sim_names):
+            vals = []
+            for cat in categories:
+                s = sub[(sub.simulation == sim) & (sub.category == cat)]
+                vals.append(float(s.fraction.iloc[0]) if len(s) else np.nan)
+            ax[cj].bar(x + (i - (len(sim_names)-1)/2) * width, vals, width, color=cols[i], label=sim if cj == 0 else None)
+        ax[cj].set_title(KELVIN_CLOUD_CONDITION_LABELS[condition])
+        ax[cj].set_xticks(x)
+        ax[cj].set_xticklabels([category_labels[c] for c in categories], rotation=30, ha="right")
+        ax[cj].grid(axis="y", alpha=0.2)
+    ax[0].set_ylabel("Tropical area/time fraction")
+    ax[0].legend(loc="best")
+    fig.suptitle("Kelvin-conditioned cloud-category fractions")
+    save_figure(KELVIN_CLOUD_FIGURE_NUMBER, fig, "kelvin_cloud_decomposition_bars")
+
+
+def plot_kelvin_cloud_decomposition_phase_composites(summary):
+    phase = summary["phase"]
+    if len(phase) == 0:
+        return
+    variable_order = [
+        "Precip",
+        "OLR",
+        "PW",
+        "total_high_cloud",
+        "deep_convective_high_cloud",
+        "anvil_high_cloud",
+        "detached_cirrus_like_high_cloud",
+    ]
+    variable_order = [v for v in variable_order if v in set(phase.variable)]
+    if len(variable_order) == 0:
+        return
+    fig, ax = plt.subplots(len(variable_order), 1, figsize=(7.0, 2.2 * len(variable_order)),
+                           constrained_layout=True, sharex=True)
+    if len(variable_order) == 1:
+        ax = [ax]
+    for r, variable in enumerate(variable_order):
+        sub = phase[phase.variable == variable]
+        label = sub.variable_label.iloc[0] if len(sub) else variable
+        units = sub.units.iloc[0] if len(sub) else ""
+        for i, sim in enumerate(sim_names):
+            s = sub[sub.simulation == sim].sort_values("signed_kelvin_sigma_bin")
+            if len(s) == 0:
+                continue
+            ax[r].plot(s.signed_kelvin_sigma_bin, s["mean"], color=cols[i], lw=1.8, label=sim if r == 0 else None)
+            ax[r].fill_between(s.signed_kelvin_sigma_bin, s.p25, s.p75, color=cols[i], alpha=0.10, linewidth=0)
+        ax[r].axvline(0, color="0.65", lw=0.7)
+        ax[r].grid(alpha=0.2)
+        ax[r].set_ylabel(f"{label}\n({units})" if units else label)
+    ax[-1].set_xlabel(r"Signed Kelvin precipitation anomaly, $P'_K / \sigma_K$")
+    ax[0].legend(loc="best")
+    fig.suptitle("Signed Kelvin precipitation composites")
+    save_figure(KELVIN_CLOUD_FIGURE_NUMBER, fig, "kelvin_cloud_decomposition_phase_composites")
+
+
+def plot_kelvin_cloud_contribution_to_change(summary):
+    scalar = summary["scalar"]
+    if len(scalar) == 0:
+        return
+    colors_by_category = {
+        "deep_convective_high_cloud": "tab:blue",
+        "anvil_high_cloud": "tab:orange",
+        "detached_cirrus_like_high_cloud": "tab:green",
+        "unclassified_high_cloud": "0.55",
+    }
+    category_labels = dict((key, label) for key, label, _ in KELVIN_CLOUD_CATEGORIES)
+    conditions = ("all", "active_kelvin")
+    fig, ax = plt.subplots(1, len(conditions), figsize=(8.8, 4.0), constrained_layout=True, sharey=True)
+    if len(conditions) == 1:
+        ax = [ax]
+    x = np.arange(2)
+    run_labels = [f"{sim_names[1]} - control", f"{sim_names[2]} - control"]
+    for cj, condition in enumerate(conditions):
+        sub = scalar[scalar.condition == condition]
+        bottom_pos = np.zeros(2)
+        bottom_neg = np.zeros(2)
+        totals = []
+        for category in KELVIN_CLOUD_CONTRIBUTION_CATEGORIES:
+            vals = []
+            for sim in sim_names[1:]:
+                s_sim = sub[(sub.simulation == sim) & (sub.category == category)]
+                s_ctl = sub[(sub.simulation == sim_names[0]) & (sub.category == category)]
+                vals.append(float(s_sim.fraction.iloc[0] - s_ctl.fraction.iloc[0]) if len(s_sim) and len(s_ctl) else np.nan)
+            vals = np.asarray(vals, dtype=float)
+            bottoms = np.where(vals >= 0, bottom_pos, bottom_neg)
+            ax[cj].bar(
+                x,
+                vals,
+                bottom=bottoms,
+                color=colors_by_category[category],
+                label=category_labels[category] if cj == 0 else None,
+            )
+            bottom_pos += np.where(vals > 0, vals, 0.0)
+            bottom_neg += np.where(vals < 0, vals, 0.0)
+        for sim in sim_names[1:]:
+            s_sim = sub[(sub.simulation == sim) & (sub.category == "total_high_cloud")]
+            s_ctl = sub[(sub.simulation == sim_names[0]) & (sub.category == "total_high_cloud")]
+            totals.append(float(s_sim.fraction.iloc[0] - s_ctl.fraction.iloc[0]) if len(s_sim) and len(s_ctl) else np.nan)
+        ax[cj].scatter(x, totals, color="k", marker="D", zorder=4, label="Total high-cloud anomaly" if cj == 0 else None)
+        ax[cj].axhline(0, color="0.65", lw=0.7)
+        ax[cj].set_xticks(x)
+        ax[cj].set_xticklabels(run_labels, rotation=20, ha="right")
+        ax[cj].set_title(KELVIN_CLOUD_CONDITION_LABELS[condition])
+        ax[cj].grid(axis="y", alpha=0.2)
+    ax[0].set_ylabel("Tropical fraction anomaly")
+    ax[0].legend(loc="best", fontsize=8)
+    fig.suptitle("Contributions to total high-cloud change")
+    save_figure(KELVIN_CLOUD_FIGURE_NUMBER, fig, "kelvin_cloud_decomposition_contribution_to_high_cloud_change")
+
+
+def plot_kelvin_cloud_decomposition(summary):
+    # If nudged T reproduces nudged u category changes, that points to the
+    # thermal/static-stability pathway. Extra u-nudged active-Kelvin anomalies
+    # point instead to wind/shear/wave-filtering effects.
+    plot_kelvin_cloud_decomposition_latitude(summary)
+    plot_kelvin_cloud_decomposition_bars(summary)
+    plot_kelvin_cloud_decomposition_phase_composites(summary)
+    plot_kelvin_cloud_contribution_to_change(summary)
+
+
+def attribution_row(metric_name, variable, wave_band, condition, values_by_sim, units, notes):
+    control = float(values_by_sim.get(sim_names[0], np.nan))
+    nudged_u = float(values_by_sim.get(sim_names[1], np.nan))
+    nudged_T = float(values_by_sim.get(sim_names[2], np.nan))
+    delta_u = nudged_u - control
+    delta_T = nudged_T - control
+    wind_unique = delta_u - delta_T
+    thermal_like = delta_T
+    denom = np.abs(wind_unique) + np.abs(thermal_like) + ATTRIBUTION_EPS
+    return dict(
+        metric_name=metric_name,
+        variable=variable,
+        wave_band=wave_band,
+        condition=condition,
+        control=control,
+        nudged_u=nudged_u,
+        nudged_T=nudged_T,
+        delta_u=delta_u,
+        delta_T=delta_T,
+        wind_unique=wind_unique,
+        thermal_like=thermal_like,
+        wind_fraction=wind_unique / denom,
+        thermal_fraction=thermal_like / denom,
+        units=units,
+        notes=notes,
+    )
+
+
+def build_compact_wave_attribution_table(wave_metrics_df, kelvin_cloud_summary=None, intense_attribution_df=None):
+    rows = []
+
+    if wave_metrics_df is not None and len(wave_metrics_df) > 0:
+        for (field, wave), sub in wave_metrics_df.groupby(["field", "wave"]):
+            values = sub.set_index("simulation")["wave_fraction"].to_dict()
+            rows.append(
+                attribution_row(
+                    "wave_variance_fraction",
+                    field,
+                    wave_label(wave),
+                    "all",
+                    values,
+                    "fraction",
+                    f"Filtered wave variance divided by total anomaly variance; projection={lat_projection_for_wave(wave)}",
+                )
+            )
+
+    if kelvin_cloud_summary is not None:
+        scalar = kelvin_cloud_summary.get("scalar", pd.DataFrame())
+        if len(scalar) > 0:
+            for category, _, _ in KELVIN_CLOUD_CATEGORIES:
+                for condition in KELVIN_CLOUD_CONDITIONS:
+                    sub = scalar[(scalar.category == category) & (scalar.condition == condition)]
+                    values = sub.set_index("simulation")["fraction"].to_dict()
+                    rows.append(
+                        attribution_row(
+                            "cloud_category_fraction",
+                            category,
+                            "Kelvin",
+                            condition,
+                            values,
+                            "fraction",
+                            "Raw cldfrac/precip category fraction conditioned on Kelvin-filtered precipitation",
+                        )
+                    )
+
+    if intense_attribution_df is not None and len(intense_attribution_df) > 0:
+        for wave, sub in intense_attribution_df.groupby("wave"):
+            frac_values = sub.set_index("simulation")["intense_event_fraction"].to_dict()
+            rows.append(
+                attribution_row(
+                    "p95_event_largest_wave_fraction",
+                    "Precip",
+                    wave_label(wave),
+                    "p95_precip_events",
+                    frac_values,
+                    "fraction",
+                    "Fraction of p95 precipitation events where this normalised wave amplitude is largest",
+                )
+            )
+            amp_values = sub.set_index("simulation")["mean_normalised_amplitude_at_events"].to_dict()
+            rows.append(
+                attribution_row(
+                    "p95_event_mean_normalised_wave_amplitude",
+                    "Precip",
+                    wave_label(wave),
+                    "p95_precip_events",
+                    amp_values,
+                    "sigma",
+                    "Mean absolute wave amplitude normalised by each run's wave standard deviation at p95 precipitation events",
+                )
+            )
+
+    table = pd.DataFrame(rows)
+    if len(table) > 0:
+        table = table[
+            [
+                "metric_name",
+                "variable",
+                "wave_band",
+                "condition",
+                "control",
+                "nudged_u",
+                "nudged_T",
+                "delta_u",
+                "delta_T",
+                "wind_unique",
+                "thermal_like",
+                "wind_fraction",
+                "thermal_fraction",
+                "units",
+                "notes",
+            ]
+        ]
+    return table
+
+
+def plot_attribution_heatmap(table, value_col, stem, title, vmin=None, vmax=None):
+    sub = table[(table.metric_name == "wave_variance_fraction") & (table.condition == "all")]
+    if len(sub) == 0:
+        return
+    pivot = sub.pivot_table(index="wave_band", columns="variable", values=value_col, aggfunc="mean")
+    wave_order = [wave_label(w) for w in wave_names if wave_label(w) in pivot.index]
+    field_order = [f for f in power_fields if f in pivot.columns]
+    if len(wave_order) == 0 or len(field_order) == 0:
+        return
+    pivot = pivot.reindex(index=wave_order, columns=field_order)
+    values = pivot.values.astype(float)
+    if vmin is None or vmax is None:
+        max_abs = np.nanmax(np.abs(values)) if np.any(np.isfinite(values)) else 1.0
+        if not np.isfinite(max_abs) or max_abs == 0:
+            max_abs = 1.0
+        vmin, vmax = -max_abs, max_abs
+    fig, ax = plt.subplots(figsize=(0.55 * len(field_order) + 4.0, 0.5 * len(wave_order) + 2.5),
+                           constrained_layout=True)
+    im = ax.imshow(values, cmap="bwr", vmin=vmin, vmax=vmax, aspect="auto")
+    ax.set_xticks(np.arange(len(field_order)))
+    ax.set_xticklabels(field_order, rotation=35, ha="right")
+    ax.set_yticks(np.arange(len(wave_order)))
+    ax.set_yticklabels(wave_order)
+    ax.set_title(title)
+    ax.grid(False)
+    fig.colorbar(im, ax=ax, label=value_col)
+    save_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER, fig, stem)
+
+
+def find_attribution_selection(table, metric_name, variable, wave_band, condition):
+    sub = table[
+        (table.metric_name == metric_name)
+        & (table.variable == variable)
+        & (table.wave_band == wave_band)
+        & (table.condition == condition)
+    ]
+    if len(sub) == 0:
+        return None
+    return sub.iloc[0]
+
+
+def plot_attribution_summary_bars(table):
+    selections = [
+        ("Kelvin precip variance", "wave_variance_fraction", "Precip", "Kelvin", "all"),
+        ("Kelvin OLR variance", "wave_variance_fraction", "OLR", "Kelvin", "all"),
+        ("Kelvin PW variance", "wave_variance_fraction", "PW", "Kelvin", "all"),
+        ("Kelvin cldfrac variance", "wave_variance_fraction", "cldfrac", "Kelvin", "all"),
+        ("Active-K deep high cloud", "cloud_category_fraction", "deep_convective_high_cloud", "Kelvin", "active_kelvin"),
+        ("Active-K anvil high cloud", "cloud_category_fraction", "anvil_high_cloud", "Kelvin", "active_kelvin"),
+        ("Active-K detached cirrus", "cloud_category_fraction", "detached_cirrus_like_high_cloud", "Kelvin", "active_kelvin"),
+        ("AD sym cldfrac variance", "wave_variance_fraction", "cldfrac", "AD sym", "all"),
+        ("AD antisym cldfrac variance", "wave_variance_fraction", "cldfrac", "AD antisym", "all"),
+        ("ER cldfrac variance", "wave_variance_fraction", "cldfrac", "ER", "all"),
+        ("Kelvin T100 variance", "wave_variance_fraction", "T100", "Kelvin", "all"),
+        ("Kelvin omega500 variance", "wave_variance_fraction", "omega500", "Kelvin", "all"),
+        ("Kelvin u850 variance", "wave_variance_fraction", "u850", "Kelvin", "all"),
+    ]
+    rows = []
+    labels = []
+    for label, metric_name, variable, wave_band, condition in selections:
+        row = find_attribution_selection(table, metric_name, variable, wave_band, condition)
+        if row is not None:
+            rows.append(row)
+            labels.append(label)
+    if len(rows) == 0:
+        return
+    x = np.arange(len(rows))
+    width = 0.25
+    delta_T = np.asarray([row.delta_T for row in rows], dtype=float)
+    wind_unique = np.asarray([row.wind_unique for row in rows], dtype=float)
+    delta_u = np.asarray([row.delta_u for row in rows], dtype=float)
+    fig, ax = plt.subplots(figsize=(max(10.0, 0.8 * len(rows)), 4.5), constrained_layout=True)
+    ax.bar(x - width, delta_T, width, color=cols[2], label=r"$\Delta T$-nudged")
+    ax.bar(x, wind_unique, width, color="0.25", label="wind_unique")
+    ax.bar(x + width, delta_u, width, color=cols[1], label=r"$\Delta u$-nudged")
+    ax.axhline(0, color="0.65", lw=0.7)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=35, ha="right")
+    ax.set_ylabel("Metric anomaly")
+    ax.grid(axis="y", alpha=0.2)
+    ax.legend(loc="best")
+    ax.set_title("Thermal-like and wind-unique wave/cloud attribution")
+    save_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER, fig, "wave_attribution_summary_bars")
+
+
+def plot_compact_wave_attribution(table):
+    if len(table) == 0:
+        return
+    # Large wind_unique points to a u-nudged response not reproduced by T nudging;
+    # opposite wind_unique/thermal_like signs indicate competing pathways.
+    plot_attribution_heatmap(
+        table,
+        "wind_unique",
+        "wave_attribution_heatmap_wind_unique",
+        "Wind-unique response: (nudged u - control) - (nudged T - control)",
+    )
+    plot_attribution_heatmap(
+        table,
+        "thermal_like",
+        "wave_attribution_heatmap_thermal_like",
+        "Thermal-like response: nudged T - control",
+    )
+    plot_attribution_heatmap(
+        table,
+        "wind_fraction",
+        "wave_attribution_heatmap_wind_fraction",
+        "Bounded wind-fraction attribution",
+        vmin=-1.0,
+        vmax=1.0,
+    )
+    plot_attribution_summary_bars(table)
+
+
 def wave_phase_speed_range(wave_name):
     """Return phase-speed min/central/max in m s-1 from k-period box."""
     box = WAVE_BOXES[wave_name]
@@ -1282,7 +2193,7 @@ if should_run_figure(1):
 #     dynamical increase, convective sensitivity has changed.
 
 wave_metrics = None
-if should_run_any([2, 3, 4, 5]):
+if should_run_any([2, 3, 4, 5, WAVE_ATTRIBUTION_FIGURE_NUMBER]):
     rows = []
     for i, ds in enumerate(dss):
         for field in power_fields:
@@ -1496,37 +2407,11 @@ if should_run_figure(4):
 #   * If u_nudge increases intense precipitation only when Kelvin/EIG/IG/AD/ER
 #     amplitude is large, that wave band is a candidate mediator.
 
+intense_precip_attribution = None
 if should_run_figure(5):
-    attribution_rows = []
     percentile = 95.0
-    for i, ds in enumerate(dss):
-        try:
-            pr = latmean_for_filter_field(ds, "Precip", lat_bounds=filter_lat_bounds, projection="direct")
-            pr_vals = np.asarray(pr.values)
-            threshold = np.nanpercentile(pr_vals, percentile)
-            events = pr >= threshold
-            norm_waves = {}
-            for wname in wave_names:
-                wav = get_filtered_wave(ds, i, "Precip", wname, avgLat=True).sel(Time=pr.Time)
-                std = float(wav.std(dim=("Time", "longitude"), skipna=True).values)
-                norm_waves[wname] = np.abs(wav / std) if std > 0 else xr.zeros_like(wav)
-            # Stack wave amplitudes into shape (wave, Time, longitude).
-            stack = xr.concat([norm_waves[w] for w in wave_names], dim=xr.DataArray(wave_names, dims="wave", name="wave"))
-            winner_index = stack.argmax(dim="wave")
-            winner = xr.DataArray(np.array(wave_names, dtype=object)[winner_index.values], dims=winner_index.dims, coords=winner_index.coords)
-            for wname in wave_names:
-                projection = lat_projection_for_wave(wname)
-                frac = float(((winner == wname).where(events)).sum().values / events.sum().values)
-                mean_amp = float(norm_waves[wname].where(events).mean().values)
-                attribution_rows.append(dict(simulation=sim_names[i], wave=wname,
-                                             wave_label=wave_label(wname),
-                                             latitude_projection=projection, intense_event_fraction=frac,
-                                             mean_normalised_amplitude_at_events=mean_amp,
-                                             precip_percentile=percentile, precip_threshold=threshold))
-        except Exception as exc:
-            print(f"Skipping event attribution for {sim_names[i]}: {exc}")
-
-    attrib = pd.DataFrame(attribution_rows)
+    intense_precip_attribution = compute_intense_precip_wave_attribution(percentile=percentile)
+    attrib = intense_precip_attribution
     if len(attrib) > 0:
         print("\nIntense-precipitation wave attribution")
         print(attrib.to_string(index=False))
@@ -1942,5 +2827,60 @@ if should_run_figure(9):
         )
         figsave.save(phase_fig, "symmetric_antisymmetric_wave_spectra_phase_speed", number=9)
         print("Done with figure: symmetric_antisymmetric_wave_spectra_phase_speed")
+
+
+# -----------------------------------------------------------------------------
+# 10. Kelvin-filtered cloud decomposition
+# -----------------------------------------------------------------------------
+# WHAT TO LOOK FOR:
+#   * Deep convective high-cloud anomalies imply more vertically connected
+#     precipitating convection.
+#   * Anvil or detached cirrus-like anomalies point more toward detrainment,
+#     cloud lifetime, radiative feedback, or upper-level wave modulation.
+
+kelvin_cloud_summary = None
+if should_run_any([KELVIN_CLOUD_FIGURE_NUMBER, WAVE_ATTRIBUTION_FIGURE_NUMBER]):
+    kelvin_cloud_summary = compute_kelvin_cloud_decomposition()
+
+if should_run_figure(KELVIN_CLOUD_FIGURE_NUMBER) and kelvin_cloud_summary is not None:
+    if len(kelvin_cloud_summary["scalar"]) > 0:
+        print("\nKelvin cloud decomposition summary")
+        print(kelvin_cloud_summary["scalar"].to_string(index=False))
+        plot_kelvin_cloud_decomposition(kelvin_cloud_summary)
+        print("Done with figure: kelvin_cloud_decomposition")
+    else:
+        print("Skipping Kelvin cloud decomposition plots: no valid cldfrac classification was built")
+
+
+# -----------------------------------------------------------------------------
+# 11. Compact attribution metrics
+# -----------------------------------------------------------------------------
+# WHAT TO LOOK FOR:
+#   * thermal_like is the part reproduced by T nudging.
+#   * wind_unique is the extra u-nudged response not reproduced by T nudging.
+#   * Large cloud/PW/T100/momentum wind_unique without matching precipitation
+#     wind_unique suggests altered coupling and organisation rather than just
+#     stronger bulk rainfall.
+
+if should_run_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER):
+    if intense_precip_attribution is None:
+        intense_precip_attribution = compute_intense_precip_wave_attribution(percentile=95.0)
+        if save and len(intense_precip_attribution) > 0:
+            intense_precip_attribution.to_csv(os.path.join(save_loc, "intense_precip_wave_attribution.csv"), index=False)
+
+    compact_attribution = build_compact_wave_attribution_table(
+        wave_metrics,
+        kelvin_cloud_summary=kelvin_cloud_summary,
+        intense_attribution_df=intense_precip_attribution,
+    )
+    if len(compact_attribution) > 0:
+        print("\nCompact wave attribution metrics")
+        print(compact_attribution.to_string(index=False))
+        if save:
+            compact_attribution.to_csv(os.path.join(save_loc, "wave_attribution_metrics.csv"), index=False)
+        plot_compact_wave_attribution(compact_attribution)
+        print("Done with figure: compact_wave_attribution_metrics")
+    else:
+        print("Skipping compact wave attribution: no source metrics were available")
 
 print("\nFinished equatorial_wave_diagnostics.py")

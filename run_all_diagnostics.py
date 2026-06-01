@@ -31,6 +31,7 @@ DEFAULT_SCRIPT_ORDER = [
     "thermal_wind_scaled_response.py",
     "matched_pattern_response.py",
     "equatorial_wave_diagnostics.py",
+    "convective_pathway_diagnostics.py",
     "jet_variability_diagnostics.py",
 ]
 

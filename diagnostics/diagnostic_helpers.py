@@ -16,6 +16,20 @@ ISOBARIC_DIM_LEVEL_VAR = {
 }
 
 
+def silence_hdf5_error_stack():
+    """Disable HDF5 C-library error-stack printing, without hiding Python errors."""
+    try:
+        import h5py
+    except Exception:
+        return False
+
+    try:
+        h5py._errors.silence_errors()
+    except Exception:
+        return False
+    return True
+
+
 def standardize_cldfrac_vertical_coordinate(ds):
     """Give cldfrac a geometric-height z coordinate regardless of its source."""
     if "cldfrac" not in ds.data_vars:

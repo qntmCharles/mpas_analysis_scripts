@@ -42,7 +42,7 @@ except ModuleNotFoundError:
 # -----------------------------------------------------------------------------
 
 save = True
-save_loc = "/home/cwp29/tmp/mpas/crf_on/jet_variability/"
+save_loc = "/home/cwp29/tmp/mpas/crf_on/final/jet_variability/"
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
