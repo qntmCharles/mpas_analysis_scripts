@@ -25,7 +25,7 @@ from tropopause import *
 from diagnostic_helpers import *
 
 save = True
-save_loc = '/home/cwp29/tmp/mpas/crf_on/convection/'
+save_loc = '/home/cwp29/tmp/mpas/crf_on/final/convection/'
 
 # Set to [] or None to run all figures.  Otherwise list the numbered figures
 # to regenerate, e.g. [18] for the conditional cloud diagnostics.
@@ -51,7 +51,7 @@ save_loc = '/home/cwp29/tmp/mpas/crf_on/convection/'
 #   18: comp_cloud_conditioned_on_precip_pw_cape_cin
 #   19: comp_atmos_radiative_heating_proxy
 #   20: comp_tropical_timeseries_extended
-figures_to_run = [8, 18]
+figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 

@@ -25,8 +25,10 @@ from matplotlib import colors
 from tropopause import *
 from diagnostic_helpers import *
 
+silence_hdf5_error_stack()
+
 save = True
-save_loc = '/home/cwp29/tmp/mpas/crf_on/mean_state/'
+save_loc = '/home/cwp29/tmp/mpas/crf_on/final/mean_state/'
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -46,10 +48,10 @@ save_loc = '/home/cwp29/tmp/mpas/crf_on/mean_state/'
 #   13: ke_latheight
 #   14: eke_latpres
 #   15: global_energy_budget
-#   16: temperature_wind_latheight
+#   16: temperature_wind_latheight, omega_rh_latheight
 #   17: mslp_maps
 #   18: scalar_constituents_latheight
-figures_to_run = [14, 15, 16, 17, 18]
+figures_to_run = [18]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 
@@ -80,6 +82,10 @@ def add_period_reference_lines_frequency(ax, periods=spectrum_period_reference_d
                     fontsize=7, color="0.25")
 
 
+RD = 287.0
+CP = 1004.0
+P0_PA = 100000.0
+G = 9.80665
 LV = 2.5e6
 
 ENERGY_BUDGET_TERMS = {
@@ -240,7 +246,37 @@ def latheight_time_mean_field(zds, spec):
             raise ValueError(f"Missing variables for temperature: {missing}")
         theta = finite_or_nan(zds.theta)
         pressure = finite_or_nan(zds.pressure)
-        da = theta * (pressure / 100000.0) ** (287.0 / 1004.0)
+        da = theta * (pressure / P0_PA) ** (RD / CP)
+    elif spec.get("derived") == "omega_hydrostatic":
+        missing = [v for v in ("theta", "pressure", "w") if v not in zds.data_vars]
+        if missing:
+            raise ValueError(f"Missing variables for omega: {missing}")
+        theta = finite_or_nan(zds.theta)
+        pressure = finite_or_nan(zds.pressure)
+        temperature = theta * (pressure / P0_PA) ** (RD / CP)
+        w = finite_or_nan(zds.w)
+        w_dim = vertical_dim(w)
+        target_dim = vertical_dim(pressure)
+
+        if w.sizes[w_dim] == pressure.sizes[target_dim] + 1:
+            lower = w.isel({w_dim: slice(0, -1)})
+            upper = w.isel({w_dim: slice(1, None)})
+            if w_dim in lower.coords and w_dim in upper.coords:
+                upper = upper.assign_coords({w_dim: lower[w_dim]})
+            w = 0.5 * (lower + upper)
+        elif w.sizes[w_dim] != pressure.sizes[target_dim]:
+            raise ValueError(
+                f"Cannot align w levels ({w.sizes[w_dim]}) with pressure levels "
+                f"({pressure.sizes[target_dim]})"
+            )
+
+        if w_dim != target_dim:
+            w = w.rename({w_dim: target_dim})
+        if target_dim in pressure.coords:
+            w = w.assign_coords({target_dim: pressure[target_dim]})
+
+        rho = pressure / (RD * temperature)
+        da = -rho * G * w
     else:
         for candidate in spec["candidates"]:
             if candidate in zds.data_vars:
@@ -275,11 +311,15 @@ def ensure_z_index_coord(da):
 
 
 def scalar_constituent_latheight(ds, spec, zmid=None):
-    varname = spec["var"]
-    if varname not in ds.data_vars:
-        raise ValueError(f"{varname} not found")
+    varnames = spec["vars"] if "vars" in spec else (spec["var"],)
+    missing = [varname for varname in varnames if varname not in ds.data_vars]
+    if missing:
+        raise ValueError(f"{missing} not found")
 
-    da = finite_or_nan(ds[varname])
+    da = None
+    for varname in varnames:
+        term = finite_or_nan(ds[varname])
+        da = term if da is None else da + term
     mean_dims = [dim for dim in ("Time", "longitude") if dim in da.dims]
     if mean_dims:
         da = da.mean(dim=mean_dims, skipna=True)
@@ -300,6 +340,48 @@ def positive_percentile_levels(fields, percentile=99.5, n=21, fallback=1.0):
     if not np.isfinite(vmax) or vmax <= 0:
         vmax = fallback
     return np.linspace(0.0, vmax, n)
+
+
+def positive_log_levels(fields, percentile=99.5, n=21, vmin=1.0e-4, fallback=1.0):
+    vals = np.concatenate([
+        np.asarray(field.values, dtype=float).ravel()
+        for field in fields
+    ])
+    vals = vals[np.isfinite(vals) & (vals > 0.0)]
+    vmax = np.nanpercentile(vals, percentile) if vals.size else fallback
+    if not np.isfinite(vmax) or vmax <= vmin:
+        vmax = fallback
+    if not np.isfinite(vmax) or vmax <= vmin:
+        vmax = vmin * 10.0
+    return np.geomspace(vmin, vmax, n)
+
+
+def scalar_raw_levels_and_norm(fields, spec):
+    raw_scale = spec.get("raw_scale", "linear")
+    if raw_scale == "log":
+        levels = positive_log_levels(
+            fields,
+            percentile=99.5,
+            vmin=spec.get("raw_log_min", 1.0e-4),
+            fallback=spec.get("raw_fallback", 1.0),
+        )
+        return levels, colors.LogNorm(vmin=levels[0], vmax=levels[-1]), "both"
+    if raw_scale != "linear":
+        raise ValueError(f"Unknown raw scale {raw_scale!r} for {spec['label']}")
+
+    levels = positive_percentile_levels(
+        fields,
+        percentile=99.5,
+        fallback=spec.get("raw_fallback", 1.0),
+    )
+    return levels, None, "max"
+
+
+def scalar_raw_values(field, spec):
+    values = np.asarray(field.values, dtype=float)
+    if spec.get("raw_scale") == "log":
+        return np.ma.masked_less_equal(np.ma.masked_invalid(values), 0.0)
+    return values
 
 
 def symmetric_percentile_levels(fields, percentile=99.0, ndiv=10, fallback=1.0):
@@ -360,6 +442,27 @@ LATHEIGHT_MEAN_STATE_SPECS = [
     },
 ]
 
+LATHEIGHT_OMEGA_RH_SPECS = [
+    {
+        "label": "Omega",
+        "derived": "omega_hydrostatic",
+        "units": r"Pa s$^{-1}$",
+        "cmap": "seismic",
+        "raw_symmetric": True,
+        "raw_fallback": 1.0,
+        "diff_fallback": 0.2,
+    },
+    {
+        "label": "Relative humidity",
+        "candidates": ("relhum",),
+        "units": "%",
+        "cmap": "BrBG",
+        "raw_symmetric": False,
+        "raw_fallback": 100.0,
+        "diff_fallback": 10.0,
+    },
+]
+
 MSLP_LATLON_SPEC = {
     "label": "MSLP",
     "candidates": ("mslp",),
@@ -383,29 +486,21 @@ SCALAR_CONSTITUENT_GROUPS = [
                 "units": r"g kg$^{-1}$",
                 "scale": 1000.0,
                 "cmap": "YlGnBu",
+                "raw_scale": "log",
+                "raw_log_min": 1.0e-4,
                 "raw_fallback": 20.0,
                 "diff_fallback": 1.0,
             },
         ],
     },
     {
-        "name": "liquid_hydrometeors",
-        "title": "Liquid-phase hydrometeors",
+        "name": "cloud_hydrometeors",
+        "title": "Cloud hydrometeors",
         "fields": [
             {
-                "var": "qc",
-                "label": "Cloud liquid",
-                "symbol": r"$q_c$",
-                "units": r"g kg$^{-1}$",
-                "scale": 1000.0,
-                "cmap": "YlGnBu",
-                "raw_fallback": 0.1,
-                "diff_fallback": 0.02,
-            },
-            {
-                "var": "qr",
-                "label": "Rain",
-                "symbol": r"$q_r$",
+                "vars": ("qi", "qc"),
+                "label": "Cloud condensate",
+                "symbol": r"$q_i + q_c$",
                 "units": r"g kg$^{-1}$",
                 "scale": 1000.0,
                 "cmap": "YlGnBu",
@@ -415,33 +510,13 @@ SCALAR_CONSTITUENT_GROUPS = [
         ],
     },
     {
-        "name": "ice_hydrometeors",
-        "title": "Ice-phase hydrometeors",
+        "name": "precipitating_hydrometeors",
+        "title": "Precipitating hydrometeors",
         "fields": [
             {
-                "var": "qi",
-                "label": "Cloud ice",
-                "symbol": r"$q_i$",
-                "units": r"g kg$^{-1}$",
-                "scale": 1000.0,
-                "cmap": "PuBu",
-                "raw_fallback": 0.05,
-                "diff_fallback": 0.01,
-            },
-            {
-                "var": "qs",
-                "label": "Snow",
-                "symbol": r"$q_s$",
-                "units": r"g kg$^{-1}$",
-                "scale": 1000.0,
-                "cmap": "PuBu",
-                "raw_fallback": 0.05,
-                "diff_fallback": 0.01,
-            },
-            {
-                "var": "qg",
-                "label": "Graupel",
-                "symbol": r"$q_g$",
+                "vars": ("qg", "qs", "qr"),
+                "label": "Precipitating condensate",
+                "symbol": r"$q_g + q_s + q_r$",
                 "units": r"g kg$^{-1}$",
                 "scale": 1000.0,
                 "cmap": "PuBu",
@@ -485,7 +560,7 @@ dss_zm = []
 
 needed_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw",
-    "qv", "qc", "qr", "qi", "qs", "qg",
+    "qv", "qc", "qr", "qi", "qs", "qg", "relhum", "w",
     "mslp",
     "uzonal_isobaric", "umeridional_isobaric", "omg_isobaric",
     "rh_isobaric", "t_isobaric", "qv_isobaric", "theta",
@@ -617,7 +692,7 @@ if should_run_figure(2):
         pressure = zds.pressure.sel(latitude=slice(-10, 10)).mean(dim=("Time", "latitude"))
         u = zds.uReconstructZonal.sel(latitude=slice(-10, 10)).mean(dim=("Time", "latitude"))
 
-        T = theta * (pressure / 100000.)**(287.0 / 1004.0)
+        T = theta * (pressure / P0_PA) ** (RD / CP)
 
         z = height_from_zm_latlon(zds).values
 
@@ -663,7 +738,7 @@ if should_run_any([3, 10, 11, 13, 14, 16, 18]):
         theta = zds.theta.mean(dim="Time")
         pressure = zds.pressure.mean(dim="Time")
 
-        T = theta * (pressure / 100000.)**(287.0 / 1004.0)
+        T = theta * (pressure / P0_PA) ** (RD / CP)
         T = model_lat_field(T)
         pressure = model_lat_field(pressure)
         z = height_from_zm_latlon(zds).values
@@ -684,15 +759,9 @@ if should_run_any([3, 10, 11, 13, 14, 16, 18]):
 
 if should_run_figure(3):
     fig, ax = plt.subplots(len(dss), 2, figsize=(8, 3.0*len(dss)), sharey=True, constrained_layout=True)
-    fig2, ax2 = plt.subplots(len(dss), 5, figsize=(10, 3.0*len(dss)), sharey=True, constrained_layout=True)
 
     if len(dss) == 1:
         ax = np.array([ax])
-        ax2 = np.array([ax2])
-
-    control_data = {}
-    T_im2 = u_im2 = v_im2 = rh_im2 = omg_im2 = None
-    Tdiff_im = udiff_im = vdiff_im = rhdiff_im = omgdiff_im = None
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
         ubar_da = isobaric_lat_mean(zds.uzonal_isobaric)
@@ -707,38 +776,8 @@ if should_run_figure(3):
         Tbar = Tbar_da.values
         rhbar = rhbar_da.values
 
-        if i == 0:
-            control_data = {
-                'ubar': ubar_da, 'vbar': vbar_da, 'omgbar': omgbar_da,
-                'Tbar': Tbar_da, 'rhbar': rhbar_da,
-            }
-
         T_im, _, _, _ = plot_Tu_latpres(ax[i, 0], zds.latitude.values, zds.pres.values, Tbar, ubar)
         rh_im, _ = plot_rhv_latpres(ax[i, 1], zds.latitude.values, zds.pres.values, rhbar, vbar, omgbar)
-
-        if i == 0:
-            T_im2 = ax2[i, 0].contourf(zds.latitude.values, zds.pres.values, Tbar, levels=np.arange(190, 305, 5), extend='both', cmap='coolwarm')
-            u_im2 = ax2[i, 1].contourf(zds.latitude.values, zds.pres.values, ubar, levels=np.arange(-20, 25, 5), extend='both', cmap='seismic')
-            v_im2 = ax2[i, 2].contourf(zds.latitude.values, zds.pres.values, vbar, levels=np.arange(-20, 25, 5), extend='both', cmap='seismic')
-            rh_im2 = ax2[i, 3].contourf(zds.latitude.values, zds.pres.values, rhbar, levels=np.arange(0, 105, 5), extend='both', cmap='BrBG')
-            omg_im2 = ax2[i, 4].contourf(zds.latitude.values, zds.pres.values, omgbar, levels=np.arange(-5, 6, 1), extend='both', cmap='seismic')
-        else:
-            cT = interp_like_control(Tbar_da, control_data['Tbar'])
-            cu = interp_like_control(ubar_da, control_data['ubar'])
-            cv = interp_like_control(vbar_da, control_data['vbar'])
-            crh = interp_like_control(rhbar_da, control_data['rhbar'])
-            comg = interp_like_control(omgbar_da, control_data['omgbar'])
-
-            Tdiff_levels = symmetric_levels(10.0, ndiv=11)
-            udiff_levels = symmetric_levels(5.0, ndiv=11)
-            rhdiff_levels = symmetric_levels(10.0, ndiv=11)
-            omgdiff_levels = symmetric_levels(1.0, ndiv=11)
-
-            Tdiff_im = ax2[i, 0].contourf(zds.latitude.values, zds.pres.values, (Tbar_da - cT).values, levels=Tdiff_levels, extend='both', cmap='bwr')
-            udiff_im = ax2[i, 1].contourf(zds.latitude.values, zds.pres.values, (ubar_da - cu).values, levels=udiff_levels, extend='both', cmap='bwr')
-            vdiff_im = ax2[i, 2].contourf(zds.latitude.values, zds.pres.values, (vbar_da - cv).values, levels=udiff_levels, extend='both', cmap='bwr')
-            rhdiff_im = ax2[i, 3].contourf(zds.latitude.values, zds.pres.values, (rhbar_da - crh).values, levels=rhdiff_levels, extend='both', cmap='bwr')
-            omgdiff_im = ax2[i, 4].contourf(zds.latitude.values, zds.pres.values, (omgbar_da - comg).values, levels=omgdiff_levels, extend='both', cmap='bwr')
 
         annotate_panel_label(ax[i, 0], sim_names[i])
         annotate_panel_label(ax[i, 1], sim_names[i])
@@ -746,59 +785,23 @@ if should_run_figure(3):
         ax[i, 0].plot(zds.latitude.values, CPTs[i][1]/100., color='k', lw=1, ls=':')
         ax[i, 1].plot(zds.latitude.values, CPTs[i][1]/100., color='k', lw=1, ls=':')
 
-        for j in range(5):
-            annotate_panel_label(ax2[i, j], control_diff_label(sim_names, i))
-            ax2[i, j].plot(zds.latitude.values, CPTs[i][1]/100., color='k', lw=1, ls=':')
-            if j > 0:
-                ax2[i, j].set_yticklabels([])
-
     for j in range(ax.shape[0]-1):
         ax[j, 0].set_xticklabels([])
         ax[j, 1].set_xticklabels([])
-        for k in range(5):
-            ax2[j, k].set_xticklabels([])
 
     ax[-1, 0].set_xlabel("Latitude (degrees)")
     ax[-1, 1].set_xlabel("Latitude (degrees)")
 
-    for k in range(5):
-        ax2[-1, k].set_xlabel("Latitude (degrees)")
-
-    ax2[0, 0].set_title("Temperature")
-    ax2[0, 1].set_title("Zonal wind")
-    ax2[0, 2].set_title("Meridional wind")
-    ax2[0, 3].set_title("Relative humidity")
-    ax2[0, 4].set_title("Omega")
-
     for j in range(ax.shape[0]):
         ax[j, 0].set_ylabel("Pressure (hPa)")
-        ax2[j, 0].set_ylabel("Pressure (hPa)")
 
     for a in ax.ravel():
-        set_latpres_axis(a, xlabel=False, ylabel=False, xlim=(-90, 90))
-    for a in ax2.ravel():
         set_latpres_axis(a, xlabel=False, ylabel=False, xlim=(-90, 90))
 
     fig.colorbar(T_im, ax=ax[-1, 0], location='bottom', label="temperature (K)")
     fig.colorbar(rh_im, ax=ax[-1, 1], location='bottom', label="relative humidity (%)")
 
-    # Absolute/control-row colourbars
-    fig2.colorbar(T_im2,   ax=ax2[0, 0], location='right', label=r"$T$")
-    fig2.colorbar(u_im2,   ax=ax2[0, 1], location='right', label=r"$u$")
-    fig2.colorbar(v_im2,   ax=ax2[0, 2], location='right', label=r"$v$")
-    fig2.colorbar(rh_im2,  ax=ax2[0, 3], location='right', label="RH")
-    fig2.colorbar(omg_im2, ax=ax2[0, 4], location='right', label=r"$\omega$")
-
-    # Difference colourbars for nudged rows
-    if Tdiff_im is not None:
-        add_symmetric_colorbar(fig2, Tdiff_im,   ax2[1:, 0], Tdiff_levels, label=r"$\Delta T$")
-        add_symmetric_colorbar(fig2, udiff_im,   ax2[1:, 1], udiff_levels, label=r"$\Delta u$")
-        add_symmetric_colorbar(fig2, vdiff_im,   ax2[1:, 2], udiff_levels, label=r"$\Delta v$")
-        add_symmetric_colorbar(fig2, rhdiff_im,  ax2[1:, 3], rhdiff_levels, label=r"$\Delta$RH")
-        add_symmetric_colorbar(fig2, omgdiff_im, ax2[1:, 4], omgdiff_levels, label=r"$\Delta\omega$")
-
     figsave.save(fig, "temp_relhum", number=3)
-    figsave.save(fig2, "temp_relhum_diff", number=3)
     print("Done with figure: comp_temp_relhum")
 
     # In[ ]:
@@ -971,9 +974,9 @@ if should_run_figure(6):
     # In[ ]:
 
 if should_run_figure(7):
-    spec_levels = np.linspace(0, 2.5, 26)
+    spec_levels = np.linspace(0, 5, 26)
     spec_cmap, spec_norm = make_spectrum_cmap(spec_levels)
-    spec_diff_levels = symmetric_levels(1.0, ndiv=11)
+    spec_diff_levels = symmetric_levels(2.0, ndiv=11)
     spec_diff_norm = make_diff_norm(spec_diff_levels)
 
     fig, ax = plt.subplots(len(data_locs), 2, figsize=(8, 8), constrained_layout=True)
@@ -1456,24 +1459,42 @@ if should_run_figure(12):
     # In[ ]:
 
 if should_run_figure(16):
-    # Time-mean latitude-height sections of temperature and reconstructed winds.
+    # Time-mean latitude-height sections using a shared raw/control-difference layout.
+    latheight_groups = [
+        {
+            "title": "temperature/wind",
+            "specs": LATHEIGHT_MEAN_STATE_SPECS,
+            "raw_name": "temperature_wind_latheight",
+            "diff_name": "temperature_wind_latheight_diff",
+        },
+        {
+            "title": "omega/RH",
+            "specs": LATHEIGHT_OMEGA_RH_SPECS,
+            "raw_name": "omega_rh_latheight",
+            "diff_name": "omega_rh_latheight_diff",
+        },
+    ]
 
-    latheight_entries = []
-    for spec in LATHEIGHT_MEAN_STATE_SPECS:
-        fields_by_sim = {}
-        for i, zds in enumerate(dss_zm):
-            try:
-                fields_by_sim[i] = latheight_time_mean_field(zds, spec)
-            except ValueError as e:
-                print(f"Skipping {spec['label']} latitude-height plot for {sim_names[i]}: {e}")
+    for group in latheight_groups:
+        latheight_entries = []
+        for spec in group["specs"]:
+            fields_by_sim = {}
+            for i, zds in enumerate(dss_zm):
+                try:
+                    fields_by_sim[i] = latheight_time_mean_field(zds, spec)
+                except ValueError as e:
+                    print(f"Skipping {spec['label']} latitude-height plot for {sim_names[i]}: {e}")
 
-        if 0 not in fields_by_sim:
-            print(f"Skipping {spec['label']} latitude-height plots: control field is missing")
+            if 0 not in fields_by_sim:
+                print(f"Skipping {spec['label']} latitude-height plots: control field is missing")
+                continue
+
+            latheight_entries.append((spec, fields_by_sim))
+
+        if not latheight_entries:
+            print(f"Skipping {group['title']} latitude-height plots: no requested fields were available")
             continue
 
-        latheight_entries.append((spec, fields_by_sim))
-
-    if latheight_entries:
         nrows = len(latheight_entries)
         ncols = len(dss_zm)
         fig, ax = plt.subplots(
@@ -1585,11 +1606,9 @@ if should_run_figure(16):
                     label=f"{spec['label']} difference ({spec['units']})",
                 )
 
-        figsave.save(fig, "temperature_wind_latheight", number=16)
-        figsave.save(fig2, "temperature_wind_latheight_diff", number=16)
-        print("Done with figure: comp_temperature_wind_latheight")
-    else:
-        print("Skipping temperature/wind latitude-height plots: no requested fields were available")
+        figsave.save(fig, group["raw_name"], number=16)
+        figsave.save(fig2, group["diff_name"], number=16)
+        print(f"Done with figure: comp_{group['raw_name']}")
 
     # In[ ]:
 
@@ -1711,8 +1730,8 @@ if should_run_figure(17):
 
 if should_run_figure(18):
     # Time-mean latitude-height sections of MPAS moist scalar constituents.
-    # Grouping follows the usual microphysics taxonomy: vapour, liquid-phase
-    # hydrometeors, and ice-phase hydrometeors.
+    # Grouping separates vapour, suspended cloud condensate, and precipitating
+    # condensate.
 
     zmid_cache = {}
     for i, ds in enumerate(dss):
@@ -1767,11 +1786,7 @@ if should_run_figure(18):
         )
 
         for row, (spec, fields_by_sim, meshes_by_sim) in enumerate(scalar_entries):
-            raw_levels = positive_percentile_levels(
-                list(fields_by_sim.values()),
-                percentile=99.5,
-                fallback=spec.get("raw_fallback", 1.0),
-            )
+            raw_levels, raw_norm, raw_extend = scalar_raw_levels_and_norm(list(fields_by_sim.values()), spec)
             control_field = fields_by_sim[0]
             diff_fields = {}
             for i, field in fields_by_sim.items():
@@ -1812,13 +1827,15 @@ if should_run_figure(18):
                     continue
 
                 lat2d, z2d = meshes_by_sim[i]
+                raw_values = scalar_raw_values(field, spec)
                 raw_im = ax[row, i].contourf(
                     lat2d,
                     z2d / 1000.0,
-                    field.values,
+                    raw_values,
                     levels=raw_levels,
                     cmap=spec["cmap"],
-                    extend="max",
+                    norm=raw_norm,
+                    extend=raw_extend,
                 )
                 ax[row, i].plot(dss_zm[i].latitude.values, CPTs[i][0]/1000.0, color="k", lw=1, ls=":")
                 annotate_panel_label(ax[row, i], sim_names[i])
@@ -1827,10 +1844,11 @@ if should_run_figure(18):
                     control_im = ax2[row, i].contourf(
                         lat2d,
                         z2d / 1000.0,
-                        field.values,
+                        raw_values,
                         levels=raw_levels,
                         cmap=spec["cmap"],
-                        extend="max",
+                        norm=raw_norm,
+                        extend=raw_extend,
                     )
                 else:
                     diff = diff_fields[i]
