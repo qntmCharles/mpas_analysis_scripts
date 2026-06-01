@@ -26,7 +26,7 @@ from tropopause import *
 from diagnostic_helpers import *
 
 save = True
-save_loc = '/home/cwp29/tmp/mpas/crf_on/thermal_wind/'
+save_loc = '/home/cwp29/tmp/mpas/crf_on/final/thermal_wind/'
 
 # Set to [] or None to run all figures.  Otherwise list the numbered figures
 # to regenerate, e.g. [4, 5, 6] for the scaled-residual lat-lon maps.
@@ -38,13 +38,14 @@ save_loc = '/home/cwp29/tmp/mpas/crf_on/thermal_wind/'
 #   4:  scaled_residual_olrtoa
 #   5:  scaled_residual_precipw
 #   6:  scaled_residual_precip
-#   7:  scaled_residual_T_latpres
-#   8:  scaled_residual_u_latpres
-#   9:  scaled_residual_RH_latpres
-#   10: scaled_residual_omega_latpres
+#   7:  scaled_residual_T_latheight
+#   8:  scaled_residual_u_latheight
+#   9:  scaled_residual_RH_latheight
+#   10: scaled_residual_omega_latheight
 #   11: scaled_residual_N2_latheight
 #   12: scaled_residual_cldfrac_latheight
-figures_to_run = [4, 5, 6]
+#   13: thermal_wind_temperature_gradient_total_fields
+figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
@@ -67,12 +68,11 @@ dss_zm = []
 
 needed_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw",
-    "uzonal_isobaric", "umeridional_isobaric", "omg_isobaric",
-    "rh_isobaric", "t_isobaric", "qv_isobaric", "theta",
-    "uReconstructZonal", "cldfrac", "olrtoa", "zgrid", "pressure", "vorticity", "ke"
+    "theta", "pressure", "uReconstructZonal", "relhum", "w",
+    "cldfrac", "olrtoa", "zgrid", "vorticity", "ke"
 ]
 
-check_vars = ['t_isobaric']
+check_vars = ["theta", "pressure", "uReconstructZonal"]
 
 
 def should_run_figure(number):
@@ -161,7 +161,7 @@ def annotate_scaled_residual_labels(ax, run_u=1, run_T=2, control=0):
 
 # Pre-compute cold-point tropopause profiles only for figures that draw them.
 CPTs = None
-if should_run_any([1, 7, 8, 9, 10, 11, 12]):
+if should_run_any([1, 7, 8, 9, 10, 11, 12, 13]):
     CPTs = []
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
@@ -204,14 +204,19 @@ if should_run_any([1, 7, 8, 9, 10, 11, 12]):
 #      wind/shear/wave pathway?
 #
 # Notes:
-#   * The pressure-coordinate thermal-wind diagnostic is singular at the
-#     equator because f -> 0.  The diagnostic is therefore masked inside
-#     +/- tw_equator_mask_deg.
+#   * The height-coordinate thermal-wind diagnostic is singular at the equator
+#     because f -> 0.  Plots keep the near-equator region visible but mark
+#     +/-5 deg; metrics still mask that band.
 #   * This is most useful on the off-equatorial flanks of the tropical
 #     anomaly, not exactly at the equator.
 #   * The scaled-residual diagnostics assume approximate linearity.  They
 #     are not a proof, but they are a good way to avoid accidentally calling
 #     a stronger thermal response a direct wind response.
+
+RD = 287.0
+CP = 1004.0
+P0_PA = 100000.0
+G = 9.80665
 
 def tropical_mean_surface(da, lat_bounds=(-10, 10)):
     """Area-weighted tropical mean for lat/lon fields."""
@@ -220,45 +225,67 @@ def tropical_mean_surface(da, lat_bounds=(-10, 10)):
     dims = [d for d in ("latitude", "longitude") if d in da.dims]
     return da.weighted(w).mean(dim=dims)
 
-def tropical_mean_isobaric(da, p=None, p_bounds=None, lat_bounds=(-10, 10)):
-    """Area-weighted tropical mean for isobaric fields."""
+def subset_between(da, dim, bounds):
+    """Subset a coordinate range without assuming ascending or descending order."""
+    if bounds is None or dim not in da.dims:
+        return da
+    lo, hi = sorted(bounds)
+    return da.where((da[dim] >= lo) & (da[dim] <= hi), drop=True)
+
+def coordinate_layer_weights(coord, dim):
+    """Positive finite-difference layer weights for a 1-D coordinate."""
+    values = np.asarray(coord.values if isinstance(coord, xr.DataArray) else coord, dtype=float)
+    if values.size == 1:
+        weights = np.ones_like(values)
+    else:
+        bounds = np.empty(values.size + 1)
+        bounds[1:-1] = 0.5 * (values[:-1] + values[1:])
+        bounds[0] = values[0] - 0.5 * (values[1] - values[0])
+        bounds[-1] = values[-1] + 0.5 * (values[-1] - values[-2])
+        weights = np.abs(np.diff(bounds))
+    return xr.DataArray(weights, dims=(dim,), coords={dim: values}, name=f"d{dim}_weight")
+
+def latheight_weights(da):
+    """Cosine-latitude and layer-thickness weights for latitude-height fields."""
+    weight = xr.ones_like(da)
+    if "latitude" in da.dims:
+        weight = weight * np.cos(np.deg2rad(da.latitude))
+    if "z" in da.dims:
+        weight = weight * coordinate_layer_weights(da.z, "z")
+    return weight
+
+def tropical_mean_latheight(da, z=None, z_bounds=None, lat_bounds=(-10, 10)):
+    """Area and dz weighted tropical mean for model-height fields."""
     x = da
-    if p is not None:
-        x = x.sel(pres=p, method="nearest")
-    if p_bounds is not None:
-        pmin, pmax = min(p_bounds), max(p_bounds)
-        x = x.sel(pres=slice(pmin, pmax))
-    x = x.sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
-    w = np.cos(np.deg2rad(x.latitude))
-    dims = [d for d in ("Time", "pres", "latitude") if d in x.dims]
-    return x.weighted(w).mean(dim=dims)
+    if z is not None:
+        x = x.interp(z=z, kwargs={"fill_value": np.nan})
+    x = subset_between(x, "z", z_bounds)
+    x = subset_between(x, "latitude", lat_bounds)
+    dims = [d for d in ("Time", "z", "latitude") if d in x.dims]
+    return x.weighted(latheight_weights(x)).mean(dim=dims)
 
-def rms_weighted_latpres(da, lat_bounds=(-60, 60), p_bounds=(50, 300)):
-    """Weighted RMS over a pressure-latitude box."""
-    x = da.sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
-    if "pres" in x.dims and p_bounds is not None:
-        pmin, pmax = min(p_bounds), max(p_bounds)
-        x = x.sel(pres=slice(pmin, pmax))
-    w = np.cos(np.deg2rad(x.latitude))
-    dims = [d for d in ("pres", "latitude") if d in x.dims]
-    return np.sqrt((x**2).weighted(w).mean(dim=dims)).values.item()
+def rms_weighted_latheight(da, lat_bounds=(-60, 60), z_bounds=(10000, 22000)):
+    """Weighted RMS over a latitude-height box."""
+    x = subset_between(da, "latitude", lat_bounds)
+    x = subset_between(x, "z", z_bounds)
+    dims = [d for d in ("z", "latitude") if d in x.dims]
+    return np.sqrt((x**2).weighted(latheight_weights(x)).mean(dim=dims)).values.item()
 
-def pattern_corr_latpres(a, b, lat_bounds=(-60, 60), p_bounds=(50, 300)):
-    """Cosine-latitude weighted pattern correlation over pressure-latitude box."""
+def pattern_corr_latheight(a, b, lat_bounds=(-60, 60), z_bounds=(10000, 22000)):
+    """Cosine-latitude and dz weighted pattern correlation over a latitude-height box."""
     aa, bb = xr.align(a, b, join="inner")
-    aa = aa.sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
-    bb = bb.sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
-    if "pres" in aa.dims and p_bounds is not None:
-        pmin, pmax = min(p_bounds), max(p_bounds)
-        aa = aa.sel(pres=slice(pmin, pmax))
-        bb = bb.sel(pres=slice(pmin, pmax))
+    aa = subset_between(aa, "latitude", lat_bounds)
+    bb = subset_between(bb, "latitude", lat_bounds)
+    aa = subset_between(aa, "z", z_bounds)
+    bb = subset_between(bb, "z", z_bounds)
+    aa, bb = xr.align(aa, bb, join="inner")
 
-    w = np.cos(np.deg2rad(aa.latitude))
-    dims = [d for d in ("pres", "latitude") if d in aa.dims]
-    aa = aa - aa.weighted(w).mean(dim=dims)
-    bb = bb - bb.weighted(w).mean(dim=dims)
-    num = (aa * bb).weighted(w).mean(dim=dims)
-    den = np.sqrt((aa**2).weighted(w).mean(dim=dims) * (bb**2).weighted(w).mean(dim=dims))
+    weights = latheight_weights(aa)
+    dims = [d for d in ("z", "latitude") if d in aa.dims]
+    aa = aa - aa.weighted(weights).mean(dim=dims)
+    bb = bb - bb.weighted(weights).mean(dim=dims)
+    num = (aa * bb).weighted(weights).mean(dim=dims)
+    den = np.sqrt((aa**2).weighted(weights).mean(dim=dims) * (bb**2).weighted(weights).mean(dim=dims))
     return (num / den).values.item()
 
 def precip_rate_mean_map(ds):
@@ -275,79 +302,213 @@ def zmean_time_mean(da):
 # Thermal wind helpers
 # -----------------------
 
+def canonical_latheight_var(var):
+    aliases = {
+        "T": "temperature",
+        "t": "temperature",
+        "temperature": "temperature",
+        "u": "uReconstructZonal",
+        "uReconstructZonal": "uReconstructZonal",
+        "RH": "relhum",
+        "rh": "relhum",
+        "relhum": "relhum",
+        "omega": "omega_hydrostatic",
+        "omega_hydrostatic": "omega_hydrostatic",
+    }
+    return aliases.get(var, var)
+
+def required_latheight_vars(var):
+    var = canonical_latheight_var(var)
+    if var == "temperature":
+        return ("theta", "pressure")
+    if var == "omega_hydrostatic":
+        return ("theta", "pressure", "w")
+    return (var,)
+
+def latheight_field_available(zds, var):
+    return all(name in zds.data_vars for name in required_latheight_vars(var))
+
+def model_level_temperature(zds):
+    theta = finite_or_nan(zds.theta)
+    pressure = finite_or_nan(zds.pressure)
+    return theta * (pressure / P0_PA) ** (RD / CP)
+
+def align_w_to_midlevels(w, pressure):
+    w_dim = vertical_dim(w)
+    target_dim = vertical_dim(pressure)
+
+    if w.sizes[w_dim] == pressure.sizes[target_dim] + 1:
+        lower = w.isel({w_dim: slice(0, -1)})
+        upper = w.isel({w_dim: slice(1, None)})
+        if w_dim in lower.coords and w_dim in upper.coords:
+            upper = upper.assign_coords({w_dim: lower[w_dim]})
+        w = 0.5 * (lower + upper)
+    elif w.sizes[w_dim] != pressure.sizes[target_dim]:
+        raise ValueError(
+            f"Cannot align w levels ({w.sizes[w_dim]}) with pressure levels "
+            f"({pressure.sizes[target_dim]})"
+        )
+
+    if w_dim != target_dim:
+        w = w.rename({w_dim: target_dim})
+    if target_dim in pressure.coords:
+        w = w.assign_coords({target_dim: pressure[target_dim]})
+    return w
+
+def hydrostatic_omega(zds):
+    pressure = finite_or_nan(zds.pressure)
+    temperature = model_level_temperature(zds)
+    w = align_w_to_midlevels(finite_or_nan(zds.w), pressure)
+    rho = pressure / (RD * temperature)
+    omega = -rho * G * w
+    omega.name = "omega_hydrostatic"
+    omega.attrs.update(units="Pa s-1", long_name="hydrostatic omega from model-level w")
+    return omega
+
+def latheight_time_mean_field(zds, var):
+    """Time-mean zonal-mean model-height field as (z, latitude)."""
+    var = canonical_latheight_var(var)
+    if not latheight_field_available(zds, var):
+        missing = [name for name in required_latheight_vars(var) if name not in zds.data_vars]
+        raise ValueError(f"Missing variables for {var}: {missing}")
+
+    if var == "temperature":
+        da = model_level_temperature(zds)
+    elif var == "omega_hydrostatic":
+        da = hydrostatic_omega(zds)
+    else:
+        da = finite_or_nan(zds[var])
+
+    if "Time" in da.dims:
+        da = da.mean(dim="Time", skipna=True)
+
+    da = model_lat_field(da).load()
+    da.name = var
+    return da
+
+_latheight_field_cache = {}
+
+def get_latheight_field(run_index, var):
+    key = (run_index, canonical_latheight_var(var))
+    if key not in _latheight_field_cache:
+        _latheight_field_cache[key] = latheight_time_mean_field(dss_zm[run_index], key[1])
+    return _latheight_field_cache[key]
+
 def thermal_wind_terms(T_da, u_da, tw_equator_mask_deg=5.0):
     """
-    Diagnose pressure-coordinate thermal-wind balance.
+    Diagnose height-coordinate thermal-wind balance.
 
-    Inputs must have dimensions (pres, latitude), with pres in hPa.
+    Inputs must have dimensions (z, latitude), with z in metres.
 
     Approximate relation used:
-        d u / d ln(p) = R/(f a) * dT/dphi
+        d u / dz = -g/(f a T) * dT/dphi
 
     where phi is latitude in radians.  This relation is not valid at the
-    equator, so a latitude band around the equator is masked.
+    equator. Set tw_equator_mask_deg to None to keep the near-equator values
+    for plotting; otherwise that latitude band is masked.
     """
-    R = 287.0
     omega = 7.2921159e-5
     a = 6.371e6
 
-    T = T_da.transpose("pres", "latitude")
-    u = u_da.transpose("pres", "latitude")
+    T, u = xr.align(T_da, u_da, join="inner")
+    T = T.transpose("z", "latitude")
+    u = u.transpose("z", "latitude")
 
     lat_rad = np.deg2rad(T.latitude.values)
-    lnp = np.log(T.pres.values)
+    z = T.z.values
     f = 2.0 * omega * np.sin(lat_rad)
 
     dT_dphi = np.gradient(T.values, lat_rad, axis=1)
-    du_dlnp = np.gradient(u.values, lnp, axis=0)
+    du_dz = np.gradient(u.values, z, axis=0)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        du_dlnp_tw =  R / (f[None, :] * a) * dT_dphi
+        du_dz_tw = -G / (f[None, :] * a * T.values) * dT_dphi
 
-    mask = np.abs(T.latitude.values) < tw_equator_mask_deg
-    du_dlnp[:, mask] = np.nan
-    du_dlnp_tw[:, mask] = np.nan
+    du_dz = np.where(np.isfinite(du_dz), du_dz, np.nan)
+    du_dz_tw = np.where(np.isfinite(du_dz_tw), du_dz_tw, np.nan)
+    if tw_equator_mask_deg is not None and tw_equator_mask_deg > 0:
+        mask = np.abs(T.latitude.values) < tw_equator_mask_deg
+        du_dz[:, mask] = np.nan
+        du_dz_tw[:, mask] = np.nan
 
-    resid = du_dlnp - du_dlnp_tw
-    coords = {"pres": T.pres, "latitude": T.latitude}
+    resid = du_dz - du_dz_tw
+    coords = {"z": T.z, "latitude": T.latitude}
 
     return (
-        xr.DataArray(du_dlnp, dims=("pres", "latitude"), coords=coords, name="du_dlnp_observed"),
-        xr.DataArray(du_dlnp_tw, dims=("pres", "latitude"), coords=coords, name="du_dlnp_thermal_wind"),
-        xr.DataArray(resid, dims=("pres", "latitude"), coords=coords, name="du_dlnp_residual"),
+        xr.DataArray(du_dz, dims=("z", "latitude"), coords=coords, name="du_dz_observed", attrs={"units": "s-1"}),
+        xr.DataArray(du_dz_tw, dims=("z", "latitude"), coords=coords, name="du_dz_thermal_wind", attrs={"units": "s-1"}),
+        xr.DataArray(resid, dims=("z", "latitude"), coords=coords, name="du_dz_residual", attrs={"units": "s-1"}),
     )
 
-def get_isobaric_anomaly(zds, zds_control, var):
-    """Time-mean isobaric anomaly relative to control, on this run's grid."""
-    field = isobaric_lat_mean(zds[var])
-    control = isobaric_lat_mean(zds_control[var]).interp(
-        pres=field.pres, latitude=field.latitude, kwargs={"fill_value": np.nan}
+def thermal_wind_temperature_gradient_terms(T_da, u_da, tw_equator_mask_deg=5.0):
+    """
+    Diagnose thermal-wind balance as a meridional temperature gradient.
+
+    Inputs must have dimensions (z, latitude), with z in metres.  The
+    inverted height-coordinate relation is:
+        dT/dy = -(f T/g) * du/dz
+
+    where y is northward distance in metres. Set tw_equator_mask_deg to None
+    to keep the near-equator values for plotting; otherwise that latitude band
+    is masked because the geostrophic thermal-wind approximation is not useful
+    there.
+    """
+    omega = 7.2921159e-5
+    a = 6.371e6
+
+    T, u = xr.align(T_da, u_da, join="inner")
+    T = T.transpose("z", "latitude")
+    u = u.transpose("z", "latitude")
+
+    lat_rad = np.deg2rad(T.latitude.values)
+    z = T.z.values
+    f = 2.0 * omega * np.sin(lat_rad)
+
+    dT_dphi = np.gradient(T.values, lat_rad, axis=1)
+    dT_dy = dT_dphi / a
+    du_dz = np.gradient(u.values, z, axis=0)
+    dT_dy_tw = -(f[None, :] * T.values / G) * du_dz
+
+    dT_dy = np.where(np.isfinite(dT_dy), dT_dy, np.nan)
+    dT_dy_tw = np.where(np.isfinite(dT_dy_tw), dT_dy_tw, np.nan)
+    if tw_equator_mask_deg is not None and tw_equator_mask_deg > 0:
+        mask = np.abs(T.latitude.values) < tw_equator_mask_deg
+        dT_dy[:, mask] = np.nan
+        dT_dy_tw[:, mask] = np.nan
+
+    resid = dT_dy - dT_dy_tw
+    coords = {"z": T.z, "latitude": T.latitude}
+
+    return (
+        xr.DataArray(dT_dy, dims=("z", "latitude"), coords=coords, name="dT_dy_observed", attrs={"units": "K m-1"}),
+        xr.DataArray(dT_dy_tw, dims=("z", "latitude"), coords=coords, name="dT_dy_thermal_wind", attrs={"units": "K m-1"}),
+        xr.DataArray(resid, dims=("z", "latitude"), coords=coords, name="dT_dy_residual", attrs={"units": "K m-1"}),
+    )
+
+def add_tw_equator_guides(ax, lat=5.0):
+    for x in (-lat, lat):
+        ax.axvline(x, color="0.2", lw=0.9, ls="--", alpha=0.9)
+
+def get_latheight_anomaly(run_index, control_index, var):
+    """Time-mean latitude-height anomaly relative to control, on this run's grid."""
+    field = get_latheight_field(run_index, var)
+    control = get_latheight_field(control_index, var).interp(
+        z=field.z, latitude=field.latitude, kwargs={"fill_value": np.nan}
     )
     return field - control
 
-def mean_TTL_temperature_anomaly(zds, zds_control, p_bounds=(70, 150), lat_bounds=(-10, 10)):
-    """Mean realised TTL temperature anomaly relative to control."""
-    dT = get_isobaric_anomaly(zds, zds_control, "t_isobaric")
-    pmin, pmax = min(p_bounds), max(p_bounds)
-    dT = dT.sel(pres=slice(pmin, pmax)).sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
-    w = np.cos(np.deg2rad(dT.latitude))
-    return dT.weighted(w).mean(dim=("pres", "latitude")).values.item()
+def mean_TTL_latheight_anomaly(var, run_index, control_index=0, z_bounds=(14000, 18000), lat_bounds=(-10, 10)):
+    """Mean realised TTL anomaly relative to control on model-height levels."""
+    dX = get_latheight_anomaly(run_index, control_index, var)
+    return tropical_mean_latheight(dX, z_bounds=z_bounds, lat_bounds=lat_bounds).values.item()
 
-def mean_TTL_wind_anomaly(zds, zds_control, p_bounds=(70, 150), lat_bounds=(-10, 10)):
-    """Mean realised TTL zonal-wind anomaly relative to control."""
-    du = get_isobaric_anomaly(zds, zds_control, "uzonal_isobaric")
-    pmin, pmax = min(p_bounds), max(p_bounds)
-    du = du.sel(pres=slice(pmin, pmax)).sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
-    w = np.cos(np.deg2rad(du.latitude))
-    return du.weighted(w).mean(dim=("pres", "latitude")).values.item()
-
-def scaled_residual_latpres(var, alpha, run_u=1, run_T=2, control=0):
+def scaled_residual_latheight(var, alpha, run_u=1, run_T=2, control=0):
     """
-    Return dX_u, dX_T, and dX_u - alpha*dX_T for isobaric fields.
+    Return dX_u, dX_T, and dX_u - alpha*dX_T for model-height fields.
     """
-    dXu = get_isobaric_anomaly(dss_zm[run_u], dss_zm[control], var)
-    dXT = get_isobaric_anomaly(dss_zm[run_T], dss_zm[control], var)
-    dXT_on_u = dXT.interp(pres=dXu.pres, latitude=dXu.latitude, kwargs={"fill_value": np.nan})
+    dXu = get_latheight_anomaly(run_u, control, var)
+    dXT = get_latheight_anomaly(run_T, control, var)
+    dXT_on_u = dXT.interp(z=dXu.z, latitude=dXu.latitude, kwargs={"fill_value": np.nan})
     resid = dXu - alpha * dXT_on_u
     return dXu, dXT, resid
 
@@ -375,19 +536,21 @@ def scaled_residual_map(var, alpha, run_u=1, run_T=2, control=0):
 # 1. Realised thermal/wind scaling numbers
 # -----------------------
 
-TTL_p_bounds = (70, 150)
+TTL_z_bounds = (14000, 18000)
+TTL_ref_z = 16000
 TTL_lat_bounds = (-10, 10)
+TW_metric_z_bounds = (10000, 22000)
 
-dT_TTL_u = mean_TTL_temperature_anomaly(dss_zm[1], dss_zm[0], p_bounds=TTL_p_bounds, lat_bounds=TTL_lat_bounds)
-dT_TTL_T = mean_TTL_temperature_anomaly(dss_zm[2], dss_zm[0], p_bounds=TTL_p_bounds, lat_bounds=TTL_lat_bounds)
-du_TTL_u = mean_TTL_wind_anomaly(dss_zm[1], dss_zm[0], p_bounds=TTL_p_bounds, lat_bounds=TTL_lat_bounds)
-du_TTL_T = mean_TTL_wind_anomaly(dss_zm[2], dss_zm[0], p_bounds=TTL_p_bounds, lat_bounds=TTL_lat_bounds)
+dT_TTL_u = mean_TTL_latheight_anomaly("temperature", 1, z_bounds=TTL_z_bounds, lat_bounds=TTL_lat_bounds)
+dT_TTL_T = mean_TTL_latheight_anomaly("temperature", 2, z_bounds=TTL_z_bounds, lat_bounds=TTL_lat_bounds)
+du_TTL_u = mean_TTL_latheight_anomaly("uReconstructZonal", 1, z_bounds=TTL_z_bounds, lat_bounds=TTL_lat_bounds)
+du_TTL_T = mean_TTL_latheight_anomaly("uReconstructZonal", 2, z_bounds=TTL_z_bounds, lat_bounds=TTL_lat_bounds)
 
 alpha_TTL = dT_TTL_u / dT_TTL_T if np.isfinite(dT_TTL_T) and abs(dT_TTL_T) > 1e-12 else np.nan
 
 print("\nTemperature scaling based on realised TTL temperature anomaly")
 print("--------------------------------------------------------")
-print(f"TTL layer: {TTL_p_bounds[0]}-{TTL_p_bounds[1]} hPa, {TTL_lat_bounds[0]} to {TTL_lat_bounds[1]} deg")
+print(f"TTL layer: {TTL_z_bounds[0]/1000:.1f}-{TTL_z_bounds[1]/1000:.1f} km, {TTL_lat_bounds[0]} to {TTL_lat_bounds[1]} deg")
 print(f"u-nudged mean ΔT_TTL = {dT_TTL_u:.3f} K")
 print(f"T-nudged mean ΔT_TTL = {dT_TTL_T:.3f} K")
 print(f"alpha_TTL = ΔT_u / ΔT_T = {alpha_TTL:.3f}")
@@ -407,47 +570,121 @@ if should_run_figure(1):
     im_obs = im_tw = im_resid = None
     thermal_wind_metric_rows = []
 
-    levels = symmetric_levels(25.0, ndiv=5)
+    levels = symmetric_levels(8.0, ndiv=16)
 
     for i, zds in enumerate(dss_zm):
-        Tbar = isobaric_lat_mean(zds.t_isobaric)
-        ubar = isobaric_lat_mean(zds.uzonal_isobaric)
-        du_obs, du_tw, tw_resid = thermal_wind_terms(Tbar, ubar, tw_equator_mask_deg=5.0)
+        Tbar = get_latheight_field(i, "temperature")
+        ubar = get_latheight_field(i, "uReconstructZonal")
+        du_obs, du_tw, tw_resid = thermal_wind_terms(Tbar, ubar, tw_equator_mask_deg=None)
+        du_obs_metric, du_tw_metric, tw_resid_metric = thermal_wind_terms(
+            Tbar, ubar, tw_equator_mask_deg=5.0
+        )
 
-        rms_obs = rms_weighted_latpres(du_obs)
-        rms_tw = rms_weighted_latpres(du_tw)
-        rms_resid = rms_weighted_latpres(tw_resid)
-        corr = pattern_corr_latpres(du_obs, du_tw)
+        rms_obs = rms_weighted_latheight(du_obs_metric * 1000.0, z_bounds=TW_metric_z_bounds)
+        rms_tw = rms_weighted_latheight(du_tw_metric * 1000.0, z_bounds=TW_metric_z_bounds)
+        rms_resid = rms_weighted_latheight(tw_resid_metric * 1000.0, z_bounds=TW_metric_z_bounds)
+        corr = pattern_corr_latheight(du_obs_metric, du_tw_metric, z_bounds=TW_metric_z_bounds)
         thermal_wind_metric_rows.append([sim_names[i], rms_obs, rms_tw, rms_resid, corr])
 
-        im_obs = ax[i, 0].contourf(zds.latitude, zds.pres, du_obs, levels=levels, cmap="bwr", extend="both")
-        im_tw = ax[i, 1].contourf(zds.latitude, zds.pres, du_tw, levels=levels, cmap="bwr", extend="both")
-        im_resid = ax[i, 2].contourf(zds.latitude, zds.pres, tw_resid, levels=levels, cmap="bwr", extend="both")
+        im_obs = ax[i, 0].contourf(du_obs.latitude, du_obs.z / 1000.0, du_obs * 1000.0, levels=levels, cmap="bwr", extend="both")
+        im_tw = ax[i, 1].contourf(du_tw.latitude, du_tw.z / 1000.0, du_tw * 1000.0, levels=levels, cmap="bwr", extend="both")
+        im_resid = ax[i, 2].contourf(tw_resid.latitude, tw_resid.z / 1000.0, tw_resid * 1000.0, levels=levels, cmap="bwr", extend="both")
 
         for j in range(3):
-            ax[i, j].plot(zds.latitude.values, CPTs[i][1] / 100.0, color="k", lw=1, ls=":")
+            ax[i, j].plot(zds.latitude.values, CPTs[i][0] / 1000.0, color="k", lw=1, ls=":")
+            add_tw_equator_guides(ax[i, j], lat=5.0)
             annotate_panel_label(ax[i, j], sim_names[i])
-            set_latpres_axis(ax[i, j], xlabel=(i == len(dss_zm) - 1), ylabel=(j == 0))
+            set_latheight_labels(ax[i, j], xlabel=(i == len(dss_zm) - 1))
+            ax[i, j].set_xlim(-60, 60)
+            ax[i, j].set_ylim(0, 25)
+            if j != 0:
+                ax[i, j].set_ylabel("")
             if i < len(dss_zm) - 1:
                 ax[i, j].set_xticklabels([])
 
-    ax[0, 0].set_title(r"Observed $\partial u/\partial \,\ln p$")
+    ax[0, 0].set_title(r"Observed $\partial u/\partial z$")
     ax[0, 1].set_title("TW-implied shear")
     ax[0, 2].set_title("Observed - implied")
-    add_symmetric_colorbar(fig, im_resid, ax[:, 2], levels, label=r"m s$^{-1}$ per ln p")
+    add_symmetric_colorbar(fig, im_resid, ax[:, 2], levels, label=r"m s$^{-1}$ km$^{-1}$")
 
     figsave.save(fig, "thermal_wind_total_fields", number=1)
     print("Done with figure: 01_thermal_wind_total_fields.png")
-    print("WHAT TO LOOK FOR: use the residual panels and total-field metrics together. Low residual RMS and high observed-vs-TW pattern correlation mean the realised shear is mostly thermal-wind balanced; coherent residuals outside +/-5 deg point to ageostrophic or transient structure not captured by the local T gradient.")
+    print("WHAT TO LOOK FOR: use the residual panels and total-field metrics together. Low residual RMS and high observed-vs-TW pattern correlation mean the realised shear is mostly thermal-wind balanced; coherent residuals outside the dashed +/-5 deg lines point to ageostrophic or transient structure not captured by the local T gradient.")
 
     thermal_wind_metrics = pd.DataFrame(
         thermal_wind_metric_rows,
-        columns=["simulation", "rms_observed_shear", "rms_TW_implied_shear", "rms_residual", "pattern_corr_obs_vs_TW"]
+        columns=["simulation", "rms_observed_shear_ms-1_km-1", "rms_TW_implied_shear_ms-1_km-1", "rms_residual_ms-1_km-1", "pattern_corr_obs_vs_TW"]
     )
-    print("\nThermal-wind total-field metrics over 50-300 hPa and 60S-60N, excluding +/-5 deg:")
+    print(f"\nThermal-wind total-field metrics over {TW_metric_z_bounds[0]/1000:.1f}-{TW_metric_z_bounds[1]/1000:.1f} km and 60S-60N, excluding +/-5 deg:")
     print(thermal_wind_metrics.to_string(index=False))
     if save:
         thermal_wind_metrics.to_csv(save_loc + "thermal_wind_total_metrics.csv", index=False)
+
+# -----------------------
+# 2b. Thermal-wind balance inverted to meridional temperature gradients
+# -----------------------
+
+if should_run_figure(13):
+    fig, ax = plt.subplots(len(dss_zm), 3, figsize=(8, 2 * len(dss_zm)), constrained_layout=True, sharex=True, sharey=True)
+    if len(dss_zm) == 1:
+        ax = np.array([ax])
+
+    im_obs = im_tw = im_resid = None
+    thermal_wind_temperature_gradient_metric_rows = []
+
+    levels = symmetric_levels(8.0, ndiv=16)
+
+    for i, zds in enumerate(dss_zm):
+        Tbar = get_latheight_field(i, "temperature")
+        ubar = get_latheight_field(i, "uReconstructZonal")
+        dTdy_obs, dTdy_tw, dTdy_resid = thermal_wind_temperature_gradient_terms(
+            Tbar, ubar, tw_equator_mask_deg=None
+        )
+        dTdy_obs_metric, dTdy_tw_metric, dTdy_resid_metric = thermal_wind_temperature_gradient_terms(
+            Tbar, ubar, tw_equator_mask_deg=5.0
+        )
+
+        rms_obs = rms_weighted_latheight(dTdy_obs_metric * 1e6, z_bounds=TW_metric_z_bounds)
+        rms_tw = rms_weighted_latheight(dTdy_tw_metric * 1e6, z_bounds=TW_metric_z_bounds)
+        rms_resid = rms_weighted_latheight(dTdy_resid_metric * 1e6, z_bounds=TW_metric_z_bounds)
+        corr = pattern_corr_latheight(dTdy_obs_metric, dTdy_tw_metric, z_bounds=TW_metric_z_bounds)
+        thermal_wind_temperature_gradient_metric_rows.append([sim_names[i], rms_obs, rms_tw, rms_resid, corr])
+
+        im_obs = ax[i, 0].contourf(dTdy_obs.latitude, dTdy_obs.z / 1000.0, dTdy_obs * 1e6, levels=levels, cmap="bwr", extend="both")
+        im_tw = ax[i, 1].contourf(dTdy_tw.latitude, dTdy_tw.z / 1000.0, dTdy_tw * 1e6, levels=levels, cmap="bwr", extend="both")
+        im_resid = ax[i, 2].contourf(dTdy_resid.latitude, dTdy_resid.z / 1000.0, dTdy_resid * 1e6, levels=levels, cmap="bwr", extend="both")
+
+        for j in range(3):
+            ax[i, j].plot(zds.latitude.values, CPTs[i][0] / 1000.0, color="k", lw=1, ls=":")
+            add_tw_equator_guides(ax[i, j], lat=5.0)
+            annotate_panel_label(ax[i, j], sim_names[i])
+            set_latheight_labels(ax[i, j], xlabel=(i == len(dss_zm) - 1))
+            ax[i, j].set_xlim(-60, 60)
+            ax[i, j].set_ylim(0, 25)
+            if j != 0:
+                ax[i, j].set_ylabel("")
+            if i < len(dss_zm) - 1:
+                ax[i, j].set_xticklabels([])
+
+    ax[0, 0].set_title(r"Observed $\partial T/\partial y$")
+    ax[0, 1].set_title("TW-implied T gradient")
+    ax[0, 2].set_title("Observed - implied")
+    add_symmetric_colorbar(fig, im_resid, ax[:, 2], levels, label=r"K per 1000 km")
+
+    figsave.save(fig, "thermal_wind_temperature_gradient_total_fields", number=13)
+    print("Done with figure: 13_thermal_wind_temperature_gradient_total_fields.png")
+    print("WHAT TO LOOK FOR: this is the same thermal-wind balance viewed the other way round. Low residual RMS means the observed meridional temperature gradient is consistent with the observed vertical shear; coherent residuals outside the dashed +/-5 deg lines indicate thermal gradients not captured by balanced shear.")
+
+    thermal_wind_temperature_gradient_metrics = pd.DataFrame(
+        thermal_wind_temperature_gradient_metric_rows,
+        columns=["simulation", "rms_observed_dTdy_K_per_1000km", "rms_TW_implied_dTdy_K_per_1000km", "rms_residual_K_per_1000km", "pattern_corr_obs_vs_TW"]
+    )
+    print(f"\nThermal-wind temperature-gradient metrics over {TW_metric_z_bounds[0]/1000:.1f}-{TW_metric_z_bounds[1]/1000:.1f} km and 60S-60N, excluding +/-5 deg:")
+    print(thermal_wind_temperature_gradient_metrics.to_string(index=False))
+    if save:
+        thermal_wind_temperature_gradient_metrics.to_csv(
+            save_loc + "thermal_wind_temperature_gradient_total_metrics.csv", index=False
+        )
 
 # -----------------------
 # 3. Realised-state summary bar chart
@@ -456,27 +693,25 @@ if should_run_figure(1):
 if should_run_any([2, 3]):
     summary_rows = []
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        T100 = tropical_mean_isobaric(zds.t_isobaric, p=100, lat_bounds=(-10, 10)).values.item()
-        u100 = tropical_mean_isobaric(zds.uzonal_isobaric, p=100, lat_bounds=(-10, 10)).values.item()
-        Tttl = tropical_mean_isobaric(zds.t_isobaric, p_bounds=TTL_p_bounds, lat_bounds=(-10, 10)).values.item()
-        uttl = tropical_mean_isobaric(zds.uzonal_isobaric, p_bounds=TTL_p_bounds, lat_bounds=(-10, 10)).values.item()
+        Tfield = get_latheight_field(i, "temperature")
+        ufield = get_latheight_field(i, "uReconstructZonal")
+        T16 = tropical_mean_latheight(Tfield, z=TTL_ref_z, lat_bounds=TTL_lat_bounds).values.item()
+        u16 = tropical_mean_latheight(ufield, z=TTL_ref_z, lat_bounds=TTL_lat_bounds).values.item()
+        Tttl = tropical_mean_latheight(Tfield, z_bounds=TTL_z_bounds, lat_bounds=TTL_lat_bounds).values.item()
+        uttl = tropical_mean_latheight(ufield, z_bounds=TTL_z_bounds, lat_bounds=TTL_lat_bounds).values.item()
 
-        theta = zds.theta.sel(latitude=slice(-10, 10)).mean(dim=("Time", "latitude"))
-        z = height_from_zm_latlon(zds).values
-        dtheta_dz = np.gradient(theta.values, z)
-        N2 = 9.80665 / theta.values * dtheta_dz
-        zmask = (z / 1000.0 >= 14) & (z / 1000.0 <= 18)
-        N2_1418 = np.nanmean(N2[zmask]) * 1e4
+        N2 = N2_latheight(zds)
+        N2_1418 = tropical_mean_latheight(N2 * 1e4, z_bounds=TTL_z_bounds, lat_bounds=TTL_lat_bounds).values.item()
 
         olr = tropical_mean_surface(ds.olrtoa, lat_bounds=(-10, 10)).mean(dim="Time").values.item()
         pw = tropical_mean_surface(ds.precipw, lat_bounds=(-10, 10)).mean(dim="Time").values.item()
         pr = tropical_mean_surface(precip_rate_from_accum(total_precip_accum(ds), dt=dt), lat_bounds=(-10, 10)).mean(dim="Time").values.item()
 
-        summary_rows.append([sim_names[i], T100, u100, Tttl, uttl, N2_1418, olr, pw, pr])
+        summary_rows.append([sim_names[i], T16, u16, Tttl, uttl, N2_1418, olr, pw, pr])
 
     summary_df = pd.DataFrame(
         summary_rows,
-        columns=["simulation", "T100_K", "u100_ms-1", "T_TTL_K", "u_TTL_ms-1", "N2_14_18km_1e-4s-2", "OLR_Wm-2", "PW_kgm-2", "precip_mmday-1"]
+        columns=["simulation", "T16km_K", "u16km_ms-1", "T_TTL_K", "u_TTL_ms-1", "N2_14_18km_1e-4s-2", "OLR_Wm-2", "PW_kgm-2", "precip_mmday-1"]
     )
 
     # Add anomalies relative to control for quick inspection
@@ -490,10 +725,10 @@ if should_run_any([2, 3]):
 
     if should_run_figure(2):
         plot_cols = [
-            ("dT100_K", r"$\Delta T_{100}$ (K)"),
-            ("du100_ms-1", r"$\Delta u_{100}$ (m s$^{-1}$)"),
-            ("dT_TTL_K", r"$\Delta T_{TTL}$ (K)"),
-            ("du_TTL_ms-1", r"$\Delta u_{TTL}$ (m s$^{-1}$)"),
+            ("dT16km_K", r"$\Delta T_{16km}$ (K)"),
+            ("du16km_ms-1", r"$\Delta u_{16km}$ (m s$^{-1}$)"),
+            ("dT_TTL_K", r"$\Delta T_{14-18km}$ (K)"),
+            ("du_TTL_ms-1", r"$\Delta u_{14-18km}$ (m s$^{-1}$)"),
             ("dN2_14_18km_1e-4s-2", r"$\Delta N^2_{14-18 km}$ ($10^{-4}$ s$^{-2}$)"),
             ("dOLR_Wm-2", r"$\Delta$ OLR (W m$^{-2}$)"),
             ("dPW_kgm-2", r"$\Delta$ PW (kg m$^{-2}$)"),
@@ -530,7 +765,7 @@ if should_run_any([2, 3]):
                 ax[j].annotate(sim_names[i], (x[i], y[i]), xytext=(4, 4), textcoords="offset points", fontsize=8)
             ax[j].axhline(0, color="grey", lw=0.5)
             ax[j].axvline(0, color="grey", lw=0.5)
-            ax[j].set_xlabel(r"$\Delta T_{TTL}$ (K)")
+            ax[j].set_xlabel(r"$\Delta T_{14-18km}$ (K)")
             ax[j].set_ylabel(ylabel)
             ax[j].grid(alpha=0.2)
 
@@ -594,40 +829,44 @@ if should_run_any([4, 5, 6]):
     print("WHAT TO LOOK FOR: small residual maps mean the u-nudged response is largely the T-nudged response scaled by realised TTL cooling. Coherent residuals imply an additional wind/shear/dynamical pathway.")
 
 # -----------------------
-# 6. Scaled-residual pressure-latitude sections
+# 6. Scaled-residual latitude-height sections
 # -----------------------
 
-latpres_residual_specs = [
-    (7, "t_isobaric", r"T anomaly (K)", 8.0, "07_scaled_residual_T_latpres.png"),
-    (8, "uzonal_isobaric", r"u anomaly (m s$^{-1}$)", 8.0, "08_scaled_residual_u_latpres.png"),
-    (9, "rh_isobaric", r"RH anomaly", 10.0, "09_scaled_residual_RH_latpres.png"),
-    (10, "omg_isobaric", r"omega anomaly (Pa s$^{-1}$)", 0.1, "10_scaled_residual_omega_latpres.png"),
+latheight_residual_specs = [
+    (7, "temperature", r"T anomaly (K)", 8.0, "07_scaled_residual_T_latheight.png"),
+    (8, "uReconstructZonal", r"u anomaly (m s$^{-1}$)", 8.0, "08_scaled_residual_u_latheight.png"),
+    (9, "relhum", r"RH anomaly (%)", 10.0, "09_scaled_residual_RH_latheight.png"),
+    (10, "omega_hydrostatic", r"omega anomaly (Pa s$^{-1}$)", 0.1, "10_scaled_residual_omega_latheight.png"),
 ]
 
-for fig_num, var, label, max_abs, fname in latpres_residual_specs:
+for fig_num, var, label, max_abs, fname in latheight_residual_specs:
     if not should_run_figure(fig_num):
         continue
 
-    if var not in dss_zm[0].data_vars or var not in dss_zm[1].data_vars or var not in dss_zm[2].data_vars:
-        print(f"Skipping {var}: not present in all zm datasets")
+    if not all(latheight_field_available(zds, var) for zds in dss_zm[:3]):
+        print(f"Skipping {var}: required height-level variables are not present in all zm datasets")
         continue
 
-    dXu, dXT, resid = scaled_residual_latpres(var, alpha_TTL)
+    dXu, dXT, resid = scaled_residual_latheight(var, alpha_TTL)
     levels = symmetric_levels(max_abs, ndiv=13)
 
     fig, ax = plt.subplots(1, 3, figsize=(11, 3.3), constrained_layout=True, sharex=True, sharey=True)
-    im0 = ax[0].contourf(dXu.latitude, dXu.pres, dXu, levels=levels, cmap="bwr", extend="both")
-    im1 = ax[1].contourf(dXT.latitude, dXT.pres, dXT, levels=levels, cmap="bwr", extend="both")
-    im2 = ax[2].contourf(resid.latitude, resid.pres, resid, levels=levels, cmap="bwr", extend="both")
+    im0 = ax[0].contourf(dXu.latitude, dXu.z / 1000.0, dXu, levels=levels, cmap="bwr", extend="both")
+    im1 = ax[1].contourf(dXT.latitude, dXT.z / 1000.0, dXT, levels=levels, cmap="bwr", extend="both")
+    im2 = ax[2].contourf(resid.latitude, resid.z / 1000.0, resid, levels=levels, cmap="bwr", extend="both")
 
     for j, a in enumerate(ax):
-        set_latpres_axis(a, ylabel=(j == 0))
+        set_latheight_labels(a)
+        a.set_xlim(-60, 60)
+        a.set_ylim(0, 25)
+        if j != 0:
+            a.set_ylabel("")
         if j == 0:
-            a.plot(dss_zm[1].latitude.values, CPTs[1][1] / 100.0, color="k", lw=1, ls=":")
+            a.plot(dss_zm[1].latitude.values, CPTs[1][0] / 1000.0, color="k", lw=1, ls=":")
         elif j == 1:
-            a.plot(dss_zm[2].latitude.values, CPTs[2][1] / 100.0, color="k", lw=1, ls=":")
+            a.plot(dss_zm[2].latitude.values, CPTs[2][0] / 1000.0, color="k", lw=1, ls=":")
         else:
-            a.plot(dss_zm[1].latitude.values, CPTs[1][1] / 100.0, color="k", lw=1, ls=":")
+            a.plot(dss_zm[1].latitude.values, CPTs[1][0] / 1000.0, color="k", lw=1, ls=":")
 
     ax[0].set_title(r"$\Delta X_u$")
     ax[1].set_title(r"$\Delta X_T$")
@@ -641,7 +880,7 @@ for fig_num, var, label, max_abs, fname in latpres_residual_specs:
     print(f"Done with figure: {outname}")
 
 if should_run_any([7, 8, 9, 10]):
-    print("WHAT TO LOOK FOR: omega/RH residuals are particularly useful. A small T residual but large omega residual suggests comparable thermal forcing but different circulation adjustment.")
+    print("WHAT TO LOOK FOR: omega/RH residuals are particularly useful. A small height-level T residual but large omega residual suggests comparable thermal forcing but different circulation adjustment.")
 
 # -----------------------
 # 7. N2 scaled residual in latitude-height coordinates
@@ -767,23 +1006,18 @@ if run_all_figures():
         trop_dT = tropical_mean_surface(dXT, lat_bounds=(-10, 10)).values.item()
         residual_rows.append([pretty, "surface_tropical_mean", trop_du, trop_dT, trop_resid])
 
-    # Isobaric metrics: TTL tropical mean residuals
-    for var, pretty in [("t_isobaric", "T"), ("uzonal_isobaric", "u"), ("rh_isobaric", "RH"), ("omg_isobaric", "omega")]:
-        if var in dss_zm[0].data_vars and var in dss_zm[1].data_vars and var in dss_zm[2].data_vars:
-            dXu, dXT, resid = scaled_residual_latpres(var, alpha_TTL)
-            pmin, pmax = min(TTL_p_bounds), max(TTL_p_bounds)
-            lat0, lat1 = TTL_lat_bounds
-            for name, field in [("dXu", dXu), ("dXT", dXT), ("resid", resid)]:
-                field_box = field.sel(pres=slice(pmin, pmax)).sel(latitude=slice(lat0, lat1))
-                w = np.cos(np.deg2rad(field_box.latitude))
-                val = field_box.weighted(w).mean(dim=("pres", "latitude")).values.item()
-                if name == "dXu":
-                    du_val = val
-                elif name == "dXT":
-                    dT_val = val
-                else:
-                    resid_val = val
-            residual_rows.append([pretty, "TTL_tropical_mean", du_val, dT_val, resid_val])
+    # Height-level metrics: TTL tropical mean residuals
+    for var, pretty in [("temperature", "T"), ("uReconstructZonal", "u"), ("relhum", "RH"), ("omega_hydrostatic", "omega")]:
+        if all(latheight_field_available(zds, var) for zds in dss_zm[:3]):
+            dXu, dXT, resid = scaled_residual_latheight(var, alpha_TTL)
+            values = []
+            for field in (dXu, dXT, resid):
+                values.append(
+                    tropical_mean_latheight(
+                        field, z_bounds=TTL_z_bounds, lat_bounds=TTL_lat_bounds
+                    ).values.item()
+                )
+            residual_rows.append([pretty, "TTL_14_18km_tropical_mean", values[0], values[1], values[2]])
 
     residual_df = pd.DataFrame(
         residual_rows,
