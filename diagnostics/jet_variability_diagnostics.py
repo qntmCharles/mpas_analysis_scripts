@@ -52,6 +52,15 @@ save_loc = "/home/cwp29/tmp/mpas/crf_on/final/jet_variability/"
 #   3: annular_mode_eof_patterns
 #   4: annular_mode_indices_and_autocorrelation
 #   5: time_mean_zonal_wind_profiles
+#
+# WHAT TO LOOK FOR:
+#   * Long jet autocorrelation or persistent jet-latitude anomalies indicate
+#     slow internal variability that can contaminate small nudged-control
+#     differences.
+#   * EOF/annular-mode patterns identify whether differences are broad
+#     hemispheric circulation shifts or local tropical/UTLS responses.
+#   * If U-nudged changes jet variability without a matching T-nudged change,
+#     that supports a wind-driven or shear-mediated pathway.
 figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 

@@ -51,6 +51,16 @@ save_loc = '/home/cwp29/tmp/mpas/crf_on/final/mean_state/'
 #   16: temperature_wind_latheight, w_rh_latheight
 #   17: mslp_maps
 #   18: scalar_constituents_latheight
+#
+# WHAT TO LOOK FOR:
+#   * Use mean-state figures to establish the baseline structural response:
+#     coherent latitude-height changes in T, RH, w, cloud fraction, and
+#     hydrometeors are more meaningful than isolated map features.
+#   * Compare precipitation PDFs, spectra, and Hovmoller plots before treating
+#     small mean precipitation shifts as dynamically important.
+#   * Treat cloud and OLR changes together with temperature/static-stability
+#     and vertical-motion changes; high cloud alone is mechanistically
+#     ambiguous.
 figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 

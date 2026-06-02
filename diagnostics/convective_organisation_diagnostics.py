@@ -60,6 +60,16 @@ save_loc = "/home/cwp29/tmp/mpas/crf_on/final/organisation/"
 #   4: Lorg conditioned on tropical-mean precipitation
 #   5: Lorg conditioned on convective area fraction
 #   6: persistence/decorrelation curves
+#
+# WHAT TO LOOK FOR:
+#   * Robust Lorg or object-count changes at fixed tropical precipitation imply
+#     organisation changes beyond a simple mean-rain-rate shift.
+#   * Compare object area, count, and convective area fraction before assigning
+#     a change to aggregation; apparent Lorg changes can come from object-size
+#     changes.
+#   * Persistence changes in equatorial precipitation or OLR support a
+#     wave/organisation pathway, especially if they differ between U-nudged and
+#     T-nudged runs.
 figures_to_run = []
 figsave = None
 

@@ -19,6 +19,7 @@ automatically interpreted as deep precipitating convection.
 import os
 import sys
 import warnings
+from datetime import datetime
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("..", "../..", "../../.."):
@@ -100,7 +101,8 @@ PLOT_SAMPLE_LIMITS = dict(max_time=96, max_lat=96, max_lon=192)
 RESIDUAL_FIT_SAMPLE_LIMITS = dict(max_time=120, max_lat=120, max_lon=240)
 RESIDUAL_PLOT_SAMPLE_LIMITS = dict(max_time=120, max_lat=120, max_lon=240)
 
-SAVE_CLASSIFICATION_CACHE = False
+SAVE_CLASSIFICATION_CACHE = True
+CLASSIFICATION_CACHE_VERSION = "high-cloud-v1"
 classification_cache_dir = os.path.join(save_loc, "classification_cache")
 
 cache_dir = "/store/atmos-adk33/cwp29/cache/convective_pathways/"
@@ -194,6 +196,32 @@ def save_figure(number, fig, stem):
     figsave.save(fig, stem, number=number)
     if save and should_run_figure(number):
         fig.savefig(os.path.join(save_loc, f"{stem}.png"), dpi=300)
+
+
+def progress(message):
+    """Print timestamped progress; useful when stdout is captured to a log."""
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
+
+
+def write_dataset_with_progress(ds, path, label, encoding=None):
+    """Write a NetCDF file through a temporary path with optional dask progress."""
+    progress(f"{label}: writing {path}")
+    tmp_path = path + ".tmp"
+    progress_bar = None
+    if dask is not None:
+        try:
+            from dask.diagnostics import ProgressBar
+            progress_bar = ProgressBar()
+        except Exception:
+            progress_bar = None
+
+    if progress_bar is None:
+        ds.to_netcdf(tmp_path, encoding=encoding)
+    else:
+        with progress_bar:
+            ds.to_netcdf(tmp_path, encoding=encoding)
+    os.replace(tmp_path, path)
+    progress(f"{label}: finished writing {path}")
 
 
 # -----------------------------------------------------------------------------
@@ -443,24 +471,78 @@ def classify_high_cloud(
 
 
 def classification_dataset(classif):
-    return xr.Dataset({key: da for key, da in classif.items()})
+    variables = {}
+    for key, da in classif.items():
+        out = da
+        if getattr(out, "dtype", None) == bool:
+            out = out.astype("int8")
+            out.attrs.update(logical_type="bool", true_value=1, false_value=0)
+        variables[key] = out
+    ds = xr.Dataset(variables)
+    ds.attrs.update(classification_cache_metadata())
+    return ds
+
+
+def classification_cache_metadata():
+    return dict(
+        cache_version=CLASSIFICATION_CACHE_VERSION,
+        cf_thresh=CF_THRESH,
+        z_high_km=Z_HIGH,
+        z_low_min_km=Z_LOW_MIN,
+        z_low_max_km=Z_LOW_MAX,
+        z_mid_min_km=Z_MID_MIN,
+        z_mid_max_km=Z_MID_MAX,
+        z_upper_min_km=Z_UPPER_MIN,
+        precip_deep_threshold_mm_day=P_DEEP,
+        precip_weak_threshold_mm_day=P_WEAK,
+        max_clear_gap_km=MAX_CLEAR_GAP,
+        anvil_radius_deg=ANVIL_RADIUS_DEG,
+        anvil_time_steps=ANVIL_TIME_STEPS,
+    )
+
+
+def cached_classification_is_current(cached):
+    expected = classification_cache_metadata()
+    for key, value in expected.items():
+        cached_value = cached.attrs.get(key)
+        if isinstance(value, float):
+            if cached_value is None or not np.isclose(float(cached_value), value):
+                return False
+        elif cached_value != value:
+            return False
+    return True
+
+
+def open_cached_classification(cache_path, sim_name):
+    cached = xr.open_dataset(cache_path, chunks={})
+    if not cached_classification_is_current(cached):
+        progress(f"{sim_name}: cached high-cloud classification is stale; rebuilding {cache_path}")
+        cached.close()
+        return None
+    progress(f"{sim_name}: using cached high-cloud classification {cache_path}")
+    return {name: cached[name] for name in cached.data_vars}
 
 
 def get_or_build_classification(ds, fields, sim_name):
     cache_path = os.path.join(classification_cache_dir, f"{sim_name.replace(' ', '_')}_classified_high_cloud.nc")
     if SAVE_CLASSIFICATION_CACHE and os.path.exists(cache_path):
-        cached = xr.open_dataset(cache_path, chunks={})
-        return {name: cached[name] for name in cached.data_vars}
+        cached = open_cached_classification(cache_path, sim_name)
+        if cached is not None:
+            return cached
 
+    progress(f"{sim_name}: preparing high-cloud classification")
     cf = get_cloud_fraction(ds)
     if cf is None:
+        progress(f"{sim_name}: no usable cloud fraction; skipping high-cloud classification")
         return None
+    progress(f"{sim_name}: checking cloud-fraction time coverage")
     valid_times = available_cloud_fraction_times(cf)
     if valid_times is not None:
         if len(valid_times) == 0:
             warnings.warn(f"{sim_name}: cloud fraction has no valid times after reindexing.")
             return None
         cf = cf.sel(Time=valid_times)
+        progress(f"{sim_name}: found {len(valid_times)} valid cloud-fraction times")
 
     precip = fields["precip"]
     if "Time" in cf.dims and "Time" in precip.dims:
@@ -471,23 +553,38 @@ def get_or_build_classification(ds, fields, sim_name):
         print(
             f"{sim_name}: high-cloud classification uses {len(common_time)} "
             f"cloud/precip times (valid cloud times={cf.sizes['Time']}, "
-            f"precip-rate times={precip.sizes['Time']})."
+            f"precip-rate times={precip.sizes['Time']}).",
+            flush=True,
         )
         cf = cf.sel(Time=common_time)
         precip = precip.sel(Time=common_time)
 
+    progress(f"{sim_name}: building high-cloud classification graph")
     classif = classify_high_cloud(cf, cf.z, precip)
+    progress(f"{sim_name}: high-cloud classification graph built")
 
     if SAVE_CLASSIFICATION_CACHE:
-        encoding = {name: {"dtype": "float32"} for name in classif if "fraction" in name or "height" in name}
-        tmp_path = cache_path + ".tmp"
-        classification_dataset(classif).to_netcdf(tmp_path, encoding=encoding)
-        os.replace(tmp_path, cache_path)
+        fds = classification_dataset(classif)
+        encoding = {
+            name: {"dtype": "float32"}
+            for name in fds.data_vars
+            if "fraction" in name or "height" in name
+        }
+        write_dataset_with_progress(
+            fds,
+            cache_path,
+            label=f"{sim_name}: high-cloud classification cache",
+            encoding=encoding,
+        )
+        cached = open_cached_classification(cache_path, sim_name)
+        if cached is not None:
+            return cached
 
     return classif
 
 
 def print_class_coverage(classifications):
+    progress("Computing high-cloud class tropical coverage")
     rows = []
     for sim_name, classif in classifications.items():
         if classif is None:
@@ -513,9 +610,10 @@ def print_class_coverage(classifications):
         return coverage
 
     print("\nHigh-cloud class tropical area/time coverage")
-    print(coverage.to_string(index=False))
+    print(coverage.to_string(index=False), flush=True)
     if save:
         coverage.to_csv(os.path.join(save_loc, "high_cloud_class_coverage.csv"), index=False)
+        progress(f"Wrote {os.path.join(save_loc, 'high_cloud_class_coverage.csv')}")
 
     for sim_name in coverage.simulation.unique():
         sub = coverage[coverage.simulation == sim_name].set_index("class_name")
@@ -859,6 +957,7 @@ def filter_latmean_wave(fields, sim_index, field_key, wave_name):
 
     cache_path = wave_cache_path(sim_index, field_key, wave_name)
     if os.path.exists(cache_path):
+        progress(f"{sim_names[sim_index]} {wave_name}: using cached {field_key} wave filter {cache_path}")
         with xr.open_dataset(cache_path) as cached:
             return cached["wave"].load()
 
@@ -870,6 +969,7 @@ def filter_latmean_wave(fields, sim_index, field_key, wave_name):
 
     da = weighted_lat_mean(fields[field_key], lat_bounds=WAVE_FILTER_LAT_BOUNDS)
     da = da.transpose("Time", "longitude")
+    progress(f"{sim_names[sim_index]} {wave_name}: filtering {field_key} over {WAVE_FILTER_LAT_BOUNDS}")
     obs_time = da.Time.load()
     lon = da.longitude.load()
     obs = np.asarray(da.load().values, dtype="f")
@@ -894,6 +994,7 @@ def filter_latmean_wave(fields, sim_index, field_key, wave_name):
     tmp_path = cache_path + ".tmp"
     wave.to_dataset().to_netcdf(tmp_path)
     os.replace(tmp_path, cache_path)
+    progress(f"{sim_names[sim_index]} {wave_name}: wrote wave cache {cache_path}")
     return wave
 
 
@@ -1055,7 +1156,9 @@ def residual_sample_data(fields, classif, target_key, feature_keys, bin_keys):
 
 dss = []
 dss_zm = []
+progress("Loading lat-lon and zonal-mean datasets")
 for i, d in enumerate(data_locs):
+    progress(f"{sim_names[i]}: opening lat-lon dataset")
     ds = load_latlon_dataset(
         os.path.join(root_dir, d),
         latlon_pattern=latlon_file[i],
@@ -1066,7 +1169,9 @@ for i, d in enumerate(data_locs):
         add_cldfrac_file=True,
     )
     ds = standardize_latlon_dataset(ds, needed_vars)
+    progress(f"{sim_names[i]}: lat-lon dataset ready with {len(ds.data_vars)} variables")
 
+    progress(f"{sim_names[i]}: opening zonal-mean dataset")
     zds = load_latlon_dataset(
         os.path.join(root_dir, d),
         latlon_pattern=zm_latlon_file[i],
@@ -1078,6 +1183,7 @@ for i, d in enumerate(data_locs):
         add_cldfrac_file=False,
     )
     zds = standardize_latlon_dataset(zds, needed_vars)
+    progress(f"{sim_names[i]}: zonal-mean dataset ready with {len(zds.data_vars)} variables")
 
     print(ds)
     print(zds)
@@ -1086,7 +1192,9 @@ for i, d in enumerate(data_locs):
 
 
 fields_by_run = []
-for ds, zds in zip(dss, dss_zm):
+progress("Preparing precipitation, thermodynamic, and TTL fields")
+for sim_name, ds, zds in zip(sim_names, dss, dss_zm):
+    progress(f"{sim_name}: preparing fields")
     fields = {"precip": get_precip_rate(ds)}
     for key in ("olr", "pw", "cape", "cin"):
         da = time_aligned_field(ds, key, fields["precip"], required=False)
@@ -1095,14 +1203,17 @@ for ds, zds in zip(dss, dss_zm):
 
     ttl_fields = compute_ttl_diagnostics(zds, fields["precip"])
     fields.update(ttl_fields)
+    progress(f"{sim_name}: fields ready ({', '.join(sorted(fields))})")
     fields_by_run.append(fields)
 
 
 classifications_by_run = {}
 if should_run_any([1, 2, 4]):
+    progress("Building or reading high-cloud classifications")
     for sim_name, ds, fields in zip(sim_names, dss, fields_by_run):
         classifications_by_run[sim_name] = get_or_build_classification(ds, fields, sim_name)
     print_class_coverage(classifications_by_run)
+    progress("High-cloud classification stage complete")
 
 
 # -----------------------------------------------------------------------------
@@ -1120,6 +1231,7 @@ if should_run_any([1, 2, 4]):
 #     convection.
 
 if should_run_figure(1):
+    progress("Starting Figure 1: conditional_highcloud_vs_precip")
     available_condition = "N2_TTL" if all("N2_TTL" in f for f in fields_by_run) else "pw"
     if not all(available_condition in f for f in fields_by_run):
         print("Skipping Figure 1: neither N2_TTL nor PW is available in all runs.")
@@ -1190,7 +1302,7 @@ if should_run_figure(1):
         fig.suptitle(f"High cloud vs precipitation conditioned on {condition_label}")
         save_figure(1, fig, "conditional_highcloud_vs_precip")
         count_rows_to_frame(count_rows, "conditional_highcloud_vs_precip")
-        print("Done with figure: conditional_highcloud_vs_precip")
+        progress("Done with figure: conditional_highcloud_vs_precip")
 
 
 # -----------------------------------------------------------------------------
@@ -1206,6 +1318,7 @@ if should_run_figure(1):
 #     effects.
 
 if should_run_figure(2):
+    progress("Starting Figure 2: conditional_cloudtop_vs_precip_pw")
     if not all("pw" in f for f in fields_by_run):
         print("Skipping Figure 2: PW is unavailable in at least one run.")
     else:
@@ -1297,7 +1410,7 @@ if should_run_figure(2):
         fig.suptitle("Cloud-top height and high-cloud class fractions at fixed PW")
         save_figure(2, fig, "conditional_cloudtop_vs_precip_pw")
         count_rows_to_frame(count_rows, "conditional_cloudtop_vs_precip_pw")
-        print("Done with figure: conditional_cloudtop_vs_precip_pw")
+        progress("Done with figure: conditional_cloudtop_vs_precip_pw")
 
 
 # -----------------------------------------------------------------------------
@@ -1312,6 +1425,7 @@ if should_run_figure(2):
 #     is strong evidence for a wind/shear/wave-filtering pathway.
 
 if should_run_figure(3):
+    progress("Starting Figure 3: conditional_precip_pw_by_wave_amplitude")
     if kf_filter is None:
         print("Skipping Figure 3: waveFilter.kf_filter is unavailable.")
     elif not all("pw" in f for f in fields_by_run):
@@ -1400,7 +1514,7 @@ if should_run_figure(3):
         fig.suptitle("Precipitation-PW relationship split by filtered wave amplitude")
         save_figure(3, fig, "conditional_precip_pw_by_wave_amplitude")
         count_rows_to_frame(count_rows, "conditional_precip_pw_by_wave_amplitude")
-        print("Done with figure: conditional_precip_pw_by_wave_amplitude")
+        progress("Done with figure: conditional_precip_pw_by_wave_amplitude")
 
 
 # -----------------------------------------------------------------------------
@@ -1419,6 +1533,7 @@ if should_run_figure(3):
 #     feedback rather than simply deeper convective cores.
 
 if should_run_figure(4):
+    progress("Starting Figure 4: residual_highcloud_thermo_controls")
     if any(classifications_by_run.get(sim_name) is None for sim_name in sim_names):
         print("Skipping Figure 4: high-cloud classification is unavailable.")
     else:
@@ -1518,4 +1633,4 @@ if should_run_figure(4):
         fig.suptitle("High-cloud residuals after removing control local-thermodynamic relationship")
         save_figure(4, fig, "residual_highcloud_thermo_controls")
         count_rows_to_frame(count_rows, "residual_highcloud_thermo_controls")
-        print("Done with figure: residual_highcloud_thermo_controls")
+        progress("Done with figure: residual_highcloud_thermo_controls")

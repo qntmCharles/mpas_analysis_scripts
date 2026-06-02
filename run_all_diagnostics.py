@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from pathlib import Path
 
 ANALYSIS_DIR = Path(__file__).resolve().parent
 DIAGNOSTICS_DIR = ANALYSIS_DIR / "diagnostics"
+DEFAULT_LOG_DIR = ANALYSIS_DIR / "diagnostic_logs"
 MODULE_SEARCH_DIRS = [
     DIAGNOSTICS_DIR,
     ANALYSIS_DIR,
@@ -32,9 +34,14 @@ DEFAULT_SCRIPT_ORDER = [
     "matched_pattern_response.py",
     "equatorial_wave_diagnostics.py",
     "convective_pathway_diagnostics.py",
+    "significance_bootstrap_diagnostics.py",
     "convective_organisation_diagnostics.py",
     "jet_variability_diagnostics.py",
 ]
+
+GUIDANCE_HEADER_RE = re.compile(
+    r"^\s*#\s*(WHAT TO LOOK FOR|What to look for|Interpretation)\s*:?\s*(.*)$"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,7 +90,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-dir",
         type=Path,
-        help="Optional directory for per-diagnostic combined stdout/stderr logs.",
+        default=DEFAULT_LOG_DIR,
+        help="Directory for per-diagnostic combined stdout/stderr logs.",
+    )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable per-diagnostic log files.",
     )
     return parser.parse_args()
 
@@ -148,6 +161,67 @@ def child_environment() -> dict[str, str]:
     return env
 
 
+def extract_guidance_blocks(script_path: Path) -> list[tuple[int, str, list[str]]]:
+    """Extract comment guidance blocks so they appear in runner logs."""
+    lines = script_path.read_text(encoding="utf-8").splitlines()
+    blocks: list[tuple[int, str, list[str]]] = []
+    index = 0
+    while index < len(lines):
+        match = GUIDANCE_HEADER_RE.match(lines[index])
+        if not match:
+            index += 1
+            continue
+
+        start_line = index + 1
+        label = match.group(1).upper()
+        first_text = match.group(2).strip()
+        body = [first_text] if first_text else []
+        index += 1
+
+        while index < len(lines):
+            line = lines[index]
+            stripped = line.strip()
+            if not stripped:
+                break
+            if not stripped.startswith("#"):
+                break
+            text = stripped[1:].strip()
+            if GUIDANCE_HEADER_RE.match(line):
+                break
+            body.append(text)
+            index += 1
+
+        blocks.append((start_line, label, body))
+    return blocks
+
+
+def emit_guidance_blocks(script_path: Path, log_file) -> None:
+    blocks = extract_guidance_blocks(script_path)
+    if not blocks:
+        return
+
+    header = "\nGuidance extracted from script comments:\n"
+    print(header, end="", flush=True)
+    if log_file:
+        log_file.write(header)
+
+    for line_number, label, body in blocks:
+        title = f"  [{label} near line {line_number}]\n"
+        print(title, end="", flush=True)
+        if log_file:
+            log_file.write(title)
+        for text in body:
+            out = f"    {text}\n" if text else "\n"
+            print(out, end="", flush=True)
+            if log_file:
+                log_file.write(out)
+
+    print("", flush=True)
+    if log_file:
+        log_file.write("\n")
+        log_file.flush()
+
+
 def run_script(script: str, args: argparse.Namespace) -> int:
     script_path = DIAGNOSTICS_DIR / script
     command = [args.python, "-u", str(script_path)]
@@ -159,7 +233,7 @@ def run_script(script: str, args: argparse.Namespace) -> int:
     print(f"Command: {command_text}", flush=True)
 
     log_file = None
-    if args.log_dir:
+    if args.log_dir and not args.no_log:
         args.log_dir.mkdir(parents=True, exist_ok=True)
         log_path = args.log_dir / f"{Path(script).stem}.log"
         log_file = log_path.open("w", encoding="utf-8")
@@ -167,6 +241,8 @@ def run_script(script: str, args: argparse.Namespace) -> int:
         log_file.write(f"Command: {command_text}\n\n")
         log_file.flush()
         print(f"Log: {log_path}", flush=True)
+
+    emit_guidance_blocks(script_path, log_file)
 
     return_code = 1
     try:
@@ -215,11 +291,20 @@ def main() -> int:
 
     print("Diagnostics to run:")
     print_script_list(scripts)
+    if args.no_log:
+        print("Logging disabled (--no-log).")
+    elif args.log_dir:
+        print(f"Logs will be written to: {args.log_dir}")
 
     if args.dry_run:
         print("\nDry run only; no diagnostics were executed.")
         for script in scripts:
-            print(shlex.join([args.python, "-u", str(DIAGNOSTICS_DIR / script)]))
+            command = shlex.join([args.python, "-u", str(DIAGNOSTICS_DIR / script)])
+            if args.no_log or not args.log_dir:
+                print(command)
+            else:
+                log_path = args.log_dir / f"{Path(script).stem}.log"
+                print(f"{command}  # log: {log_path}")
         return 0
 
     failures: list[tuple[str, int]] = []

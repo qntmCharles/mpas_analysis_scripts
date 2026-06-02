@@ -626,4 +626,5 @@ class FigureSaver:
         fname = f"{number:02d}_{stem}.png"
         if self.enabled and figure_should_run(self.figures_to_run, number):
             fig.savefig(os.path.join(self.save_loc, fname), dpi=self.dpi if dpi is None else dpi)
+            print(f"Done with figure file: {fname}", flush=True)
         return fname
