@@ -1,6 +1,7 @@
 import glob
 import os
 import numbers
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -133,6 +134,17 @@ def finite_or_nan(da, max_abs=1e30):
     return da.where(np.isfinite(da) & (np.abs(da) < max_abs))
 
 
+def safe_nanpercentile(values, q, default=1.0):
+    vals = np.asarray(values)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return default
+    out = np.nanpercentile(vals, q)
+    if not np.isfinite(out) or out == 0:
+        return default
+    return out
+
+
 def total_precip_accum(ds):
     """Accumulated total precipitation in mm, including MPAS bucket counters."""
     return (
@@ -178,6 +190,144 @@ def midlevel_height_from_latlon(ds, latitude_sel=None, mean_latitude=False):
     )
 
 
+def align_vertical_velocity_to_reference(w, reference):
+    """Align standard vertical velocity to a model-level reference field."""
+    w_dim = vertical_dim(w)
+    target_dim = vertical_dim(reference)
+
+    if w.sizes[w_dim] == reference.sizes[target_dim] + 1:
+        lower = w.isel({w_dim: slice(0, -1)})
+        upper = w.isel({w_dim: slice(1, None)})
+        if w_dim in lower.coords and w_dim in upper.coords:
+            upper = upper.assign_coords({w_dim: lower[w_dim]})
+        w = 0.5 * (lower + upper)
+    elif w.sizes[w_dim] != reference.sizes[target_dim]:
+        raise ValueError(
+            f"Cannot align w levels ({w.sizes[w_dim]}) with reference levels "
+            f"({reference.sizes[target_dim]})"
+        )
+
+    if w_dim != target_dim:
+        w = w.rename({w_dim: target_dim})
+    if target_dim in reference.coords:
+        w = w.assign_coords({target_dim: reference[target_dim]})
+    return w
+
+
+def vertical_velocity_from_zm(zds):
+    """Return standard zonal-mean vertical velocity from a zm dataset."""
+    if "w" not in zds.data_vars:
+        raise ValueError("Missing standard vertical velocity variable 'w'")
+
+    w = finite_or_nan(zds.w)
+    if "pressure" in zds.data_vars:
+        w = align_vertical_velocity_to_reference(w, finite_or_nan(zds.pressure))
+    elif vertical_dim(w) != "z":
+        w = w.rename({vertical_dim(w): "z"})
+
+    w.name = "w"
+    w.attrs.update(units="m s-1", long_name="standard vertical velocity")
+    return w
+
+
+def _interp_column_to_pressure(pressure_pa, values, target_hpa):
+    pressure_hpa = np.asarray(pressure_pa, dtype=float) / 100.0
+    vals = np.asarray(values, dtype=float)
+    ok = np.isfinite(pressure_hpa) & np.isfinite(vals)
+    if np.count_nonzero(ok) < 2:
+        return np.nan
+
+    p_ok = pressure_hpa[ok]
+    vals_ok = vals[ok]
+    order = np.argsort(p_ok)
+    p_sorted = p_ok[order]
+    vals_sorted = vals_ok[order]
+    p_unique, unique_idx = np.unique(p_sorted, return_index=True)
+    if p_unique.size < 2:
+        return np.nan
+    return np.interp(float(target_hpa), p_unique, vals_sorted[unique_idx], left=np.nan, right=np.nan)
+
+
+def vertical_velocity_at_pressure(ds, pressure_hpa):
+    """Interpolate standard vertical velocity to one pressure level in hPa."""
+    missing = [name for name in ("w", "pressure") if name not in ds.data_vars]
+    if missing:
+        raise ValueError(f"Missing variables for pressure-level w: {missing}")
+
+    pressure = finite_or_nan(ds.pressure)
+    w = align_vertical_velocity_to_reference(finite_or_nan(ds.w), pressure)
+    pressure, w = xr.align(pressure, w, join="inner")
+    z_dim = vertical_dim(pressure)
+
+    out = xr.apply_ufunc(
+        _interp_column_to_pressure,
+        pressure,
+        w,
+        input_core_dims=[[z_dim], [z_dim]],
+        output_core_dims=[[]],
+        kwargs={"target_hpa": float(pressure_hpa)},
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[float],
+        dask_gufunc_kwargs={"allow_rechunk": True},
+    )
+    out.name = f"w{float(pressure_hpa):g}".replace(".", "p")
+    out.attrs.update(
+        units="m s-1",
+        long_name="standard vertical velocity interpolated to pressure level",
+        selected_pressure_hpa=float(pressure_hpa),
+    )
+    return out
+
+
+def isobaric_vertical_velocity_from_zm(zds, pressure_levels_hpa=None, hemispheric_parity="even"):
+    """Interpolate time-mean zonal-mean w to the dataset's pressure levels."""
+    if "pressure" not in zds.data_vars:
+        raise ValueError("pressure is required to interpolate zonal-mean w to pressure levels")
+
+    if pressure_levels_hpa is None:
+        if "pres" not in zds.coords:
+            raise ValueError("No pressure levels supplied and zds has no pres coordinate")
+        pressure_levels_hpa = zds.pres.values
+
+    w = vertical_velocity_from_zm(zds)
+    pressure = finite_or_nan(zds.pressure)
+    if "Time" in w.dims:
+        w = w.mean(dim="Time", skipna=True)
+    if "Time" in pressure.dims:
+        pressure = pressure.mean(dim="Time", skipna=True)
+
+    w = model_lat_field(w)
+    pressure_hpa = model_lat_field(pressure) / 100.0
+    target = np.asarray(pressure_levels_hpa, dtype=float)
+    out = np.full((target.size, w.sizes["latitude"]), np.nan, dtype=float)
+
+    for j in range(w.sizes["latitude"]):
+        p_col = np.asarray(pressure_hpa.isel(latitude=j).values, dtype=float)
+        w_col = np.asarray(w.isel(latitude=j).values, dtype=float)
+        ok = np.isfinite(p_col) & np.isfinite(w_col)
+        if np.count_nonzero(ok) < 2:
+            continue
+        p_ok = p_col[ok]
+        w_ok = w_col[ok]
+        order = np.argsort(p_ok)
+        p_sorted = p_ok[order]
+        w_sorted = w_ok[order]
+        p_unique, unique_idx = np.unique(p_sorted, return_index=True)
+        if p_unique.size < 2:
+            continue
+        out[:, j] = np.interp(target, p_unique, w_sorted[unique_idx], left=np.nan, right=np.nan)
+
+    da = xr.DataArray(
+        out,
+        dims=("pres", "latitude"),
+        coords={"pres": target, "latitude": w.latitude},
+        name="w",
+        attrs={"units": "m s-1", "long_name": "standard vertical velocity interpolated to pressure levels"},
+    )
+    return hemispheric_fold(da, parity=hemispheric_parity)
+
+
 def height_from_zm_latlon(zds):
     return zds["z"]
 
@@ -204,13 +354,14 @@ def N2_latheight(zds, g=9.80665):
     theta = model_lat_field(zds.theta.mean(dim="Time"))
     z = height_from_zm_latlon(zds).values
     dtheta_dz = np.gradient(theta.values, z, axis=0)
-    return xr.DataArray(
+    n2 = xr.DataArray(
         g / theta.values * dtheta_dz,
         dims=theta.dims,
         coords=theta.coords,
         name="N2",
         attrs={"units": "s-2"},
     )
+    return hemispheric_fold(n2, parity="even")
 
 
 def _pressure_axis_values(ds, name, dim):
@@ -285,6 +436,46 @@ def lat_mean(da, lat_dim="latitude"):
     return da.weighted(np.cos(np.deg2rad(da[lat_dim]))).mean(dim=lat_dim)
 
 
+def latitude_is_hemispherically_symmetric(latitude, rtol=1e-7, atol=1e-8):
+    """Return True when a latitude coordinate can be paired across the equator."""
+    values = np.asarray(latitude.values if isinstance(latitude, xr.DataArray) else latitude, dtype=float)
+    if values.ndim != 1 or values.size == 0 or not np.all(np.isfinite(values)):
+        return False
+    return np.allclose(values, -values[::-1], rtol=rtol, atol=atol)
+
+
+def hemispheric_fold(da, lat_dim="latitude", parity="even", warn=True):
+    """
+    Average paired hemispheres on the original latitude grid.
+
+    ``parity="even"`` uses 0.5 * (NH + SH), appropriate for scalars, zonal wind,
+    vertical velocity, and energies. ``parity="odd"`` flips the reflected sign,
+    appropriate for northward vectors and meridional fluxes.
+    """
+    if da is None or lat_dim not in da.dims:
+        return da
+    if parity is None:
+        return da
+    if parity not in ("even", "odd"):
+        raise ValueError(f"Unknown hemispheric parity {parity!r}; expected 'even' or 'odd'")
+    if not latitude_is_hemispherically_symmetric(da[lat_dim]):
+        if warn:
+            warnings.warn(
+                f"Skipping hemispheric fold for {getattr(da, 'name', None)!r}: "
+                f"{lat_dim!r} is not symmetric about the equator."
+            )
+        return da
+
+    reflected = da.isel({lat_dim: slice(None, None, -1)})
+    reflected = reflected.assign_coords({lat_dim: da[lat_dim].values})
+    sign = 1.0 if parity == "even" else -1.0
+    out = 0.5 * (da + sign * reflected)
+    out.name = da.name
+    out.attrs.update(getattr(da, "attrs", {}))
+    out.attrs["hemispheric_fold"] = f"{parity} paired-hemisphere average"
+    return out
+
+
 def plot_Tu_latpres(a, lats, pres, Tbar, ubar):
     T_im = a.contourf(lats, pres, Tbar, levels=np.arange(190, 305, 5), extend="both", cmap="coolwarm")
     u_im_neg = a.contour(lats, pres, ubar, levels=np.arange(-20, 0, 5), colors="k", linestyles=":", linewidths=0.5)
@@ -295,19 +486,34 @@ def plot_Tu_latpres(a, lats, pres, Tbar, ubar):
     return T_im, u_im_neg, u_im_zero, u_im_pos
 
 
-def plot_rhv_latpres(a, lats, pres, rhbar, vbar, omgbar):
+def plot_rhw_latpres(a, lats, pres, rhbar, vbar, wbar, tbar, rd=287.0, g=9.80665):
+    rh_im = a.contourf(lats, pres, rhbar, levels=np.arange(0, 105, 5), cmap="BrBG")
     xi = np.linspace(lats.min(), lats.max(), len(lats))
     yi = np.linspace(pres.min(), pres.max(), len(pres))
     X, Y = np.meshgrid(xi, yi)
-    U = intp.interpn((lats, pres), vbar.T, (X, Y))
-    V = intp.interpn((lats, pres), omgbar.T, (X, Y))
-    rh_im = a.contourf(lats, pres, rhbar, levels=np.arange(0, 105, 5), cmap="BrBG")
-    medcirc_im = a.streamplot(X, Y, U / 111111.0, V / 100.0, color="k", linewidth=1, density=1)
+
+    V_meridional = intp.interpn((lats, pres), vbar.T, (X, Y))
+    W_vertical = intp.interpn((lats, pres), wbar.T, (X, Y))
+    T_interp = intp.interpn((lats, pres), tbar.T, (X, Y))
+    pressure_pa = Y * 100.0
+    rho = pressure_pa / (rd * T_interp)
+    dpdt_hpa_s = -rho * g * W_vertical / 100.0
+
+    medcirc_im = a.streamplot(
+        X,
+        Y,
+        V_meridional / 111111.0,
+        dpdt_hpa_s,
+        color="k",
+        linewidth=1,
+        density=1,
+    )
     return rh_im, medcirc_im
 
 
-def isobaric_lat_mean(da):
-    return da.mean(dim="Time").transpose("pres", "latitude")
+def isobaric_lat_mean(da, hemispheric_parity=None):
+    out = da.mean(dim="Time").transpose("pres", "latitude")
+    return hemispheric_fold(out, parity=hemispheric_parity)
 
 
 def interp_like_control(field, control_field):

@@ -64,8 +64,9 @@ time_format = "time"
 
 needed_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw", "olrtoa",
-    "uzonal_isobaric", "umeridional_isobaric", "omg_isobaric",
+    "uzonal_isobaric", "umeridional_isobaric",
     "rh_isobaric", "t_isobaric", "theta", "zgrid", "pressure",
+    "w",
 ]
 
 
@@ -274,8 +275,8 @@ def compute_cpts(zm_datasets):
         if not required.issubset(set(zds.data_vars)) or "z" not in zds.coords:
             return None
 
-        theta = zds.theta.mean(dim="Time")
-        pressure = zds.pressure.mean(dim="Time")
+        theta = hemispheric_fold(zds.theta.mean(dim="Time"), parity="even")
+        pressure = hemispheric_fold(zds.pressure.mean(dim="Time"), parity="even")
         T = theta * (pressure / 100000.0) ** (287.0 / 1004.0)
         T = model_lat_field(T)
         pressure = model_lat_field(pressure)
@@ -305,8 +306,14 @@ def overlay_cpt_pressure(ax, run_index=1):
 
 def anomaly_latpres(var, run_index, control_index=0):
     """Time-mean zonal-mean pressure-latitude anomaly on the run grid."""
-    field = isobaric_lat_mean(dss_zm[run_index][var])
-    control = isobaric_lat_mean(dss_zm[control_index][var]).interp(
+    if var == "w":
+        field = isobaric_vertical_velocity_from_zm(dss_zm[run_index])
+        control_field = isobaric_vertical_velocity_from_zm(dss_zm[control_index])
+    else:
+        parity = latpres_var_hemispheric_parity(var)
+        field = isobaric_lat_mean(dss_zm[run_index][var], hemispheric_parity=parity)
+        control_field = isobaric_lat_mean(dss_zm[control_index][var], hemispheric_parity=parity)
+    control = control_field.interp(
         pres=field.pres,
         latitude=field.latitude,
         kwargs={"fill_value": np.nan},
@@ -322,6 +329,8 @@ def anomaly_surface_map(var, run_index, control_index=0):
     else:
         run_field = finite_or_nan(dss[run_index][var]).mean(dim="Time")
         control_field = finite_or_nan(dss[control_index][var]).mean(dim="Time")
+    run_field = hemispheric_fold(run_field, parity="even")
+    control_field = hemispheric_fold(control_field, parity="even")
 
     control_on_run = control_field.interp(
         latitude=run_field.latitude,
@@ -329,6 +338,12 @@ def anomaly_surface_map(var, run_index, control_index=0):
         kwargs={"fill_value": np.nan},
     )
     return run_field - control_on_run
+
+
+def latpres_var_hemispheric_parity(var):
+    if var in ("umeridional_isobaric", "v_isobaric", "v"):
+        return "odd"
+    return "even"
 
 
 def max_abs_for_levels(fields, default=8.0, percentile=99.0):
@@ -346,9 +361,9 @@ def max_abs_for_levels(fields, default=8.0, percentile=99.0):
 # In[4]:
 
 print("\nComputing pressure-latitude temperature anomalies")
-T_control = isobaric_lat_mean(dss_zm[0].t_isobaric)
-T_u = isobaric_lat_mean(dss_zm[1].t_isobaric)
-T_T = isobaric_lat_mean(dss_zm[2].t_isobaric)
+T_control = isobaric_lat_mean(dss_zm[0].t_isobaric, hemispheric_parity="even")
+T_u = isobaric_lat_mean(dss_zm[1].t_isobaric, hemispheric_parity="even")
+T_T = isobaric_lat_mean(dss_zm[2].t_isobaric, hemispheric_parity="even")
 
 dT_u = T_u - T_control.interp(pres=T_u.pres, latitude=T_u.latitude, kwargs={"fill_value": np.nan})
 dT_T = T_T - T_control.interp(pres=T_T.pres, latitude=T_T.latitude, kwargs={"fill_value": np.nan})
@@ -470,7 +485,7 @@ latpres_specs = [
     ("t_isobaric", r"T anomaly (K)", 8.0),
     ("uzonal_isobaric", r"u anomaly (m s$^{-1}$)", 8.0),
     ("rh_isobaric", r"RH anomaly", 10.0),
-    ("omg_isobaric", r"omega anomaly (Pa s$^{-1}$)", 0.1),
+    ("w", r"w anomaly (m s$^{-1}$)", 0.03),
 ]
 
 for domain_name, result in projection_results.items():

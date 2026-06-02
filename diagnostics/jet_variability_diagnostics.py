@@ -8,8 +8,8 @@ The script provides two complementary checks for jets becoming trapped in
 particular configurations:
 
   * fixed-level zonal-mean wind, by default u at 700 hPa, with latitude-time
-    anomalies, hemispheric jet-latitude tracks, and latitude-resolved
-    autocorrelation;
+    wind fields, hemispheric jet-latitude tracks, and latitude-resolved
+    autocorrelation of the wind fluctuations;
   * leading EOFs of zonal-mean u in each hemisphere, interpreted as annular-mode
     zonal indices, with EOF patterns, index time series, and autocorrelation.
 
@@ -51,6 +51,7 @@ save_loc = "/home/cwp29/tmp/mpas/crf_on/final/jet_variability/"
 #   2: fixed_level_zonal_wind_autocorrelation
 #   3: annular_mode_eof_patterns
 #   4: annular_mode_indices_and_autocorrelation
+#   5: time_mean_zonal_wind_profiles
 figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
@@ -78,7 +79,8 @@ dt = 6
 analysis_end_date = "2000-11-21"
 time_format = "time"
 
-fixed_pressure_level = 700.0
+fixed_pressure_level = 250.0
+jet_profile_pressure_levels = [700.0, 200.0]
 time_average_days = 1.0
 max_autocorr_lag_days = 80.0
 autocorr_efold_threshold = np.exp(-1.0)
@@ -112,6 +114,22 @@ def safe_name(value):
 
 def pressure_name(value):
     return safe_name(f"{float(value):g}")
+
+
+def tight_layout_with_right_margin(fig, right=0.86, top=0.94):
+    fig.tight_layout(rect=[0.0, 0.0, right, top])
+
+
+def add_right_margin_colorbar(fig, mappable, axes, label, pad=0.015, width=0.025):
+    axes_flat = [axis for axis in np.asarray(axes, dtype=object).ravel() if axis.get_visible()]
+    if not axes_flat:
+        return None
+    boxes = [axis.get_position() for axis in axes_flat]
+    x0 = max(box.x1 for box in boxes) + pad
+    y0 = min(box.y0 for box in boxes)
+    y1 = max(box.y1 for box in boxes)
+    cax = fig.add_axes([x0, y0, width, y1 - y0])
+    return fig.colorbar(mappable, cax=cax, label=label)
 
 
 def subset_between(da, dim, bounds):
@@ -357,6 +375,15 @@ def zonal_mean_u_at_level(ds, plev=fixed_pressure_level):
         time_average_days=time_average_days,
     )
     return u
+
+
+def time_mean_zonal_mean_u_at_level(ds, plev):
+    u = zonal_mean_u_at_level(ds, plev=plev)
+    u_mean = u.mean(dim="Time", skipna=True).load()
+    u_mean.name = "u_time_mean_zonal_mean"
+    u_mean.attrs.update(u.attrs)
+    u_mean.attrs["long_name"] = "time-mean zonal-mean zonal wind"
+    return u_mean
 
 
 def zonal_mean_u_profile(ds):
@@ -707,13 +734,41 @@ if should_run_any([3, 4]):
         pd.DataFrame(annular_index_rows).to_csv(os.path.join(save_loc, "annular_mode_zonal_indices.csv"), index=False)
 
 
+jet_mean_profiles = {}
+if should_run_figure(5):
+    for i, ds in enumerate(dss):
+        for plev in jet_profile_pressure_levels:
+            try:
+                jet_mean_profiles[(i, plev)] = time_mean_zonal_mean_u_at_level(ds, plev)
+            except Exception as exc:
+                print(f"Skipping {plev:g} hPa jet profile for {sim_names[i]}: {exc}")
+
+    if save and jet_mean_profiles:
+        members = list(jet_mean_profiles)
+        profile_da = xr.concat(
+            [jet_mean_profiles[member].rename("u_zonal_mean") for member in members],
+            dim=xr.IndexVariable("profile_member", np.arange(len(members))),
+            join="outer",
+        )
+        profile_ds = profile_da.to_dataset()
+        profile_ds = profile_ds.assign_coords(
+            simulation=("profile_member", [sim_names[i] for i, _ in members]),
+            requested_pressure_hpa=("profile_member", [plev for _, plev in members]),
+            selected_pressure_hpa=(
+                "profile_member",
+                [jet_mean_profiles[member].attrs["selected_pressure_hpa"] for member in members],
+            ),
+        )
+        save_dataset(profile_ds, "u700_u200_time_mean_zonal_profiles.nc")
+
+
 # -----------------------------------------------------------------------------
 # Figures
 # -----------------------------------------------------------------------------
 
 if should_run_figure(1) and fixed_level:
-    all_anom = np.concatenate([np.ravel(v.values) for v in fixed_level_anomaly.values()])
-    vmax = np.nanpercentile(np.abs(all_anom[np.isfinite(all_anom)]), 98) if np.isfinite(all_anom).any() else 1.0
+    all_u = np.concatenate([np.ravel(v.values) for v in fixed_level.values()])
+    vmax = np.nanpercentile(np.abs(all_u[np.isfinite(all_u)]), 98) if np.isfinite(all_u).any() else 1.0
     vmax = max(vmax, 1.0)
     levels = np.linspace(-vmax, vmax, 25)
 
@@ -722,16 +777,24 @@ if should_run_figure(1) and fixed_level:
     im = None
     for row, i in enumerate(fixed_level):
         u = fixed_level[i]
-        anom = fixed_level_anomaly[i]
         tdays = time_days_since_start(u)
         im = ax[row].contourf(
             tdays,
-            anom.latitude,
-            anom.transpose("latitude", "Time").values,
+            u.latitude,
+            u.transpose("latitude", "Time").values,
             levels=levels,
             cmap="RdBu_r",
             extend="both",
         )
+        if np.nanmin(u.values) < 0.0 < np.nanmax(u.values):
+            ax[row].contour(
+                tdays,
+                u.latitude,
+                u.transpose("latitude", "Time").values,
+                levels=[0.0],
+                colors="0.15",
+                linewidths=0.6,
+            )
         for hemisphere, track in jet_latitudes.get(i, {}).items():
             ax[row].plot(tdays, track.values, color="w", lw=1.6)
             ax[row].plot(tdays, track.values, color="0.1", lw=0.7, label=hemisphere if row == 0 else None)
@@ -739,12 +802,12 @@ if should_run_figure(1) and fixed_level:
         ax[row].set_ylabel("Latitude")
         annotate_panel_label(ax[row], sim_names[i])
     ax[-1].set_xlabel("Time since analysis start (days)")
-    fig.suptitle(f"Zonal-mean u anomalies at {fixed_pressure_level:g} hPa")
-    if im is not None:
-        fig.colorbar(im, ax=ax, location="right", label="m s$^{-1}$")
+    fig.suptitle(f"Zonal-mean u at {fixed_pressure_level:g} hPa")
     if jet_latitudes:
         ax[0].legend(loc="upper right", frameon=True)
-    fig.tight_layout()
+    tight_layout_with_right_margin(fig)
+    if im is not None:
+        add_right_margin_colorbar(fig, im, ax, label="m s$^{-1}$")
     figsave.save(fig, f"u{pressure_name(fixed_pressure_level)}_zonal_wind_hovmoller", number=1)
     print("Done with figure: fixed_level_zonal_wind_hovmoller")
 
@@ -772,9 +835,9 @@ if should_run_figure(2) and fixed_level_autocorr:
         annotate_panel_label(ax[row], sim_names[i])
     ax[-1].set_xlabel("Lag (days)")
     fig.suptitle(f"Autocorrelation of zonal-mean u anomalies at {fixed_pressure_level:g} hPa")
+    tight_layout_with_right_margin(fig)
     if im is not None:
-        fig.colorbar(im, ax=ax, location="right", label="correlation")
-    fig.tight_layout()
+        add_right_margin_colorbar(fig, im, ax, label="correlation")
     figsave.save(fig, f"u{pressure_name(fixed_pressure_level)}_zonal_wind_autocorrelation", number=2)
     print("Done with figure: fixed_level_zonal_wind_autocorrelation")
 
@@ -815,9 +878,9 @@ if should_run_figure(3) and annular_results:
             annotate_panel_label(axis, f"{sim_names[row]} {hemisphere}")
             axis.set_title(f"EOF1 {100 * result['variance_fraction']:.1f}%")
     fig.suptitle("Hemispheric annular-mode EOFs of zonal-mean u")
+    tight_layout_with_right_margin(fig)
     if im is not None:
-        fig.colorbar(im, ax=ax, location="right", label="m s$^{-1}$ per index std. dev.")
-    fig.tight_layout()
+        add_right_margin_colorbar(fig, im, ax, label="m s$^{-1}$ per index std. dev.")
     figsave.save(fig, "annular_mode_eof_patterns", number=3)
     print("Done with figure: annular_mode_eof_patterns")
 
@@ -845,6 +908,52 @@ if should_run_figure(4) and annular_results:
         ax[1, col].set_ylim(-0.4, 1.05)
     ax[0, 0].legend(loc="upper right", frameon=False)
     fig.suptitle("Annular-mode zonal indices and persistence")
-    fig.tight_layout()
+    tight_layout_with_right_margin(fig, right=0.98)
     figsave.save(fig, "annular_mode_indices_and_autocorrelation", number=4)
     print("Done with figure: annular_mode_indices_and_autocorrelation")
+
+
+if should_run_figure(5) and jet_mean_profiles:
+    fig, ax = plt.subplots(
+        1,
+        len(jet_profile_pressure_levels),
+        figsize=(5.0 * len(jet_profile_pressure_levels), 3.8),
+        sharey=True,
+        constrained_layout=True,
+        squeeze=False,
+    )
+    ax = ax[0]
+
+    for col, plev in enumerate(jet_profile_pressure_levels):
+        axis = ax[col]
+        selected_pressures = [
+            jet_mean_profiles[(i, plev)].attrs["selected_pressure_hpa"]
+            for i in range(len(dss))
+            if (i, plev) in jet_mean_profiles
+        ]
+        title_pressure = np.nanmedian(selected_pressures) if selected_pressures else plev
+
+        for i in range(len(dss)):
+            profile = jet_mean_profiles.get((i, plev))
+            if profile is None:
+                continue
+            axis.plot(profile.latitude.values, profile.values, color=cols[i], lw=1.5, label=sim_names[i])
+            for bounds in hemisphere_jet_bounds.values():
+                hemi = subset_between(profile, "latitude", bounds)
+                if hemi.sizes.get("latitude", 0) == 0 or not np.isfinite(hemi.values).any():
+                    continue
+                jet_lat = float(hemi.idxmax(dim="latitude", skipna=True).values)
+                jet_u = float(hemi.sel(latitude=jet_lat).values)
+                axis.scatter(jet_lat, jet_u, color=cols[i], s=22, edgecolor="w", linewidth=0.5, zorder=3)
+
+        axis.axhline(0, color="0.3", lw=0.7)
+        axis.axvline(0, color="0.3", lw=0.7, ls=":")
+        axis.set_title(f"{title_pressure:g} hPa")
+        axis.set_xlabel("Latitude")
+        axis.grid(True, lw=0.4, alpha=0.5)
+
+    ax[0].set_ylabel(r"Zonal-mean u (m s$^{-1}$)")
+    ax[0].legend(loc="best", frameon=False)
+    fig.suptitle("Time-mean zonal-mean u")
+    figsave.save(fig, "u700_u200_time_mean_zonal_profiles", number=5)
+    print("Done with figure: time_mean_zonal_wind_profiles")

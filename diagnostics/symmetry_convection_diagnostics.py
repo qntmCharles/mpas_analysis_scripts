@@ -51,6 +51,7 @@ save_loc = '/home/cwp29/tmp/mpas/crf_on/final/convection/'
 #   18: comp_cloud_conditioned_on_precip_pw_cape_cin
 #   19: comp_atmos_radiative_heating_proxy
 #   20: comp_tropical_timeseries_extended
+#   21: diag_meridional_wavenumber_variance
 figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
@@ -107,7 +108,7 @@ dss_zm = []
 
 needed_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw",
-    "uzonal_isobaric", "umeridional_isobaric", "omg_isobaric",
+    "uzonal_isobaric", "umeridional_isobaric",
     "rh_isobaric", "t_isobaric", "qv_isobaric", "theta",
     "uReconstructZonal", "cldfrac", "olrtoa", "zgrid", "pressure", "vorticity", "ke",
     # Extra 2-D variables for convective/radiative mechanism diagnostics.
@@ -193,8 +194,8 @@ if should_run_any([4, 5, 6, 14]):
     CPTs = []
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        theta = zds.theta.mean(dim="Time")
-        pressure = zds.pressure.mean(dim="Time")
+        theta = hemispheric_fold(zds.theta.mean(dim="Time"), parity="even")
+        pressure = hemispheric_fold(zds.pressure.mean(dim="Time"), parity="even")
 
         T = theta * (pressure / 100000.)**(287.0 / 1004.0)
         T = model_lat_field(T)
@@ -570,9 +571,7 @@ def hemi_components_latlon(da, lat_dim="latitude"):
 
 def hemispheric_symmetrise_lat(da, lat_dim="latitude"):
     """Return the hemispherically symmetric part on the original latitude grid."""
-    flipped = da.isel({lat_dim: slice(None, None, -1)})
-    flipped = flipped.assign_coords({lat_dim: da[lat_dim].values})
-    return 0.5 * (da + flipped)
+    return hemispheric_fold(da, lat_dim=lat_dim, parity="even")
 
 def pressure_level_nearest(da, p_hpa):
     """Select nearest pressure level in hPa."""
@@ -581,9 +580,10 @@ def pressure_level_nearest(da, p_hpa):
 def add_cpt_height(ax, i):
     ax.plot(dss_zm[i].latitude.values, CPTs[i][0] / 1000.0, color="k", lw=1, ls=":")
 
-def get_latheight_field_from_zm(zds, var):
+def get_latheight_field_from_zm(zds, var, hemispheric_parity="even"):
     """Time-mean zonal-mean model-level variable as (z, latitude)."""
     x = finite_or_nan(zds[var]).mean(dim="Time")
+    x = hemispheric_fold(x, parity=hemispheric_parity)
     zmid = height_from_zm_latlon(zds)
     return lat_height_mesh(x, zmid, zds.latitude.values)
 
@@ -591,6 +591,7 @@ def get_cldfrac_latheight(ds, zds, i=None, hemisym_control=False):
     """Return cloud fraction as (z, latitude), plus matching mesh arrays."""
     if "cldfrac" in zds.data_vars:
         cld = finite_or_nan(zds.cldfrac).mean(dim="Time")
+        cld = hemispheric_fold(cld, parity="even")
         zmid = height_from_zm_latlon(zds)
         cld, lat2d, z2d = lat_height_mesh(cld, zmid, zds.latitude.values)
         return cld, lat2d, z2d, zds.latitude.values
@@ -598,8 +599,7 @@ def get_cldfrac_latheight(ds, zds, i=None, hemisym_control=False):
     if "cldfrac" in ds.data_vars:
         cld = finite_or_nan(ds.cldfrac).mean(dim=("Time", "longitude"))
         cld = model_lat_field(cld)
-        if hemisym_control and i == 0:
-            cld = hemispheric_symmetrise_lat(cld)
+        cld = hemispheric_fold(cld, parity="even")
         zmid = midlevel_height_from_latlon(ds)
         cld, lat2d, z2d = lat_height_mesh(cld, zmid, ds.latitude.values)
         return cld, lat2d, z2d, ds.latitude.values
@@ -613,12 +613,14 @@ def condensate_latheight(ds, zds, varlist):
 
     if len(available_zm) > 0:
         q = sum(finite_or_nan(zds[v]) for v in available_zm).mean(dim="Time") * 1000.0
+        q = hemispheric_fold(q, parity="even")
         zmid = height_from_zm_latlon(zds)
         return lat_height_mesh(q, zmid, zds.latitude.values)
 
     if len(available_ll) > 0:
         q = sum(finite_or_nan(ds[v]) for v in available_ll).mean(dim=("Time", "longitude")) * 1000.0
         q = model_lat_field(q)
+        q = hemispheric_fold(q, parity="even")
         zmid = midlevel_height_from_latlon(ds)
         return lat_height_mesh(q, zmid, ds.latitude.values)
 
@@ -738,13 +740,17 @@ def tropical_zonal_series(da, latmax=10):
     x = tropics(da, latmax=latmax)
     return x.weighted(lat_weights(x)).mean(dim="latitude")
 
-def zonal_wavenumber_variance_fraction(da, latmax=10, max_k=15):
-    x = tropical_zonal_series(da, latmax=latmax)
+def tropical_meridional_series(da, latmax=10):
+    x = tropics(da, latmax=latmax)
+    return x.mean(dim="longitude", skipna=True)
+
+def spatial_wavenumber_variance_fraction(x, spatial_dim, max_k=15):
     x = x - x.mean(dim="Time", skipna=True)
+    x = x.transpose("Time", spatial_dim)
     arr = np.asarray(x.values)
     if arr.ndim != 2:
-        raise ValueError(f"Expected (Time, longitude), got shape {arr.shape}")
-    # Fill occasional NaNs with the longitude mean at that time before FFT.
+        raise ValueError(f"Expected (Time, {spatial_dim}), got shape {arr.shape}")
+    # Fill occasional NaNs with the spatial mean at that time before FFT.
     if np.any(~np.isfinite(arr)):
         row_mean = np.nanmean(arr, axis=1, keepdims=True)
         arr = np.where(np.isfinite(arr), arr, row_mean)
@@ -757,6 +763,14 @@ def zonal_wavenumber_variance_fraction(da, latmax=10, max_k=15):
     kk = np.arange(pk.size)
     keep = kk <= max_k
     return kk[keep], pk[keep]
+
+def zonal_wavenumber_variance_fraction(da, latmax=10, max_k=15):
+    x = tropical_zonal_series(da, latmax=latmax)
+    return spatial_wavenumber_variance_fraction(x, "longitude", max_k=max_k)
+
+def meridional_wavenumber_variance_fraction(da, latmax=10, max_k=15):
+    x = tropical_meridional_series(da, latmax=latmax)
+    return spatial_wavenumber_variance_fraction(x, "latitude", max_k=max_k)
 
 if should_run_figure(2):
     fig, ax = plt.subplots(1, 3, figsize=(11, 3.5), constrained_layout=True, sharey=True)
@@ -781,6 +795,39 @@ if should_run_figure(2):
 
     save_figure(2, fig, "zonal_wavenumber_variance")
     print("Done with figure: diag_zonal_wavenumber_variance")
+
+# In[ ]:
+
+# 21. Meridional wavenumber variance fractions of zonal-mean tropical anomalies.
+# This repeats the figure-2 variance spectrum along latitude rather than longitude.
+# What to look for:
+#   * low meridional-wavenumber dominance: broad tropical meridional structure.
+#   * enhanced higher meridional wavenumbers: narrower or more latitudinally
+#     structured precip/OLR/PW anomalies.
+
+if should_run_figure(21):
+    fig, ax = plt.subplots(1, 3, figsize=(11, 3.5), constrained_layout=True, sharey=True)
+    plot_vars = [("Precip", None), ("OLR", "olrtoa"), ("PW", "precipw")]
+    for j, (label, vname) in enumerate(plot_vars):
+        for i, ds in enumerate(dss):
+            try:
+                if label == "Precip":
+                    da = precip_rate(ds, component="total")
+                else:
+                    da = ds[vname]
+                k, frac = meridional_wavenumber_variance_fraction(da, latmax=10, max_k=15)
+                ax[j].plot(k, frac, marker="o", color=cols[i], label=sim_names[i] if j == 0 else None)
+            except Exception as e:
+                print(f"Skipping meridional wavenumber plot for {sim_names[i]} {label}: {e}")
+        ax[j].set_title(label)
+        ax[j].set_xlabel("Meridional wavenumber")
+        ax[j].set_xlim(0, 15)
+        ax[j].set_yscale("log")
+    ax[0].set_ylabel("Fraction of tropical anomaly variance")
+    ax[0].legend(loc="best")
+
+    save_figure(21, fig, "meridional_wavenumber_variance")
+    print("Done with figure: diag_meridional_wavenumber_variance")
 
 # In[ ]:
 
@@ -885,15 +932,17 @@ if should_run_figure(4):
 
 def zonal_wind_shear_latheight(zds):
     u = model_lat_field(zds.uReconstructZonal.mean(dim="Time"))
+    u = hemispheric_fold(u, parity="even")
     z = height_from_zm_latlon(zds).values
     du_dz = np.gradient(u.values, z, axis=0)
-    return xr.DataArray(
+    shear = xr.DataArray(
         du_dz,
         dims=u.dims,
         coords=u.coords,
         name="du_dz",
         attrs={"units": "s-1"},
     )
+    return hemispheric_fold(shear, parity="even")
 
 if should_run_figure(5):
     if all("uReconstructZonal" in zds.data_vars for zds in dss_zm):
@@ -997,7 +1046,7 @@ if should_run_figure(7):
     hc_fields = []
     for ds in dss:
         hc = high_cloud_fraction(ds, zmin=12000.0)
-        hc_fields.append(hc.mean(dim="Time") if hc is not None else None)
+        hc_fields.append(hemispheric_fold(hc.mean(dim="Time"), parity="even") if hc is not None else None)
 
     if any(h is not None for h in hc_fields):
         fig, ax = plt.subplots(1, len(dss), figsize=(3.6*len(dss), 3.2), constrained_layout=True, sharey=True)
@@ -1301,6 +1350,7 @@ if should_run_figure(13):
                 x = finite_or_nan(ds[var])
 
             xm = x.mean(dim=("Time", "longitude"))
+            xm = hemispheric_fold(xm, parity="even")
             ax[j].plot(ds.latitude.values, xm.values, color=cols[i], label=sim_names[i])
 
             if i == 0:
@@ -1510,6 +1560,7 @@ if should_run_figure(17):
             cld, _, _, _ = get_cldfrac_latheight(ds, zds, i=i, hemisym_control=True)
             ctop_lat = cloud_top_latheight_from_cldfrac(cld, threshold=0.01)
             pr_lat = pr.mean(dim=("Time", "longitude"))
+            pr_lat = hemispheric_fold(pr_lat, parity="even")
             pr_lat, ctop_lat = xr.align(pr_lat, ctop_lat, join="inner")
             xc2, ym2, y252, y752, count2 = binned_statistic_1d(pr_lat.values, ctop_lat.values, precip_bins, min_count=2)
             ax[1].plot(xc2, ym2, color=cols[i], label=sim_names[i])
@@ -1620,9 +1671,9 @@ if should_run_figure(19):
         for i, ds in enumerate(dss):
             atm_lw, atm_sw, atm_rad = atmospheric_radiative_heating_proxy(ds)
             profiles = [
-                atm_lw.mean(dim=("Time", "longitude")),
-                atm_sw.mean(dim=("Time", "longitude")),
-                atm_rad.mean(dim=("Time", "longitude")),
+                hemispheric_fold(atm_lw.mean(dim=("Time", "longitude")), parity="even"),
+                hemispheric_fold(atm_sw.mean(dim=("Time", "longitude")), parity="even"),
+                hemispheric_fold(atm_rad.mean(dim=("Time", "longitude")), parity="even"),
             ]
 
             for j, prof in enumerate(profiles):

@@ -84,7 +84,7 @@ save_loc = "/home/cwp29/tmp/mpas/crf_on/final/waves/"
 #       plus period-axis and wavenumber-phase-speed variants
 #   10: kelvin_cloud_decomposition
 #   11: compact_wave_attribution_metrics
-figures_to_run = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 # Figure 8 is deliberately excluded from the default list because it filters
@@ -197,19 +197,19 @@ wave_latitude_projection = {
 # Variables used in the wave diagnostics.  Names are interpreted by
 # get_filter_field(); cldfrac without a height is the vertical mean, cldfrac5km
 # means the nearest cloud-fraction level to 5 km, and pressure-level fields are
-# parsed from names like u850, omega250, T100, v850, qv700, RH500.
+# parsed from names like u850, w500, T100, v850, qv700, RH500.
 power_fields = [
     "Precip", "OLR", "PW", "cldfrac",
     "u850", "u250", "u100",
     "v850", "v250",
-    "omega500", "omega250",
+    "w500", "w250",
     "T250", "T100",
 ]
 
 lag_target_fields = ["Precip", "OLR", "PW", "cldfrac"]
 conditioned_fields = ["Precip", "OLR", "PW", "cldfrac"]
 vertical_profile_waves = wave_names
-vertical_profile_fields = ["u", "omega", "T", "cldfrac"]
+vertical_profile_fields = ["u", "w", "T", "cldfrac"]
 vertical_profile_levels = [100, 150, 200, 250, 300, 500, 700, 850]
 cldfrac_profile_heights_km = [2, 5, 8, 11, 14, 17]
 
@@ -249,7 +249,7 @@ os.makedirs(input_cache_dir, exist_ok=True)
 # changes. Existing pressure-level filter inputs/wave caches without this marker
 # are regenerated automatically.
 PRESSURE_FIELD_CACHE_VERSION = "pressure-axis-fixed"
-PRESSURE_FIELD_PREFIXES = ("omega", "u", "v", "T", "qv", "RH")
+PRESSURE_FIELD_PREFIXES = ("w", "u", "v", "T", "qv", "RH")
 
 # Avoid giant chunks when selecting latitude/longitude subsets.
 dask.config.set({"array.slicing.split_large_chunks": True})
@@ -257,9 +257,9 @@ dask.config.set({"array.slicing.split_large_chunks": True})
 needed_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw", "olrtoa",
     "cldfrac",
-    "uzonal_isobaric", "umeridional_isobaric", "omg_isobaric",
+    "uzonal_isobaric", "umeridional_isobaric",
     "rh_isobaric", "t_isobaric", "qv_isobaric",
-    "theta", "pressure", "zgrid",
+    "theta", "pressure", "zgrid", "w",
 ]
 
 # Keep full lat-lon fields chunked in both time and space.  The k-f filters
@@ -605,9 +605,9 @@ def get_filter_field(ds, field_name):
     if field_name == "cldfrac" or field_name.startswith("cldfrac"):
         return sel_common_times(get_cldfrac_field(ds, field_name), pr)
 
-    # Pressure-level fields encoded as u850, v250, omega500, T100, qv700, RH500.
+    # Pressure-level fields encoded as u850, v250, w500, T100, qv700, RH500.
     prefixes = [
-        ("omega", "omg_isobaric"),
+        ("w", None),
         ("u", "uzonal_isobaric"),
         ("v", "umeridional_isobaric"),
         ("T", "t_isobaric"),
@@ -620,6 +620,10 @@ def get_filter_field(ds, field_name):
             if not level_text:
                 raise ValueError(f"No pressure level supplied in {field_name}")
             plev = float(level_text)
+            if var is None:
+                out = vertical_velocity_at_pressure(ds, plev).sel(Time=pr.Time)
+                out.name = field_name
+                return out
             if var not in ds.data_vars:
                 raise ValueError(f"{var} is not available in this dataset")
             out = finite_or_nan(ds[var]).sel(pres=plev, method="nearest").sel(Time=pr.Time)
@@ -652,8 +656,8 @@ def field_units(field_name):
         return "kg m$^{-2}$"
     if field_name == "cldfrac" or field_name.startswith("cldfrac"):
         return "fraction"
-    if field_name.startswith("omega"):
-        return "Pa s$^{-1}$"
+    if is_pressure_level_field(field_name) and field_name.startswith("w"):
+        return "m s$^{-1}$"
     if field_name.startswith("T"):
         return "K"
     if field_name.startswith("qv"):
@@ -1158,7 +1162,7 @@ def latitude_profile_fraction(da, condition=None, lat_bounds=TROPICAL_LAT_BOUNDS
     dims = [d for d in ("Time", "longitude") if d in x.dims]
     out = x.mean(dim=dims, skipna=True)
     out.name = "fraction"
-    return out
+    return hemispheric_fold(out, parity="even")
 
 
 def latitude_mean_lon_time(da, lat_bounds=filter_lat_bounds):
@@ -1771,7 +1775,7 @@ def plot_attribution_summary_bars(table):
         ("AD antisym cldfrac variance", "wave_variance_fraction", "cldfrac", "AD antisym", "all"),
         ("ER cldfrac variance", "wave_variance_fraction", "cldfrac", "ER", "all"),
         ("Kelvin T100 variance", "wave_variance_fraction", "T100", "Kelvin", "all"),
-        ("Kelvin omega500 variance", "wave_variance_fraction", "omega500", "Kelvin", "all"),
+        ("Kelvin w500 variance", "wave_variance_fraction", "w500", "Kelvin", "all"),
         ("Kelvin u850 variance", "wave_variance_fraction", "u850", "Kelvin", "all"),
     ]
     rows = []
@@ -1859,25 +1863,25 @@ def shallow_water_frequency_cpd(wave_name, zonal_wavenumber, equivalent_depth):
     filter_name = WAVE_BOXES.get(wave_name, {}).get("filter_name", wave_name)
 
     if filter_name == "Kelvin":
-        omega = k * c
+        angular_frequency = k * c
     elif filter_name == "ER":
-        omega = -beta * k / (k**2 + 3.0 * beta / c)
+        angular_frequency = -beta * k / (k**2 + 3.0 * beta / c)
     elif filter_name == "IG1":
-        omega = np.sqrt(3.0 * beta * c + k**2 * c**2)
+        angular_frequency = np.sqrt(3.0 * beta * c + k**2 * c**2)
     elif filter_name == "IG2":
-        omega = np.sqrt(5.0 * beta * c + k**2 * c**2)
+        angular_frequency = np.sqrt(5.0 * beta * c + k**2 * c**2)
     elif filter_name in ("MRG", "IG0"):
         with np.errstate(divide="ignore", invalid="ignore"):
-            omega = np.where(
+            angular_frequency = np.where(
                 k > 0,
                 k * c * (0.5 + 0.5 * np.sqrt(1.0 + 4.0 * beta / (k**2 * c))),
                 k * c * (0.5 - 0.5 * np.sqrt(1.0 + 4.0 * beta / (k**2 * c))),
             )
-        omega = np.where(np.isclose(k, 0.0), np.sqrt(beta * c), omega)
+        angular_frequency = np.where(np.isclose(k, 0.0), np.sqrt(beta * c), angular_frequency)
     else:
         raise ValueError(f"No dispersion-outline helper for {wave_name}")
 
-    return np.abs(omega) * 86400.0 / (2.0 * np.pi)
+    return np.abs(angular_frequency) * 86400.0 / (2.0 * np.pi)
 
 
 def wave_filter_mask_on_spectrum(wavenumber, frequency, wave_name):
@@ -2187,7 +2191,7 @@ if should_run_figure(1):
 # WHAT TO LOOK FOR:
 #   * A wave-band precipitation fraction tells you how much of the tropical
 #     precip variance is attributable to each filtered band.
-#   * Compare precipitation with dynamical fields. If u/omega/T wave power
+#   * Compare precipitation with dynamical fields. If u/w/T wave power
 #     increases but precipitation power does not, waves are modified aloft but
 #     weakly coupled to rainfall. If precipitation power increases without a
 #     dynamical increase, convective sensitivity has changed.
@@ -2239,7 +2243,7 @@ if should_run_any([2, 3, 4, 5, WAVE_ATTRIBUTION_FIGURE_NUMBER]):
             wave_metrics.to_csv(os.path.join(save_loc, "wave_band_variance_metrics.csv"), index=False)
 
 if should_run_figure(2) and wave_metrics is not None and len(wave_metrics) > 0:
-    plot_fields = ["Precip", "OLR", "PW", "cldfrac", "u850", "omega500", "T100"]
+    plot_fields = ["Precip", "OLR", "PW", "cldfrac", "u850", "w500", "T100"]
     plot_fields = [f for f in plot_fields if f in set(wave_metrics.field)]
 
     fig, ax = plt.subplots(2, len(plot_fields), figsize=(3.2 * len(plot_fields), 6.0), constrained_layout=True)
@@ -2440,7 +2444,7 @@ if should_run_figure(5):
 # 6. Vertical profiles of wave-filtered power
 # -----------------------------------------------------------------------------
 # WHAT TO LOOK FOR:
-#   * Does u_nudge amplify UTLS wave variance in u/T/omega more than T_nudge?
+#   * Does u_nudge amplify UTLS wave variance in u/T/w more than T_nudge?
 #   * Does the precipitation response line up with increased lower-tropospheric
 #     ascent, upper-tropospheric temperature variance, or near-tropopause wave
 #     activity?
@@ -2570,7 +2574,7 @@ if should_run_figure(7):
 # 8. Wave-filtered eddy fluxes (heavier, latitude-resolved filtering)
 # -----------------------------------------------------------------------------
 # WHAT TO LOOK FOR:
-#   * Kelvin-like waves should be dominated by u/omega/T structure rather than
+#   * Kelvin-like waves should be dominated by u/w/T structure rather than
 #     meridional momentum flux.  AD/ER/IG changes in u'v', EKE or vorticity-like
 #     flow would point to rotational-wave mediation.
 #   * Run this after the cheaper figures, because avgLat=False applies the k-f

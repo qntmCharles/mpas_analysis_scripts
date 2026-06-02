@@ -48,10 +48,10 @@ save_loc = '/home/cwp29/tmp/mpas/crf_on/final/mean_state/'
 #   13: ke_latheight
 #   14: eke_latpres
 #   15: global_energy_budget
-#   16: temperature_wind_latheight, omega_rh_latheight
+#   16: temperature_wind_latheight, w_rh_latheight
 #   17: mslp_maps
 #   18: scalar_constituents_latheight
-figures_to_run = [18]
+figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 
@@ -150,7 +150,7 @@ def isobaric_eddy_kinetic_energy(ds):
     eke = 0.5 * (ua * ua + va * va).mean(dim=eddy_dims, skipna=True)
     eke.name = "eke_isobaric"
     eke.attrs.update(units="m2 s-2", long_name="isobaric eddy kinetic energy")
-    return eke.transpose("pres", "latitude")
+    return hemispheric_fold(eke.transpose("pres", "latitude"), parity="even")
 
 
 def positive_contour_levels(fields, n=21, fallback=1.0):
@@ -216,7 +216,7 @@ def global_energy_budget_fields(ds):
     return fields
 
 
-def latlon_time_mean_field(ds, candidates, level_index=0, scale=1.0, name=None):
+def latlon_time_mean_field(ds, candidates, level_index=0, scale=1.0, name=None, hemispheric_parity=None):
     for candidate in candidates:
         if candidate not in ds.data_vars:
             continue
@@ -232,7 +232,8 @@ def latlon_time_mean_field(ds, candidates, level_index=0, scale=1.0, name=None):
         if "Time" in da.dims:
             da = da.mean(dim="Time", skipna=True)
 
-        da = (da * scale).transpose("latitude", "longitude").load()
+        da = (da * scale).transpose("latitude", "longitude")
+        da = hemispheric_fold(da, parity=hemispheric_parity).load()
         da.name = name or candidate
         return da
 
@@ -247,36 +248,8 @@ def latheight_time_mean_field(zds, spec):
         theta = finite_or_nan(zds.theta)
         pressure = finite_or_nan(zds.pressure)
         da = theta * (pressure / P0_PA) ** (RD / CP)
-    elif spec.get("derived") == "omega_hydrostatic":
-        missing = [v for v in ("theta", "pressure", "w") if v not in zds.data_vars]
-        if missing:
-            raise ValueError(f"Missing variables for omega: {missing}")
-        theta = finite_or_nan(zds.theta)
-        pressure = finite_or_nan(zds.pressure)
-        temperature = theta * (pressure / P0_PA) ** (RD / CP)
-        w = finite_or_nan(zds.w)
-        w_dim = vertical_dim(w)
-        target_dim = vertical_dim(pressure)
-
-        if w.sizes[w_dim] == pressure.sizes[target_dim] + 1:
-            lower = w.isel({w_dim: slice(0, -1)})
-            upper = w.isel({w_dim: slice(1, None)})
-            if w_dim in lower.coords and w_dim in upper.coords:
-                upper = upper.assign_coords({w_dim: lower[w_dim]})
-            w = 0.5 * (lower + upper)
-        elif w.sizes[w_dim] != pressure.sizes[target_dim]:
-            raise ValueError(
-                f"Cannot align w levels ({w.sizes[w_dim]}) with pressure levels "
-                f"({pressure.sizes[target_dim]})"
-            )
-
-        if w_dim != target_dim:
-            w = w.rename({w_dim: target_dim})
-        if target_dim in pressure.coords:
-            w = w.assign_coords({target_dim: pressure[target_dim]})
-
-        rho = pressure / (RD * temperature)
-        da = -rho * G * w
+    elif spec.get("derived") == "vertical_velocity":
+        da = vertical_velocity_from_zm(zds)
     else:
         for candidate in spec["candidates"]:
             if candidate in zds.data_vars:
@@ -288,7 +261,8 @@ def latheight_time_mean_field(zds, spec):
     if "Time" in da.dims:
         da = da.mean(dim="Time", skipna=True)
 
-    da = model_lat_field(da).load()
+    da = model_lat_field(da)
+    da = hemispheric_fold(da, parity=spec.get("hemispheric_parity", "even")).load()
     da.name = spec["label"]
     return da
 
@@ -325,6 +299,7 @@ def scalar_constituent_latheight(ds, spec, zmid=None):
         da = da.mean(dim=mean_dims, skipna=True)
 
     da = model_lat_field(da) * spec.get("scale", 1.0)
+    da = hemispheric_fold(da, parity=spec.get("hemispheric_parity", "even"))
     da = ensure_z_index_coord(da).load()
     da.name = spec["label"]
     if zmid is None:
@@ -421,6 +396,7 @@ LATHEIGHT_MEAN_STATE_SPECS = [
         "raw_symmetric": False,
         "raw_fallback": 300.0,
         "diff_fallback": 2.0,
+        "hemispheric_parity": "even",
     },
     {
         "label": "Zonal wind",
@@ -430,6 +406,7 @@ LATHEIGHT_MEAN_STATE_SPECS = [
         "raw_symmetric": True,
         "raw_fallback": 10.0,
         "diff_fallback": 2.0,
+        "hemispheric_parity": "even",
     },
     {
         "label": "Meridional wind",
@@ -439,18 +416,20 @@ LATHEIGHT_MEAN_STATE_SPECS = [
         "raw_symmetric": True,
         "raw_fallback": 10.0,
         "diff_fallback": 2.0,
+        "hemispheric_parity": "odd",
     },
 ]
 
-LATHEIGHT_OMEGA_RH_SPECS = [
+LATHEIGHT_W_RH_SPECS = [
     {
-        "label": "Omega",
-        "derived": "omega_hydrostatic",
-        "units": r"Pa s$^{-1}$",
+        "label": "Vertical velocity",
+        "derived": "vertical_velocity",
+        "units": r"m s$^{-1}$",
         "cmap": "seismic",
         "raw_symmetric": True,
-        "raw_fallback": 1.0,
-        "diff_fallback": 0.2,
+        "raw_fallback": 0.05,
+        "diff_fallback": 0.01,
+        "hemispheric_parity": "even",
     },
     {
         "label": "Relative humidity",
@@ -460,6 +439,7 @@ LATHEIGHT_OMEGA_RH_SPECS = [
         "raw_symmetric": False,
         "raw_fallback": 100.0,
         "diff_fallback": 10.0,
+        "hemispheric_parity": "even",
     },
 ]
 
@@ -472,6 +452,7 @@ MSLP_LATLON_SPEC = {
     "raw_symmetric": False,
     "raw_fallback": 1010.0,
     "diff_fallback": 2.0,
+    "hemispheric_parity": "even",
 }
 
 SCALAR_CONSTITUENT_GROUPS = [
@@ -490,6 +471,7 @@ SCALAR_CONSTITUENT_GROUPS = [
                 "raw_log_min": 1.0e-4,
                 "raw_fallback": 20.0,
                 "diff_fallback": 1.0,
+                "hemispheric_parity": "even",
             },
         ],
     },
@@ -506,6 +488,7 @@ SCALAR_CONSTITUENT_GROUPS = [
                 "cmap": "YlGnBu",
                 "raw_fallback": 0.1,
                 "diff_fallback": 0.02,
+                "hemispheric_parity": "even",
             },
         ],
     },
@@ -522,6 +505,7 @@ SCALAR_CONSTITUENT_GROUPS = [
                 "cmap": "PuBu",
                 "raw_fallback": 0.05,
                 "diff_fallback": 0.01,
+                "hemispheric_parity": "even",
             },
         ],
     },
@@ -562,7 +546,7 @@ needed_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw",
     "qv", "qc", "qr", "qi", "qs", "qg", "relhum", "w",
     "mslp",
-    "uzonal_isobaric", "umeridional_isobaric", "omg_isobaric",
+    "uzonal_isobaric", "umeridional_isobaric",
     "rh_isobaric", "t_isobaric", "qv_isobaric", "theta",
     "uReconstructZonal", "uReconstructMeridional",
     "cldfrac", "olrtoa", "zgrid", "pressure", "vorticity", "ke",
@@ -735,8 +719,8 @@ if should_run_any([3, 10, 11, 13, 14, 16, 18]):
     CPTs = []
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        theta = zds.theta.mean(dim="Time")
-        pressure = zds.pressure.mean(dim="Time")
+        theta = hemispheric_fold(zds.theta.mean(dim="Time"), parity="even")
+        pressure = hemispheric_fold(zds.pressure.mean(dim="Time"), parity="even")
 
         T = theta * (pressure / P0_PA) ** (RD / CP)
         T = model_lat_field(T)
@@ -764,20 +748,20 @@ if should_run_figure(3):
         ax = np.array([ax])
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        ubar_da = isobaric_lat_mean(zds.uzonal_isobaric)
-        vbar_da = isobaric_lat_mean(zds.umeridional_isobaric)
-        omgbar_da = isobaric_lat_mean(zds.omg_isobaric)
-        Tbar_da = isobaric_lat_mean(zds.t_isobaric)
-        rhbar_da = isobaric_lat_mean(zds.rh_isobaric)
+        ubar_da = isobaric_lat_mean(zds.uzonal_isobaric, hemispheric_parity="even")
+        vbar_da = isobaric_lat_mean(zds.umeridional_isobaric, hemispheric_parity="odd")
+        wbar_da = isobaric_vertical_velocity_from_zm(zds)
+        Tbar_da = isobaric_lat_mean(zds.t_isobaric, hemispheric_parity="even")
+        rhbar_da = isobaric_lat_mean(zds.rh_isobaric, hemispheric_parity="even")
 
         ubar = ubar_da.values
         vbar = vbar_da.values
-        omgbar = omgbar_da.values
+        wbar = wbar_da.values
         Tbar = Tbar_da.values
         rhbar = rhbar_da.values
 
         T_im, _, _, _ = plot_Tu_latpres(ax[i, 0], zds.latitude.values, zds.pres.values, Tbar, ubar)
-        rh_im, _ = plot_rhv_latpres(ax[i, 1], zds.latitude.values, zds.pres.values, rhbar, vbar, omgbar)
+        rh_im, _ = plot_rhw_latpres(ax[i, 1], zds.latitude.values, zds.pres.values, rhbar, vbar, wbar, Tbar)
 
         annotate_panel_label(ax[i, 0], sim_names[i])
         annotate_panel_label(ax[i, 1], sim_names[i])
@@ -821,6 +805,10 @@ if should_run_figure(4):
         memf = (ua*va).mean(dim=('longitude', 'Time'))
         mehf = (va*Ta).mean(dim=('longitude', 'Time'))
         mewvf = (va*qva).mean(dim=('longitude', 'Time'))
+        eke = hemispheric_fold(eke, parity="even")
+        memf = hemispheric_fold(memf, parity="odd")
+        mehf = hemispheric_fold(mehf, parity="odd")
+        mewvf = hemispheric_fold(mewvf, parity="odd")
 
         for j, var in enumerate([eke, memf, mehf, mewvf]):
             if j == 0:
@@ -1235,23 +1223,12 @@ if should_run_figure(10):
     im = im2 = im3 = None
     control_cldfrac = None
 
-    def hemispheric_symmetrise_lat(da, lat_dim="latitude"):
-        """
-        Average a latitude field with its hemispherically flipped version.
-
-        Assumes the latitude grid is symmetric and ordered monotonically, e.g.
-        -89.75 ... 89.75. The returned DataArray keeps the original latitude
-        coordinate.
-        """
-        flipped = da.isel({lat_dim: slice(None, None, -1)})
-        flipped = flipped.assign_coords({lat_dim: da[lat_dim].values})
-        return 0.5 * (da + flipped)
-
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
         if "cldfrac" in zds.data_vars:
             # Newer zm_latlon files may contain precomputed zonal-mean cloud fraction
             # with dimensions (Time, z, latitude).
             cldfrac = zds.cldfrac.mean(dim="Time")
+            cldfrac = hemispheric_fold(cldfrac, parity="even")
             zmid = height_from_zm_latlon(zds)
             cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, zds.latitude.values)
             lat_for_cpt = zds.latitude.values
@@ -1262,9 +1239,7 @@ if should_run_figure(10):
             # compute the zonal mean here.
             cldfrac = ds.cldfrac.mean(dim=("Time", "longitude"))
             cldfrac = model_lat_field(cldfrac)
-
-            if i == 0:
-                cldfrac = hemispheric_symmetrise_lat(cldfrac)
+            cldfrac = hemispheric_fold(cldfrac, parity="even")
 
             zmid = midlevel_height_from_latlon(ds)
             cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, ds.latitude.values)
@@ -1339,6 +1314,7 @@ if should_run_figure(11):
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
         if 'vorticity' in zds.data_vars:
             vort = zds.vorticity.mean(dim="Time")
+            vort = hemispheric_fold(vort, parity="odd")
             zmid = height_from_zm_latlon(zds)
             vort, lat2d, z2d = lat_height_mesh(vort, zmid, zds.latitude.values)
 
@@ -1382,13 +1358,28 @@ if should_run_figure(11):
 if should_run_figure(12):
     # Histogram of OLR and time-mean lat/lon maps
 
-    fig, ax = plt.subplots(1, len(dss), figsize=(10, 3.5), constrained_layout=True)
-    fig2, ax2 = plt.subplots(1, len(dss), figsize=(10, 3.5), constrained_layout=True)
+    map_profile_widths = [1.0] * len(dss) + [0.72]
+    fig, axes = plt.subplots(
+        1, len(dss) + 1,
+        figsize=(12, 3.5),
+        constrained_layout=True,
+        sharey=True,
+        squeeze=False,
+        gridspec_kw={"width_ratios": map_profile_widths},
+    )
+    fig2, axes2 = plt.subplots(
+        1, len(dss) + 1,
+        figsize=(12, 3.5),
+        constrained_layout=True,
+        sharey=True,
+        squeeze=False,
+        gridspec_kw={"width_ratios": map_profile_widths},
+    )
     fig3, ax3 = plt.subplots(figsize=(8, 3), constrained_layout=True)
-
-    if len(dss) == 1:
-        ax = [ax]
-        ax2 = [ax2]
+    ax = axes[0, :-1]
+    ax_profile = axes[0, -1]
+    ax2 = axes2[0, :-1]
+    ax2_profile = axes2[0, -1]
 
     olr_cols = cols
     bins = np.linspace(100, 350, 80)
@@ -1398,6 +1389,10 @@ if should_run_figure(12):
     for i, ds in enumerate(dss):
         olr = ds.olrtoa
         olr_mean = olr.mean(dim='Time')
+        olr_mean = hemispheric_fold(olr_mean, parity="even")
+        olr_zonal_mean = olr_mean.mean(dim="longitude", skipna=True).load()
+        ax_profile.plot(olr_zonal_mean.values, olr_zonal_mean.latitude.values,
+                        color=olr_cols[i], label=sim_names[i])
 
         h, b = np.histogram(olr.values.ravel(), bins=bins)
         ax3.plot(0.5 * (b[1:] + b[:-1]), h / h.sum(), color=olr_cols[i], label=sim_names[i])
@@ -1426,30 +1421,57 @@ if should_run_figure(12):
         else:
             ax[i].set_yticklabels([])
             control_interp = control_olr.interp(latitude=olr_mean.latitude, longitude=olr_mean.longitude)
+            olr_diff = (olr_mean - control_interp).load()
             im3 = ax2[i].contourf(
                 ds.longitude.values,
                 ds.latitude.values,
-                (olr_mean - control_interp).values,
+                olr_diff.values,
                 levels=symmetric_levels(20.0, ndiv=11),
                 cmap='bwr',
                 extend='both'
             )
+            olr_diff_zonal_mean = olr_diff.mean(dim="longitude", skipna=True)
+            ax2_profile.plot(olr_diff_zonal_mean.values, olr_diff_zonal_mean.latitude.values,
+                             color=olr_cols[i], label=sim_names[i])
 
         annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
         ax2[i].set_xlabel('Longitude')
         if i == 0:
             ax2[i].set_ylabel('Latitude')
+            ax2_profile.plot(np.zeros_like(olr_zonal_mean.values), olr_zonal_mean.latitude.values,
+                             color=olr_cols[i], label=sim_names[i])
         else:
             ax2[i].set_yticklabels([])
+
+    ax_profile.axhline(0, color="0.3", lw=0.6)
+    ax_profile.set_title("Longitude mean")
+    ax_profile.set_xlabel(r'OLR (W m$^{-2}$)')
+    ax_profile.tick_params(labelleft=False)
+    ax_profile.grid(True, axis="x", lw=0.4, alpha=0.5)
+    ax_profile.legend(loc="best", fontsize=8, frameon=False)
+
+    ax2_profile.axvline(0, color="0.3", lw=0.7)
+    ax2_profile.axhline(0, color="0.3", lw=0.6)
+    ax2_profile.set_title("Longitude mean")
+    ax2_profile.set_xlabel(r'$\Delta$ OLR (W m$^{-2}$)')
+    ax2_profile.tick_params(labelleft=False)
+    ax2_profile.grid(True, axis="x", lw=0.4, alpha=0.5)
+    ax2_profile.legend(loc="best", fontsize=8, frameon=False)
 
     ax3.set_xlabel(r'OLR (W m$^{-2}$)')
     ax3.set_ylabel('Normalised frequency')
     ax3.legend(loc='best')
 
-    fig.colorbar(im, ax=ax[-1], location='right', label=r'OLR (W m$^{-2}$)')
+    fig.colorbar(im, ax=list(ax) + [ax_profile], location='right', label=r'OLR (W m$^{-2}$)')
     fig2.colorbar(im2, ax=ax2[0], location='right', label=r'OLR (W m$^{-2}$)')
     if im3 is not None:
-        add_symmetric_colorbar(fig2, im3, ax2[1:], symmetric_levels(20.0, ndiv=11), label=r'OLR difference (W m$^{-2}$)')
+        add_symmetric_colorbar(
+            fig2,
+            im3,
+            list(ax2[1:]) + [ax2_profile],
+            symmetric_levels(20.0, ndiv=11),
+            label=r'OLR difference (W m$^{-2}$)',
+        )
 
     figsave.save(fig, "olrtoa_maps", number=12)
     figsave.save(fig2, "olrtoa_maps_diff", number=12)
@@ -1468,10 +1490,10 @@ if should_run_figure(16):
             "diff_name": "temperature_wind_latheight_diff",
         },
         {
-            "title": "omega/RH",
-            "specs": LATHEIGHT_OMEGA_RH_SPECS,
-            "raw_name": "omega_rh_latheight",
-            "diff_name": "omega_rh_latheight_diff",
+            "title": "w/RH",
+            "specs": LATHEIGHT_W_RH_SPECS,
+            "raw_name": "w_rh_latheight",
+            "diff_name": "w_rh_latheight_diff",
         },
     ]
 
@@ -1625,15 +1647,33 @@ if should_run_figure(17):
                 spec["candidates"],
                 scale=spec.get("scale", 1.0),
                 name=spec["label"],
+                hemispheric_parity=spec.get("hemispheric_parity", "even"),
             )
         except ValueError as e:
             print(f"Skipping {spec['label']} map for {sim_names[i]}: {e}")
 
     if 0 in fields_by_sim:
-        fig, ax = plt.subplots(1, len(dss), figsize=(10, 3.5), constrained_layout=True, squeeze=False)
-        fig2, ax2 = plt.subplots(1, len(dss), figsize=(10, 3.5), constrained_layout=True, squeeze=False)
-        ax = ax[0]
-        ax2 = ax2[0]
+        map_profile_widths = [1.0] * len(dss) + [0.72]
+        fig, axes = plt.subplots(
+            1, len(dss) + 1,
+            figsize=(12, 3.5),
+            constrained_layout=True,
+            sharey=True,
+            squeeze=False,
+            gridspec_kw={"width_ratios": map_profile_widths},
+        )
+        fig2, axes2 = plt.subplots(
+            1, len(dss) + 1,
+            figsize=(12, 3.5),
+            constrained_layout=True,
+            sharey=True,
+            squeeze=False,
+            gridspec_kw={"width_ratios": map_profile_widths},
+        )
+        ax = axes[0, :-1]
+        ax_profile = axes[0, -1]
+        ax2 = axes2[0, :-1]
+        ax2_profile = axes2[0, -1]
 
         raw_levels = latlon_contour_levels(
             list(fields_by_sim.values()),
@@ -1676,6 +1716,8 @@ if should_run_figure(17):
             )
             annotate_panel_label(ax[i], sim_names[i])
             ax[i].set_xlabel("Longitude")
+            zonal_mean = field.mean(dim="longitude", skipna=True).load()
+            ax_profile.plot(zonal_mean.values, zonal_mean.latitude.values, color=cols[i], label=sim_names[i])
 
             if i == 0:
                 ax[i].set_ylabel("Latitude")
@@ -1687,6 +1729,8 @@ if should_run_figure(17):
                     cmap=spec["cmap"],
                     extend="both",
                 )
+                ax2_profile.plot(np.zeros_like(zonal_mean.values), zonal_mean.latitude.values,
+                                 color=cols[i], label=sim_names[i])
             else:
                 ax[i].tick_params(labelleft=False)
                 diff = diff_fields[i]
@@ -1698,6 +1742,9 @@ if should_run_figure(17):
                     cmap="bwr",
                     extend="both",
                 )
+                diff_zonal_mean = diff.mean(dim="longitude", skipna=True).load()
+                ax2_profile.plot(diff_zonal_mean.values, diff_zonal_mean.latitude.values,
+                                 color=cols[i], label=sim_names[i])
 
             annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
             ax2[i].set_xlabel("Longitude")
@@ -1707,15 +1754,30 @@ if should_run_figure(17):
                 ax2[i].tick_params(labelleft=False)
 
         label = f"{spec['label']} ({spec['units']})"
+        ax_profile.axhline(0, color="0.3", lw=0.6)
+        ax_profile.set_title("Longitude mean")
+        ax_profile.set_xlabel(label)
+        ax_profile.tick_params(labelleft=False)
+        ax_profile.grid(True, axis="x", lw=0.4, alpha=0.5)
+        ax_profile.legend(loc="best", fontsize=8, frameon=False)
+
+        ax2_profile.axvline(0, color="0.3", lw=0.7)
+        ax2_profile.axhline(0, color="0.3", lw=0.6)
+        ax2_profile.set_title("Longitude mean")
+        ax2_profile.set_xlabel(f"{spec['label']} difference ({spec['units']})")
+        ax2_profile.tick_params(labelleft=False)
+        ax2_profile.grid(True, axis="x", lw=0.4, alpha=0.5)
+        ax2_profile.legend(loc="best", fontsize=8, frameon=False)
+
         if raw_im is not None:
-            fig.colorbar(raw_im, ax=ax[-1], location="right", label=label)
+            fig.colorbar(raw_im, ax=list(ax) + [ax_profile], location="right", label=label)
         if control_im is not None:
             fig2.colorbar(control_im, ax=ax2[0], location="right", label=label)
         if diff_im is not None:
             add_symmetric_colorbar(
                 fig2,
                 diff_im,
-                ax2[1:],
+                list(ax2[1:]) + [ax2_profile],
                 diff_levels,
                 label=f"{spec['label']} difference ({spec['units']})",
             )
@@ -1902,6 +1964,7 @@ if should_run_figure(13):
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
         if 'ke' in zds.data_vars:
             ke = zds.ke.mean(dim="Time")
+            ke = hemispheric_fold(ke, parity="even")
             zmid = height_from_zm_latlon(zds)
             ke, lat2d, z2d = lat_height_mesh(ke, zmid, zds.latitude.values)
 

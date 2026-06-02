@@ -41,7 +41,7 @@ save_loc = '/home/cwp29/tmp/mpas/crf_on/final/thermal_wind/'
 #   7:  scaled_residual_T_latheight
 #   8:  scaled_residual_u_latheight
 #   9:  scaled_residual_RH_latheight
-#   10: scaled_residual_omega_latheight
+#   10: scaled_residual_w_latheight
 #   11: scaled_residual_N2_latheight
 #   12: scaled_residual_cldfrac_latheight
 #   13: thermal_wind_temperature_gradient_total_fields
@@ -165,8 +165,8 @@ if should_run_any([1, 7, 8, 9, 10, 11, 12, 13]):
     CPTs = []
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        theta = zds.theta.mean(dim="Time")
-        pressure = zds.pressure.mean(dim="Time")
+        theta = hemispheric_fold(zds.theta.mean(dim="Time"), parity="even")
+        pressure = hemispheric_fold(zds.pressure.mean(dim="Time"), parity="even")
 
         T = theta * (pressure / 100000.)**(287.0 / 1004.0)
         T = model_lat_field(T)
@@ -199,7 +199,7 @@ if should_run_any([1, 7, 8, 9, 10, 11, 12, 13]):
 #      the T-nudged run?
 #   2. Are the realised total wind and temperature fields close to
 #      thermal-wind balance, and where do residuals remain?
-#   3. Do OLR/precip/PW/RH/omega/cloud responses scale mainly with realised
+#   3. Do OLR/precip/PW/RH/w/cloud responses scale mainly with realised
 #      TTL temperature, or is there a residual response that points to a
 #      wind/shear/wave pathway?
 #
@@ -291,12 +291,13 @@ def pattern_corr_latheight(a, b, lat_bounds=(-60, 60), z_bounds=(10000, 22000)):
 def precip_rate_mean_map(ds):
     """Time-mean precipitation-rate map in mm/day."""
     pr = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
-    return pr.mean(dim="Time")
+    return hemispheric_fold(pr.mean(dim="Time"), parity="even")
 
 def zmean_time_mean(da):
     """Time mean, zonal mean if longitude is present."""
     dims = [d for d in ("Time", "longitude") if d in da.dims]
-    return da.mean(dim=dims)
+    out = da.mean(dim=dims)
+    return hemispheric_fold(out, parity="even")
 
 # -----------------------
 # Thermal wind helpers
@@ -312,8 +313,8 @@ def canonical_latheight_var(var):
         "RH": "relhum",
         "rh": "relhum",
         "relhum": "relhum",
-        "omega": "omega_hydrostatic",
-        "omega_hydrostatic": "omega_hydrostatic",
+        "w": "w",
+        "vertical_velocity": "w",
     }
     return aliases.get(var, var)
 
@@ -321,49 +322,25 @@ def required_latheight_vars(var):
     var = canonical_latheight_var(var)
     if var == "temperature":
         return ("theta", "pressure")
-    if var == "omega_hydrostatic":
-        return ("theta", "pressure", "w")
+    if var == "w":
+        return ("w",)
     return (var,)
 
 def latheight_field_available(zds, var):
     return all(name in zds.data_vars for name in required_latheight_vars(var))
 
+def latheight_var_hemispheric_parity(var):
+    var = canonical_latheight_var(var)
+    if var in ("temperature", "uReconstructZonal", "relhum", "w"):
+        return "even"
+    if var in ("uReconstructMeridional", "v", "umeridional"):
+        return "odd"
+    return "even"
+
 def model_level_temperature(zds):
     theta = finite_or_nan(zds.theta)
     pressure = finite_or_nan(zds.pressure)
     return theta * (pressure / P0_PA) ** (RD / CP)
-
-def align_w_to_midlevels(w, pressure):
-    w_dim = vertical_dim(w)
-    target_dim = vertical_dim(pressure)
-
-    if w.sizes[w_dim] == pressure.sizes[target_dim] + 1:
-        lower = w.isel({w_dim: slice(0, -1)})
-        upper = w.isel({w_dim: slice(1, None)})
-        if w_dim in lower.coords and w_dim in upper.coords:
-            upper = upper.assign_coords({w_dim: lower[w_dim]})
-        w = 0.5 * (lower + upper)
-    elif w.sizes[w_dim] != pressure.sizes[target_dim]:
-        raise ValueError(
-            f"Cannot align w levels ({w.sizes[w_dim]}) with pressure levels "
-            f"({pressure.sizes[target_dim]})"
-        )
-
-    if w_dim != target_dim:
-        w = w.rename({w_dim: target_dim})
-    if target_dim in pressure.coords:
-        w = w.assign_coords({target_dim: pressure[target_dim]})
-    return w
-
-def hydrostatic_omega(zds):
-    pressure = finite_or_nan(zds.pressure)
-    temperature = model_level_temperature(zds)
-    w = align_w_to_midlevels(finite_or_nan(zds.w), pressure)
-    rho = pressure / (RD * temperature)
-    omega = -rho * G * w
-    omega.name = "omega_hydrostatic"
-    omega.attrs.update(units="Pa s-1", long_name="hydrostatic omega from model-level w")
-    return omega
 
 def latheight_time_mean_field(zds, var):
     """Time-mean zonal-mean model-height field as (z, latitude)."""
@@ -374,15 +351,16 @@ def latheight_time_mean_field(zds, var):
 
     if var == "temperature":
         da = model_level_temperature(zds)
-    elif var == "omega_hydrostatic":
-        da = hydrostatic_omega(zds)
+    elif var == "w":
+        da = vertical_velocity_from_zm(zds)
     else:
         da = finite_or_nan(zds[var])
 
     if "Time" in da.dims:
         da = da.mean(dim="Time", skipna=True)
 
-    da = model_lat_field(da).load()
+    da = model_lat_field(da)
+    da = hemispheric_fold(da, parity=latheight_var_hemispheric_parity(var)).load()
     da.name = var
     return da
 
@@ -407,7 +385,7 @@ def thermal_wind_terms(T_da, u_da, tw_equator_mask_deg=5.0):
     equator. Set tw_equator_mask_deg to None to keep the near-equator values
     for plotting; otherwise that latitude band is masked.
     """
-    omega = 7.2921159e-5
+    earth_rotation_rate = 7.2921159e-5
     a = 6.371e6
 
     T, u = xr.align(T_da, u_da, join="inner")
@@ -416,7 +394,7 @@ def thermal_wind_terms(T_da, u_da, tw_equator_mask_deg=5.0):
 
     lat_rad = np.deg2rad(T.latitude.values)
     z = T.z.values
-    f = 2.0 * omega * np.sin(lat_rad)
+    f = 2.0 * earth_rotation_rate * np.sin(lat_rad)
 
     dT_dphi = np.gradient(T.values, lat_rad, axis=1)
     du_dz = np.gradient(u.values, z, axis=0)
@@ -453,7 +431,7 @@ def thermal_wind_temperature_gradient_terms(T_da, u_da, tw_equator_mask_deg=5.0)
     is masked because the geostrophic thermal-wind approximation is not useful
     there.
     """
-    omega = 7.2921159e-5
+    earth_rotation_rate = 7.2921159e-5
     a = 6.371e6
 
     T, u = xr.align(T_da, u_da, join="inner")
@@ -462,7 +440,7 @@ def thermal_wind_temperature_gradient_terms(T_da, u_da, tw_equator_mask_deg=5.0)
 
     lat_rad = np.deg2rad(T.latitude.values)
     z = T.z.values
-    f = 2.0 * omega * np.sin(lat_rad)
+    f = 2.0 * earth_rotation_rate * np.sin(lat_rad)
 
     dT_dphi = np.gradient(T.values, lat_rad, axis=1)
     dT_dy = dT_dphi / a
@@ -522,9 +500,9 @@ def scaled_residual_map(var, alpha, run_u=1, run_T=2, control=0):
         Xu = precip_rate_mean_map(dss[run_u])
         XT = precip_rate_mean_map(dss[run_T])
     else:
-        Xc = dss[control][var].mean(dim="Time")
-        Xu = dss[run_u][var].mean(dim="Time")
-        XT = dss[run_T][var].mean(dim="Time")
+        Xc = hemispheric_fold(dss[control][var].mean(dim="Time"), parity="even")
+        Xu = hemispheric_fold(dss[run_u][var].mean(dim="Time"), parity="even")
+        XT = hemispheric_fold(dss[run_T][var].mean(dim="Time"), parity="even")
 
     dXu = Xu - Xc.interp(latitude=Xu.latitude, longitude=Xu.longitude, kwargs={"fill_value": np.nan})
     dXT = XT - Xc.interp(latitude=XT.latitude, longitude=XT.longitude, kwargs={"fill_value": np.nan})
@@ -836,7 +814,7 @@ latheight_residual_specs = [
     (7, "temperature", r"T anomaly (K)", 8.0, "07_scaled_residual_T_latheight.png"),
     (8, "uReconstructZonal", r"u anomaly (m s$^{-1}$)", 8.0, "08_scaled_residual_u_latheight.png"),
     (9, "relhum", r"RH anomaly (%)", 10.0, "09_scaled_residual_RH_latheight.png"),
-    (10, "omega_hydrostatic", r"omega anomaly (Pa s$^{-1}$)", 0.1, "10_scaled_residual_omega_latheight.png"),
+    (10, "w", r"w anomaly (m s$^{-1}$)", 0.03, "10_scaled_residual_w_latheight.png"),
 ]
 
 for fig_num, var, label, max_abs, fname in latheight_residual_specs:
@@ -880,7 +858,7 @@ for fig_num, var, label, max_abs, fname in latheight_residual_specs:
     print(f"Done with figure: {outname}")
 
 if should_run_any([7, 8, 9, 10]):
-    print("WHAT TO LOOK FOR: omega/RH residuals are particularly useful. A small height-level T residual but large omega residual suggests comparable thermal forcing but different circulation adjustment.")
+    print("WHAT TO LOOK FOR: w/RH residuals are particularly useful. A small height-level T residual but large w residual suggests comparable thermal forcing but different circulation adjustment.")
 
 # -----------------------
 # 7. N2 scaled residual in latitude-height coordinates
@@ -937,15 +915,14 @@ if should_run_figure(12):
         zds = dss_zm[i]
         if "cldfrac" in zds.data_vars:
             cld = zds.cldfrac.mean(dim="Time")
+            cld = hemispheric_fold(cld, parity="even")
             zmid = height_from_zm_latlon(zds)
             cld, _, _ = lat_height_mesh(cld, zmid, zds.latitude.values)
             return cld
         if "cldfrac" in ds.data_vars:
             cld = ds.cldfrac.mean(dim=("Time", "longitude"))
             cld = model_lat_field(cld)
-            # Keep the same optional control symmetrisation used in the earlier cloud-fraction section.
-            if i == 0 and "hemispheric_symmetrise_lat" in globals():
-                cld = hemispheric_symmetrise_lat(cld)
+            cld = hemispheric_fold(cld, parity="even")
             return cld
         return None
 
@@ -1007,7 +984,7 @@ if run_all_figures():
         residual_rows.append([pretty, "surface_tropical_mean", trop_du, trop_dT, trop_resid])
 
     # Height-level metrics: TTL tropical mean residuals
-    for var, pretty in [("temperature", "T"), ("uReconstructZonal", "u"), ("relhum", "RH"), ("omega_hydrostatic", "omega")]:
+    for var, pretty in [("temperature", "T"), ("uReconstructZonal", "u"), ("relhum", "RH"), ("w", "w")]:
         if all(latheight_field_available(zds, var) for zds in dss_zm[:3]):
             dXu, dXT, resid = scaled_residual_latheight(var, alpha_TTL)
             values = []
@@ -1030,5 +1007,5 @@ if run_all_figures():
 
     print("\nInterpretation guide:")
     print("  * If scaled_residual is small: the u-nudged response is mostly the T-nudged response scaled by realised TTL ΔT.")
-    print("  * If scaled_residual remains large for u/omega/RH but not T/N2: likely extra dynamical/shear/secondary-circulation effect.")
+    print("  * If scaled_residual remains large for u/w/RH but not T/N2: likely extra dynamical/shear/secondary-circulation effect.")
     print("  * If scaled_residual remains large for cloud/OLR/precip: the u-nudged run is doing something beyond simple thermal scaling, worth examining with wave/eddy diagnostics.")
