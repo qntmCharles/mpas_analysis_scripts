@@ -104,6 +104,10 @@ RESIDUAL_PLOT_SAMPLE_LIMITS = dict(max_time=120, max_lat=120, max_lon=240)
 SAVE_CLASSIFICATION_CACHE = True
 CLASSIFICATION_CACHE_VERSION = "high-cloud-v1"
 classification_cache_dir = os.path.join(save_loc, "classification_cache")
+classification_cache_read_dirs = [
+    "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/classification_cache",
+    classification_cache_dir,
+]
 
 cache_dir = "/store/atmos-adk33/cwp29/cache/convective_pathways/"
 os.makedirs(cache_dir, exist_ok=True)
@@ -524,11 +528,16 @@ def open_cached_classification(cache_path, sim_name):
 
 
 def get_or_build_classification(ds, fields, sim_name):
-    cache_path = os.path.join(classification_cache_dir, f"{sim_name.replace(' ', '_')}_classified_high_cloud.nc")
-    if SAVE_CLASSIFICATION_CACHE and os.path.exists(cache_path):
-        cached = open_cached_classification(cache_path, sim_name)
-        if cached is not None:
-            return cached
+    cache_filename = f"{sim_name.replace(' ', '_')}_classified_high_cloud.nc"
+    cache_path = os.path.join(classification_cache_dir, cache_filename)
+    if SAVE_CLASSIFICATION_CACHE:
+        for read_dir in classification_cache_read_dirs:
+            read_path = os.path.join(read_dir, cache_filename)
+            if not os.path.exists(read_path):
+                continue
+            cached = open_cached_classification(read_path, sim_name)
+            if cached is not None:
+                return cached
 
     progress(f"{sim_name}: preparing high-cloud classification")
     cf = get_cloud_fraction(ds)

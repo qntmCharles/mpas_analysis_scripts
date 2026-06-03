@@ -48,7 +48,7 @@ save_loc = '/home/cwp29/tmp/mpas/crf_on/final/mean_state/'
 #   13: ke_latheight
 #   14: eke_latpres
 #   15: global_energy_budget
-#   16: temperature_wind_latheight, w_rh_latheight
+#   16: temperature_wind_latheight, w_rh_latheight, tem_latheight
 #   17: mslp_maps
 #   18: scalar_constituents_latheight
 #
@@ -271,7 +271,7 @@ def latheight_time_mean_field(zds, spec):
     if "Time" in da.dims:
         da = da.mean(dim="Time", skipna=True)
 
-    da = model_lat_field(da)
+    da = model_lat_field(da) * spec.get("scale", 1.0)
     da = hemispheric_fold(da, parity=spec.get("hemispheric_parity", "even")).load()
     da.name = spec["label"]
     return da
@@ -453,6 +453,46 @@ LATHEIGHT_W_RH_SPECS = [
     },
 ]
 
+LATHEIGHT_TEM_SPECS = [
+    {
+        "label": "Wave forcing",
+        "candidates": ("EPFd", "divF", "dF"),
+        "units": r"m s$^{-1}$ day$^{-1}$",
+        "scale": 86400.0,
+        "cmap": "seismic",
+        "raw_symmetric": True,
+        "raw_fallback": 1.0,
+        "raw_percentile": 99.0,
+        "diff_fallback": 0.5,
+        "diff_percentile": 99.0,
+        "hemispheric_parity": "even",
+    },
+    {
+        "label": "Residual vertical velocity",
+        "candidates": ("wres",),
+        "units": r"m s$^{-1}$",
+        "cmap": "seismic",
+        "raw_symmetric": True,
+        "raw_fallback": 0.01,
+        "raw_percentile": 99.0,
+        "diff_fallback": 0.002,
+        "diff_percentile": 99.0,
+        "hemispheric_parity": "even",
+    },
+    {
+        "label": "Residual meridional velocity",
+        "candidates": ("vres",),
+        "units": r"m s$^{-1}$",
+        "cmap": "seismic",
+        "raw_symmetric": True,
+        "raw_fallback": 1.0,
+        "raw_percentile": 99.0,
+        "diff_fallback": 0.5,
+        "diff_percentile": 99.0,
+        "hemispheric_parity": "odd",
+    },
+]
+
 MSLP_LATLON_SPEC = {
     "label": "MSLP",
     "candidates": ("mslp",),
@@ -560,6 +600,7 @@ needed_vars = [
     "rh_isobaric", "t_isobaric", "qv_isobaric", "theta",
     "uReconstructZonal", "uReconstructMeridional",
     "cldfrac", "olrtoa", "zgrid", "pressure", "vorticity", "ke",
+    "EPFd", "wres", "vres",
     "lwdnt", "lwdnb", "lwupb", "lwupt", "swdnt", "swdnb", "swupb", "swupt",
     "lh", "hfx"
 ]
@@ -1505,6 +1546,12 @@ if should_run_figure(16):
             "raw_name": "w_rh_latheight",
             "diff_name": "w_rh_latheight_diff",
         },
+        {
+            "title": "TEM circulation and forcing",
+            "specs": LATHEIGHT_TEM_SPECS,
+            "raw_name": "tem_latheight",
+            "diff_name": "tem_latheight_diff",
+        },
     ]
 
     for group in latheight_groups:
@@ -1548,11 +1595,19 @@ if should_run_figure(16):
 
         for row, (spec, fields_by_sim) in enumerate(latheight_entries):
             raw_fields = list(fields_by_sim.values())
-            raw_levels = latlon_contour_levels(
-                raw_fields,
-                symmetric=spec.get("raw_symmetric", False),
-                fallback=spec.get("raw_fallback", 1.0),
-            )
+            if spec.get("raw_percentile") is not None and spec.get("raw_symmetric", False):
+                raw_levels = symmetric_percentile_levels(
+                    raw_fields,
+                    percentile=spec.get("raw_percentile", 99.0),
+                    ndiv=10,
+                    fallback=spec.get("raw_fallback", 1.0),
+                )
+            else:
+                raw_levels = latlon_contour_levels(
+                    raw_fields,
+                    symmetric=spec.get("raw_symmetric", False),
+                    fallback=spec.get("raw_fallback", 1.0),
+                )
             control_field = fields_by_sim[0]
             diff_fields = {}
             for i, field in fields_by_sim.items():
@@ -1561,15 +1616,23 @@ if should_run_figure(16):
                 control_interp = control_field.interp(z=field.z, latitude=field.latitude)
                 diff_fields[i] = (field - control_interp).load()
 
-            diff_levels = (
-                symmetric_contour_levels(
+            if diff_fields and spec.get("diff_percentile") is not None:
+                diff_levels = symmetric_percentile_levels(
                     list(diff_fields.values()),
+                    percentile=spec.get("diff_percentile", 99.0),
                     ndiv=10,
                     fallback=spec.get("diff_fallback", 1.0),
                 )
-                if diff_fields
-                else symmetric_levels(spec.get("diff_fallback", 1.0), ndiv=10)
-            )
+            else:
+                diff_levels = (
+                    symmetric_contour_levels(
+                        list(diff_fields.values()),
+                        ndiv=10,
+                        fallback=spec.get("diff_fallback", 1.0),
+                    )
+                    if diff_fields
+                    else symmetric_levels(spec.get("diff_fallback", 1.0), ndiv=10)
+                )
 
             raw_im = control_im = diff_im = None
             for i in range(ncols):

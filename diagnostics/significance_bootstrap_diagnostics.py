@@ -2,12 +2,13 @@
 # coding: utf-8
 
 """
-Block-bootstrap significance diagnostics for the MPAS-A nudging experiments.
+Block-resampling consistency diagnostics for the MPAS-A nudging experiments.
 
-This script is a compact significance wrapper around the diagnostic families
-that have proved useful in the other scripts in this directory.  It asks whether
-the small nudged-control differences are robust against internal variability,
-and whether robust changes look more wind-driven or temperature-driven.
+This script is a compact block-resampling wrapper around diagnostic families
+that have proved useful in the other scripts in this directory. It does not
+claim formal statistical significance from a short simulation. Instead, it asks
+whether small nudged-control differences have the same sign and comparable
+magnitude across time chunks, or whether they look like internal variability.
 
 The diagnostics are intentionally computed from the model output here rather
 than imported from the other scripts, because those scripts execute full figure
@@ -53,17 +54,23 @@ save = True
 save_loc = "/home/cwp29/tmp/mpas/crf_on/final/significance_bootstrap/"
 
 # Figure numbers:
-#   1: mean-state lat-height bootstrap response maps
-#   2: precipitation scalar/PDF bootstrap diagnostics
-#   3: cloud profile/cloud-type bootstrap diagnostics
-#   4: CCEW wave-box variance bootstrap diagnostics
+#   1: mean-state lat-height block-resampled response maps
+#   2: precipitation scalar/PDF block-consistency diagnostics
+#   3: cloud profile/cloud-type block-consistency diagnostics
+#   4: CCEW wave-box variance block-consistency diagnostics
+#   5: convective organisation block-consistency diagnostics
+#   6: basic convection PDF block-consistency diagnostics
+#   7: vertical wave-power profile block-consistency diagnostics
+#   8: wave-amplitude lag-correlation block-consistency diagnostics
+#   9: zonal/meridional wavenumber-variance block-consistency diagnostics
 #
 # WHAT TO LOOK FOR:
-#   * Treat a response as robust only when the bootstrap confidence interval
-#     excludes zero and sign robustness is high across resamples or blocks.
+#   * Treat a response as robust only when the central block-resampling interval
+#     excludes zero and the response sign is consistent across resampled chunks.
+#     These are internal-consistency checks, not formal significance tests.
 #   * For spatial fields, prioritise coherent latitude-height or physically
-#     meaningful regions over isolated robust grid cells.
-#   * Compare robust U-control and T-control responses with the U-T contrast:
+#     meaningful regions over isolated cells that pass the chunk-consistency rule.
+#   * Compare chunk-consistent U-control and T-control responses with the U-T contrast:
 #     shared thermal/static-stability/cloud-depth structures favour a
 #     temperature-driven pathway, while U-only wind/wave residuals favour a
 #     wind-driven pathway.
@@ -84,12 +91,16 @@ time_format = "time"
 obs_per_day = int(round(24 / dt))
 
 BOOTSTRAP_BLOCK_DAYS = 10.0
+CLOUD_TYPE_BLOCK_DAYS = 5.0
 N_BOOTSTRAP = 1000
 FIELD_N_BOOTSTRAP = 600
 BOOTSTRAP_SEED = 20240602
 MIN_BLOCKS = 6
 CI_PERCENTILES = (2.5, 97.5)
 ROBUST_SIGN_THRESHOLD = 0.95
+# Output columns retain ci_low/ci_high for compatibility. Interpret them as a
+# central interval from resampled time chunks, not as a formal confidence
+# interval from an independent observational sample.
 
 TROPICAL_LAT_BOUNDS = (-20.0, 20.0)
 DEEP_TROPICS_LAT_BOUNDS = (-10.0, 10.0)
@@ -102,6 +113,62 @@ PRECIP_STRONG_THRESHOLD = 5.0
 PRECIP_WEAK_THRESHOLD = 1.0
 PRECIP_HEAVY_THRESHOLD = 20.0
 PRECIP_PDF_BINS = np.linspace(0.0, 120.0, 121)
+PRECIP_PDF_PLOT_MAX = 35.0
+PRECIP_PDF_SYMLOG_LINTHRESH = 1.0e-3
+
+BASIC_CONVECTION_PDF_SPECS = [
+    dict(name="Precip", label="Precipitation", units="mm day-1", bins=np.linspace(0.0, 80.0, 121), symlog=True),
+    dict(name="OLR", label="OLR", units="W m-2", bins=np.linspace(100.0, 350.0, 121), symlog=False),
+    dict(name="PW", label="Precipitable water", units="kg m-2", bins=np.linspace(0.0, 80.0, 121), symlog=False),
+    dict(name="CAPE", label="CAPE", units="J kg-1", bins=np.linspace(0.0, 5000.0, 121), symlog=False),
+]
+WAVENUMBER_FIELDS = ["Precip", "OLR", "PW"]
+WAVENUMBER_LAT_BOUNDS = (-10.0, 10.0)
+WAVENUMBER_MAX_K = 15
+
+WAVE_PROFILE_WAVES = ["Kelvin", "ER", "AD_sym", "AD_antisym"]
+WAVE_PROFILE_FIELDS = [
+    dict(name="u", prefix="u", units="m s-1"),
+    dict(name="T", prefix="T", units="K"),
+    dict(name="w", prefix="w", units="m s-1"),
+]
+WAVE_PROFILE_LEVELS_HPA = [100, 150, 200, 250, 300, 500, 700, 850]
+
+WAVE_LAG_WAVES = ["Kelvin", "ER", "AD_sym", "AD_antisym"]
+WAVE_LAG_TARGET_FIELDS = ["Precip", "OLR", "PW"]
+WAVE_LAG_MAX_DAYS = 8.0
+WAVE_LAG_BLOCK_DAYS = 30.0
+
+ORGANISATION_OUTPUT_DIR = "/home/cwp29/tmp/mpas/crf_on/final/organisation"
+ORGANISATION_TIMESERIES_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_lorg_timeseries.csv")
+ORGANISATION_TRACKS_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_track_lifetimes.csv")
+ORGANISATION_BLOCK_DAYS = 5.0
+ORGANISATION_CONDITION_NBINS = 4
+ORGANISATION_MIN_CONDITION_SAMPLES = 3
+ORGANISATION_METRIC_SPECS = [
+    ("lorg_km", "km"),
+    ("lorg_normalised", ""),
+    ("object_count", "count"),
+    ("mean_object_area_km2", "km2"),
+    ("median_object_area_km2", "km2"),
+    ("largest_object_area_km2", "km2"),
+    ("largest_object_fraction", "fraction"),
+    ("convective_area_fraction", "fraction"),
+]
+ORGANISATION_TRACK_METRIC_SPECS = [
+    ("lifetime_hours", "h"),
+    ("max_area_km2", "km2"),
+    ("mean_area_km2", "km2"),
+    ("area_time_km2_h", "km2 h"),
+    ("precip_area_rate_time", "mm day-1 km2 h"),
+    ("starts_as_split", "fraction"),
+    ("ends_as_merge", "fraction"),
+    ("complete_lifecycle", "fraction"),
+]
+# Track-persistence rows come from convective_organisation_diagnostics.py, which
+# uses PyFLEXTRKR overlap tracking to define object lifetimes. This script does
+# the across-time chunk-consistency check; it is not invoking a separate
+# PyFLEXTRKR statistical test.
 
 # Cloud-type thresholds copied from convective_pathway_diagnostics.py.
 CF_THRESH = 0.05
@@ -117,6 +184,7 @@ MAX_CLEAR_GAP_KM = 3.0
 ANVIL_RADIUS_DEG = 5.0
 ANVIL_TIME_STEPS = 1
 CLOUD_CLASSIFICATION_CACHE_DIRS = [
+    "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/classification_cache",
     "/home/cwp29/tmp/mpas/crf_on/final/convective_pathways/classification_cache",
     os.path.join(save_loc, "classification_cache"),
 ]
@@ -161,10 +229,10 @@ WAVE_LATITUDE_PROJECTION = {
     "AD_antisym": "antisymmetric",
     "ER": "symmetric",
 }
-WAVE_FIELDS = ["Precip", "OLR"]
+WAVE_FIELDS = ["Precip", "OLR", "PW"]
 
 needed_vars = [
-    "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw", "olrtoa",
+    "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw", "olrtoa", "cape",
     "qv", "qc", "qr", "qi", "qs", "qg", "relhum", "w",
     "theta", "pressure", "zgrid", "cldfrac",
     "uReconstructZonal", "uReconstructMeridional",
@@ -477,6 +545,30 @@ def rename_vertical_to_z(da):
     return da
 
 
+def assign_midlevel_height_from_zgrid(da, source_ds):
+    out = rename_vertical_to_z(da)
+    if "z" in out.coords:
+        zvals = np.asarray(out.z.values, dtype=float)
+        if zvals.size == out.sizes["z"] and np.nanmax(np.abs(zvals)) > 100.0:
+            return out
+
+    if "zgrid" not in source_ds.data_vars:
+        raise ValueError("zgrid is required to assign geometric height to model-level field")
+
+    zgrid = finite_or_nan(source_ds.zgrid)
+    mean_dims = [dim for dim in ("latitude", "longitude") if dim in zgrid.dims]
+    zgrid_mean = zgrid.mean(dim=mean_dims, skipna=True).load()
+    zmid = 0.5 * (
+        zgrid_mean.isel(nVertLevelsP1=slice(0, -1)).values
+        + zgrid_mean.isel(nVertLevelsP1=slice(1, None)).values
+    )
+    if out.sizes["z"] != zmid.size:
+        raise ValueError(
+            f"model-level field has {out.sizes['z']} levels but zgrid implies {zmid.size}"
+        )
+    return out.assign_coords(z=("z", zmid))
+
+
 def zm_temperature(zds):
     missing = [name for name in ("theta", "pressure") if name not in zds.data_vars]
     if missing:
@@ -544,6 +636,21 @@ def field_from_candidates(zds, candidates, name, scale=1.0):
     raise ValueError(f"None of {candidates} available")
 
 
+def latlon_field_from_candidates(ds, candidates, name, scale=1.0):
+    for candidate in candidates:
+        if candidate in ds.data_vars:
+            out = assign_midlevel_height_from_zgrid(finite_or_nan(ds[candidate]), ds) * scale
+            out.name = name
+            return out
+    raise ValueError(f"None of {candidates} available")
+
+
+def water_vapour_field(ds, zds):
+    if "qv" in zds.data_vars:
+        return field_from_candidates(zds, ("qv",), "water_vapour", scale=1000.0)
+    return latlon_field_from_candidates(ds, ("qv",), "water_vapour", scale=1000.0)
+
+
 LATHEIGHT_FIELD_SPECS = [
     dict(name="temperature", label="Temperature", units="K", diff_fallback=2.0,
          getter=lambda ds, zds: zm_temperature(zds), parity="even"),
@@ -556,7 +663,7 @@ LATHEIGHT_FIELD_SPECS = [
     dict(name="relative_humidity", label="Relative humidity", units="%", diff_fallback=10.0,
          getter=lambda ds, zds: field_from_candidates(zds, ("relhum",), "relative_humidity"), parity="even"),
     dict(name="water_vapour", label="Water vapour", units="g kg-1", diff_fallback=1.0,
-         getter=lambda ds, zds: field_from_candidates(zds, ("qv",), "water_vapour", scale=1000.0), parity="even"),
+         getter=water_vapour_field, parity="even"),
     dict(name="vertical_velocity", label="Vertical velocity", units="m s-1", diff_fallback=0.01,
          getter=lambda ds, zds: zm_vertical_velocity(zds), parity="even"),
     dict(name="cloud_fraction", label="Cloud fraction", units="fraction", diff_fallback=0.05,
@@ -603,7 +710,11 @@ def symmetric_field_levels(fields, fallback=1.0, percentile=99.0, ndiv=16):
 def plot_latheight_bootstrap(spec, diff_by_comparison):
     if not should_run_figure(1):
         return
-    comp_items = [(name, label, ds) for name, _, _, label in COMPARISONS if name in diff_by_comparison]
+    comp_items = [
+        (name, label, diff_by_comparison[name])
+        for name, _, _, label in COMPARISONS
+        if name in diff_by_comparison
+    ]
     if not comp_items:
         return
 
@@ -636,8 +747,8 @@ def plot_latheight_bootstrap(spec, diff_by_comparison):
     axes[0].set_ylabel("Height (km)")
     add_symmetric_colorbar(fig, last_im, axes, levels, label=f"{spec['label']} response ({spec['units']})")
     fig.suptitle(
-        f"{spec['label']}: mean response; hatching = CI excludes zero and "
-        f"bootstrap sign >= {ROBUST_SIGN_THRESHOLD:.2f}"
+        f"{spec['label']}: mean response; hatching = block-resampling interval excludes zero and "
+        f"sign consistency >= {ROBUST_SIGN_THRESHOLD:.2f}"
     )
     figsave.save(fig, f"mean_state_{spec['name']}_bootstrap_latheight", number=1)
     plt.close(fig)
@@ -769,14 +880,29 @@ def plot_precip_pdf_differences(pdf_diffs):
     for comp_name, ds in pdf_diffs.items():
         label = next(label for name, _, _, label in COMPARISONS if name == comp_name)
         x = ds.precip_bin.values
+        plot_mask = x <= PRECIP_PDF_PLOT_MAX
         y = ds.mean_response.values
-        ax.plot(x, y, color=colors_by_comp.get(comp_name, "k"), lw=1.4, label=label)
-        ax.fill_between(x, ds.ci_low.values, ds.ci_high.values, color=colors_by_comp.get(comp_name, "k"), alpha=0.12)
+        ax.plot(
+            x[plot_mask],
+            y[plot_mask],
+            color=colors_by_comp.get(comp_name, "k"),
+            lw=1.4,
+            label=label,
+        )
+        ax.fill_between(
+            x[plot_mask],
+            ds.ci_low.values[plot_mask],
+            ds.ci_high.values[plot_mask],
+            color=colors_by_comp.get(comp_name, "k"),
+            alpha=0.12,
+        )
     ax.axhline(0.0, color="0.6", lw=0.8)
-    ax.set_xlim(0.0, 80.0)
+    ax.set_xlim(0.0, PRECIP_PDF_PLOT_MAX)
+    ax.set_yscale("symlog", linthresh=PRECIP_PDF_SYMLOG_LINTHRESH)
+    ax.grid(alpha=0.18)
     ax.set_xlabel("Precipitation (mm day-1)")
-    ax.set_ylabel("PDF response")
-    ax.set_title("Tropical precipitation PDF bootstrap response")
+    ax.set_ylabel("PDF response (symlog)")
+    ax.set_title("Tropical precipitation PDF block-consistency response, low-rate focus")
     ax.legend(frameon=False, fontsize=8)
     figsave.save(fig, "precipitation_pdf_bootstrap_response", number=2)
     plt.close(fig)
@@ -821,11 +947,235 @@ def run_precipitation_response():
                 )
         save_table(pd.DataFrame(pdf_rows), "precipitation_pdf_bootstrap_response.csv")
         plot_precip_pdf_differences(pdf_diffs)
-        record_implemented("precipitation mean, variance, upper-tail, weak-rain fraction, and PDF bootstrap metrics")
+        record_implemented("precipitation mean, variance, upper-tail, weak-rain fraction, and PDF block-consistency metrics")
         return precip_by_run
     except Exception as exc:
         record_failure("precipitation response bootstrap", exc)
         return {}
+
+
+# -----------------------------------------------------------------------------
+# Basic convection distributions: PDFs of PR/OLR/PW/CAPE
+# -----------------------------------------------------------------------------
+
+def field_pdf_block_values(da, bins, lat_bounds=TROPICAL_LAT_BOUNDS):
+    x = subset_latitude(da, lat_bounds)
+    centres = 0.5 * (bins[:-1] + bins[1:])
+    blocks = []
+    for slc in block_slices(x):
+        vals = np.asarray(x.isel(Time=slc).values, dtype=float).ravel()
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            hist = np.full(centres.size, np.nan)
+        else:
+            hist, _ = np.histogram(vals, bins=bins, density=True)
+        blocks.append(xr.DataArray(hist, dims=("pdf_bin",), coords={"pdf_bin": centres}, name="pdf"))
+    return xr.concat(blocks, dim=xr.IndexVariable("block", np.arange(len(blocks))))
+
+
+def plot_basic_convection_pdf_differences(pdf_diffs_by_field):
+    if not should_run_figure(6) or not pdf_diffs_by_field:
+        return
+    nfields = len(pdf_diffs_by_field)
+    ncols = min(2, nfields)
+    nrows = int(np.ceil(nfields / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 3.2 * nrows), constrained_layout=True, squeeze=False)
+    colors_by_comp = {"u_minus_control": "b", "T_minus_control": "r", "u_minus_T": "0.2"}
+    spec_by_name = {spec["name"]: spec for spec in BASIC_CONVECTION_PDF_SPECS}
+
+    for ax, (field_name, diffs) in zip(axes.ravel(), pdf_diffs_by_field.items()):
+        spec = spec_by_name[field_name]
+        for comp_name, ds in diffs.items():
+            label = next(label for name, _, _, label in COMPARISONS if name == comp_name)
+            x = ds.pdf_bin.values
+            y = ds.mean_response.values
+            color = colors_by_comp.get(comp_name, "k")
+            ax.plot(x, y, color=color, lw=1.25, label=label)
+            ax.fill_between(x, ds.ci_low.values, ds.ci_high.values, color=color, alpha=0.12)
+        ax.axhline(0.0, color="0.6", lw=0.8)
+        ax.set_yscale("symlog", linthresh=1.0e-4)
+        if field_name == "Precip":
+            ax.set_xlim(0.0, PRECIP_PDF_PLOT_MAX)
+        ax.set_title(spec["label"])
+        ax.set_xlabel(f"{spec['label']} ({spec['units']})")
+        ax.set_ylabel("PDF response (symlog)")
+        ax.grid(alpha=0.18)
+    for ax in axes.ravel()[nfields:]:
+        ax.set_visible(False)
+    axes.ravel()[0].legend(frameon=False, fontsize=8)
+    fig.suptitle("Basic convective-regime PDF block-consistency responses")
+    figsave.save(fig, "basic_convection_pdf_bootstrap_response", number=6)
+    plt.close(fig)
+
+
+def run_basic_convection_pdf_bootstrap():
+    try:
+        rows = []
+        pdf_diffs_by_field = {}
+        rng = np.random.default_rng(BOOTSTRAP_SEED + 222)
+        for spec in BASIC_CONVECTION_PDF_SPECS:
+            try:
+                blocks_by_run = {
+                    i: field_pdf_block_values(get_surface_convection_field(dss[i], spec["name"]), spec["bins"])
+                    for i in range(len(dss))
+                }
+            except Exception as exc:
+                record_skip(f"basic convection PDF {spec['name']} ({exc})")
+                continue
+
+            diffs = {}
+            for comp_name, run_idx, ref_idx, comp_label in COMPARISONS:
+                ds = bootstrap_field_difference(blocks_by_run[run_idx], blocks_by_run[ref_idx], rng)
+                diffs[comp_name] = ds
+                for k, bin_center in enumerate(ds.pdf_bin.values):
+                    rows.append(
+                        {
+                            "field": spec["name"],
+                            "field_label": spec["label"],
+                            "units": spec["units"],
+                            "comparison": comp_name,
+                            "comparison_label": comp_label,
+                            "bin_center": float(bin_center),
+                            "mean_response": float(ds.mean_response.isel(pdf_bin=k).values),
+                            "ci_low": float(ds.ci_low.isel(pdf_bin=k).values),
+                            "ci_high": float(ds.ci_high.isel(pdf_bin=k).values),
+                            "sign_robustness": float(ds.sign_robustness.isel(pdf_bin=k).values),
+                            "robust": bool(ds.robust.isel(pdf_bin=k).values),
+                        }
+                    )
+            pdf_diffs_by_field[spec["name"]] = diffs
+
+        if rows:
+            save_table(pd.DataFrame(rows), "basic_convection_pdf_bootstrap_response.csv")
+            plot_basic_convection_pdf_differences(pdf_diffs_by_field)
+            record_implemented("basic convection PDF block-consistency metrics for precipitation, OLR, PW, and CAPE where available")
+    except Exception as exc:
+        record_failure("basic convection PDF bootstrap", exc)
+
+
+# -----------------------------------------------------------------------------
+# Basic organisation spectra: zonal and meridional wavenumber variance fractions
+# -----------------------------------------------------------------------------
+
+def spatial_wavenumber_fraction_from_series(x, spatial_dim, max_k=WAVENUMBER_MAX_K):
+    x = x - x.mean(dim="Time", skipna=True)
+    x = x.transpose("Time", spatial_dim)
+    arr = np.asarray(x.values, dtype=float)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected (Time, {spatial_dim}), got shape {arr.shape}")
+    if np.any(~np.isfinite(arr)):
+        row_mean = np.nanmean(arr, axis=1, keepdims=True)
+        arr = np.where(np.isfinite(arr), arr, row_mean)
+    arr = np.where(np.isfinite(arr), arr, 0.0)
+    fft = np.fft.rfft(arr, axis=1)
+    power = np.abs(fft) ** 2
+    if power.shape[1] > 2:
+        power[:, 1:-1] *= 2.0
+    pk = np.nanmean(power, axis=0)
+    denom = np.nansum(pk)
+    pk = pk / denom if denom > 0 else np.full_like(pk, np.nan)
+    kk = np.arange(pk.size)
+    keep = kk <= max_k
+    return kk[keep], pk[keep]
+
+
+def block_wavenumber_fraction_values(da, direction):
+    x = subset_latitude(da, WAVENUMBER_LAT_BOUNDS)
+    blocks = []
+    for slc in block_slices(x):
+        xb = x.isel(Time=slc)
+        if direction == "zonal":
+            series = weighted_mean_dims(xb, ["latitude"])
+            spatial_dim = "longitude"
+        elif direction == "meridional":
+            series = xb.mean(dim="longitude", skipna=True)
+            spatial_dim = "latitude"
+        else:
+            raise ValueError(f"unknown wavenumber direction {direction}")
+        k, frac = spatial_wavenumber_fraction_from_series(series, spatial_dim, max_k=WAVENUMBER_MAX_K)
+        blocks.append(
+            xr.DataArray(
+                frac,
+                dims=("wavenumber",),
+                coords={"wavenumber": k},
+                name=f"{direction}_wavenumber_variance_fraction",
+            )
+        )
+    return xr.concat(blocks, dim=xr.IndexVariable("block", np.arange(len(blocks))))
+
+
+def plot_wavenumber_bootstrap_differences(diff_by_direction_field):
+    if not should_run_figure(9) or not diff_by_direction_field:
+        return
+    fields = [field for field in WAVENUMBER_FIELDS if any((direction, field) in diff_by_direction_field for direction in ("zonal", "meridional"))]
+    directions = ["zonal", "meridional"]
+    fig, axes = plt.subplots(len(directions), len(fields), figsize=(3.7 * len(fields), 3.2 * len(directions)), constrained_layout=True, squeeze=False, sharey=True)
+    colors_by_comp = {"u_minus_control": "b", "T_minus_control": "r", "u_minus_T": "0.2"}
+    for ri, direction in enumerate(directions):
+        for ci, field in enumerate(fields):
+            ax = axes[ri, ci]
+            diffs = diff_by_direction_field.get((direction, field), {})
+            for comp_name, ds in diffs.items():
+                label = next(label for name, _, _, label in COMPARISONS if name == comp_name)
+                k = ds.wavenumber.values
+                color = colors_by_comp.get(comp_name, "k")
+                ax.plot(k, ds.mean_response.values, color=color, marker="o", ms=3, lw=1.1, label=label)
+                ax.fill_between(k, ds.ci_low.values, ds.ci_high.values, color=color, alpha=0.12)
+            ax.axhline(0.0, color="0.6", lw=0.8)
+            ax.set_title(f"{field}: {direction}")
+            ax.set_xlabel("Wavenumber")
+            ax.set_xlim(0, WAVENUMBER_MAX_K)
+            ax.grid(alpha=0.18)
+            if ci == 0:
+                ax.set_ylabel("Variance-fraction response")
+    axes[0, 0].legend(frameon=False, fontsize=8)
+    fig.suptitle("Tropical wavenumber variance-fraction block-consistency responses")
+    figsave.save(fig, "wavenumber_variance_fraction_bootstrap_response", number=9)
+    plt.close(fig)
+
+
+def run_wavenumber_variance_bootstrap():
+    try:
+        rows = []
+        diffs_by_direction_field = {}
+        rng = np.random.default_rng(BOOTSTRAP_SEED + 333)
+        for field_name in WAVENUMBER_FIELDS:
+            try:
+                field_by_run = {i: get_surface_convection_field(dss[i], field_name) for i in range(len(dss))}
+            except Exception as exc:
+                record_skip(f"wavenumber variance {field_name} ({exc})")
+                continue
+            for direction in ("zonal", "meridional"):
+                blocks_by_run = {
+                    i: block_wavenumber_fraction_values(field_by_run[i], direction)
+                    for i in range(len(dss))
+                }
+                diffs = {}
+                for comp_name, run_idx, ref_idx, comp_label in COMPARISONS:
+                    ds = bootstrap_field_difference(blocks_by_run[run_idx], blocks_by_run[ref_idx], rng)
+                    diffs[comp_name] = ds
+                    for k_index, wavenumber in enumerate(ds.wavenumber.values):
+                        rows.append(
+                            {
+                                "field": field_name,
+                                "direction": direction,
+                                "comparison": comp_name,
+                                "comparison_label": comp_label,
+                                "wavenumber": int(wavenumber),
+                                "mean_response": float(ds.mean_response.isel(wavenumber=k_index).values),
+                                "ci_low": float(ds.ci_low.isel(wavenumber=k_index).values),
+                                "ci_high": float(ds.ci_high.isel(wavenumber=k_index).values),
+                                "sign_robustness": float(ds.sign_robustness.isel(wavenumber=k_index).values),
+                                "robust": bool(ds.robust.isel(wavenumber=k_index).values),
+                            }
+                        )
+                diffs_by_direction_field[(direction, field_name)] = diffs
+        if rows:
+            save_table(pd.DataFrame(rows), "wavenumber_variance_fraction_bootstrap_response.csv")
+            plot_wavenumber_bootstrap_differences(diffs_by_direction_field)
+            record_implemented("zonal and meridional wavenumber variance-fraction block-consistency metrics for precipitation/OLR/PW")
+    except Exception as exc:
+        record_failure("wavenumber variance-fraction bootstrap", exc)
 
 
 # -----------------------------------------------------------------------------
@@ -1048,7 +1398,11 @@ def cloud_masks_from_cache(sim_name, precip_ref):
 def block_area_fraction_values(da):
     x = subset_latitude(da.astype(float), TROPICAL_LAT_BOUNDS)
     dims = [dim for dim in ("Time", "latitude", "longitude") if dim in x.dims]
-    return block_scalar_values(x, lambda xb: weighted_mean_dims(xb, dims))
+    return block_scalar_values(
+        x,
+        lambda xb: weighted_mean_dims(xb, dims),
+        block_days=CLOUD_TYPE_BLOCK_DAYS,
+    )
 
 
 def run_cloud_response(precip_by_run):
@@ -1078,7 +1432,7 @@ def run_cloud_response(precip_by_run):
             "tropical_high_cloud_fraction_12_18km",
             units="fraction",
         )
-        record_implemented("high-cloud fraction and vertical cloud-fraction profile bootstrap metrics")
+        record_implemented("high-cloud fraction and vertical cloud-fraction profile block-consistency metrics")
     except Exception as exc:
         record_failure("cloud fraction profile/depth bootstrap", exc)
 
@@ -1117,7 +1471,7 @@ def run_cloud_response(precip_by_run):
                 key,
                 units="fraction",
             )
-        record_implemented("column-connected, deep-convective, anvil, cirrus-like, and nonprecipitating high-cloud class bootstrap metrics")
+        record_implemented("cloud-class fraction block-consistency metrics, including passive high-cloud classes as cloud-regime checks rather than organisation checks")
     except Exception as exc:
         record_failure("cloud-type classification bootstrap", exc)
         record_todo(
@@ -1186,19 +1540,421 @@ def run_conditional_precipitation_states(precip_by_run):
                     state_name,
                     units=getattr(by_run[0], "units", ""),
                 )
-        record_implemented("strong-versus-weak precipitation conditional bootstrap metrics for precip/OLR/PW")
+        record_implemented("strong-versus-weak precipitation conditional block-consistency metrics for precip/OLR/PW")
         record_todo(
             "Kelvin-active versus inactive conditional bootstrap",
             "State-dependent changes can be hidden in small means, and Kelvin-active sampling directly tests wave-coupled convection.",
             "equatorial_wave_diagnostics.py by exposing cached Kelvin amplitude indices as import-safe block metrics",
         )
-        record_todo(
-            "Organised versus disorganised convection bootstrap",
-            "Organisation-conditioned changes test whether nudging affects intermittency and object clustering rather than only rain amount.",
-            "convective_organisation_diagnostics.py by writing a reusable per-time Lorg/object metric table",
-        )
     except Exception as exc:
         record_failure("conditional strong/weak precipitation bootstrap", exc)
+
+
+# -----------------------------------------------------------------------------
+# Convective organisation: cached Lorg/object metrics from organisation script
+# -----------------------------------------------------------------------------
+
+ORGANISATION_SOURCE_ORDER = [
+    "precip_ge_1mmh",
+    "precip_ge_2mmh",
+    "precip_ge_8mmh",
+    "olr_tb241",
+    "olr_tb233",
+    "olr_cold_p05",
+    "deep_convective_high_cloud_mask",
+    "column_connected_mask",
+    "high_cloud_mask",
+    "anvil_high_cloud_mask",
+    "precip_p95",
+    "precip_p99",
+]
+ORGANISATION_EXCLUDED_SOURCES = {
+    "cirrus_like_high_cloud_mask",
+    "nonprecipitating_high_cloud_mask",
+}
+ORGANISATION_CONTEXT_SOURCES = {
+    "high_cloud_mask",
+    "anvil_high_cloud_mask",
+}
+
+
+def load_organisation_timeseries():
+    if not os.path.exists(ORGANISATION_TIMESERIES_FILE):
+        record_skip(
+            "convective organisation bootstrap "
+            f"({ORGANISATION_TIMESERIES_FILE} not found; run convective_organisation_diagnostics.py first)"
+        )
+        record_todo(
+            "Import-safe organisation metric builder",
+            "Organisation changes are scientifically useful only if object metrics can be tested against internal variability without rerunning every figure workflow.",
+            "convective_organisation_diagnostics.py by exposing a reusable metric-table builder/cache interface",
+        )
+        return None
+
+    df = pd.read_csv(ORGANISATION_TIMESERIES_FILE)
+    required = {"source", "source_label", "simulation", "time_days"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"organisation timeseries is missing columns: {missing}")
+
+    df = df[df["simulation"].isin(sim_names)].copy()
+    for col in (
+        ["time_days", "tropical_mean_precip", "convective_area_fraction"]
+        + [metric for metric, _ in ORGANISATION_METRIC_SPECS]
+    ):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def load_organisation_tracks():
+    if not os.path.exists(ORGANISATION_TRACKS_FILE):
+        record_skip(
+            "convective organisation PyFLEXTRKR-method track block-consistency diagnostics "
+            f"({ORGANISATION_TRACKS_FILE} not found; run convective_organisation_diagnostics.py first)"
+        )
+        return None
+
+    df = pd.read_csv(ORGANISATION_TRACKS_FILE)
+    required = {"source", "source_label", "simulation", "track_id"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"organisation track table is missing columns: {missing}")
+
+    df = df[df["simulation"].isin(sim_names)].copy()
+    for col in ["starts_as_split", "ends_as_merge"]:
+        if col in df.columns:
+            if df[col].dtype == bool:
+                df[col] = df[col].astype(float)
+            else:
+                text = df[col].astype(str).str.lower()
+                df[col] = np.where(text.isin(["true", "1", "yes"]), 1.0, np.where(text.isin(["false", "0", "no"]), 0.0, np.nan))
+    if "starts_as_split" in df.columns and "ends_as_merge" in df.columns:
+        df["complete_lifecycle"] = np.where(
+            np.isfinite(df["starts_as_split"]) & np.isfinite(df["ends_as_merge"]),
+            ((df["starts_as_split"] == 0.0) & (df["ends_as_merge"] == 0.0)).astype(float),
+            np.nan,
+        )
+    for col in [metric for metric, _ in ORGANISATION_TRACK_METRIC_SPECS]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def organisation_source_label(df, source):
+    sub = df[df["source"] == source]
+    if len(sub) == 0 or "source_label" not in sub.columns:
+        return source
+    vals = sub["source_label"].dropna().unique()
+    return str(vals[0]) if len(vals) else source
+
+
+def dataframe_time_block_values(
+    sub,
+    metric,
+    block_days=ORGANISATION_BLOCK_DAYS,
+    condition_key=None,
+    bin_edges=None,
+    bin_index=None,
+):
+    sub = sub.sort_values("time_days")
+    sub = sub[np.isfinite(sub["time_days"].values)]
+    if len(sub) == 0:
+        raise ValueError(f"no finite times for {metric}")
+
+    unique_times = np.unique(np.asarray(sub["time_days"].values, dtype=float))
+    dt_values = np.diff(unique_times)
+    dt_values = dt_values[np.isfinite(dt_values) & (dt_values > 0.0)]
+    dt_days = float(np.nanmedian(dt_values)) if dt_values.size else dt / 24.0
+    block_len = max(1, int(round(block_days / dt_days)))
+    nblocks = len(sub) // block_len
+    if nblocks < MIN_BLOCKS:
+        raise ValueError(
+            f"Only {nblocks} complete organisation blocks for {metric}; "
+            f"need at least {MIN_BLOCKS}."
+        )
+
+    vals = []
+    for bi in range(nblocks):
+        block = sub.iloc[bi * block_len:(bi + 1) * block_len]
+        if condition_key is not None:
+            lo = bin_edges[bin_index]
+            hi = bin_edges[bin_index + 1]
+            cond = block[condition_key]
+            if bin_index == len(bin_edges) - 2:
+                keep = (cond >= lo) & (cond <= hi)
+            else:
+                keep = (cond >= lo) & (cond < hi)
+            block = block[keep]
+            if len(block) < ORGANISATION_MIN_CONDITION_SAMPLES:
+                vals.append(np.nan)
+                continue
+        values = np.asarray(block[metric].values, dtype=float)
+        values = values[np.isfinite(values)]
+        vals.append(np.nanmean(values) if values.size else np.nan)
+
+    vals = np.asarray(vals, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size < MIN_BLOCKS:
+        raise ValueError(
+            f"Only {vals.size} finite organisation blocks for {metric}; "
+            f"need at least {MIN_BLOCKS}."
+        )
+    return vals
+
+
+def organisation_condition_edges(df, source, condition_key):
+    sub = df[df["source"] == source]
+    values = np.asarray(sub[condition_key].values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size < ORGANISATION_CONDITION_NBINS:
+        return None
+    edges = np.unique(np.nanpercentile(values, np.linspace(0.0, 100.0, ORGANISATION_CONDITION_NBINS + 1)))
+    return edges if edges.size >= 3 else None
+
+
+def ordered_organisation_sources(df):
+    present = set(df["source"].dropna().unique())
+    usable = present - ORGANISATION_EXCLUDED_SOURCES
+    ordered = [source for source in ORGANISATION_SOURCE_ORDER if source in usable]
+    ordered.extend(sorted(usable - set(ordered)))
+    return ordered
+
+
+def note_skipped_organisation_sources(df):
+    present = set(df["source"].dropna().unique())
+    skipped = sorted(present & ORGANISATION_EXCLUDED_SOURCES)
+    if skipped:
+        record_skip(
+            "organisation/Lorg metrics for passive high-cloud classes "
+            f"({', '.join(skipped)} are cloud-regime diagnostics, not convective-organisation diagnostics)"
+        )
+
+
+def organisation_source_role(source):
+    if source in ORGANISATION_CONTEXT_SOURCES:
+        return "cloud_context"
+    return "convective_proxy"
+
+
+def plot_organisation_bootstrap_summary(org_df, org_source_labels):
+    if not should_run_figure(5) or len(org_df) == 0:
+        return
+
+    display_metrics = [
+        ("lorg_km", "Lorg (km)"),
+        ("object_count", "Object count"),
+        ("convective_area_fraction", "Convective area fraction"),
+        ("largest_object_fraction", "Largest-object fraction"),
+    ]
+    plot_df = org_df[
+        (org_df["category"] == "convective_organisation")
+        & (org_df["metric"].isin([metric for metric, _ in display_metrics]))
+    ].copy()
+    if len(plot_df) == 0:
+        return
+
+    sources = [source for source in org_source_labels if source in set(plot_df["diagnostic"])]
+    if not sources:
+        sources = sorted(plot_df["diagnostic"].unique())
+
+    fig, axes = plt.subplots(
+        len(display_metrics),
+        1,
+        figsize=(8.2, max(6.0, 1.85 * len(display_metrics) + 0.34 * len(sources))),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    offsets = {"u_minus_control": -0.24, "T_minus_control": 0.0, "u_minus_T": 0.24}
+    colors_by_comp = {"u_minus_control": "b", "T_minus_control": "r", "u_minus_T": "0.2"}
+    ybase = np.arange(len(sources), dtype=float)
+
+    for ax, (metric, label) in zip(axes.ravel(), display_metrics):
+        sub_metric = plot_df[plot_df["metric"] == metric]
+        for comp_name, _, _, comp_label in COMPARISONS:
+            sub = sub_metric[sub_metric["comparison"] == comp_name]
+            if len(sub) == 0:
+                continue
+            yvals = []
+            xvals = []
+            xerr_low = []
+            xerr_high = []
+            robust = []
+            for si, source in enumerate(sources):
+                row = sub[sub["diagnostic"] == source]
+                if len(row) == 0:
+                    continue
+                row = row.iloc[0]
+                x = float(row["mean_response"])
+                yvals.append(ybase[si] + offsets[comp_name])
+                xvals.append(x)
+                xerr_low.append(max(0.0, x - float(row["ci_low"])))
+                xerr_high.append(max(0.0, float(row["ci_high"]) - x))
+                robust.append(bool(row["robust"]))
+            if not xvals:
+                continue
+            color = colors_by_comp.get(comp_name, "k")
+            ax.errorbar(
+                xvals,
+                yvals,
+                xerr=[xerr_low, xerr_high],
+                fmt="o",
+                ms=4.0,
+                color=color,
+                ecolor=color,
+                elinewidth=1.0,
+                capsize=2,
+                label=comp_label,
+            )
+            for x, y, is_robust in zip(xvals, yvals, robust):
+                if not is_robust:
+                    ax.plot(x, y, marker="o", ms=4.5, mfc="white", mec=color, mew=1.0, linestyle="none")
+        ax.axvline(0.0, color="0.55", lw=0.8)
+        ax.set_yticks(ybase)
+        ax.set_yticklabels([org_source_labels.get(source, source) for source in sources])
+        ax.invert_yaxis()
+        ax.grid(axis="x", alpha=0.18)
+        ax.set_xlabel(f"{label} response")
+    axes.ravel()[0].legend(frameon=False, fontsize=8, loc="best")
+    fig.suptitle("Convective/object organisation block-consistency response; filled points pass the chunk-consistency rule")
+    figsave.save(fig, "organisation_bootstrap_summary", number=5)
+    plt.close(fig)
+
+
+def run_convective_organisation_bootstrap():
+    try:
+        org = load_organisation_timeseries()
+        if org is None or len(org) == 0:
+            return
+
+        note_skipped_organisation_sources(org)
+        sources = ordered_organisation_sources(org)
+        source_labels = {source: organisation_source_label(org, source) for source in sources}
+        org_row_start = len(scalar_metric_rows)
+        skipped_pairs = 0
+
+        for source in sources:
+            sub_source = org[org["source"] == source]
+            for metric, units in ORGANISATION_METRIC_SPECS:
+                if metric not in sub_source.columns:
+                    continue
+                values_by_run = {}
+                for i, sim_name in enumerate(sim_names):
+                    sub = sub_source[sub_source["simulation"] == sim_name]
+                    try:
+                        values_by_run[i] = dataframe_time_block_values(sub, metric)
+                    except ValueError:
+                        skipped_pairs += 1
+                        values_by_run = None
+                        break
+                if values_by_run is None:
+                    continue
+                append_bootstrap_metric_rows(
+                    scalar_metric_rows,
+                    values_by_run,
+                    "convective_organisation",
+                    source,
+                    metric,
+                    units=units,
+                    extra={
+                        "source_label": source_labels[source],
+                        "organisation_role": organisation_source_role(source),
+                    },
+                )
+
+            for condition_key, condition_label in (
+                ("tropical_mean_precip", "fixed_tropical_mean_precip"),
+                ("convective_area_fraction", "fixed_convective_area_fraction"),
+            ):
+                if condition_key not in sub_source.columns:
+                    continue
+                edges = organisation_condition_edges(org, source, condition_key)
+                if edges is None:
+                    continue
+                for bin_index in range(len(edges) - 1):
+                    values_by_run = {}
+                    for i, sim_name in enumerate(sim_names):
+                        sub = sub_source[sub_source["simulation"] == sim_name]
+                        try:
+                            values_by_run[i] = dataframe_time_block_values(
+                                sub,
+                                "lorg_km",
+                                condition_key=condition_key,
+                                bin_edges=edges,
+                                bin_index=bin_index,
+                            )
+                        except ValueError:
+                            skipped_pairs += 1
+                            values_by_run = None
+                            break
+                    if values_by_run is None:
+                        continue
+                    append_bootstrap_metric_rows(
+                        scalar_metric_rows,
+                        values_by_run,
+                        "convective_organisation_conditioned",
+                        source,
+                        "lorg_km",
+                        units="km",
+                        extra={
+                            "source_label": source_labels[source],
+                            "organisation_role": organisation_source_role(source),
+                            "condition": condition_label,
+                            "bin_index": bin_index,
+                            "bin_low": float(edges[bin_index]),
+                            "bin_high": float(edges[bin_index + 1]),
+                            "bin_center": float(0.5 * (edges[bin_index] + edges[bin_index + 1])),
+                        },
+                    )
+
+        tracks = load_organisation_tracks()
+        if tracks is not None and len(tracks) > 0:
+            note_skipped_organisation_sources(tracks)
+            for source in ordered_organisation_sources(tracks):
+                source_labels.setdefault(source, organisation_source_label(tracks, source))
+                sub_source = tracks[tracks["source"] == source]
+                for metric, units in ORGANISATION_TRACK_METRIC_SPECS:
+                    if metric not in sub_source.columns:
+                        continue
+                    values_by_run = {}
+                    for i, sim_name in enumerate(sim_names):
+                        vals = np.asarray(sub_source.loc[sub_source["simulation"] == sim_name, metric].values, dtype=float)
+                        vals = vals[np.isfinite(vals)]
+                        if vals.size < MIN_BLOCKS:
+                            skipped_pairs += 1
+                            values_by_run = None
+                            break
+                        values_by_run[i] = vals
+                    if values_by_run is None:
+                        continue
+                    append_bootstrap_metric_rows(
+                        scalar_metric_rows,
+                        values_by_run,
+                        "convective_organisation_persistence",
+                        source,
+                        metric,
+                        units=units,
+                        extra={
+                            "source_label": source_labels[source],
+                            "organisation_role": organisation_source_role(source),
+                        },
+                    )
+
+        org_df = pd.DataFrame(scalar_metric_rows[org_row_start:])
+        if len(org_df) == 0:
+            record_skip("convective organisation bootstrap (no source had enough finite time blocks)")
+            return
+        save_table(org_df, "organisation_bootstrap_metrics.csv")
+        plot_organisation_bootstrap_summary(org_df, source_labels)
+        message = (
+            "convective-organisation block-consistency checks for Lorg/object metrics, PyFLEXTRKR-method "
+            "track-persistence metrics, plus Lorg conditioned on tropical-mean precipitation and convective area fraction"
+        )
+        if skipped_pairs:
+            message += f" ({skipped_pairs} source/metric/bin entries skipped for insufficient blocks)"
+        record_implemented(message)
+    except Exception as exc:
+        record_failure("convective organisation bootstrap", exc)
 
 
 # -----------------------------------------------------------------------------
@@ -1219,14 +1975,56 @@ def safe_name(text):
     return str(text).replace(" ", "_").replace("/", "-").replace(".", "p").replace("-", "m")
 
 
-def get_wave_filter_field(ds, field_name):
+def get_surface_convection_field(ds, field_name, ref=None):
     pr = get_precip_rate(ds)
     if field_name == "Precip":
         return pr
-    if field_name == "OLR":
-        if "olrtoa" not in ds.data_vars:
-            raise ValueError("olrtoa unavailable")
-        return finite_or_nan(ds.olrtoa).sel(Time=pr.Time)
+    aliases = {
+        "OLR": ("olrtoa", "olr", "OLR"),
+        "PW": ("precipw", "pw", "prw"),
+        "CAPE": ("cape",),
+    }
+    for name in aliases.get(field_name, (field_name,)):
+        if name in ds.data_vars:
+            out = finite_or_nan(ds[name])
+            if ref is not None and "Time" in out.dims and "Time" in ref.dims:
+                out = out.sel(Time=ref.Time)
+            elif "Time" in out.dims and "Time" in pr.dims:
+                out = out.sel(Time=pr.Time)
+            out.name = field_name
+            return out
+    raise ValueError(f"{field_name} unavailable")
+
+
+def get_wave_filter_field(ds, field_name):
+    pr = get_precip_rate(ds)
+    if field_name in ("Precip", "OLR", "PW", "CAPE"):
+        return get_surface_convection_field(ds, field_name, ref=pr)
+
+    pressure_fields = [
+        ("w", None),
+        ("u", "uzonal_isobaric"),
+        ("v", "umeridional_isobaric"),
+        ("T", "t_isobaric"),
+        ("qv", "qv_isobaric"),
+        ("RH", "rh_isobaric"),
+    ]
+    for prefix, var in pressure_fields:
+        if not field_name.startswith(prefix):
+            continue
+        level_text = field_name[len(prefix):]
+        if not level_text:
+            continue
+        plev = float(level_text)
+        if var is None:
+            out = vertical_velocity_at_pressure(ds, plev).sel(Time=pr.Time)
+        else:
+            if var not in ds.data_vars:
+                raise ValueError(f"{var} unavailable")
+            out = finite_or_nan(ds[var]).sel(pres=plev, method="nearest").sel(Time=pr.Time)
+        out.name = field_name
+        return out
+
     raise ValueError(f"Unsupported wave field {field_name}")
 
 
@@ -1314,7 +2112,7 @@ def block_variance_values(da):
 
 def run_wave_pathway():
     if kf_filter is None:
-        record_skip("wave-mediated bootstrap (waveFilter.kf_filter unavailable)")
+        record_skip("wave-mediated block-consistency diagnostics (waveFilter.kf_filter unavailable)")
         record_todo(
             "CCEW wave-box bootstrap",
             "Integrated wave-box variance tests whether nudged responses are tied to organised equatorial wave-coupled convection.",
@@ -1361,7 +2159,7 @@ def run_wave_pathway():
         wave_df = pd.DataFrame(wave_rows)
         save_table(wave_df, "wave_box_variance_bootstrap_metrics.csv")
         plot_wave_summary(wave_df)
-        record_implemented("integrated Kelvin/CCEW-filtered Precip and OLR wave-box variance bootstrap metrics")
+        record_implemented("integrated Kelvin/CCEW-filtered Precip, OLR, and PW wave-power and variance-fraction block-consistency metrics")
     except Exception as exc:
         record_failure("wave-mediated pathway bootstrap", exc)
 
@@ -1370,49 +2168,296 @@ def plot_wave_summary(wave_df):
     if not should_run_figure(4) or len(wave_df) == 0:
         return
     sub = wave_df[
-        (wave_df["metric"] == "wave_variance_fraction")
+        (wave_df["metric"].isin(["wave_variance", "wave_variance_fraction"]))
         & (wave_df["comparison"].isin(["u_minus_control", "T_minus_control"]))
     ].copy()
     if len(sub) == 0:
         return
     waves = list(WAVE_BOXES)
-    fields = sorted(sub["diagnostic"].unique())
-    fig, axes = plt.subplots(len(fields), 1, figsize=(7.2, 3.0 * len(fields)), constrained_layout=True, sharex=True)
-    if len(fields) == 1:
-        axes = [axes]
+    fields = [field for field in WAVE_FIELDS if field in set(sub["diagnostic"])]
+    metrics = [
+        ("wave_variance", "Wave-power response"),
+        ("wave_variance_fraction", "Wave-fraction response"),
+    ]
+    fig, axes = plt.subplots(
+        len(fields), len(metrics),
+        figsize=(7.2 * len(metrics), 3.0 * len(fields)),
+        constrained_layout=True,
+        sharex=True,
+        squeeze=False,
+    )
     offsets = {"u_minus_control": -0.15, "T_minus_control": 0.15}
     colors_by_comp = {"u_minus_control": "b", "T_minus_control": "r"}
     x = np.arange(len(waves))
-    for ax, field in zip(axes, fields):
-        for comp in ("u_minus_control", "T_minus_control"):
-            y = []
-            err_low = []
-            err_high = []
-            for wave in waves:
-                row = sub[(sub["diagnostic"] == field) & (sub["comparison"] == comp) & (sub["wave"] == wave)]
-                if len(row) == 0:
-                    y.append(np.nan)
-                    err_low.append(np.nan)
-                    err_high.append(np.nan)
-                    continue
-                row = row.iloc[0]
-                y.append(row["mean_response"])
-                err_low.append(row["mean_response"] - row["ci_low"])
-                err_high.append(row["ci_high"] - row["mean_response"])
-            label = next(label for name, _, _, label in COMPARISONS if name == comp)
-            ax.errorbar(
-                x + offsets[comp], y, yerr=[err_low, err_high], fmt="o",
-                color=colors_by_comp[comp], label=label, capsize=2
-            )
-        ax.axhline(0.0, color="0.6", lw=0.8)
-        ax.set_ylabel(f"{field}\nwave-fraction response")
-        ax.grid(axis="y", alpha=0.2)
-        ax.legend(frameon=False, fontsize=8)
-    axes[-1].set_xticks(x)
-    axes[-1].set_xticklabels([WAVE_BOXES[w]["label"] for w in waves], rotation=25, ha="right")
-    fig.suptitle("CCEW wave-box variance-fraction bootstrap response")
+    for ri, field in enumerate(fields):
+        for ci, (metric, metric_label) in enumerate(metrics):
+            ax = axes[ri, ci]
+            metric_sub = sub[(sub["diagnostic"] == field) & (sub["metric"] == metric)]
+            for comp in ("u_minus_control", "T_minus_control"):
+                y = []
+                err_low = []
+                err_high = []
+                for wave in waves:
+                    row = metric_sub[(metric_sub["comparison"] == comp) & (metric_sub["wave"] == wave)]
+                    if len(row) == 0:
+                        y.append(np.nan)
+                        err_low.append(np.nan)
+                        err_high.append(np.nan)
+                        continue
+                    row = row.iloc[0]
+                    y.append(row["mean_response"])
+                    err_low.append(row["mean_response"] - row["ci_low"])
+                    err_high.append(row["ci_high"] - row["mean_response"])
+                label = next(label for name, _, _, label in COMPARISONS if name == comp)
+                ax.errorbar(
+                    x + offsets[comp], y, yerr=[err_low, err_high], fmt="o",
+                    color=colors_by_comp[comp], label=label, capsize=2
+                )
+            ax.axhline(0.0, color="0.6", lw=0.8)
+            ax.set_ylabel(f"{field}\n{metric_label}")
+            ax.grid(axis="y", alpha=0.2)
+            if ri == 0:
+                ax.set_title(metric_label)
+            if ri == len(fields) - 1:
+                ax.set_xticks(x)
+                ax.set_xticklabels([WAVE_BOXES[w]["label"] for w in waves], rotation=25, ha="right")
+            if ri == 0 and ci == 0:
+                ax.legend(frameon=False, fontsize=8)
+    fig.suptitle("CCEW wave-box block-consistency response: power changes relative to control and variance fractions")
     figsave.save(fig, "wave_box_variance_fraction_bootstrap_summary", number=4)
     plt.close(fig)
+
+
+def wave_profile_field_name(field_spec, level_hpa):
+    return f"{field_spec['prefix']}{float(level_hpa):g}".replace(".", "p")
+
+
+def plot_vertical_wave_power_profiles(profile_df):
+    if not should_run_figure(7) or len(profile_df) == 0:
+        return
+    plot_df = profile_df[
+        (profile_df["comparison"].isin(["u_minus_control", "T_minus_control"]))
+        & (profile_df["metric"] == "wave_variance")
+    ].copy()
+    if len(plot_df) == 0:
+        return
+    fields = [spec["name"] for spec in WAVE_PROFILE_FIELDS if spec["name"] in set(plot_df["field"])]
+    waves = [wave for wave in WAVE_PROFILE_WAVES if wave in set(plot_df["wave"])]
+    fig, axes = plt.subplots(
+        len(fields), len(waves),
+        figsize=(3.4 * len(waves), 3.0 * len(fields)),
+        constrained_layout=True,
+        squeeze=False,
+        sharey=True,
+    )
+    colors_by_comp = {"u_minus_control": "b", "T_minus_control": "r"}
+    for fi, field in enumerate(fields):
+        for wi, wave in enumerate(waves):
+            ax = axes[fi, wi]
+            for comp in ("u_minus_control", "T_minus_control"):
+                sub = plot_df[(plot_df["field"] == field) & (plot_df["wave"] == wave) & (plot_df["comparison"] == comp)].sort_values("pressure_hpa")
+                if len(sub) == 0:
+                    continue
+                color = colors_by_comp[comp]
+                label = next(text for name, _, _, text in COMPARISONS if name == comp)
+                ax.plot(sub["mean_response"], sub["pressure_hpa"], color=color, marker="o", ms=3, lw=1.1, label=label)
+                ax.fill_betweenx(sub["pressure_hpa"], sub["ci_low"], sub["ci_high"], color=color, alpha=0.12)
+            ax.axvline(0.0, color="0.6", lw=0.8)
+            ax.invert_yaxis()
+            ax.set_yscale("log")
+            ax.set_ylim(max(WAVE_PROFILE_LEVELS_HPA), min(WAVE_PROFILE_LEVELS_HPA))
+            ax.grid(alpha=0.18)
+            if fi == 0:
+                ax.set_title(wave_label(wave))
+            if wi == 0:
+                ax.set_ylabel(f"{field}\nPressure (hPa)")
+            if fi == len(fields) - 1:
+                ax.set_xlabel("Wave-power response")
+    axes[0, 0].legend(frameon=False, fontsize=8)
+    fig.suptitle("Vertical wave-power profile block-consistency response relative to control")
+    figsave.save(fig, "vertical_wave_power_profile_bootstrap_response", number=7)
+    plt.close(fig)
+
+
+def run_vertical_wave_power_profile_bootstrap():
+    if kf_filter is None:
+        record_skip("vertical wave-power profile block-consistency diagnostics (waveFilter.kf_filter unavailable)")
+        return
+    try:
+        rows = []
+        for wave_name in WAVE_PROFILE_WAVES:
+            for field_spec in WAVE_PROFILE_FIELDS:
+                for level_hpa in WAVE_PROFILE_LEVELS_HPA:
+                    field_name = wave_profile_field_name(field_spec, level_hpa)
+                    try:
+                        values_by_run = {}
+                        for i in range(len(dss)):
+                            raw = get_wave_filter_field(dss[i], field_name)
+                            projected = project_wave_latitude(raw, wave_name)
+                            filtered = filter_projected_wave(projected, wave_name, i, field_name)
+                            values_by_run[i] = block_variance_values(filtered)
+                    except Exception as exc:
+                        record_skip(f"vertical wave power {field_name} {wave_name} ({exc})")
+                        continue
+
+                    before = len(scalar_metric_rows)
+                    append_bootstrap_metric_rows(
+                        scalar_metric_rows,
+                        values_by_run,
+                        "vertical_wave_power_profile",
+                        field_spec["name"],
+                        "wave_variance",
+                        units=f"{field_spec['units']} variance",
+                        extra={
+                            "field": field_spec["name"],
+                            "source_field": field_name,
+                            "pressure_hpa": float(level_hpa),
+                            "wave": wave_name,
+                            "wave_label": wave_label(wave_name),
+                            "latitude_projection": WAVE_LATITUDE_PROJECTION[wave_name],
+                        },
+                    )
+                    rows.extend(scalar_metric_rows[before:])
+        if rows:
+            df = pd.DataFrame(rows)
+            save_table(df, "vertical_wave_power_profile_bootstrap_metrics.csv")
+            plot_vertical_wave_power_profiles(df)
+            record_implemented("vertical wave-power profile block-consistency metrics for selected u/T/w pressure levels and dominant wave boxes")
+    except Exception as exc:
+        record_failure("vertical wave-power profile bootstrap", exc)
+
+
+def lag_correlation_for_lags(x, y, lag_steps):
+    xv = np.asarray(x, dtype=float)
+    yv = np.asarray(y, dtype=float)
+    out = np.full(lag_steps.size, np.nan)
+    for j, lag in enumerate(lag_steps):
+        if lag < 0:
+            xs, ys = xv[-lag:], yv[:lag]
+        elif lag > 0:
+            xs, ys = xv[:-lag], yv[lag:]
+        else:
+            xs, ys = xv, yv
+        ok = np.isfinite(xs) & np.isfinite(ys)
+        if np.count_nonzero(ok) >= 4:
+            out[j] = float(np.corrcoef(xs[ok], ys[ok])[0, 1])
+    return out
+
+
+def block_lag_correlation_values(wave_amp, target_ts):
+    wave_amp, target_ts = xr.align(wave_amp, target_ts, join="inner")
+    dt_days_here = time_step_days(wave_amp)
+    max_steps = max(1, int(round(WAVE_LAG_MAX_DAYS / dt_days_here)))
+    lag_steps = np.arange(-max_steps, max_steps + 1)
+    lag_days = lag_steps * dt_days_here
+    blocks = []
+    for slc in block_slices(wave_amp, block_days=WAVE_LAG_BLOCK_DAYS):
+        corr = lag_correlation_for_lags(
+            wave_amp.isel(Time=slc).values,
+            target_ts.isel(Time=slc).values,
+            lag_steps,
+        )
+        blocks.append(
+            xr.DataArray(corr, dims=("lag_days",), coords={"lag_days": lag_days}, name="lag_correlation")
+        )
+    return xr.concat(blocks, dim=xr.IndexVariable("block", np.arange(len(blocks))))
+
+
+def plot_wave_lag_correlation_differences(lag_diffs):
+    if not should_run_figure(8) or not lag_diffs:
+        return
+    waves = [wave for wave in WAVE_LAG_WAVES if any(key[0] == wave for key in lag_diffs)]
+    targets = [target for target in WAVE_LAG_TARGET_FIELDS if any(key[1] == target for key in lag_diffs)]
+    fig, axes = plt.subplots(
+        len(waves), len(targets),
+        figsize=(3.7 * len(targets), 2.5 * len(waves)),
+        constrained_layout=True,
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+    )
+    colors_by_comp = {"u_minus_control": "b", "T_minus_control": "r", "u_minus_T": "0.2"}
+    for wi, wave in enumerate(waves):
+        for ti, target in enumerate(targets):
+            ax = axes[wi, ti]
+            diffs = lag_diffs.get((wave, target), {})
+            for comp_name, ds in diffs.items():
+                label = next(label for name, _, _, label in COMPARISONS if name == comp_name)
+                color = colors_by_comp.get(comp_name, "k")
+                lag = ds.lag_days.values
+                ax.plot(lag, ds.mean_response.values, color=color, lw=1.1, label=label)
+                ax.fill_between(lag, ds.ci_low.values, ds.ci_high.values, color=color, alpha=0.12)
+            ax.axhline(0.0, color="0.6", lw=0.7)
+            ax.axvline(0.0, color="0.6", lw=0.7)
+            ax.grid(alpha=0.18)
+            if wi == 0:
+                ax.set_title(target)
+            if ti == 0:
+                ax.set_ylabel(f"{wave_label(wave)}\nCorrelation response")
+            if wi == len(waves) - 1:
+                ax.set_xlabel("Lag (days; + wave leads)")
+    axes[0, 0].legend(frameon=False, fontsize=8)
+    fig.suptitle("Wave-amplitude lag-correlation block-consistency response")
+    figsave.save(fig, "wave_lag_correlation_bootstrap_response", number=8)
+    plt.close(fig)
+
+
+def run_wave_lag_correlation_bootstrap():
+    if kf_filter is None:
+        record_skip("wave lag-correlation block-consistency diagnostics (waveFilter.kf_filter unavailable)")
+        return
+    try:
+        rows = []
+        lag_diffs = {}
+        rng = np.random.default_rng(BOOTSTRAP_SEED + 444)
+        for wave_name in WAVE_LAG_WAVES:
+            amp_by_run = {}
+            for i in range(len(dss)):
+                raw = get_wave_filter_field(dss[i], "Precip")
+                projected = project_wave_latitude(raw, wave_name)
+                filtered = filter_projected_wave(projected, wave_name, i, "Precip")
+                amp_by_run[i] = np.sqrt((filtered ** 2).mean(dim="longitude", skipna=True))
+                amp_by_run[i].name = "wave_amplitude"
+
+            for target_name in WAVE_LAG_TARGET_FIELDS:
+                try:
+                    blocks_by_run = {}
+                    for i in range(len(dss)):
+                        target_raw = get_wave_filter_field(dss[i], target_name)
+                        target_projected = project_wave_latitude(target_raw, wave_name)
+                        target_ts = target_projected.mean(dim="longitude", skipna=True)
+                        blocks_by_run[i] = block_lag_correlation_values(amp_by_run[i], target_ts)
+                except Exception as exc:
+                    record_skip(f"wave lag correlation {wave_name} {target_name} ({exc})")
+                    continue
+
+                diffs = {}
+                for comp_name, run_idx, ref_idx, comp_label in COMPARISONS:
+                    ds = bootstrap_field_difference(blocks_by_run[run_idx], blocks_by_run[ref_idx], rng)
+                    diffs[comp_name] = ds
+                    for lag_index, lag_day in enumerate(ds.lag_days.values):
+                        rows.append(
+                            {
+                                "wave": wave_name,
+                                "wave_label": wave_label(wave_name),
+                                "target": target_name,
+                                "comparison": comp_name,
+                                "comparison_label": comp_label,
+                                "lag_days": float(lag_day),
+                                "mean_response": float(ds.mean_response.isel(lag_days=lag_index).values),
+                                "ci_low": float(ds.ci_low.isel(lag_days=lag_index).values),
+                                "ci_high": float(ds.ci_high.isel(lag_days=lag_index).values),
+                                "sign_robustness": float(ds.sign_robustness.isel(lag_days=lag_index).values),
+                                "robust": bool(ds.robust.isel(lag_days=lag_index).values),
+                            }
+                        )
+                lag_diffs[(wave_name, target_name)] = diffs
+        if rows:
+            save_table(pd.DataFrame(rows), "wave_lag_correlation_bootstrap_metrics.csv")
+            plot_wave_lag_correlation_differences(lag_diffs)
+            record_implemented("wave-amplitude lag-correlation block-consistency metrics for precipitation/OLR/PW targets")
+    except Exception as exc:
+        record_failure("wave lag-correlation bootstrap", exc)
 
 
 # -----------------------------------------------------------------------------
@@ -1439,6 +2484,35 @@ def subset_latpres_domain(blocks, lat_bounds, p_bounds):
     if x.sizes.get("pres", 0) == 0 or x.sizes.get("latitude", 0) == 0:
         raise ValueError("empty matched-pattern domain")
     return x
+
+
+def pressure_layer_weights(pres):
+    if isinstance(pres, xr.DataArray):
+        pres_values = np.asarray(pres.values, dtype=float)
+        pres_coord = pres_values
+    else:
+        pres_values = np.asarray(pres, dtype=float)
+        pres_coord = pres_values
+
+    if np.any(pres_values <= 0):
+        raise ValueError("Pressure values must be positive before taking log(p)")
+
+    if pres_values.size == 1:
+        weights = np.ones_like(pres_values)
+    else:
+        lnp = np.log(pres_values)
+        bounds = np.empty(pres_values.size + 1)
+        bounds[1:-1] = 0.5 * (lnp[:-1] + lnp[1:])
+        bounds[0] = lnp[0] - 0.5 * (lnp[1] - lnp[0])
+        bounds[-1] = lnp[-1] + 0.5 * (lnp[-1] - lnp[-2])
+        weights = np.abs(np.diff(bounds))
+
+    return xr.DataArray(
+        weights,
+        dims=("pres",),
+        coords={"pres": pres_coord},
+        name="dlnp_weight",
+    )
 
 
 def latpres_weights(template):
@@ -1564,7 +2638,7 @@ def concise_metric_table(df):
     if len(df) == 0:
         return
     robust = df[df.get("robust", False) == True].copy()
-    print("\nRobust scalar responses (CI excludes zero and bootstrap sign is robust):")
+    print("\nChunk-consistent scalar responses (central resampling interval excludes zero and sign consistency is high):")
     if len(robust) == 0:
         print("  None by the current thresholds.")
         return
@@ -1600,6 +2674,17 @@ def print_mechanism_cues(metrics_df, matched_df):
         ]
         if len(wave_robust) > 0:
             print("  Robust wave-box changes are present; compare U-control and T-control rows in wave_box_variance_bootstrap_metrics.csv for wind-mediated organisation.")
+        org_robust = metrics_df[
+            (metrics_df["category"].isin([
+                "convective_organisation",
+                "convective_organisation_conditioned",
+                "convective_organisation_persistence",
+            ]))
+            & (metrics_df["comparison"].isin(["u_minus_control", "T_minus_control"]))
+            & (metrics_df.get("robust", False) == True)
+        ]
+        if len(org_robust) > 0:
+            print("  Robust organisation/object/persistence changes are present; use organisation_bootstrap_metrics.csv to check Lorg, object metrics, and PyFLEXTRKR-method track lifetimes.")
         thermal_robust = metrics_df[
             (metrics_df["category"] == "mean_state_pathway")
             & (metrics_df["diagnostic"].isin(["temperature", "static_stability_N2", "lapse_rate", "cloud_fraction"]))
@@ -1612,7 +2697,7 @@ def print_mechanism_cues(metrics_df, matched_df):
 
 def print_final_summary(metrics_df, matched_df):
     print("\n" + "=" * 78)
-    print("Significance bootstrap summary")
+    print("Block-resampling consistency summary")
     print("=" * 78)
 
     print("\nDiagnostics implemented and run:")
@@ -1647,7 +2732,7 @@ def print_final_summary(metrics_df, matched_df):
     print_mechanism_cues(metrics_df, matched_df)
 
     print("\nAnswering the headline question:")
-    print("  Use bootstrap_scalar_metrics.csv for scalar robustness, the lat-height figures for coherent structures rather than isolated gridpoints, wave_box_variance_bootstrap_metrics.csv for organised wave-mediated changes, and matched_pattern_bootstrap_metrics.csv for thermal-pattern attribution.")
+    print("  Use bootstrap_scalar_metrics.csv for scalar robustness, basic_convection_pdf_bootstrap_response.csv for PR/OLR/PW/CAPE distribution changes, wavenumber_variance_fraction_bootstrap_response.csv for planetary-scale organisation/noise checks, organisation_bootstrap_metrics.csv for Lorg/object robustness, the lat-height figures for coherent structures rather than isolated gridpoints, wave_box_variance_bootstrap_metrics.csv plus vertical_wave_power_profile_bootstrap_metrics.csv and wave_lag_correlation_bootstrap_metrics.csv for organised wave-mediated changes, and matched_pattern_bootstrap_metrics.csv for thermal-pattern attribution.")
     print("  Robust U-control changes in zonal wind or CCEW variance that are absent from T-control point toward a wind-driven pathway; robust shared temperature/N2/cloud-depth structures with high matched-pattern correlation point toward a temperature-driven pathway.")
 
 
@@ -1655,12 +2740,17 @@ def print_final_summary(metrics_df, matched_df):
 # Main top-level workflow
 # -----------------------------------------------------------------------------
 
-print("\nRunning significance bootstrap diagnostics")
+print("\nRunning block-resampling consistency diagnostics")
 run_mean_state_pathway()
 precip_by_run = run_precipitation_response()
+run_basic_convection_pdf_bootstrap()
+run_wavenumber_variance_bootstrap()
 run_cloud_response(precip_by_run)
 run_conditional_precipitation_states(precip_by_run)
+run_convective_organisation_bootstrap()
 run_wave_pathway()
+run_vertical_wave_power_profile_bootstrap()
+run_wave_lag_correlation_bootstrap()
 matched_pattern_df = run_matched_pattern_attribution()
 
 metrics_df = pd.DataFrame(scalar_metric_rows)

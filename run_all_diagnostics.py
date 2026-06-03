@@ -34,8 +34,8 @@ DEFAULT_SCRIPT_ORDER = [
     "matched_pattern_response.py",
     "equatorial_wave_diagnostics.py",
     "convective_pathway_diagnostics.py",
-    "significance_bootstrap_diagnostics.py",
     "convective_organisation_diagnostics.py",
+    "significance_bootstrap_diagnostics.py",
     "jet_variability_diagnostics.py",
 ]
 
