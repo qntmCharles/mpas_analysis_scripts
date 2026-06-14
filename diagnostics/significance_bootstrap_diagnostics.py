@@ -17,6 +17,7 @@ workflows at module top level.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import numbers
@@ -39,11 +40,23 @@ except ModuleNotFoundError:
     dask = None
 
 from diagnostic_helpers import *
+from high_cloud_classification import (
+    CLASSIFICATION_CACHE_VERSION,
+    HighCloudThresholds,
+    cached_classification_is_current as shared_cached_classification_is_current,
+)
 
 try:
     from waveFilter import kf_filter
 except ModuleNotFoundError:
     kf_filter = None
+
+
+def env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
 # -----------------------------------------------------------------------------
@@ -89,6 +102,16 @@ dt = 6
 analysis_end_date = "2000-11-21"
 time_format = "time"
 obs_per_day = int(round(24 / dt))
+
+USE_BOOTSTRAP_CACHE = True
+FORCE_RECOMPUTE_BOOTSTRAP_CACHE = False
+
+USE_BOOTSTRAP_CACHE = USE_BOOTSTRAP_CACHE and not env_flag("DISABLE_BOOTSTRAP_CACHE")
+FORCE_RECOMPUTE_BOOTSTRAP_CACHE = (
+    FORCE_RECOMPUTE_BOOTSTRAP_CACHE
+    or env_flag("FORCE_RECOMPUTE_BOOTSTRAP_CACHE")
+)
+BOOTSTRAP_CACHE_DIR = diagnostic_cache_dir("significance_bootstrap_cache", root_dir=root_dir)
 
 BOOTSTRAP_BLOCK_DAYS = 10.0
 CLOUD_TYPE_BLOCK_DAYS = 5.0
@@ -142,6 +165,8 @@ WAVE_LAG_BLOCK_DAYS = 30.0
 ORGANISATION_OUTPUT_DIR = "/home/cwp29/tmp/mpas/crf_on/final/organisation"
 ORGANISATION_TIMESERIES_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_lorg_timeseries.csv")
 ORGANISATION_TRACKS_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_track_lifetimes.csv")
+ORGANISATION_METRIC_METADATA_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_metric_cache_metadata.json")
+ORGANISATION_TRACK_METADATA_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_track_persistence_cache_metadata.json")
 ORGANISATION_BLOCK_DAYS = 5.0
 ORGANISATION_CONDITION_NBINS = 4
 ORGANISATION_MIN_CONDITION_SAMPLES = 3
@@ -181,12 +206,8 @@ Z_UPPER_MIN_KM = 10.0
 P_DEEP = 5.0
 P_WEAK = 1.0
 MAX_CLEAR_GAP_KM = 3.0
-ANVIL_RADIUS_DEG = 5.0
-ANVIL_TIME_STEPS = 1
 CLOUD_CLASSIFICATION_CACHE_DIRS = [
-    "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/classification_cache",
-    "/home/cwp29/tmp/mpas/crf_on/final/convective_pathways/classification_cache",
-    os.path.join(save_loc, "classification_cache"),
+    diagnostic_cache_dir("classification_cache", root_dir=root_dir),
 ]
 
 RD = 287.0
@@ -233,14 +254,11 @@ WAVE_FIELDS = ["Precip", "OLR", "PW"]
 
 needed_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw", "olrtoa", "cape",
-    "qv", "qc", "qr", "qi", "qs", "qg", "relhum", "w",
+    "qv", "relhum", "w",
     "theta", "pressure", "zgrid", "cldfrac",
     "uReconstructZonal", "uReconstructMeridional",
     "t_isobaric", "uzonal_isobaric", "umeridional_isobaric", "rh_isobaric",
     "qv_isobaric",
-    "high_cloud_mask", "column_connected_mask", "column_connected_high_cloud_mask",
-    "deep_convective_high_cloud_mask", "anvil_high_cloud_mask",
-    "cirrus_like_high_cloud_mask", "nonprecipitating_high_cloud_mask",
 ]
 
 latlon_chunks = {"Time": 8, "latitude": 90, "longitude": 180}
@@ -291,6 +309,249 @@ def save_table(df, filename):
     if save and len(df) > 0:
         os.makedirs(save_loc, exist_ok=True)
         df.to_csv(os.path.join(save_loc, filename), index=False)
+
+
+def ensure_bootstrap_cache_dir():
+    os.makedirs(BOOTSTRAP_CACHE_DIR, exist_ok=True)
+    return BOOTSTRAP_CACHE_DIR
+
+
+def bootstrap_cache_path(filename):
+    return os.path.join(ensure_bootstrap_cache_dir(), filename)
+
+
+def jsonable_value(value):
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [jsonable_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): jsonable_value(v) for k, v in value.items()}
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def base_bootstrap_cache_signature(family, extra=None):
+    signature = dict(
+        cache_version="significance_bootstrap_v1",
+        family=family,
+        root_dir=root_dir,
+        data_locs=list(data_locs),
+        latlon_file=list(latlon_file),
+        zm_latlon_file=list(zm_latlon_file),
+        sim_names=list(sim_names),
+        ndays=int(ndays),
+        dt=float(dt),
+        analysis_end_date=analysis_end_date,
+        time_format=time_format,
+        bootstrap_block_days=float(BOOTSTRAP_BLOCK_DAYS),
+        cloud_type_block_days=float(CLOUD_TYPE_BLOCK_DAYS),
+        n_bootstrap=int(N_BOOTSTRAP),
+        field_n_bootstrap=int(FIELD_N_BOOTSTRAP),
+        bootstrap_seed=int(BOOTSTRAP_SEED),
+        min_blocks=int(MIN_BLOCKS),
+        ci_percentiles=jsonable_value(CI_PERCENTILES),
+        robust_sign_threshold=float(ROBUST_SIGN_THRESHOLD),
+        comparisons=jsonable_value(COMPARISONS),
+    )
+    if extra:
+        signature.update(jsonable_value(extra))
+    return signature
+
+
+def read_cache_metadata(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_cache_metadata(path, signature):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(jsonable_value(signature), handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, path)
+
+
+def bootstrap_cache_matches(cache_name, signature):
+    if not USE_BOOTSTRAP_CACHE:
+        return False
+    if FORCE_RECOMPUTE_BOOTSTRAP_CACHE:
+        print(f"Ignoring cached {cache_name}: force recompute is enabled.")
+        return False
+    metadata_path = bootstrap_cache_path(f"{cache_name}.metadata.json")
+    try:
+        cached = read_cache_metadata(metadata_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Ignoring cached {cache_name}: could not read metadata ({exc}).")
+        return False
+    if cached is None:
+        return False
+    signature = jsonable_value(signature)
+    changed = [
+        key
+        for key in sorted(signature)
+        if cached.get(key) != signature.get(key)
+    ]
+    if changed:
+        shown = ", ".join(changed[:8])
+        suffix = "" if len(changed) <= 8 else ", ..."
+        print(f"Ignoring cached {cache_name}: metadata changed ({shown}{suffix}).")
+        return False
+    return True
+
+
+def load_cached_table(cache_name, signature):
+    if not bootstrap_cache_matches(cache_name, signature):
+        return None
+    path = bootstrap_cache_path(f"{cache_name}.csv")
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        df = pd.DataFrame()
+    print(f"Using cached bootstrap table {path}")
+    return df
+
+
+def write_cached_table(cache_name, df, signature):
+    if not USE_BOOTSTRAP_CACHE or df is None:
+        return
+    df.to_csv(bootstrap_cache_path(f"{cache_name}.csv"), index=False)
+    write_cache_metadata(bootstrap_cache_path(f"{cache_name}.metadata.json"), signature)
+
+
+def append_cached_scalar_rows(df):
+    if df is not None and len(df) > 0:
+        scalar_metric_rows.extend(df.to_dict("records"))
+
+
+def cached_diff_dataset_filename(cache_name, comp_name):
+    return f"{cache_name}_{comp_name}.nc"
+
+
+def load_cached_diff_datasets(cache_name, signature):
+    if not bootstrap_cache_matches(cache_name, signature):
+        return None
+    metadata = read_cache_metadata(bootstrap_cache_path(f"{cache_name}.metadata.json")) or {}
+    comp_names = metadata.get("comparison_names", [name for name, *_ in COMPARISONS])
+    out = {}
+    for comp_name in comp_names:
+        path = bootstrap_cache_path(cached_diff_dataset_filename(cache_name, comp_name))
+        if not os.path.exists(path):
+            return None
+        with xr.open_dataset(path) as ds:
+            out[comp_name] = ds.load()
+    print(f"Using cached bootstrap response fields for {cache_name}")
+    return out
+
+
+def write_cached_diff_datasets(cache_name, diff_by_comp, signature):
+    if not USE_BOOTSTRAP_CACHE or not diff_by_comp:
+        return
+    for comp_name, ds in diff_by_comp.items():
+        path = bootstrap_cache_path(cached_diff_dataset_filename(cache_name, comp_name))
+        tmp = path + ".tmp"
+        ds.to_netcdf(tmp)
+        os.replace(tmp, path)
+    metadata = dict(jsonable_value(signature))
+    metadata["comparison_names"] = list(diff_by_comp)
+    write_cache_metadata(bootstrap_cache_path(f"{cache_name}.metadata.json"), metadata)
+
+
+def response_dataset_from_table(df, coord_col, coord_name, dim_name=None):
+    dim_name = dim_name or coord_name
+    sub = df.sort_values(coord_col)
+    coord = sub[coord_col].to_numpy(dtype=float)
+    data_vars = {}
+    for col in ("mean_response", "ci_low", "ci_high", "bootstrap_noise", "response_to_noise", "sign_robustness"):
+        if col in sub.columns:
+            data_vars[col] = (dim_name, pd.to_numeric(sub[col], errors="coerce").to_numpy(dtype=float))
+    if "robust" in sub.columns:
+        robust = sub["robust"]
+        if robust.dtype == bool:
+            robust_values = robust.to_numpy()
+        else:
+            robust_values = robust.astype(str).str.lower().isin(["true", "1", "yes", "y"]).to_numpy()
+        data_vars["robust"] = (dim_name, robust_values)
+    if "ci_excludes_zero" in sub.columns:
+        excludes = sub["ci_excludes_zero"]
+        if excludes.dtype == bool:
+            excludes_values = excludes.to_numpy()
+        else:
+            excludes_values = excludes.astype(str).str.lower().isin(["true", "1", "yes", "y"]).to_numpy()
+        data_vars["ci_excludes_zero"] = (dim_name, excludes_values)
+    return xr.Dataset(data_vars, coords={coord_name: (dim_name, coord)})
+
+
+def precip_pdf_diffs_from_table(df):
+    return {
+        comp_name: response_dataset_from_table(sub, "precip_bin_center_mmday", "precip_bin")
+        for comp_name, sub in df.groupby("comparison")
+    }
+
+
+def basic_pdf_diffs_from_table(df):
+    out = {}
+    for field_name, field_df in df.groupby("field"):
+        out[field_name] = {
+            comp_name: response_dataset_from_table(sub, "bin_center", "pdf_bin")
+            for comp_name, sub in field_df.groupby("comparison")
+        }
+    return out
+
+
+def wavenumber_diffs_from_table(df):
+    out = {}
+    for (direction, field_name), group in df.groupby(["direction", "field"]):
+        out[(direction, field_name)] = {
+            comp_name: response_dataset_from_table(sub, "wavenumber", "wavenumber")
+            for comp_name, sub in group.groupby("comparison")
+        }
+    return out
+
+
+def cloud_profile_diffs_from_table(df):
+    return {
+        comp_name: response_dataset_from_table(sub, "z_m", "z")
+        for comp_name, sub in df.groupby("comparison")
+    }
+
+
+def wave_lag_diffs_from_table(df):
+    out = {}
+    for (wave_name, target_name), group in df.groupby(["wave", "target"]):
+        out[(wave_name, target_name)] = {
+            comp_name: response_dataset_from_table(sub, "lag_days", "lag_days")
+            for comp_name, sub in group.groupby("comparison")
+        }
+    return out
+
+
+def diff_datasets_to_profile_table(diff_by_comp):
+    rows = []
+    for comp_name, ds in diff_by_comp.items():
+        comp_label = next(label for name, _, _, label in COMPARISONS if name == comp_name)
+        z_vals = z_values_m(ds.mean_response)
+        for zi, z_m in enumerate(z_vals):
+            rows.append(
+                dict(
+                    comparison=comp_name,
+                    comparison_label=comp_label,
+                    z_m=float(z_m),
+                    mean_response=float(ds.mean_response.isel(z=zi).values),
+                    ci_low=float(ds.ci_low.isel(z=zi).values),
+                    ci_high=float(ds.ci_high.isel(z=zi).values),
+                    sign_robustness=float(ds.sign_robustness.isel(z=zi).values),
+                    robust=bool(ds.robust.isel(z=zi).values),
+                )
+            )
+    return pd.DataFrame(rows)
 
 
 def subset_between(da, dim, bounds):
@@ -758,6 +1019,24 @@ def run_mean_state_pathway():
     for spec in LATHEIGHT_FIELD_SPECS:
         try:
             print(f"\nMean-state bootstrap: {spec['name']}")
+            cache_signature = base_bootstrap_cache_signature(
+                "mean_state_pathway",
+                extra=dict(
+                    diagnostic=spec["name"],
+                    domains=jsonable_value(LATHEIGHT_DOMAINS),
+                    tropical_lat_bounds=list(TROPICAL_LAT_BOUNDS),
+                    deep_tropics_lat_bounds=list(DEEP_TROPICS_LAT_BOUNDS),
+                ),
+            )
+            cached_rows = load_cached_table(f"mean_state_{spec['name']}_scalar", cache_signature)
+            cached_diffs = load_cached_diff_datasets(f"mean_state_{spec['name']}_diffs", cache_signature)
+            if cached_rows is not None and cached_diffs is not None:
+                append_cached_scalar_rows(cached_rows)
+                plot_latheight_bootstrap(spec, cached_diffs)
+                record_implemented(f"cached mean-state lat-height bootstrap for {spec['name']}")
+                continue
+
+            row_start = len(scalar_metric_rows)
             blocks_by_run = {}
             for i in range(len(dss)):
                 field = spec["getter"](dss[i], dss_zm[i])
@@ -794,6 +1073,9 @@ def run_mean_state_pathway():
                         "z_max_m": domain["z_bounds"][1],
                     },
                 )
+            spec_rows = pd.DataFrame(scalar_metric_rows[row_start:])
+            write_cached_table(f"mean_state_{spec['name']}_scalar", spec_rows, cache_signature)
+            write_cached_diff_datasets(f"mean_state_{spec['name']}_diffs", diff_by_comp, cache_signature)
             record_implemented(f"mean-state lat-height bootstrap for {spec['name']}")
         except Exception as exc:
             if "unavailable" in str(exc) or "Missing" in str(exc) or "None of" in str(exc):
@@ -911,6 +1193,25 @@ def plot_precip_pdf_differences(pdf_diffs):
 def run_precipitation_response():
     try:
         precip_by_run = {i: get_precip_rate(ds) for i, ds in enumerate(dss)}
+        cache_signature = base_bootstrap_cache_signature(
+            "precipitation_response",
+            extra=dict(
+                tropical_lat_bounds=list(TROPICAL_LAT_BOUNDS),
+                precip_heavy_threshold=float(PRECIP_HEAVY_THRESHOLD),
+                precip_weak_threshold=float(PRECIP_WEAK_THRESHOLD),
+                precip_pdf_bins=jsonable_value(PRECIP_PDF_BINS),
+            ),
+        )
+        cached_scalar = load_cached_table("precipitation_response_scalar", cache_signature)
+        cached_pdf = load_cached_table("precipitation_pdf_response", cache_signature)
+        if cached_scalar is not None and cached_pdf is not None:
+            append_cached_scalar_rows(cached_scalar)
+            save_table(cached_pdf, "precipitation_pdf_bootstrap_response.csv")
+            plot_precip_pdf_differences(precip_pdf_diffs_from_table(cached_pdf))
+            record_implemented("cached precipitation response block-consistency metrics")
+            return precip_by_run
+
+        row_start = len(scalar_metric_rows)
         metric_by_run = {i: precip_metric_values(precip_by_run[i]) for i in range(len(dss))}
         metric_names = sorted(metric_by_run[0])
         for metric in metric_names:
@@ -947,6 +1248,8 @@ def run_precipitation_response():
                 )
         save_table(pd.DataFrame(pdf_rows), "precipitation_pdf_bootstrap_response.csv")
         plot_precip_pdf_differences(pdf_diffs)
+        write_cached_table("precipitation_response_scalar", pd.DataFrame(scalar_metric_rows[row_start:]), cache_signature)
+        write_cached_table("precipitation_pdf_response", pd.DataFrame(pdf_rows), cache_signature)
         record_implemented("precipitation mean, variance, upper-tail, weak-rain fraction, and PDF block-consistency metrics")
         return precip_by_run
     except Exception as exc:
@@ -1010,6 +1313,23 @@ def plot_basic_convection_pdf_differences(pdf_diffs_by_field):
 
 def run_basic_convection_pdf_bootstrap():
     try:
+        cache_signature = base_bootstrap_cache_signature(
+            "basic_convection_pdf",
+            extra=dict(
+                specs=[
+                    dict(name=spec["name"], bins=jsonable_value(spec["bins"]))
+                    for spec in BASIC_CONVECTION_PDF_SPECS
+                ],
+                tropical_lat_bounds=list(TROPICAL_LAT_BOUNDS),
+            ),
+        )
+        cached_rows = load_cached_table("basic_convection_pdf_response", cache_signature)
+        if cached_rows is not None:
+            save_table(cached_rows, "basic_convection_pdf_bootstrap_response.csv")
+            plot_basic_convection_pdf_differences(basic_pdf_diffs_from_table(cached_rows))
+            record_implemented("cached basic convection PDF block-consistency metrics")
+            return
+
         rows = []
         pdf_diffs_by_field = {}
         rng = np.random.default_rng(BOOTSTRAP_SEED + 222)
@@ -1046,8 +1366,10 @@ def run_basic_convection_pdf_bootstrap():
             pdf_diffs_by_field[spec["name"]] = diffs
 
         if rows:
-            save_table(pd.DataFrame(rows), "basic_convection_pdf_bootstrap_response.csv")
+            rows_df = pd.DataFrame(rows)
+            save_table(rows_df, "basic_convection_pdf_bootstrap_response.csv")
             plot_basic_convection_pdf_differences(pdf_diffs_by_field)
+            write_cached_table("basic_convection_pdf_response", rows_df, cache_signature)
             record_implemented("basic convection PDF block-consistency metrics for precipitation, OLR, PW, and CAPE where available")
     except Exception as exc:
         record_failure("basic convection PDF bootstrap", exc)
@@ -1136,6 +1458,21 @@ def plot_wavenumber_bootstrap_differences(diff_by_direction_field):
 
 def run_wavenumber_variance_bootstrap():
     try:
+        cache_signature = base_bootstrap_cache_signature(
+            "wavenumber_variance",
+            extra=dict(
+                fields=list(WAVENUMBER_FIELDS),
+                lat_bounds=list(WAVENUMBER_LAT_BOUNDS),
+                max_k=int(WAVENUMBER_MAX_K),
+            ),
+        )
+        cached_rows = load_cached_table("wavenumber_variance_fraction_response", cache_signature)
+        if cached_rows is not None:
+            save_table(cached_rows, "wavenumber_variance_fraction_bootstrap_response.csv")
+            plot_wavenumber_bootstrap_differences(wavenumber_diffs_from_table(cached_rows))
+            record_implemented("cached wavenumber variance-fraction block-consistency metrics")
+            return
+
         rows = []
         diffs_by_direction_field = {}
         rng = np.random.default_rng(BOOTSTRAP_SEED + 333)
@@ -1171,8 +1508,10 @@ def run_wavenumber_variance_bootstrap():
                         )
                 diffs_by_direction_field[(direction, field_name)] = diffs
         if rows:
-            save_table(pd.DataFrame(rows), "wavenumber_variance_fraction_bootstrap_response.csv")
+            rows_df = pd.DataFrame(rows)
+            save_table(rows_df, "wavenumber_variance_fraction_bootstrap_response.csv")
             plot_wavenumber_bootstrap_differences(diffs_by_direction_field)
+            write_cached_table("wavenumber_variance_fraction_response", rows_df, cache_signature)
             record_implemented("zonal and meridional wavenumber variance-fraction block-consistency metrics for precipitation/OLR/PW")
     except Exception as exc:
         record_failure("wavenumber variance-fraction bootstrap", exc)
@@ -1234,165 +1573,73 @@ def plot_cloud_profile_diffs(profile_diffs):
     plt.close(fig)
 
 
-def available_cloud_times(cf):
-    if "Time" not in cf.dims:
-        return None
-    indexers = {dim: 0 for dim in cf.dims if dim != "Time"}
-    valid = cf.isel(indexers).notnull().load()
-    return valid.Time.values[np.asarray(valid.values, dtype=bool)]
+def classification_thresholds():
+    return HighCloudThresholds(
+        cf_thresh=CF_THRESH,
+        z_high_km=Z_HIGH_KM,
+        low_cloud_min_km=Z_LOW_MIN_KM,
+        low_cloud_max_km=Z_LOW_MAX_KM,
+        mid_cloud_min_km=Z_MID_MIN_KM,
+        mid_cloud_max_km=Z_MID_MAX_KM,
+        upper_cloud_min_km=Z_UPPER_MIN_KM,
+        max_clear_gap_km=MAX_CLEAR_GAP_KM,
+        surface_precip_deep_mm_day=P_DEEP,
+        surface_precip_weak_mm_day=P_WEAK,
+    )
 
 
-def z_km_from_cldfrac(cf):
-    z = np.asarray(cf.z.values, dtype=float)
-    z = z / 1000.0 if np.nanmax(np.abs(z)) > 100.0 else z
-    return xr.DataArray(z, dims=("z",), coords={"z": cf.z}, name="z_km")
+def cached_classification_is_current(cached):
+    return shared_cached_classification_is_current(cached, classification_thresholds())
 
 
-def any_cloud_in_layer(cloudy, z_km, zmin, zmax):
-    return cloudy.where((z_km >= zmin) & (z_km < zmax), drop=True).any(dim="z")
-
-
-def rolling_or_dilated_max(mask, lat_radius=ANVIL_RADIUS_DEG, lon_radius=ANVIL_RADIUS_DEG, time_radius=ANVIL_TIME_STEPS):
-    x = mask.astype(np.int8)
-    rolling_kwargs = {}
-    if "Time" in x.dims and time_radius > 0:
-        rolling_kwargs["Time"] = 2 * int(time_radius) + 1
-    if "latitude" in x.dims and lat_radius > 0 and x.sizes.get("latitude", 0) > 1:
-        dlat = float(np.nanmedian(np.abs(np.diff(x.latitude.values))))
-        rolling_kwargs["latitude"] = 2 * int(np.ceil(lat_radius / dlat)) + 1
-    if "longitude" in x.dims and lon_radius > 0 and x.sizes.get("longitude", 0) > 1:
-        dlon = float(np.nanmedian(np.abs(np.diff(x.longitude.values))))
-        rolling_kwargs["longitude"] = 2 * int(np.ceil(lon_radius / dlon)) + 1
-    if not rolling_kwargs:
-        return mask
-    return x.rolling(**rolling_kwargs, center=True, min_periods=1).max() >= 1
-
-
-def classify_high_cloud(cldfrac, precip):
-    cf = rename_vertical_to_z(finite_or_nan(cldfrac))
-    if "z" not in cf.coords:
-        raise ValueError("cldfrac has no z coordinate")
-    times = available_cloud_times(cf)
-    if times is not None:
-        cf = cf.sel(Time=times)
-    cf, pr = xr.align(cf, precip, join="inner")
-    z_km = z_km_from_cldfrac(cf)
-
-    cloudy = cf >= CF_THRESH
-    cloud_top_height = z_km.where(cloudy).max(dim="z", skipna=True)
-    cloud_top_height.name = "cloud_top_height"
-
-    high_cloud_fraction = cf.where(z_km >= Z_HIGH_KM).mean(dim="z", skipna=True)
-    high_cloud_fraction.name = "high_cloud_fraction"
-    high_cloud_mask = ((cloud_top_height >= Z_HIGH_KM) | (high_cloud_fraction >= CF_THRESH)).fillna(False)
-    high_cloud_mask.name = "high_cloud_mask"
-
-    low_cloud = any_cloud_in_layer(cloudy, z_km, Z_LOW_MIN_KM, Z_LOW_MAX_KM)
-    mid_cloud = any_cloud_in_layer(cloudy, z_km, Z_MID_MIN_KM, Z_MID_MAX_KM)
-    upper_cloud = any_cloud_in_layer(cloudy, z_km, Z_UPPER_MIN_KM, max(float(z_km.max()), Z_HIGH_KM + 0.1))
-
-    gap_ok = xr.ones_like(high_cloud_mask, dtype=bool)
-    if MAX_CLEAR_GAP_KM is not None and MAX_CLEAR_GAP_KM > 0:
-        for z0 in np.arange(Z_LOW_MIN_KM, Z_HIGH_KM, MAX_CLEAR_GAP_KM):
-            z1 = min(z0 + MAX_CLEAR_GAP_KM, max(float(z_km.max()), Z_HIGH_KM))
-            if z1 > z0:
-                gap_ok = gap_ok & any_cloud_in_layer(cloudy, z_km, z0, z1 + 1.0e-6)
-
-    column_connected = (high_cloud_mask & low_cloud & mid_cloud & upper_cloud & gap_ok).fillna(False)
-    column_connected.name = "column_connected_mask"
-    deep_convective = (high_cloud_mask & column_connected & (pr >= P_DEEP)).fillna(False)
-    deep_convective.name = "deep_convective_high_cloud_mask"
-
-    near_deep_core = rolling_or_dilated_max(deep_convective).fillna(False)
-    anvil = (high_cloud_mask & ~deep_convective & near_deep_core).fillna(False)
-    anvil.name = "anvil_high_cloud_mask"
-    cirrus_like = (high_cloud_mask & ~column_connected & ~near_deep_core & (pr <= P_WEAK)).fillna(False)
-    cirrus_like.name = "cirrus_like_high_cloud_mask"
-    nonprecip = (high_cloud_mask & (pr <= P_WEAK)).fillna(False)
-    nonprecip.name = "nonprecipitating_high_cloud_mask"
-
-    return {
-        "high_cloud_fraction": high_cloud_fraction,
-        "high_cloud_mask": high_cloud_mask,
-        "column_connected_mask": column_connected,
-        "deep_convective_high_cloud_mask": deep_convective,
-        "anvil_high_cloud_mask": anvil,
-        "cirrus_like_high_cloud_mask": cirrus_like,
-        "nonprecipitating_high_cloud_mask": nonprecip,
-    }
-
-
-def existing_cloud_masks(ds, precip_ref):
-    aliases = {
-        "high_cloud_mask": ("high_cloud_mask",),
-        "column_connected_mask": ("column_connected_mask", "column_connected_high_cloud_mask"),
-        "deep_convective_high_cloud_mask": ("deep_convective_high_cloud_mask",),
-        "anvil_high_cloud_mask": ("anvil_high_cloud_mask",),
-        "cirrus_like_high_cloud_mask": ("cirrus_like_high_cloud_mask",),
-        "nonprecipitating_high_cloud_mask": ("nonprecipitating_high_cloud_mask",),
-    }
-    out = {}
-    for key, names in aliases.items():
-        for name in names:
-            if name in ds.data_vars:
-                da = ds[name]
-                if "Time" in da.dims:
-                    da = da.sel(Time=precip_ref.Time)
-                out[key] = da
-                break
-    if len(out) != len(aliases):
-        return None
-
-    if "high_cloud_fraction" in ds.data_vars:
-        high = finite_or_nan(ds.high_cloud_fraction)
-        if "Time" in high.dims:
-            high = high.sel(Time=precip_ref.Time)
-        out["high_cloud_fraction"] = high
-    else:
-        cf = get_cloud_fraction(ds)
-        if cf is None:
-            return None
-        if "Time" in cf.dims:
-            cf = cf.sel(Time=precip_ref.Time)
-        out["high_cloud_fraction"] = subset_z_m(cf, HIGH_CLOUD_Z_BOUNDS_M).mean(dim="z", skipna=True)
-    return out
+REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS = (
+    "high_cloud_fraction",
+    "high_cloud_mask",
+    "column_connected_mask",
+    "active_deep_convection_high_cloud_mask",
+    "convectively_generated_high_cloud_mask",
+    "cirrus_like_high_cloud_mask",
+    "unclassified_high_cloud_mask",
+    "nonprecipitating_high_cloud_mask",
+)
 
 
 def cloud_masks_from_cache(sim_name, precip_ref):
     filename = f"{sim_name.replace(' ', '_')}_classified_high_cloud.nc"
-    aliases = {
-        "high_cloud_fraction": ("high_cloud_fraction",),
-        "high_cloud_mask": ("high_cloud_mask",),
-        "column_connected_mask": ("column_connected_mask", "column_connected_high_cloud_mask"),
-        "deep_convective_high_cloud_mask": ("deep_convective_high_cloud_mask",),
-        "anvil_high_cloud_mask": ("anvil_high_cloud_mask",),
-        "cirrus_like_high_cloud_mask": ("cirrus_like_high_cloud_mask",),
-        "nonprecipitating_high_cloud_mask": ("nonprecipitating_high_cloud_mask",),
-    }
-
+    checked = []
     for cache_dir in CLOUD_CLASSIFICATION_CACHE_DIRS:
         path = os.path.join(cache_dir, filename)
+        checked.append(path)
         if not os.path.exists(path):
             continue
-        try:
-            cached = xr.open_dataset(path, chunks={})
-            out = {}
-            for key, names in aliases.items():
-                for name in names:
-                    if name in cached.data_vars:
-                        da = cached[name]
-                        if "Time" in da.dims and "Time" in precip_ref.dims:
-                            common = da.Time.to_index().intersection(precip_ref.Time.to_index())
-                            da = da.sel(Time=common)
-                        out[key] = da
-                        break
-            if len(out) == len(aliases):
-                print(f"Using cached high-cloud classification for {sim_name}: {path}")
-                return out
+        cached = xr.open_dataset(path, chunks={})
+        if not cached_classification_is_current(cached):
             cached.close()
-        except Exception as exc:
-            print(f"Could not use cached high-cloud classification {path}: {exc}")
-    return None
+            raise RuntimeError(f"{sim_name}: stale high-cloud classification cache: {path}")
+        missing = [
+            key for key in REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS
+            if key not in cached.data_vars
+        ]
+        if missing:
+            cached.close()
+            raise RuntimeError(
+                f"{sim_name}: high-cloud classification cache lacks required shared variables {missing}: {path}"
+            )
+        out = {}
+        for key in REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS:
+            da = cached[key]
+            if "Time" in da.dims and "Time" in precip_ref.dims:
+                common = da.Time.to_index().intersection(precip_ref.Time.to_index())
+                da = da.sel(Time=common)
+            if key.endswith("_mask") or key == "column_connected_mask":
+                da = da.fillna(False).astype(bool)
+            out[key] = da
+        print(f"Using cached high-cloud classification for {sim_name}: {path}")
+        return out
+    raise FileNotFoundError(
+        f"{sim_name}: required shared high-cloud classification cache is missing. "
+        f"Run refined_high_cloud_classification_diagnostics.py first. Checked: {checked}"
+    )
 
 
 def block_area_fraction_values(da):
@@ -1406,6 +1653,37 @@ def block_area_fraction_values(da):
 
 
 def run_cloud_response(precip_by_run):
+    cache_signature = base_bootstrap_cache_signature(
+        "cloud_response",
+        extra=dict(
+            tropical_lat_bounds=list(TROPICAL_LAT_BOUNDS),
+            high_cloud_z_bounds_m=list(HIGH_CLOUD_Z_BOUNDS_M),
+            cloud_thresholds=dict(
+                cf_thresh=float(CF_THRESH),
+                z_high_km=float(Z_HIGH_KM),
+                z_low_min_km=float(Z_LOW_MIN_KM),
+                z_low_max_km=float(Z_LOW_MAX_KM),
+                z_mid_min_km=float(Z_MID_MIN_KM),
+                z_mid_max_km=float(Z_MID_MAX_KM),
+                z_upper_min_km=float(Z_UPPER_MIN_KM),
+                p_deep=float(P_DEEP),
+                p_weak=float(P_WEAK),
+                max_clear_gap_km=jsonable_value(MAX_CLEAR_GAP_KM),
+                cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
+                classifier="shared 3-D hydrometeor-aware high-cloud classification",
+            ),
+        ),
+    )
+    cached_scalar = load_cached_table("cloud_response_scalar", cache_signature)
+    cached_profile = load_cached_table("cloud_profile_response", cache_signature)
+    if cached_scalar is not None and cached_profile is not None:
+        append_cached_scalar_rows(cached_scalar)
+        plot_cloud_profile_diffs(cloud_profile_diffs_from_table(cached_profile))
+        record_implemented("cached cloud profile/depth/type block-consistency metrics")
+        return
+
+    row_start = len(scalar_metric_rows)
+    profile_rows = pd.DataFrame()
     try:
         cf_by_run = {}
         for i in range(len(dss)):
@@ -1422,6 +1700,7 @@ def run_cloud_response(precip_by_run):
         for comp_name, run_idx, ref_idx, _ in COMPARISONS:
             profile_diffs[comp_name] = bootstrap_field_difference(profile_by_run[run_idx], profile_by_run[ref_idx], rng)
         plot_cloud_profile_diffs(profile_diffs)
+        profile_rows = diff_datasets_to_profile_table(profile_diffs)
 
         high_values_by_run = {i: high_cloud_fraction_blocks(cf_by_run[i]) for i in range(len(dss))}
         append_bootstrap_metric_rows(
@@ -1443,23 +1722,16 @@ def run_cloud_response(precip_by_run):
     try:
         class_by_run = {}
         for i in range(len(dss)):
-            masks = existing_cloud_masks(dss[i], precip_by_run[i])
-            if masks is None:
-                masks = cloud_masks_from_cache(sim_names[i], precip_by_run[i])
-            if masks is None:
-                cf = get_cloud_fraction(dss[i])
-                if cf is None:
-                    raise ValueError(f"full lat-lon cldfrac unavailable for {sim_names[i]}")
-                masks = classify_high_cloud(cf, precip_by_run[i])
-            class_by_run[i] = masks
+            class_by_run[i] = cloud_masks_from_cache(sim_names[i], precip_by_run[i])
 
         for key in (
             "high_cloud_fraction",
             "high_cloud_mask",
             "column_connected_mask",
-            "deep_convective_high_cloud_mask",
-            "anvil_high_cloud_mask",
+            "active_deep_convection_high_cloud_mask",
+            "convectively_generated_high_cloud_mask",
             "cirrus_like_high_cloud_mask",
+            "unclassified_high_cloud_mask",
             "nonprecipitating_high_cloud_mask",
         ):
             values_by_run = {i: block_area_fraction_values(class_by_run[i][key]) for i in range(len(dss))}
@@ -1475,10 +1747,17 @@ def run_cloud_response(precip_by_run):
     except Exception as exc:
         record_failure("cloud-type classification bootstrap", exc)
         record_todo(
-            "Cloud-type bootstrap refinement",
-            "Cloud-type differences matter because high cloud is mechanistically ambiguous without separating deep convective towers from anvil and detached cirrus.",
-            "convective_pathway_diagnostics.py by exposing an import-safe cached classification dataset and block-metric helper",
+            "Cloud-type classification cache",
+            "The cloud-type bootstrap requires the shared refined high-cloud classification for every run.",
+            "refined_high_cloud_classification_diagnostics.py by running it before this bootstrap script",
         )
+        raise
+
+    scalar_rows = pd.DataFrame(scalar_metric_rows[row_start:])
+    if len(scalar_rows) > 0:
+        write_cached_table("cloud_response_scalar", scalar_rows, cache_signature)
+    if len(profile_rows) > 0:
+        write_cached_table("cloud_profile_response", profile_rows, cache_signature)
 
 
 # -----------------------------------------------------------------------------
@@ -1513,6 +1792,21 @@ def run_conditional_precipitation_states(precip_by_run):
         record_skip("strong/weak precipitation conditional bootstrap (precipitation unavailable)")
         return
     try:
+        cache_signature = base_bootstrap_cache_signature(
+            "conditional_precipitation_states",
+            extra=dict(
+                tropical_lat_bounds=list(TROPICAL_LAT_BOUNDS),
+                precip_strong_threshold=float(PRECIP_STRONG_THRESHOLD),
+                precip_weak_threshold=float(PRECIP_WEAK_THRESHOLD),
+            ),
+        )
+        cached_rows = load_cached_table("conditional_precipitation_state_metrics", cache_signature)
+        if cached_rows is not None:
+            append_cached_scalar_rows(cached_rows)
+            record_implemented("cached strong-versus-weak precipitation conditional block-consistency metrics")
+            return
+
+        row_start = len(scalar_metric_rows)
         targets = {
             "precip": {i: precip_by_run[i] for i in range(len(dss))},
             "OLR": {i: aligned_optional_field(dss[i], "OLR", precip_by_run[i]) for i in range(len(dss))},
@@ -1540,6 +1834,11 @@ def run_conditional_precipitation_states(precip_by_run):
                     state_name,
                     units=getattr(by_run[0], "units", ""),
                 )
+        write_cached_table(
+            "conditional_precipitation_state_metrics",
+            pd.DataFrame(scalar_metric_rows[row_start:]),
+            cache_signature,
+        )
         record_implemented("strong-versus-weak precipitation conditional block-consistency metrics for precip/OLR/PW")
         record_todo(
             "Kelvin-active versus inactive conditional bootstrap",
@@ -1556,17 +1855,18 @@ def run_conditional_precipitation_states(precip_by_run):
 
 ORGANISATION_SOURCE_ORDER = [
     "precip_ge_1mmh",
+    "olr_tb241",
+    "active_deep_convection_high_cloud_mask",
+    "convectively_generated_high_cloud_mask",
+    # Sensitivity-only sources from convective_organisation_diagnostics.py.
     "precip_ge_2mmh",
     "precip_ge_8mmh",
-    "olr_tb241",
-    "olr_tb233",
-    "olr_cold_p05",
-    "deep_convective_high_cloud_mask",
-    "column_connected_mask",
-    "high_cloud_mask",
-    "anvil_high_cloud_mask",
     "precip_p95",
     "precip_p99",
+    "olr_tb233",
+    "olr_cold_p05",
+    "column_connected_mask",
+    "high_cloud_mask",
 ]
 ORGANISATION_EXCLUDED_SOURCES = {
     "cirrus_like_high_cloud_mask",
@@ -1574,8 +1874,26 @@ ORGANISATION_EXCLUDED_SOURCES = {
 }
 ORGANISATION_CONTEXT_SOURCES = {
     "high_cloud_mask",
-    "anvil_high_cloud_mask",
+    "convectively_generated_high_cloud_mask",
 }
+
+
+def require_current_organisation_metadata(path, label):
+    if not os.path.exists(path):
+        raise RuntimeError(
+            f"{label} metadata is missing: {path}. "
+            "Run convective_organisation_diagnostics.py with the new shared high-cloud classification first."
+        )
+    with open(path, "r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    cached_version = metadata.get("cloud_classification_cache_version")
+    if cached_version != CLASSIFICATION_CACHE_VERSION:
+        raise RuntimeError(
+            f"{label} metadata was built with high-cloud classification version "
+            f"{cached_version!r}, expected {CLASSIFICATION_CACHE_VERSION!r}. "
+            "Run convective_organisation_diagnostics.py before this bootstrap script."
+        )
+    return metadata
 
 
 def load_organisation_timeseries():
@@ -1591,6 +1909,7 @@ def load_organisation_timeseries():
         )
         return None
 
+    require_current_organisation_metadata(ORGANISATION_METRIC_METADATA_FILE, "organisation metric")
     df = pd.read_csv(ORGANISATION_TIMESERIES_FILE)
     required = {"source", "source_label", "simulation", "time_days"}
     missing = sorted(required - set(df.columns))
@@ -1615,6 +1934,7 @@ def load_organisation_tracks():
         )
         return None
 
+    require_current_organisation_metadata(ORGANISATION_TRACK_METADATA_FILE, "organisation track")
     df = pd.read_csv(ORGANISATION_TRACKS_FILE)
     required = {"source", "source_label", "simulation", "track_id"}
     missing = sorted(required - set(df.columns))
@@ -1823,6 +2143,36 @@ def plot_organisation_bootstrap_summary(org_df, org_source_labels):
 
 def run_convective_organisation_bootstrap():
     try:
+        cache_signature = base_bootstrap_cache_signature(
+            "convective_organisation",
+            extra=dict(
+                organisation_timeseries_file=ORGANISATION_TIMESERIES_FILE,
+                organisation_tracks_file=ORGANISATION_TRACKS_FILE,
+                organisation_block_days=float(ORGANISATION_BLOCK_DAYS),
+                condition_nbins=int(ORGANISATION_CONDITION_NBINS),
+                min_condition_samples=int(ORGANISATION_MIN_CONDITION_SAMPLES),
+                metric_specs=jsonable_value(ORGANISATION_METRIC_SPECS),
+                track_metric_specs=jsonable_value(ORGANISATION_TRACK_METRIC_SPECS),
+                excluded_sources=sorted(ORGANISATION_EXCLUDED_SOURCES),
+                cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
+            ),
+        )
+        cached_rows = load_cached_table("organisation_bootstrap_metrics", cache_signature)
+        if cached_rows is not None:
+            append_cached_scalar_rows(cached_rows)
+            save_table(cached_rows, "organisation_bootstrap_metrics.csv")
+            source_labels = (
+                cached_rows.dropna(subset=["diagnostic", "source_label"])
+                .drop_duplicates("diagnostic")
+                .set_index("diagnostic")["source_label"]
+                .to_dict()
+                if {"diagnostic", "source_label"}.issubset(cached_rows.columns)
+                else {}
+            )
+            plot_organisation_bootstrap_summary(cached_rows, source_labels)
+            record_implemented("cached convective-organisation block-consistency checks")
+            return
+
         org = load_organisation_timeseries()
         if org is None or len(org) == 0:
             return
@@ -1946,6 +2296,7 @@ def run_convective_organisation_bootstrap():
             return
         save_table(org_df, "organisation_bootstrap_metrics.csv")
         plot_organisation_bootstrap_summary(org_df, source_labels)
+        write_cached_table("organisation_bootstrap_metrics", org_df, cache_signature)
         message = (
             "convective-organisation block-consistency checks for Lorg/object metrics, PyFLEXTRKR-method "
             "track-persistence metrics, plus Lorg conditioned on tropical-mean precipitation and convective area fraction"
@@ -1966,7 +2317,7 @@ def wave_label(wave):
 
 
 def wave_cache_dir():
-    path = os.path.join(save_loc, "wave_cache")
+    path = diagnostic_cache_dir("significance_bootstrap_wave_cache", root_dir=root_dir)
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -2121,6 +2472,23 @@ def run_wave_pathway():
         return
 
     try:
+        cache_signature = base_bootstrap_cache_signature(
+            "wave_pathway",
+            extra=dict(
+                wave_fields=list(WAVE_FIELDS),
+                wave_boxes=jsonable_value(WAVE_BOXES),
+                latitude_projection=jsonable_value(WAVE_LATITUDE_PROJECTION),
+                wave_filter_lat_bounds=list(WAVE_FILTER_LAT_BOUNDS),
+            ),
+        )
+        cached_rows = load_cached_table("wave_box_variance_bootstrap_metrics", cache_signature)
+        if cached_rows is not None:
+            append_cached_scalar_rows(cached_rows)
+            save_table(cached_rows, "wave_box_variance_bootstrap_metrics.csv")
+            plot_wave_summary(cached_rows)
+            record_implemented("cached integrated CCEW wave-power and variance-fraction block-consistency metrics")
+            return
+
         wave_rows = []
         for field_name in WAVE_FIELDS:
             projected_by_run_by_wave = {}
@@ -2159,6 +2527,7 @@ def run_wave_pathway():
         wave_df = pd.DataFrame(wave_rows)
         save_table(wave_df, "wave_box_variance_bootstrap_metrics.csv")
         plot_wave_summary(wave_df)
+        write_cached_table("wave_box_variance_bootstrap_metrics", wave_df, cache_signature)
         record_implemented("integrated Kelvin/CCEW-filtered Precip, OLR, and PW wave-power and variance-fraction block-consistency metrics")
     except Exception as exc:
         record_failure("wave-mediated pathway bootstrap", exc)
@@ -2284,6 +2653,23 @@ def run_vertical_wave_power_profile_bootstrap():
         record_skip("vertical wave-power profile block-consistency diagnostics (waveFilter.kf_filter unavailable)")
         return
     try:
+        cache_signature = base_bootstrap_cache_signature(
+            "vertical_wave_power_profile",
+            extra=dict(
+                waves=list(WAVE_PROFILE_WAVES),
+                fields=jsonable_value(WAVE_PROFILE_FIELDS),
+                levels_hpa=jsonable_value(WAVE_PROFILE_LEVELS_HPA),
+                wave_filter_lat_bounds=list(WAVE_FILTER_LAT_BOUNDS),
+            ),
+        )
+        cached_rows = load_cached_table("vertical_wave_power_profile_bootstrap_metrics", cache_signature)
+        if cached_rows is not None:
+            append_cached_scalar_rows(cached_rows)
+            save_table(cached_rows, "vertical_wave_power_profile_bootstrap_metrics.csv")
+            plot_vertical_wave_power_profiles(cached_rows)
+            record_implemented("cached vertical wave-power profile block-consistency metrics")
+            return
+
         rows = []
         for wave_name in WAVE_PROFILE_WAVES:
             for field_spec in WAVE_PROFILE_FIELDS:
@@ -2322,6 +2708,7 @@ def run_vertical_wave_power_profile_bootstrap():
             df = pd.DataFrame(rows)
             save_table(df, "vertical_wave_power_profile_bootstrap_metrics.csv")
             plot_vertical_wave_power_profiles(df)
+            write_cached_table("vertical_wave_power_profile_bootstrap_metrics", df, cache_signature)
             record_implemented("vertical wave-power profile block-consistency metrics for selected u/T/w pressure levels and dominant wave boxes")
     except Exception as exc:
         record_failure("vertical wave-power profile bootstrap", exc)
@@ -2407,6 +2794,23 @@ def run_wave_lag_correlation_bootstrap():
         record_skip("wave lag-correlation block-consistency diagnostics (waveFilter.kf_filter unavailable)")
         return
     try:
+        cache_signature = base_bootstrap_cache_signature(
+            "wave_lag_correlation",
+            extra=dict(
+                waves=list(WAVE_LAG_WAVES),
+                targets=list(WAVE_LAG_TARGET_FIELDS),
+                max_days=float(WAVE_LAG_MAX_DAYS),
+                block_days=float(WAVE_LAG_BLOCK_DAYS),
+                wave_filter_lat_bounds=list(WAVE_FILTER_LAT_BOUNDS),
+            ),
+        )
+        cached_rows = load_cached_table("wave_lag_correlation_bootstrap_metrics", cache_signature)
+        if cached_rows is not None:
+            save_table(cached_rows, "wave_lag_correlation_bootstrap_metrics.csv")
+            plot_wave_lag_correlation_differences(wave_lag_diffs_from_table(cached_rows))
+            record_implemented("cached wave-amplitude lag-correlation block-consistency metrics")
+            return
+
         rows = []
         lag_diffs = {}
         rng = np.random.default_rng(BOOTSTRAP_SEED + 444)
@@ -2453,8 +2857,10 @@ def run_wave_lag_correlation_bootstrap():
                         )
                 lag_diffs[(wave_name, target_name)] = diffs
         if rows:
-            save_table(pd.DataFrame(rows), "wave_lag_correlation_bootstrap_metrics.csv")
+            rows_df = pd.DataFrame(rows)
+            save_table(rows_df, "wave_lag_correlation_bootstrap_metrics.csv")
             plot_wave_lag_correlation_differences(lag_diffs)
+            write_cached_table("wave_lag_correlation_bootstrap_metrics", rows_df, cache_signature)
             record_implemented("wave-amplitude lag-correlation block-consistency metrics for precipitation/OLR/PW targets")
     except Exception as exc:
         record_failure("wave lag-correlation bootstrap", exc)
@@ -2610,6 +3016,19 @@ def bootstrap_matched_pattern(blocks_control, blocks_u, blocks_T, domain_name, d
 
 def run_matched_pattern_attribution():
     try:
+        cache_signature = base_bootstrap_cache_signature(
+            "matched_pattern_attribution",
+            extra=dict(
+                domains=jsonable_value(MATCHED_PATTERN_DOMAINS),
+                source_variable="t_isobaric",
+            ),
+        )
+        cached_rows = load_cached_table("matched_pattern_bootstrap_metrics", cache_signature)
+        if cached_rows is not None:
+            save_table(cached_rows, "matched_pattern_bootstrap_metrics.csv")
+            record_implemented("cached matched-pattern projection bootstrap")
+            return cached_rows
+
         blocks_c = block_latpres_field(dss_zm[0], "t_isobaric", parity="even")
         blocks_u = block_latpres_field(dss_zm[1], "t_isobaric", parity="even")
         blocks_T = block_latpres_field(dss_zm[2], "t_isobaric", parity="even")
@@ -2618,6 +3037,7 @@ def run_matched_pattern_attribution():
             rows.extend(bootstrap_matched_pattern(blocks_c, blocks_u, blocks_T, domain_name, domain))
         df = pd.DataFrame(rows)
         save_table(df, "matched_pattern_bootstrap_metrics.csv")
+        write_cached_table("matched_pattern_bootstrap_metrics", df, cache_signature)
         record_implemented("matched-pattern projection bootstrap for u-nudged temperature response onto T-nudged temperature response")
         return df
     except Exception as exc:

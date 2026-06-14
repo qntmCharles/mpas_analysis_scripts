@@ -21,6 +21,15 @@ from pathlib import Path
 ANALYSIS_DIR = Path(__file__).resolve().parent
 DIAGNOSTICS_DIR = ANALYSIS_DIR / "diagnostics"
 DEFAULT_LOG_DIR = ANALYSIS_DIR / "diagnostic_logs"
+DEFAULT_SIMULATION_ROOT = Path(
+    os.environ.get(
+        "MPAS_SIMULATION_ROOT",
+        "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on",
+    )
+)
+DEFAULT_DIAGNOSTIC_CACHE_ROOT = Path(
+    os.environ.get("MPAS_DIAGNOSTIC_CACHE_ROOT", str(DEFAULT_SIMULATION_ROOT))
+)
 MODULE_SEARCH_DIRS = [
     DIAGNOSTICS_DIR,
     ANALYSIS_DIR,
@@ -29,11 +38,14 @@ MODULE_SEARCH_DIRS = [
 
 DEFAULT_SCRIPT_ORDER = [
     "mean_state_diagnostics.py",
+    "global_atmospheric_energy_budget_diagnostics.py",
     "symmetry_convection_diagnostics.py",
     "thermal_wind_scaled_response.py",
     "matched_pattern_response.py",
+    "refined_high_cloud_classification_diagnostics.py",
     "equatorial_wave_diagnostics.py",
     "convective_pathway_diagnostics.py",
+    "convective_lifecycle_composite_diagnostics.py",
     "convective_organisation_diagnostics.py",
     "significance_bootstrap_diagnostics.py",
     "jet_variability_diagnostics.py",
@@ -144,8 +156,10 @@ def print_script_list(scripts: list[str]) -> None:
 def child_environment() -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("MPAS_SIMULATION_ROOT", str(DEFAULT_SIMULATION_ROOT))
+    env.setdefault("MPAS_DIAGNOSTIC_CACHE_ROOT", str(DEFAULT_DIAGNOSTIC_CACHE_ROOT))
     env.setdefault("MPLCONFIGDIR", str(Path("/tmp") / f"matplotlib-{os.getuid()}"))
-    env.setdefault("XDG_CACHE_HOME", str(Path("/tmp") / f"xdg-cache-{os.getuid()}"))
+    env.setdefault("XDG_CACHE_HOME", str(DEFAULT_DIAGNOSTIC_CACHE_ROOT / f"xdg-cache-{os.getuid()}"))
 
     Path(env["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
     Path(env["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)

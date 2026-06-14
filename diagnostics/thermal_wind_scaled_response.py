@@ -45,7 +45,8 @@ save_loc = '/home/cwp29/tmp/mpas/crf_on/final/thermal_wind/'
 #   11: scaled_residual_N2_latheight
 #   12: scaled_residual_cldfrac_latheight
 #   13: thermal_wind_temperature_gradient_total_fields
-figures_to_run = []
+#   14: thermal_wind_gradient_shear_latheight_diff
+figures_to_run = [14]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
@@ -161,7 +162,7 @@ def annotate_scaled_residual_labels(ax, run_u=1, run_T=2, control=0):
 
 # Pre-compute cold-point tropopause profiles only for figures that draw them.
 CPTs = None
-if should_run_any([1, 7, 8, 9, 10, 11, 12, 13]):
+if should_run_any([1, 7, 8, 9, 10, 11, 12, 13, 14]):
     CPTs = []
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
@@ -467,6 +468,24 @@ def add_tw_equator_guides(ax, lat=5.0):
     for x in (-lat, lat):
         ax.axvline(x, color="0.2", lw=0.9, ls="--", alpha=0.9)
 
+def symmetric_percentile_levels_for_fields(fields, percentile=99.0, ndiv=12, fallback=1.0):
+    vals = []
+    for field in fields:
+        if field is None:
+            continue
+        arr = np.asarray(field.values, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size:
+            vals.append(np.abs(arr))
+
+    if vals:
+        vmax = np.nanpercentile(np.concatenate(vals), percentile)
+    else:
+        vmax = fallback
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = fallback
+    return symmetric_levels(vmax, ndiv=ndiv)
+
 def get_latheight_anomaly(run_index, control_index, var):
     """Time-mean latitude-height anomaly relative to control, on this run's grid."""
     field = get_latheight_field(run_index, var)
@@ -509,6 +528,17 @@ def scaled_residual_map(var, alpha, run_u=1, run_T=2, control=0):
     dXT_on_u = dXT.interp(latitude=dXu.latitude, longitude=dXu.longitude, kwargs={"fill_value": np.nan})
     resid = dXu - alpha * dXT_on_u
     return dXu, dXT, resid
+
+def thermal_gradient_shear_fields(run_index):
+    """Return observed dT/dy and du/dz on model height levels for one run."""
+    Tbar = get_latheight_field(run_index, "temperature")
+    ubar = get_latheight_field(run_index, "uReconstructZonal")
+    du_dz, _, _ = thermal_wind_terms(Tbar, ubar, tw_equator_mask_deg=None)
+    dT_dy, _, _ = thermal_wind_temperature_gradient_terms(Tbar, ubar, tw_equator_mask_deg=None)
+    return {
+        "dT_dy": (dT_dy * 1.0e6).rename("dT_dy_K_per_1000km"),
+        "du_dz": (du_dz * 1000.0).rename("du_dz_ms-1_per_km"),
+    }
 
 # -----------------------
 # 1. Realised thermal/wind scaling numbers
@@ -647,7 +677,7 @@ if should_run_figure(13):
     ax[0, 0].set_title(r"Observed $\partial T/\partial y$")
     ax[0, 1].set_title("TW-implied T gradient")
     ax[0, 2].set_title("Observed - implied")
-    add_symmetric_colorbar(fig, im_resid, ax[:, 2], levels, label=r"K per 1000 km")
+    add_symmetric_colorbar(fig, im_resid, ax[:, 2], levels, label=r"K $(10^3$ km)$^{-1}$")
 
     figsave.save(fig, "thermal_wind_temperature_gradient_total_fields", number=13)
     print("Done with figure: 13_thermal_wind_temperature_gradient_total_fields.png")
@@ -663,6 +693,131 @@ if should_run_figure(13):
         thermal_wind_temperature_gradient_metrics.to_csv(
             save_loc + "thermal_wind_temperature_gradient_total_metrics.csv", index=False
         )
+
+# -----------------------
+# 2c. Observed gradient/shear control fields and nudged differences
+# -----------------------
+
+if should_run_figure(14):
+    gradient_shear_by_sim = {
+        i: thermal_gradient_shear_fields(i)
+        for i in range(len(dss_zm))
+    }
+    gradient_shear_specs = [
+        {
+            "key": "dT_dy",
+            "label": r"$\partial T/\partial y$",
+            "units": r"K $(10^3$ km)$^{-1}$",
+            "cmap": "coolwarm",
+            "raw_fallback": 8.0,
+            "diff_fallback": 2.0,
+        },
+        {
+            "key": "du_dz",
+            "label": r"$\partial u/\partial z$",
+            "units": r"m s$^{-1}$ km$^{-1}$",
+            "cmap": "bwr",
+            "raw_fallback": 8.0,
+            "diff_fallback": 2.0,
+        },
+    ]
+
+    nrows = len(gradient_shear_specs)
+    ncols = len(dss_zm)
+    fig, ax = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(3.8 * ncols, 2.9 * nrows),
+        constrained_layout=True,
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+    )
+
+    for row, spec in enumerate(gradient_shear_specs):
+        control_field = gradient_shear_by_sim[0][spec["key"]]
+        diff_fields = {}
+        for i in range(1, ncols):
+            field = gradient_shear_by_sim[i][spec["key"]]
+            control_interp = control_field.interp(
+                z=field.z, latitude=field.latitude, kwargs={"fill_value": np.nan}
+            )
+            diff_fields[i] = (field - control_interp).load()
+
+        raw_levels = symmetric_percentile_levels_for_fields(
+            [control_field],
+            percentile=99.0,
+            ndiv=12,
+            fallback=spec["raw_fallback"],
+        )
+        diff_levels = symmetric_percentile_levels_for_fields(
+            list(diff_fields.values()),
+            percentile=99.0,
+            ndiv=12,
+            fallback=spec["diff_fallback"],
+        )
+
+        control_im = diff_im = None
+        for i in range(ncols):
+            axis = ax[row, i]
+            if i == 0:
+                field = control_field
+                levels = raw_levels
+                cmap = spec["cmap"]
+                control_im = axis.contourf(
+                    field.latitude.values,
+                    field.z.values / 1000.0,
+                    field.values,
+                    levels=levels,
+                    cmap=cmap,
+                    extend="both",
+                )
+            else:
+                field = diff_fields[i]
+                levels = diff_levels
+                diff_im = axis.contourf(
+                    field.latitude.values,
+                    field.z.values / 1000.0,
+                    field.values,
+                    levels=levels,
+                    cmap="bwr",
+                    extend="both",
+                )
+
+            axis.plot(dss_zm[i].latitude.values, CPTs[i][0] / 1000.0, color="k", lw=1, ls=":")
+            add_tw_equator_guides(axis, lat=5.0)
+            annotate_panel_label(axis, control_diff_label(sim_names, i))
+            set_latheight_labels(axis, xlabel=(row == nrows - 1))
+            axis.set_xlim(-60, 60)
+            axis.set_ylim(0, 25)
+            if i == 0:
+                axis.set_ylabel(f"{spec['label']}\nHeight (km)")
+            else:
+                axis.set_ylabel("")
+                axis.tick_params(labelleft=False)
+            if row < nrows - 1:
+                axis.tick_params(labelbottom=False)
+
+        if control_im is not None:
+            fig.colorbar(
+                control_im,
+                ax=ax[row, 0],
+                location="right",
+                label=f"{spec['label']} ({spec['units']})",
+            )
+        if diff_im is not None:
+            add_symmetric_colorbar(
+                fig,
+                diff_im,
+                ax[row, 1:],
+                diff_levels,
+                label=f"{spec['label']} difference ({spec['units']})",
+            )
+
+    fig.suptitle("Observed thermal gradient and vertical shear")
+    figsave.save(fig, "thermal_wind_gradient_shear_latheight_diff", number=14)
+    print("Done with figure: 14_thermal_wind_gradient_shear_latheight_diff.png")
+    print("WHAT TO LOOK FOR: the control column gives the raw dT/dy and du/dz structure; the nudged columns show where each experiment changes the balanced-gradient and shear ingredients relative to control.")
 
 # -----------------------
 # 3. Realised-state summary bar chart

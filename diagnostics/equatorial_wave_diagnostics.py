@@ -29,11 +29,11 @@ AD is a broad westward disturbance filter rather than a single Matsuno normal
 mode, so this script analyzes its symmetric and antisymmetric projections
 separately.
 
-The script caches filtered fields as NetCDF files in save_loc/wave_cache so that
-figures can be regenerated without re-running the k-f filters.
+The script caches filtered fields as NetCDF files beside the source simulations
+so that figures can be regenerated without re-running the k-f filters.
 """
 
-import os, sys, numbers, glob
+import os, sys, numbers, glob, json
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("../..", "../../.."):
@@ -51,6 +51,11 @@ import xarray as xr
 import dask
 
 from diagnostic_helpers import *
+from high_cloud_classification import (
+    CLASSIFICATION_CACHE_VERSION as SHARED_HIGH_CLOUD_CLASSIFICATION_VERSION,
+    HighCloudThresholds,
+    cached_classification_is_current as shared_cached_classification_is_current,
+)
 from wavenumber_frequency_functions import spacetime_power, smooth_wavefreq
 
 try:
@@ -86,6 +91,12 @@ save_loc = "/home/cwp29/tmp/mpas/crf_on/final/waves/"
 #   11: compact_wave_attribution_metrics
 figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
+
+# Restart/resume controls.  With the default full run, existing figure files are
+# treated as completed products; set this to False if you explicitly want to
+# redraw figures from cached/intermediate data.
+skip_existing_figures = True
+force_recompute_caches = False
 
 # Figure 8 is deliberately excluded from the default list because it filters
 # latitude-resolved u and v. Add 8 to figures_to_run after the cheaper figures
@@ -148,20 +159,20 @@ KELVIN_CLOUD_CONDITION_LABELS = {
 
 KELVIN_CLOUD_CATEGORIES = (
     ("total_high_cloud", "Total high cloud", "high_cloud_mask"),
-    ("deep_convective_high_cloud", "Deep convective", "deep_convective_high_cloud_mask"),
-    ("anvil_high_cloud", "Anvil", "anvil_high_cloud_mask"),
-    ("detached_cirrus_like_high_cloud", "Detached cirrus-like", "cirrus_like_high_cloud_mask"),
-    ("unclassified_high_cloud", "Unclassified", "unclassified_high_cloud_mask"),
+    ("active_deep_convection_high_cloud", "Active deep convection", "active_deep_convection_high_cloud_mask"),
+    ("convectively_generated_high_cloud", "Convectively generated high cloud", "convectively_generated_high_cloud_mask"),
+    ("cirrus_like_high_cloud", "Cirrus-like high cloud", "cirrus_like_high_cloud_mask"),
+    ("unclassified_high_cloud", "Ambiguous/unclassified", "unclassified_high_cloud_mask"),
 )
 KELVIN_CLOUD_PLOT_CATEGORIES = (
-    "deep_convective_high_cloud",
-    "anvil_high_cloud",
-    "detached_cirrus_like_high_cloud",
+    "active_deep_convection_high_cloud",
+    "convectively_generated_high_cloud",
+    "cirrus_like_high_cloud",
 )
 KELVIN_CLOUD_CONTRIBUTION_CATEGORIES = (
-    "deep_convective_high_cloud",
-    "anvil_high_cloud",
-    "detached_cirrus_like_high_cloud",
+    "active_deep_convection_high_cloud",
+    "convectively_generated_high_cloud",
+    "cirrus_like_high_cloud",
     "unclassified_high_cloud",
 )
 
@@ -210,13 +221,13 @@ lag_target_fields = ["Precip", "OLR", "PW", "cldfrac"]
 conditioned_fields = ["Precip", "OLR", "PW", "cldfrac"]
 vertical_profile_waves = wave_names
 vertical_profile_fields = ["u", "w", "T", "cldfrac"]
-vertical_profile_levels = [100, 150, 200, 250, 300, 500, 700, 850]
-cldfrac_profile_heights_km = [2, 5, 8, 11, 14, 17]
+vertical_profile_levels = [50, 70, 100, 150, 200, 250, 300, 500, 700, 850]
+cldfrac_profile_heights_km = [2, 5, 8, 11, 14, 17, 20]
 
 # Figure 8 keeps latitude resolved, so hemispheric projections such as AD_sym
 # and AD_antisym are not applied there. Use the underlying AD filter once.
 eddy_flux_waves = ["Kelvin", "EIG", "IG_antisym", "AD_sym", "AD_antisym", "ER"]
-eddy_flux_levels = [100, 250, 850]
+eddy_flux_levels = [70, 100, 250, 850]
 
 spectrum_field = "Precip"
 spectrum_lat_bounds = filter_lat_bounds
@@ -240,16 +251,24 @@ spectrum_outline_colors = {
 earth_radius_m = 6.371e6
 
 # Input/output cache for k-f filtered fields.
-cache_dir = '/store/atmos-adk33/cwp29/cache/'
+cache_dir = diagnostic_cache_dir("wave_cache", root_dir=root_dir)
 input_cache_dir = os.path.join(cache_dir, "filter_inputs")
+derived_cache_dir = os.path.join(cache_dir, "derived")
+classification_cache_dirs = [
+    diagnostic_cache_dir("classification_cache", root_dir=root_dir),
+]
 os.makedirs(cache_dir, exist_ok=True)
 os.makedirs(input_cache_dir, exist_ok=True)
+os.makedirs(derived_cache_dir, exist_ok=True)
 
 # Bump this when the pressure-level source fields or their coordinate handling
 # changes. Existing pressure-level filter inputs/wave caches without this marker
 # are regenerated automatically.
 PRESSURE_FIELD_CACHE_VERSION = "pressure-axis-fixed"
 PRESSURE_FIELD_PREFIXES = ("w", "u", "v", "T", "qv", "RH")
+DERIVED_CACHE_VERSION = "equatorial-wave-derived-v2"
+SPECTRUM_CACHE_VERSION = "equatorial-wave-spectrum-v1"
+CLOUD_CLASSIFICATION_CACHE_VERSION = SHARED_HIGH_CLOUD_CLASSIFICATION_VERSION
 
 # Avoid giant chunks when selecting latitude/longitude subsets.
 dask.config.set({"array.slicing.split_large_chunks": True})
@@ -281,11 +300,247 @@ def run_all_figures():
     return all_figures_requested(figures_to_run)
 
 
+def numbered_figure_path(number, stem):
+    return os.path.join(save_loc, f"{number:02d}_{stem}.png")
+
+
+def figure_outputs_exist(number, stems):
+    if isinstance(stems, str):
+        stems = [stems]
+    return all(os.path.exists(numbered_figure_path(number, stem)) for stem in stems)
+
+
+def should_build_figure(number, stems):
+    if not should_run_figure(number):
+        return False
+    if save and skip_existing_figures and not force_recompute_caches and figure_outputs_exist(number, stems):
+        if isinstance(stems, str):
+            stems = [stems]
+        print(
+            f"Skipping figure {number}: existing output file(s) found "
+            f"({', '.join(f'{number:02d}_{stem}.png' for stem in stems)})"
+        )
+        return False
+    return True
+
+
 def save_figure(number, fig, stem):
     """Save both numbered project-style figures and exact task filenames."""
     figsave.save(fig, stem, number=number)
     if save and should_run_figure(number):
         fig.savefig(os.path.join(save_loc, f"{stem}.png"), dpi=figsave.dpi)
+
+
+def jsonable_value(value):
+    if isinstance(value, dict):
+        return {str(k): jsonable_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable_value(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return jsonable_value(value.tolist())
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
+
+
+def derived_cache_path(cache_name, suffix):
+    return os.path.join(derived_cache_dir, f"{safe_name(cache_name)}.{suffix}")
+
+
+def read_cache_metadata(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_cache_metadata(path, signature):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(jsonable_value(signature), handle, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def cache_signature(kind, extra=None):
+    signature = dict(
+        cache_version=DERIVED_CACHE_VERSION,
+        kind=kind,
+        root_dir=os.path.abspath(root_dir),
+        data_locs=list(data_locs),
+        sim_names=list(sim_names),
+        latlon_file=list(latlon_file),
+        zm_latlon_file=list(zm_latlon_file),
+        ndays=ndays,
+        dt_hours=dt,
+        obs_per_day=obs_per_day,
+        analysis_end_date=analysis_end_date,
+        time_format=time_format,
+        filter_lat_bounds=jsonable_value(filter_lat_bounds),
+        filter_avg_lat=filter_avg_lat,
+        wave_names=list(wave_names),
+        wave_boxes=jsonable_value(WAVE_BOXES) if "WAVE_BOXES" in globals() else None,
+        wave_latitude_projection=jsonable_value(wave_latitude_projection),
+        pressure_field_cache_version=PRESSURE_FIELD_CACHE_VERSION,
+    )
+    if extra:
+        signature.update(jsonable_value(extra))
+    return signature
+
+
+def cache_metadata_matches(metadata_path, signature, label):
+    if force_recompute_caches:
+        print(f"Ignoring cached {label}: force_recompute_caches is enabled.")
+        return False
+    try:
+        cached = read_cache_metadata(metadata_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Ignoring cached {label}: could not read metadata ({exc}).")
+        return False
+    if cached is None:
+        return False
+    signature = jsonable_value(signature)
+    changed = sorted(
+        key for key in set(cached) | set(signature)
+        if cached.get(key) != signature.get(key)
+    )
+    if changed:
+        shown = ", ".join(changed[:6])
+        suffix = "" if len(changed) <= 6 else f", +{len(changed) - 6} more"
+        print(f"Ignoring cached {label}: metadata changed ({shown}{suffix}).")
+        return False
+    return True
+
+
+def figure_metadata_path(number, stem):
+    return derived_cache_path(f"figure_{number:02d}_{stem}", "metadata.json")
+
+
+def figure_outputs_current(number, stems, signature):
+    if isinstance(stems, str):
+        stems = [stems]
+    if not figure_outputs_exist(number, stems):
+        return False
+    return all(
+        cache_metadata_matches(
+            figure_metadata_path(number, stem),
+            signature,
+            f"figure {number:02d}_{stem}",
+        )
+        for stem in stems
+    )
+
+
+def should_build_versioned_figure(number, stems, signature):
+    if not should_run_figure(number):
+        return False
+    if (
+        save
+        and skip_existing_figures
+        and not force_recompute_caches
+        and figure_outputs_current(number, stems, signature)
+    ):
+        if isinstance(stems, str):
+            stems = [stems]
+        print(
+            f"Skipping figure {number}: existing output file(s) and metadata match "
+            f"({', '.join(f'{number:02d}_{stem}.png' for stem in stems)})"
+        )
+        return False
+    return True
+
+
+def write_figure_output_metadata(number, stems, signature):
+    if not save:
+        return
+    if isinstance(stems, str):
+        stems = [stems]
+    for stem in stems:
+        write_cache_metadata(figure_metadata_path(number, stem), signature)
+
+
+def load_cached_table(cache_name, signature, output_filename=None, required_columns=None):
+    """Load a derived CSV cache, seeding it from save_loc output if available."""
+    csv_path = derived_cache_path(cache_name, "csv")
+    metadata_path = derived_cache_path(cache_name, "metadata.json")
+    required_columns = set(required_columns or ())
+
+    if cache_metadata_matches(metadata_path, signature, cache_name) and os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            if required_columns.issubset(df.columns):
+                print(f"Using cached table {csv_path}")
+                return df
+        except Exception as exc:
+            print(f"Ignoring cached table {csv_path}: {exc}")
+
+    if output_filename is not None and not force_recompute_caches:
+        output_path = os.path.join(save_loc, output_filename)
+        if os.path.exists(output_path):
+            try:
+                df = pd.read_csv(output_path)
+                if required_columns.issubset(df.columns):
+                    print(f"Using existing output table as cache: {output_path}")
+                    try:
+                        write_cached_table(cache_name, df, signature)
+                    except Exception as exc:
+                        print(f"Could not seed derived cache for {cache_name}: {exc}")
+                    return df
+            except Exception as exc:
+                print(f"Ignoring existing output table {output_path}: {exc}")
+    return None
+
+
+def write_cached_table(cache_name, df, signature):
+    csv_path = derived_cache_path(cache_name, "csv")
+    metadata_path = derived_cache_path(cache_name, "metadata.json")
+    tmp = csv_path + ".tmp"
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, csv_path)
+    write_cache_metadata(metadata_path, signature)
+
+
+def table_key_set(df, key_columns):
+    if df is None or len(df) == 0 or any(col not in df.columns for col in key_columns):
+        return set()
+    return set(map(tuple, df[list(key_columns)].itertuples(index=False, name=None)))
+
+
+def append_cached_rows(cache_name, existing, rows, signature):
+    if not rows:
+        return existing if existing is not None else pd.DataFrame()
+    new_df = pd.DataFrame(rows)
+    if existing is not None and len(existing) > 0:
+        combined = pd.concat([existing, new_df], ignore_index=True)
+    else:
+        combined = new_df
+    write_cached_table(cache_name, combined, signature)
+    return combined
+
+
+def load_cached_dataset(cache_name, signature):
+    nc_path = derived_cache_path(cache_name, "nc")
+    metadata_path = derived_cache_path(cache_name, "metadata.json")
+    if not (os.path.exists(nc_path) and cache_metadata_matches(metadata_path, signature, cache_name)):
+        return None
+    try:
+        print(f"Using cached dataset {nc_path}")
+        return xr.open_dataset(nc_path, chunks={})
+    except Exception as exc:
+        print(f"Ignoring cached dataset {nc_path}: {exc}")
+        return None
+
+
+def write_cached_dataset(cache_name, ds, signature):
+    nc_path = derived_cache_path(cache_name, "nc")
+    metadata_path = derived_cache_path(cache_name, "metadata.json")
+    tmp = nc_path + ".tmp"
+    netcdf_safe_dataset(ds).to_netcdf(tmp)
+    os.replace(tmp, nc_path)
+    write_cache_metadata(metadata_path, signature)
 
 
 # -----------------------------------------------------------------------------
@@ -475,121 +730,93 @@ def rolling_or_dilated_max(
     return x.rolling(**rolling_kwargs, center=True, min_periods=1).max() >= 1
 
 
-def classify_high_cloud_like_convective_pathway(
-    cldfrac,
-    precip,
-    cf_thresh=CLOUD_FRAC_THRESH,
-    z_high=Z_HIGH_KM,
-    z_low_min=LOW_CLOUD_ZMIN_KM,
-    z_low_max=LOW_CLOUD_ZMAX_KM,
-    z_mid_min=MID_CLOUD_ZMIN_KM,
-    z_mid_max=MID_CLOUD_ZMAX_KM,
-    z_upper_min=UPPER_CLOUD_ZMIN_KM,
-    p_deep=PRECIP_DEEP_THRESH_MM_DAY,
-    p_weak=PRECIP_WEAK_THRESH_MM_DAY,
-    max_clear_gap=MAX_CLEAR_GAP_KM,
-    anvil_radius_deg=ANVIL_RADIUS_DEG,
-    anvil_time_steps=ANVIL_TIME_STEPS,
-):
-    """
-    Classify high cloud using the same definitions as convective_pathway_diagnostics.
+def classification_thresholds():
+    return HighCloudThresholds(
+        cf_thresh=CLOUD_FRAC_THRESH,
+        z_high_km=Z_HIGH_KM,
+        low_cloud_min_km=LOW_CLOUD_ZMIN_KM,
+        low_cloud_max_km=LOW_CLOUD_ZMAX_KM,
+        mid_cloud_min_km=MID_CLOUD_ZMIN_KM,
+        mid_cloud_max_km=MID_CLOUD_ZMAX_KM,
+        upper_cloud_min_km=UPPER_CLOUD_ZMIN_KM,
+        max_clear_gap_km=MAX_CLEAR_GAP_KM,
+        surface_precip_deep_mm_day=PRECIP_DEEP_THRESH_MM_DAY,
+        surface_precip_weak_mm_day=PRECIP_WEAK_THRESH_MM_DAY,
+    )
 
-    The physical categories are built from raw cldfrac and precipitation first;
-    Kelvin-filtered precipitation is used only later as a conditioning variable.
-    """
-    cf = finite_or_nan(cldfrac)
-    zdim = vertical_dim(cf)
-    if zdim != "z":
-        cf = cf.rename({zdim: "z"})
-    if "Time" in cf.dims:
-        cf = cf.sel(Time=available_cldfrac_times(cf))
-    cf, pr = xr.align(cf, precip, join="inner")
-    z_km = z_km_from_cldfrac(cf)
 
-    cloudy = cf >= cf_thresh
-    cloud_top_height = z_km.where(cloudy).max(dim="z", skipna=True)
-    cloud_top_height.name = "cloud_top_height"
-    cloud_top_height.attrs["units"] = "km"
+def cached_classification_is_current(cached):
+    return shared_cached_classification_is_current(cached, classification_thresholds())
 
-    high_cloud_fraction = cf.where(z_km >= z_high).mean(dim="z", skipna=True)
-    high_cloud_fraction.name = "high_cloud_fraction"
-    high_cloud_mask = ((cloud_top_height >= z_high) | (high_cloud_fraction >= cf_thresh)).fillna(False)
-    high_cloud_mask.name = "high_cloud_mask"
 
-    low_cloud = any_cloud_in_layer(cloudy, z_km, z_low_min, z_low_max)
-    mid_cloud = any_cloud_in_layer(cloudy, z_km, z_mid_min, z_mid_max)
-    upper_cloud = any_cloud_in_layer(cloudy, z_km, z_upper_min, max(float(z_km.max()), z_high + 0.1))
+REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS = (
+    "high_cloud_mask",
+    "active_deep_convection_high_cloud_mask",
+    "convectively_generated_high_cloud_mask",
+    "cirrus_like_high_cloud_mask",
+    "unclassified_high_cloud_mask",
+)
 
-    gap_ok = xr.ones_like(high_cloud_mask, dtype=bool)
-    if max_clear_gap is not None and max_clear_gap > 0:
-        slab_starts = np.arange(z_low_min, z_high, max_clear_gap)
-        for z0 in slab_starts:
-            z1 = min(z0 + max_clear_gap, max(float(z_km.max()), z_high))
-            if z1 <= z0:
+
+def classification_dict_from_dataset(ds):
+    out = {}
+    for name in ds.data_vars:
+        da = ds[name]
+        if int(da.attrs.get("boolean_mask", 0)) == 1 or da.attrs.get("logical_type") == "bool":
+            da = da.astype(bool)
+        out[name] = da
+    return out
+
+
+def classification_cache_names(sim_name):
+    safe = sim_name.replace(" ", "_")
+    return [
+        f"{safe}_classified_high_cloud.nc",
+        f"{safe.lower()}_classified_high_cloud.nc",
+        f"{safe_name(sim_name)}_classified_high_cloud.nc",
+    ]
+
+
+def open_shared_high_cloud_classification(sim_name, precip_ref):
+    checked = []
+    for cache_dir_i in classification_cache_dirs:
+        for fname in classification_cache_names(sim_name):
+            path = os.path.join(cache_dir_i, fname)
+            checked.append(path)
+            if not os.path.exists(path):
                 continue
-            gap_ok = gap_ok & any_cloud_in_layer(cloudy, z_km, z0, z1 + 1.0e-6)
-
-    column_connected_mask = (
-        high_cloud_mask & low_cloud & mid_cloud & upper_cloud & gap_ok
-    ).fillna(False)
-    column_connected_mask.name = "column_connected_high_cloud_mask"
-
-    deep_convective_high_cloud_mask = (
-        high_cloud_mask & column_connected_mask & (pr >= p_deep)
-    ).fillna(False)
-    deep_convective_high_cloud_mask.name = "deep_convective_high_cloud_mask"
-
-    near_deep_core = rolling_or_dilated_max(
-        deep_convective_high_cloud_mask,
-        lat_radius=anvil_radius_deg,
-        lon_radius=anvil_radius_deg,
-        time_radius=anvil_time_steps,
-    ).fillna(False)
-    near_deep_core.name = "near_deep_core"
-
-    anvil_high_cloud_mask = (
-        high_cloud_mask & ~deep_convective_high_cloud_mask & near_deep_core
-    ).fillna(False)
-    anvil_high_cloud_mask.name = "anvil_high_cloud_mask"
-
-    cirrus_like_high_cloud_mask = (
-        high_cloud_mask & ~column_connected_mask & ~near_deep_core & (pr <= p_weak)
-    ).fillna(False)
-    cirrus_like_high_cloud_mask.name = "cirrus_like_high_cloud_mask"
-
-    unclassified_high_cloud_mask = (
-        high_cloud_mask
-        & ~(
-            deep_convective_high_cloud_mask
-            | anvil_high_cloud_mask
-            | cirrus_like_high_cloud_mask
-        )
-    ).fillna(False)
-    unclassified_high_cloud_mask.name = "unclassified_high_cloud_mask"
-
-    nonprecipitating_high_cloud = (high_cloud_mask & (pr <= p_weak)).fillna(False)
-    nonprecipitating_high_cloud.name = "nonprecipitating_high_cloud_mask"
-
-    return {
-        "cloud_top_height": cloud_top_height,
-        "high_cloud_fraction": high_cloud_fraction,
-        "high_cloud_mask": high_cloud_mask,
-        "column_connected_mask": column_connected_mask,
-        "deep_convective_high_cloud_mask": deep_convective_high_cloud_mask,
-        "near_deep_core": near_deep_core,
-        "anvil_high_cloud_mask": anvil_high_cloud_mask,
-        "cirrus_like_high_cloud_mask": cirrus_like_high_cloud_mask,
-        "unclassified_high_cloud_mask": unclassified_high_cloud_mask,
-        "nonprecipitating_high_cloud_mask": nonprecipitating_high_cloud,
-    }
+            cached = xr.open_dataset(path, chunks={})
+            if not cached_classification_is_current(cached):
+                cached.close()
+                raise RuntimeError(f"{sim_name}: stale high-cloud classification cache: {path}")
+            missing = [
+                name for name in REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS
+                if name not in cached.data_vars
+            ]
+            if missing:
+                cached.close()
+                raise RuntimeError(
+                    f"{sim_name}: high-cloud classification cache lacks required shared variables "
+                    f"{missing}: {path}"
+                )
+            print(f"Using shared high-cloud classification for {sim_name}: {path}")
+            out = classification_dict_from_dataset(cached)
+            if precip_ref is not None:
+                out = {
+                    name: sel_common_times(da, precip_ref) if "Time" in da.dims and "Time" in precip_ref.dims else da
+                    for name, da in out.items()
+                }
+            return out
+    raise FileNotFoundError(
+        f"{sim_name}: required shared high-cloud classification cache is missing. "
+        f"Run refined_high_cloud_classification_diagnostics.py first. Checked: {checked}"
+    )
 
 
-def get_high_cloud_classification(ds, precip=None):
-    if "cldfrac" not in ds.data_vars:
-        raise ValueError("cldfrac is not available for Kelvin cloud decomposition")
+def get_high_cloud_classification_cached(ds, sim_index, precip=None):
     if precip is None:
         precip = precip_rate(ds)
-    return classify_high_cloud_like_convective_pathway(ds.cldfrac, precip)
+    return open_shared_high_cloud_classification(sim_names[sim_index], precip)
 
 
 def get_filter_field(ds, field_name):
@@ -832,6 +1059,7 @@ def read_cached_wave(cache_path, field_name, wave_name, avgLat, lat_bounds, proj
         cached = xr.open_dataset(cache_path)
         wave_cached = cached["wave"]
         if wave_cache_matches(wave_cached, field_name, wave_name, avgLat, lat_bounds, projection):
+            print(f"Using cached filtered wave {cache_path}")
             return wave_cached
         print(f"Regenerating stale cached wave file {cache_path}")
         cached.close()
@@ -1208,7 +1436,66 @@ def category_info(category):
     raise KeyError(category)
 
 
+def kelvin_cloud_decomposition_signature():
+    return cache_signature(
+        "kelvin_cloud_decomposition",
+        extra=dict(
+            conditions=list(KELVIN_CLOUD_CONDITIONS),
+            categories=jsonable_value(KELVIN_CLOUD_CATEGORIES),
+            tropical_lat_bounds=jsonable_value(TROPICAL_LAT_BOUNDS),
+            phase_bins=jsonable_value(np.linspace(-3.0, 3.0, 25)),
+            active_kelvin_amp_threshold=ACTIVE_KELVIN_AMP_THRESH,
+            cloud_classification_cache_version=CLOUD_CLASSIFICATION_CACHE_VERSION,
+        ),
+    )
+
+
 def compute_kelvin_cloud_decomposition():
+    signature = kelvin_cloud_decomposition_signature()
+    scalar_cached = load_cached_table(
+        "kelvin_cloud_decomposition_scalar",
+        signature,
+        output_filename="kelvin_cloud_decomposition_summary.csv",
+        required_columns=("simulation", "condition", "category", "fraction"),
+    )
+    profiles_cached = load_cached_table(
+        "kelvin_cloud_decomposition_profiles",
+        signature,
+        output_filename="kelvin_cloud_decomposition_latitude_profiles.csv",
+        required_columns=("simulation", "condition", "category", "latitude", "fraction"),
+    )
+    phase_cached = load_cached_table(
+        "kelvin_cloud_decomposition_phase",
+        signature,
+        output_filename="kelvin_cloud_decomposition_phase_composites.csv",
+        required_columns=("simulation", "variable", "signed_kelvin_sigma_bin", "mean"),
+    )
+    needs_full_plot_tables = (
+        should_run_figure(KELVIN_CLOUD_FIGURE_NUMBER)
+        and not figure_outputs_current(
+            KELVIN_CLOUD_FIGURE_NUMBER,
+            [
+                "kelvin_cloud_decomposition_latitude",
+                "kelvin_cloud_decomposition_bars",
+                "kelvin_cloud_decomposition_phase_composites",
+                "kelvin_cloud_decomposition_contribution_to_high_cloud_change",
+            ],
+            signature,
+        )
+    )
+    if scalar_cached is not None and (
+        not needs_full_plot_tables
+        or (profiles_cached is not None and phase_cached is not None)
+    ):
+        return {
+            "scalar": scalar_cached,
+            "profiles": profiles_cached if profiles_cached is not None else pd.DataFrame(),
+            "phase": phase_cached if phase_cached is not None else pd.DataFrame(),
+            "classifications": {},
+            "kelvin_waves": {},
+            "conditions": {},
+        }
+
     scalar_rows = []
     profile_rows = []
     phase_rows = []
@@ -1221,7 +1508,7 @@ def compute_kelvin_cloud_decomposition():
         sim = sim_names[i]
         try:
             pr = precip_rate(ds)
-            classif = get_high_cloud_classification(ds, precip=pr)
+            classif = get_high_cloud_classification_cached(ds, i, precip=pr)
             kelvin = kelvin_precip_anomaly(ds, i)
             masks, amp, sigma = kelvin_condition_masks(kelvin)
             classifications[sim] = classif
@@ -1336,6 +1623,13 @@ def compute_kelvin_cloud_decomposition():
     profiles = pd.DataFrame(profile_rows)
     phase = pd.DataFrame(phase_rows)
 
+    if len(scalar) > 0:
+        write_cached_table("kelvin_cloud_decomposition_scalar", scalar, signature)
+    if len(profiles) > 0:
+        write_cached_table("kelvin_cloud_decomposition_profiles", profiles, signature)
+    if len(phase) > 0:
+        write_cached_table("kelvin_cloud_decomposition_phase", phase, signature)
+
     if save and len(scalar) > 0:
         scalar.to_csv(os.path.join(save_loc, "kelvin_cloud_decomposition_summary.csv"), index=False)
         if len(profiles) > 0:
@@ -1356,7 +1650,7 @@ def compute_kelvin_cloud_decomposition():
                 )
             summary_ds = xr.merge(summary_pieces, compat="override")
             summary_ds.attrs.update(
-                description="Kelvin-conditioned cloud categories using raw cldfrac/precip classification",
+                description="Kelvin-conditioned cloud categories from the shared 3-D hydrometeor-aware high-cloud classification",
                 classification_reference="diagnostics/convective_pathway_diagnostics.py",
                 active_kelvin_amp_threshold_sigma=ACTIVE_KELVIN_AMP_THRESH,
             )
@@ -1375,6 +1669,23 @@ def compute_kelvin_cloud_decomposition():
 
 
 def compute_intense_precip_wave_attribution(percentile=95.0):
+    signature = cache_signature(
+        "intense_precip_wave_attribution",
+        extra=dict(
+            percentile=percentile,
+            waves=list(wave_names),
+            filter_lat_bounds=jsonable_value(filter_lat_bounds),
+        ),
+    )
+    cached = load_cached_table(
+        "intense_precip_wave_attribution",
+        signature,
+        output_filename="intense_precip_wave_attribution.csv",
+        required_columns=("simulation", "wave", "intense_event_fraction", "mean_normalised_amplitude_at_events"),
+    )
+    if cached is not None:
+        return cached
+
     attribution_rows = []
     for i, ds in enumerate(dss):
         try:
@@ -1414,7 +1725,10 @@ def compute_intense_precip_wave_attribution(percentile=95.0):
                 )
         except Exception as exc:
             print(f"Skipping event attribution for {sim_names[i]}: {exc}")
-    return pd.DataFrame(attribution_rows)
+    out = pd.DataFrame(attribution_rows)
+    if len(out) > 0:
+        write_cached_table("intense_precip_wave_attribution", out, signature)
+    return out
 
 
 def plot_kelvin_cloud_decomposition_latitude(summary):
@@ -1472,9 +1786,9 @@ def plot_kelvin_cloud_decomposition_bars(summary):
         return
     categories = (
         "total_high_cloud",
-        "deep_convective_high_cloud",
-        "anvil_high_cloud",
-        "detached_cirrus_like_high_cloud",
+        "active_deep_convection_high_cloud",
+        "convectively_generated_high_cloud",
+        "cirrus_like_high_cloud",
     )
     category_labels = dict((key, label) for key, label, _ in KELVIN_CLOUD_CATEGORIES)
     fig, ax = plt.subplots(1, len(KELVIN_CLOUD_CONDITIONS), figsize=(4.0 * len(KELVIN_CLOUD_CONDITIONS), 4.0),
@@ -1510,9 +1824,9 @@ def plot_kelvin_cloud_decomposition_phase_composites(summary):
         "OLR",
         "PW",
         "total_high_cloud",
-        "deep_convective_high_cloud",
-        "anvil_high_cloud",
-        "detached_cirrus_like_high_cloud",
+        "active_deep_convection_high_cloud",
+        "convectively_generated_high_cloud",
+        "cirrus_like_high_cloud",
     ]
     variable_order = [v for v in variable_order if v in set(phase.variable)]
     if len(variable_order) == 0:
@@ -1545,9 +1859,9 @@ def plot_kelvin_cloud_contribution_to_change(summary):
     if len(scalar) == 0:
         return
     colors_by_category = {
-        "deep_convective_high_cloud": "tab:blue",
-        "anvil_high_cloud": "tab:orange",
-        "detached_cirrus_like_high_cloud": "tab:green",
+        "active_deep_convection_high_cloud": "tab:purple",
+        "convectively_generated_high_cloud": "tab:orange",
+        "cirrus_like_high_cloud": "tab:green",
         "unclassified_high_cloud": "0.55",
     }
     category_labels = dict((key, label) for key, label, _ in KELVIN_CLOUD_CATEGORIES)
@@ -1666,7 +1980,7 @@ def build_compact_wave_attribution_table(wave_metrics_df, kelvin_cloud_summary=N
                             condition,
                             values,
                             "fraction",
-                            "Raw cldfrac/precip category fraction conditioned on Kelvin-filtered precipitation",
+                            "Shared 3-D high-cloud category fraction conditioned on Kelvin-filtered precipitation",
                         )
                     )
 
@@ -1768,9 +2082,9 @@ def plot_attribution_summary_bars(table):
         ("Kelvin OLR variance", "wave_variance_fraction", "OLR", "Kelvin", "all"),
         ("Kelvin PW variance", "wave_variance_fraction", "PW", "Kelvin", "all"),
         ("Kelvin cldfrac variance", "wave_variance_fraction", "cldfrac", "Kelvin", "all"),
-        ("Active-K deep high cloud", "cloud_category_fraction", "deep_convective_high_cloud", "Kelvin", "active_kelvin"),
-        ("Active-K anvil high cloud", "cloud_category_fraction", "anvil_high_cloud", "Kelvin", "active_kelvin"),
-        ("Active-K detached cirrus", "cloud_category_fraction", "detached_cirrus_like_high_cloud", "Kelvin", "active_kelvin"),
+        ("Active-K active deep convection", "cloud_category_fraction", "active_deep_convection_high_cloud", "Kelvin", "active_kelvin"),
+        ("Active-K convectively generated high cloud", "cloud_category_fraction", "convectively_generated_high_cloud", "Kelvin", "active_kelvin"),
+        ("Active-K cirrus-like high cloud", "cloud_category_fraction", "cirrus_like_high_cloud", "Kelvin", "active_kelvin"),
         ("AD sym cldfrac variance", "wave_variance_fraction", "cldfrac", "AD sym", "all"),
         ("AD antisym cldfrac variance", "wave_variance_fraction", "cldfrac", "AD antisym", "all"),
         ("ER cldfrac variance", "wave_variance_fraction", "cldfrac", "ER", "all"),
@@ -2138,6 +2452,74 @@ def spectrum_input_field(ds, field_name, lat_bounds):
     return da.rename({"latitude": "lat", "longitude": "lon"}).load()
 
 
+def spectrum_cache_signature(sim_index):
+    return cache_signature(
+        "normalised_wave_spectrum",
+        extra=dict(
+            cache_version=SPECTRUM_CACHE_VERSION,
+            simulation=sim_names[sim_index],
+            spectrum_field=spectrum_field,
+            spectrum_lat_bounds=jsonable_value(spectrum_lat_bounds),
+            spectrum_segment_days=spectrum_segment_days,
+            spectrum_overlap_days=spectrum_overlap_days,
+            obs_per_day=obs_per_day,
+            components=["symmetric", "antisymmetric"],
+        ),
+    )
+
+
+def load_cached_spectra(sim_index):
+    cache_name = f"normalised_wave_spectrum_{safe_name(sim_names[sim_index])}"
+    cached = load_cached_dataset(cache_name, spectrum_cache_signature(sim_index))
+    if cached is None or "normalised_power" not in cached:
+        return None
+    return {
+        str(component): cached["normalised_power"].sel(component=component)
+        for component in cached.component.values
+    }
+
+
+def write_cached_spectra(sim_index, spectra):
+    components = list(spectra)
+    spectrum_stack = xr.concat(
+        [spectra[component] for component in components],
+        dim=xr.DataArray(components, dims="component", name="component"),
+    )
+    ds_out = spectrum_stack.to_dataset(name="normalised_power")
+    ds_out.attrs.update(
+        description="Cached normalised symmetric/antisymmetric wave spectrum",
+        simulation=sim_names[sim_index],
+        field=spectrum_field,
+    )
+    cache_name = f"normalised_wave_spectrum_{safe_name(sim_names[sim_index])}"
+    write_cached_dataset(cache_name, ds_out, spectrum_cache_signature(sim_index))
+
+
+def add_wave_metric_ratios(wave_metrics):
+    if wave_metrics is None or len(wave_metrics) == 0:
+        return wave_metrics
+    base = wave_metrics.drop(
+        columns=["power_ratio_to_control", "fraction_ratio_to_control"],
+        errors="ignore",
+    ).copy()
+    control = base[base.simulation_index == 0].set_index(["field", "wave"])
+    ratios = []
+    for _, row in base.iterrows():
+        key = (row.field, row.wave)
+        if key in control.index:
+            cvar = control.loc[key, "wave_variance"]
+            cfrac = control.loc[key, "wave_fraction"]
+            ratios.append(
+                dict(
+                    power_ratio_to_control=row.wave_variance / cvar if cvar > 0 else np.nan,
+                    fraction_ratio_to_control=row.wave_fraction / cfrac if cfrac > 0 else np.nan,
+                )
+            )
+        else:
+            ratios.append(dict(power_ratio_to_control=np.nan, fraction_ratio_to_control=np.nan))
+    return pd.concat([base.reset_index(drop=True), pd.DataFrame(ratios)], axis=1)
+
+
 # -----------------------------------------------------------------------------
 # 1. Wave-filtered Hovmoller diagrams
 # -----------------------------------------------------------------------------
@@ -2147,7 +2529,7 @@ def spectrum_input_field(ds, field_name, lat_bounds):
 #     variability?
 #   * Kelvin/EIG: eastward streaks. IG/AD/ER: mostly westward or mixed structure.
 
-if should_run_figure(1):
+if should_build_figure(1, "wave_filtered_hovmollers_precip"):
     hov_field = "Precip"
     fields = {}
     vmax = 0.0
@@ -2197,11 +2579,36 @@ if should_run_figure(1):
 #     dynamical increase, convective sensitivity has changed.
 
 wave_metrics = None
-if should_run_any([2, 3, 4, 5, WAVE_ATTRIBUTION_FIGURE_NUMBER]):
-    rows = []
+if should_run_any([2, WAVE_ATTRIBUTION_FIGURE_NUMBER]):
+    wave_metrics_signature = cache_signature(
+        "wave_band_variance_metrics",
+        extra=dict(
+            fields=list(power_fields),
+            waves=list(wave_names),
+            filter_lat_bounds=jsonable_value(filter_lat_bounds),
+        ),
+    )
+    wave_metrics = load_cached_table(
+        "wave_band_variance_metrics",
+        wave_metrics_signature,
+        output_filename="wave_band_variance_metrics.csv",
+        required_columns=("simulation", "simulation_index", "field", "wave", "wave_variance", "wave_fraction"),
+    )
+    if wave_metrics is None:
+        wave_metrics = pd.DataFrame()
+    else:
+        wave_metrics = wave_metrics.drop(
+            columns=["power_ratio_to_control", "fraction_ratio_to_control"],
+            errors="ignore",
+        )
+
+    completed_metric_keys = table_key_set(wave_metrics, ("simulation_index", "field", "wave"))
     for i, ds in enumerate(dss):
         for field in power_fields:
             for wname in wave_names:
+                key = (i, field, wname)
+                if key in completed_metric_keys:
+                    continue
                 projection = lat_projection_for_wave(wname)
                 try:
                     total_var = anomaly_variance_latmean(
@@ -2209,7 +2616,7 @@ if should_run_any([2, 3, 4, 5, WAVE_ATTRIBUTION_FIGURE_NUMBER]):
                     )
                     wav = get_filtered_wave(ds, i, field, wname, avgLat=True)
                     wvar = wave_variance(wav)
-                    rows.append(dict(
+                    row = dict(
                         simulation=sim_names[i],
                         simulation_index=i,
                         field=field,
@@ -2219,30 +2626,26 @@ if should_run_any([2, 3, 4, 5, WAVE_ATTRIBUTION_FIGURE_NUMBER]):
                         total_variance=total_var,
                         wave_variance=wvar,
                         wave_fraction=wvar / total_var if total_var > 0 else np.nan,
-                    ))
+                    )
+                    wave_metrics = append_cached_rows(
+                        "wave_band_variance_metrics",
+                        wave_metrics,
+                        [row],
+                        wave_metrics_signature,
+                    )
+                    completed_metric_keys.add(key)
                 except Exception as exc:
                     print(f"Skipping wave variance for {sim_names[i]} {field} {wname}: {exc}")
-    wave_metrics = pd.DataFrame(rows)
     if len(wave_metrics) > 0:
         # Add nudged/control ratios field-by-field and wave-by-wave.
-        control = wave_metrics[wave_metrics.simulation_index == 0].set_index(["field", "wave"])
-        ratios = []
-        for _, row in wave_metrics.iterrows():
-            key = (row.field, row.wave)
-            if key in control.index:
-                cvar = control.loc[key, "wave_variance"]
-                cfrac = control.loc[key, "wave_fraction"]
-                ratios.append(dict(power_ratio_to_control=row.wave_variance / cvar if cvar > 0 else np.nan,
-                                   fraction_ratio_to_control=row.wave_fraction / cfrac if cfrac > 0 else np.nan))
-            else:
-                ratios.append(dict(power_ratio_to_control=np.nan, fraction_ratio_to_control=np.nan))
-        wave_metrics = pd.concat([wave_metrics.reset_index(drop=True), pd.DataFrame(ratios)], axis=1)
+        wave_metrics = add_wave_metric_ratios(wave_metrics)
+        write_cached_table("wave_band_variance_metrics", wave_metrics, wave_metrics_signature)
         print("\nWave-band variance metrics")
         print(wave_metrics.to_string(index=False))
         if save:
             wave_metrics.to_csv(os.path.join(save_loc, "wave_band_variance_metrics.csv"), index=False)
 
-if should_run_figure(2) and wave_metrics is not None and len(wave_metrics) > 0:
+if should_build_figure(2, "wave_power_fractions_and_ratios") and wave_metrics is not None and len(wave_metrics) > 0:
     plot_fields = ["Precip", "OLR", "PW", "cldfrac", "u850", "w500", "T100"]
     plot_fields = [f for f in plot_fields if f in set(wave_metrics.field)]
 
@@ -2287,21 +2690,34 @@ if should_run_figure(2) and wave_metrics is not None and len(wave_metrics) > 0:
 #   * If correlations are similar but wave power differs, occurrence/intensity
 #     rather than coupling is the dominant change.
 
-if should_run_figure(3):
+if should_build_figure(3, "wave_amplitude_lag_correlations"):
     lag_days_max = 10.0
-    lag_rows = []
-    fig, ax = plt.subplots(len(wave_names), len(lag_target_fields),
-                           figsize=(3.6 * len(lag_target_fields), 2.3 * len(wave_names)),
-                           constrained_layout=True, sharex=True, sharey=True)
-    if len(wave_names) == 1:
-        ax = ax[None, :]
-    if len(lag_target_fields) == 1:
-        ax = ax[:, None]
+    lag_signature = cache_signature(
+        "wave_amplitude_lag_correlations",
+        extra=dict(
+            waves=list(wave_names),
+            lag_target_fields=list(lag_target_fields),
+            lag_days_max=lag_days_max,
+            filter_lat_bounds=jsonable_value(filter_lat_bounds),
+        ),
+    )
+    lag_df = load_cached_table(
+        "wave_amplitude_lag_correlations",
+        lag_signature,
+        output_filename="wave_amplitude_lag_correlations.csv",
+        required_columns=("simulation", "wave", "target", "lag_days", "correlation"),
+    )
+    if lag_df is None:
+        lag_df = pd.DataFrame()
+    completed_lag_keys = table_key_set(lag_df, ("simulation", "wave", "target"))
 
-    for wj, wname in enumerate(wave_names):
+    for wname in wave_names:
         projection = lat_projection_for_wave(wname)
-        for tj, target in enumerate(lag_target_fields):
+        for target in lag_target_fields:
             for i, ds in enumerate(dss):
+                key = (sim_names[i], wname, target)
+                if key in completed_lag_keys:
+                    continue
                 try:
                     wav = get_filtered_wave(ds, i, "Precip", wname, avgLat=True)
                     amp = wave_amplitude_index(wav)
@@ -2315,14 +2731,52 @@ if should_run_figure(3):
                     max_steps = max(1, int(round(lag_days_max / dt_days_here)))
                     lags, corr = lag_corr(amp.values, ts.values, max_lag_steps=max_steps)
                     lag_days = lags * dt_days_here
-                    ax[wj, tj].plot(lag_days, corr, color=cols[i], label=sim_names[i] if (wj == 0 and tj == 0) else None)
-                    for lg, cc in zip(lag_days, corr):
-                        lag_rows.append(dict(simulation=sim_names[i], wave=wname,
-                                             wave_label=wave_label(wname),
-                                             latitude_projection=projection, target=target,
-                                             lag_days=lg, correlation=cc))
+                    rows = [
+                        dict(
+                            simulation=sim_names[i],
+                            wave=wname,
+                            wave_label=wave_label(wname),
+                            latitude_projection=projection,
+                            target=target,
+                            lag_days=lg,
+                            correlation=cc,
+                        )
+                        for lg, cc in zip(lag_days, corr)
+                    ]
+                    lag_df = append_cached_rows(
+                        "wave_amplitude_lag_correlations",
+                        lag_df,
+                        rows,
+                        lag_signature,
+                    )
+                    completed_lag_keys.add(key)
                 except Exception as exc:
                     print(f"Skipping lag correlation {sim_names[i]} {wname} {target}: {exc}")
+
+    fig, ax = plt.subplots(len(wave_names), len(lag_target_fields),
+                           figsize=(3.6 * len(lag_target_fields), 2.3 * len(wave_names)),
+                           constrained_layout=True, sharex=True, sharey=True)
+    if len(wave_names) == 1:
+        ax = ax[None, :]
+    if len(lag_target_fields) == 1:
+        ax = ax[:, None]
+
+    for wj, wname in enumerate(wave_names):
+        for tj, target in enumerate(lag_target_fields):
+            for i, ds in enumerate(dss):
+                s = lag_df[
+                    (lag_df.simulation == sim_names[i])
+                    & (lag_df.wave == wname)
+                    & (lag_df.target == target)
+                ].sort_values("lag_days")
+                if len(s) == 0:
+                    continue
+                ax[wj, tj].plot(
+                    s.lag_days,
+                    s.correlation,
+                    color=cols[i],
+                    label=sim_names[i] if (wj == 0 and tj == 0) else None,
+                )
             ax[wj, tj].axhline(0, color="0.6", lw=0.6)
             ax[wj, tj].axvline(0, color="0.6", lw=0.6)
             ax[wj, tj].grid(alpha=0.2)
@@ -2334,7 +2788,6 @@ if should_run_figure(3):
                 ax[wj, tj].set_xlabel("Lag (days; + means wave leads)")
     ax[0, 0].legend(loc="best")
     figsave.save(fig, "wave_amplitude_lag_correlations", number=3)
-    lag_df = pd.DataFrame(lag_rows)
     if save and len(lag_df) > 0:
         lag_df.to_csv(os.path.join(save_loc, "wave_amplitude_lag_correlations.csv"), index=False)
     print("Done with figure: wave_amplitude_lag_correlations")
@@ -2349,21 +2802,34 @@ if should_run_figure(3):
 #   * Curves shifted upward in precipitation at fixed normalised wave amplitude
 #     imply changed convective sensitivity.
 
-if should_run_figure(4):
-    cond_rows = []
+if should_build_figure(4, "wave_conditioned_precip_olr_pw"):
     amp_bins = np.linspace(0, 3.5, 22)
-    fig, ax = plt.subplots(len(wave_names), len(conditioned_fields),
-                           figsize=(3.6 * len(conditioned_fields), 2.3 * len(wave_names)),
-                           constrained_layout=True, sharex=True)
-    if len(wave_names) == 1:
-        ax = ax[None, :]
-    if len(conditioned_fields) == 1:
-        ax = ax[:, None]
+    cond_signature = cache_signature(
+        "wave_conditioned_precip_olr_pw",
+        extra=dict(
+            waves=list(wave_names),
+            conditioned_fields=list(conditioned_fields),
+            amp_bins=jsonable_value(amp_bins),
+            filter_lat_bounds=jsonable_value(filter_lat_bounds),
+        ),
+    )
+    cond_df = load_cached_table(
+        "wave_conditioned_precip_olr_pw",
+        cond_signature,
+        output_filename="wave_conditioned_precip_olr_pw.csv",
+        required_columns=("simulation", "wave", "target", "amp_norm_bin", "mean", "count"),
+    )
+    if cond_df is None:
+        cond_df = pd.DataFrame()
+    completed_cond_keys = table_key_set(cond_df, ("simulation", "wave", "target"))
 
-    for wj, wname in enumerate(wave_names):
+    for wname in wave_names:
         projection = lat_projection_for_wave(wname)
-        for tj, target in enumerate(conditioned_fields):
+        for target in conditioned_fields:
             for i, ds in enumerate(dss):
+                key = (sim_names[i], wname, target)
+                if key in completed_cond_keys:
+                    continue
                 try:
                     wav = get_filtered_wave(ds, i, "Precip", wname, avgLat=True)
                     # Local wave amplitude in longitude-time, normalised by its std.
@@ -2379,15 +2845,57 @@ if should_run_figure(4):
                     if a_norm.sizes.get("Time", 0) == 0:
                         continue
                     xc, ym, y25, y75, count = binned_mean_1d(a_norm.values, y.values, amp_bins, min_count=20)
-                    ax[wj, tj].plot(xc, ym, color=cols[i], label=sim_names[i] if (wj == 0 and tj == 0) else None)
-                    ax[wj, tj].fill_between(xc, y25, y75, color=cols[i], alpha=0.12, linewidth=0)
-                    for xx, yy, cnum in zip(xc, ym, count):
-                        cond_rows.append(dict(simulation=sim_names[i], wave=wname,
-                                              wave_label=wave_label(wname),
-                                              latitude_projection=projection, target=target,
-                                              amp_norm_bin=xx, mean=yy, count=cnum))
+                    rows = [
+                        dict(
+                            simulation=sim_names[i],
+                            wave=wname,
+                            wave_label=wave_label(wname),
+                            latitude_projection=projection,
+                            target=target,
+                            amp_norm_bin=xx,
+                            mean=yy,
+                            p25=lo,
+                            p75=hi,
+                            count=cnum,
+                        )
+                        for xx, yy, lo, hi, cnum in zip(xc, ym, y25, y75, count)
+                    ]
+                    cond_df = append_cached_rows(
+                        "wave_conditioned_precip_olr_pw",
+                        cond_df,
+                        rows,
+                        cond_signature,
+                    )
+                    completed_cond_keys.add(key)
                 except Exception as exc:
                     print(f"Skipping conditional curve {sim_names[i]} {wname} {target}: {exc}")
+
+    fig, ax = plt.subplots(len(wave_names), len(conditioned_fields),
+                           figsize=(3.6 * len(conditioned_fields), 2.3 * len(wave_names)),
+                           constrained_layout=True, sharex=True)
+    if len(wave_names) == 1:
+        ax = ax[None, :]
+    if len(conditioned_fields) == 1:
+        ax = ax[:, None]
+
+    for wj, wname in enumerate(wave_names):
+        for tj, target in enumerate(conditioned_fields):
+            for i, ds in enumerate(dss):
+                s = cond_df[
+                    (cond_df.simulation == sim_names[i])
+                    & (cond_df.wave == wname)
+                    & (cond_df.target == target)
+                ].sort_values("amp_norm_bin")
+                if len(s) == 0:
+                    continue
+                ax[wj, tj].plot(
+                    s.amp_norm_bin,
+                    s["mean"],
+                    color=cols[i],
+                    label=sim_names[i] if (wj == 0 and tj == 0) else None,
+                )
+                if {"p25", "p75"}.issubset(s.columns):
+                    ax[wj, tj].fill_between(s.amp_norm_bin, s.p25, s.p75, color=cols[i], alpha=0.12, linewidth=0)
             if wj == 0:
                 ax[wj, tj].set_title(target)
             if tj == 0:
@@ -2397,7 +2905,6 @@ if should_run_figure(4):
             ax[wj, tj].grid(alpha=0.2)
     ax[0, 0].legend(loc="best")
     figsave.save(fig, "wave_conditioned_precip_olr_pw", number=4)
-    cond_df = pd.DataFrame(cond_rows)
     if save and len(cond_df) > 0:
         cond_df.to_csv(os.path.join(save_loc, "wave_conditioned_precip_olr_pw.csv"), index=False)
     print("Done with figure: wave_conditioned_precip_olr_pw")
@@ -2412,7 +2919,7 @@ if should_run_figure(4):
 #     amplitude is large, that wave band is a candidate mediator.
 
 intense_precip_attribution = None
-if should_run_figure(5):
+if should_build_figure(5, "intense_precip_wave_attribution"):
     percentile = 95.0
     intense_precip_attribution = compute_intense_precip_wave_attribution(percentile=percentile)
     attrib = intense_precip_attribution
@@ -2449,8 +2956,27 @@ if should_run_figure(5):
 #     ascent, upper-tropospheric temperature variance, or near-tropopause wave
 #     activity?
 
-if should_run_figure(6):
-    profile_rows = []
+if should_build_figure(6, "vertical_wave_power_profiles"):
+    profile_signature = cache_signature(
+        "vertical_wave_power_profiles",
+        extra=dict(
+            vertical_profile_waves=list(vertical_profile_waves),
+            vertical_profile_fields=list(vertical_profile_fields),
+            vertical_profile_levels=jsonable_value(vertical_profile_levels),
+            cldfrac_profile_heights_km=jsonable_value(cldfrac_profile_heights_km),
+            filter_lat_bounds=jsonable_value(filter_lat_bounds),
+        ),
+    )
+    prof = load_cached_table(
+        "vertical_wave_power_profiles",
+        profile_signature,
+        output_filename="vertical_wave_power_profiles.csv",
+        required_columns=("simulation", "simulation_index", "wave", "field", "vertical_coord", "wave_variance"),
+    )
+    if prof is None:
+        prof = pd.DataFrame()
+    completed_profile_keys = table_key_set(prof, ("simulation_index", "wave", "field", "vertical_coord"))
+
     for i, ds in enumerate(dss):
         for wname in vertical_profile_waves:
             projection = lat_projection_for_wave(wname)
@@ -2466,20 +2992,30 @@ if should_run_figure(6):
                     vertical_axis = "pressure_hpa"
                     vertical_units = "hPa"
                 for level, field in zip(levels, field_names):
+                    key = (i, wname, var, level)
+                    if key in completed_profile_keys:
+                        continue
                     try:
                         wav = get_filtered_wave(ds, i, field, wname, avgLat=True)
-                        profile_rows.append(dict(simulation=sim_names[i], simulation_index=i,
-                                                 wave=wname, wave_label=wave_label(wname),
-                                                 latitude_projection=projection,
-                                                 field=var,
-                                                 vertical_coord=level,
-                                                 vertical_axis=vertical_axis,
-                                                 vertical_units=vertical_units,
-                                                 wave_variance=wave_variance(wav)))
+                        row = dict(simulation=sim_names[i], simulation_index=i,
+                                   wave=wname, wave_label=wave_label(wname),
+                                   latitude_projection=projection,
+                                   field=var,
+                                   vertical_coord=level,
+                                   vertical_axis=vertical_axis,
+                                   vertical_units=vertical_units,
+                                   wave_variance=wave_variance(wav))
+                        prof = append_cached_rows(
+                            "vertical_wave_power_profiles",
+                            prof,
+                            [row],
+                            profile_signature,
+                        )
+                        completed_profile_keys.add(key)
                     except Exception as exc:
                         print(f"Skipping vertical wave power {sim_names[i]} {wname} {field}: {exc}")
-    prof = pd.DataFrame(profile_rows)
     if len(prof) > 0:
+        write_cached_table("vertical_wave_power_profiles", prof, profile_signature)
         if save:
             prof.to_csv(os.path.join(save_loc, "vertical_wave_power_profiles.csv"), index=False)
 
@@ -2531,7 +3067,7 @@ if should_run_figure(6):
 #     or absorption layer.  If u_nudge moves such a layer into/out of the UTLS,
 #     the wave--convection coupling can change without a large mean precip shift.
 
-if should_run_figure(7):
+if should_build_figure(7, "critical_level_phase_speed_profiles"):
     speed_rows = []
     for wname in wave_names:
         cmin, ccen, cmax = wave_phase_speed_range(wname)
@@ -2580,11 +3116,31 @@ if should_run_figure(7):
 #   * Run this after the cheaper figures, because avgLat=False applies the k-f
 #     filter separately to every retained latitude.
 
-if should_run_figure(8):
-    flux_rows = []
+if should_build_figure(8, "wave_filtered_eddy_momentum_fluxes"):
+    flux_signature = cache_signature(
+        "wave_filtered_eddy_fluxes",
+        extra=dict(
+            eddy_flux_waves=list(eddy_flux_waves),
+            eddy_flux_levels=jsonable_value(eddy_flux_levels),
+            eddy_flux_lat_bounds=jsonable_value(eddy_flux_lat_bounds),
+        ),
+    )
+    flux = load_cached_table(
+        "wave_filtered_eddy_fluxes",
+        flux_signature,
+        output_filename="wave_filtered_eddy_fluxes.csv",
+        required_columns=("simulation", "wave", "pres", "latitude", "uv", "vT", "eke"),
+    )
+    if flux is None:
+        flux = pd.DataFrame()
+    completed_flux_keys = table_key_set(flux, ("simulation", "wave", "pres"))
+
     for i, ds in enumerate(dss):
         for wname in eddy_flux_waves:
             for plev in eddy_flux_levels:
+                key = (sim_names[i], wname, plev)
+                if key in completed_flux_keys:
+                    continue
                 try:
                     uw = get_filtered_wave(ds, i, f"u{plev}", wname, avgLat=False, lat_bounds=eddy_flux_lat_bounds)
                     vw = get_filtered_wave(ds, i, f"v{plev}", wname, avgLat=False, lat_bounds=eddy_flux_lat_bounds)
@@ -2593,15 +3149,23 @@ if should_run_figure(8):
                     uv = (uw * vw).mean(dim=("Time", "longitude"), skipna=True)
                     vT = (vw * Tw).mean(dim=("Time", "longitude"), skipna=True)
                     eke = 0.5 * (uw**2 + vw**2).mean(dim=("Time", "longitude"), skipna=True)
+                    rows = []
                     for lat, uvv, vTv, ekev in zip(uv.latitude.values, uv.values, vT.values, eke.values):
-                        flux_rows.append(dict(simulation=sim_names[i], wave=wname,
-                                              wave_label=wave_label(wname), pres=plev,
-                                              latitude_projection="latitude_resolved",
-                                              latitude=lat, uv=uvv, vT=vTv, eke=ekev))
+                        rows.append(dict(simulation=sim_names[i], wave=wname,
+                                         wave_label=wave_label(wname), pres=plev,
+                                         latitude_projection="latitude_resolved",
+                                         latitude=lat, uv=uvv, vT=vTv, eke=ekev))
+                    flux = append_cached_rows(
+                        "wave_filtered_eddy_fluxes",
+                        flux,
+                        rows,
+                        flux_signature,
+                    )
+                    completed_flux_keys.add(key)
                 except Exception as exc:
                     print(f"Skipping wave-filtered eddy flux {sim_names[i]} {wname} {plev}: {exc}")
-    flux = pd.DataFrame(flux_rows)
     if len(flux) > 0:
+        write_cached_table("wave_filtered_eddy_fluxes", flux, flux_signature)
         if save:
             flux.to_csv(os.path.join(save_loc, "wave_filtered_eddy_fluxes.csv"), index=False)
         fig, ax = plt.subplots(len(eddy_flux_waves), len(eddy_flux_levels),
@@ -2638,7 +3202,14 @@ if should_run_figure(8):
 #   * Are nudged-run changes concentrated in symmetric/even or antisymmetric/odd
 #     power, or are they broad changes to the convective background?
 
-if should_run_figure(9):
+if should_build_figure(
+    9,
+    [
+        "symmetric_antisymmetric_wave_spectra",
+        "symmetric_antisymmetric_wave_spectra_period",
+        "symmetric_antisymmetric_wave_spectra_phase_speed",
+    ],
+):
     spec_levels = np.linspace(0, 2.5, 26)
     spec_cmap, spec_norm = make_spectrum_cmap(spec_levels)
 
@@ -2646,22 +3217,25 @@ if should_run_figure(9):
     spectra_by_sim = []
     for i, ds in enumerate(dss):
         try:
-            sp_input = spectrum_input_field(ds, spectrum_field, spectrum_lat_bounds)
-            raw_spectrum = spacetime_power(
-                sp_input,
-                lataggreg="mean",
-                latitude_bounds=normalise_lat_bounds(spectrum_lat_bounds),
-                dosymmetries=True,
-                segsize=spectrum_segment_days,
-                noverlap=spectrum_overlap_days,
-                spd=obs_per_day,
-            )
+            spectra = load_cached_spectra(i)
+            if spectra is None:
+                sp_input = spectrum_input_field(ds, spectrum_field, spectrum_lat_bounds)
+                raw_spectrum = spacetime_power(
+                    sp_input,
+                    lataggreg="mean",
+                    latitude_bounds=normalise_lat_bounds(spectrum_lat_bounds),
+                    dosymmetries=True,
+                    segsize=spectrum_segment_days,
+                    noverlap=spectrum_overlap_days,
+                    spd=obs_per_day,
+                )
 
-            spectra = {}
-            for component in components:
-                raw_component = raw_spectrum.sel(component=component)
-                background = smooth_wavefreq(raw_component, freq_name="frequency")
-                spectra[component] = xr.where(background > 0, raw_component / background, np.nan)
+                spectra = {}
+                for component in components:
+                    raw_component = raw_spectrum.sel(component=component)
+                    background = smooth_wavefreq(raw_component, freq_name="frequency")
+                    spectra[component] = xr.where(background > 0, raw_component / background, np.nan).load()
+                write_cached_spectra(i, spectra)
             spectra_by_sim.append(spectra)
         except Exception as exc:
             spectra_by_sim.append(None)
@@ -2837,23 +3411,50 @@ if should_run_figure(9):
 # 10. Kelvin-filtered cloud decomposition
 # -----------------------------------------------------------------------------
 # WHAT TO LOOK FOR:
-#   * Deep convective high-cloud anomalies imply more vertically connected
-#     precipitating convection.
-#   * Anvil or detached cirrus-like anomalies point more toward detrainment,
-#     cloud lifetime, radiative feedback, or upper-level wave modulation.
+#   * Active deep-convection high-cloud anomalies imply more vertically
+#     connected precipitating convection.
+#   * Convectively generated or cirrus-like anomalies point more toward
+#     detrainment, cloud lifetime, radiative feedback, or upper-level wave
+#     modulation.
 
 kelvin_cloud_summary = None
-if should_run_any([KELVIN_CLOUD_FIGURE_NUMBER, WAVE_ATTRIBUTION_FIGURE_NUMBER]):
+kelvin_cloud_figure_stems = [
+    "kelvin_cloud_decomposition_latitude",
+    "kelvin_cloud_decomposition_bars",
+    "kelvin_cloud_decomposition_phase_composites",
+    "kelvin_cloud_decomposition_contribution_to_high_cloud_change",
+]
+compact_attribution_figure_stems = [
+    "wave_attribution_heatmap_wind_unique",
+    "wave_attribution_heatmap_thermal_like",
+    "wave_attribution_heatmap_wind_fraction",
+    "wave_attribution_summary_bars",
+]
+kelvin_cloud_figure_signature = kelvin_cloud_decomposition_signature()
+needs_kelvin_cloud_figure = (
+    should_run_figure(KELVIN_CLOUD_FIGURE_NUMBER)
+    and not figure_outputs_current(KELVIN_CLOUD_FIGURE_NUMBER, kelvin_cloud_figure_stems, kelvin_cloud_figure_signature)
+)
+if needs_kelvin_cloud_figure:
     kelvin_cloud_summary = compute_kelvin_cloud_decomposition()
 
-if should_run_figure(KELVIN_CLOUD_FIGURE_NUMBER) and kelvin_cloud_summary is not None:
+if should_build_versioned_figure(
+    KELVIN_CLOUD_FIGURE_NUMBER,
+    kelvin_cloud_figure_stems,
+    kelvin_cloud_figure_signature,
+) and kelvin_cloud_summary is not None:
     if len(kelvin_cloud_summary["scalar"]) > 0:
         print("\nKelvin cloud decomposition summary")
         print(kelvin_cloud_summary["scalar"].to_string(index=False))
         plot_kelvin_cloud_decomposition(kelvin_cloud_summary)
+        write_figure_output_metadata(
+            KELVIN_CLOUD_FIGURE_NUMBER,
+            kelvin_cloud_figure_stems,
+            kelvin_cloud_figure_signature,
+        )
         print("Done with figure: kelvin_cloud_decomposition")
     else:
-        print("Skipping Kelvin cloud decomposition plots: no valid cldfrac classification was built")
+        print("Skipping Kelvin cloud decomposition plots: no valid shared classification diagnostics were built")
 
 
 # -----------------------------------------------------------------------------
@@ -2866,23 +3467,51 @@ if should_run_figure(KELVIN_CLOUD_FIGURE_NUMBER) and kelvin_cloud_summary is not
 #     wind_unique suggests altered coupling and organisation rather than just
 #     stronger bulk rainfall.
 
-if should_run_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER):
-    if intense_precip_attribution is None:
-        intense_precip_attribution = compute_intense_precip_wave_attribution(percentile=95.0)
-        if save and len(intense_precip_attribution) > 0:
-            intense_precip_attribution.to_csv(os.path.join(save_loc, "intense_precip_wave_attribution.csv"), index=False)
-
-    compact_attribution = build_compact_wave_attribution_table(
-        wave_metrics,
-        kelvin_cloud_summary=kelvin_cloud_summary,
-        intense_attribution_df=intense_precip_attribution,
+compact_signature = cache_signature(
+    "compact_wave_attribution_metrics",
+    extra=dict(
+        wave_metric_fields=list(power_fields),
+        waves=list(wave_names),
+        kelvin_cloud_conditions=list(KELVIN_CLOUD_CONDITIONS),
+        kelvin_cloud_categories=jsonable_value(KELVIN_CLOUD_CATEGORIES),
+        cloud_classification_cache_version=CLOUD_CLASSIFICATION_CACHE_VERSION,
+        intense_precip_percentile=95.0,
+        attribution_eps=ATTRIBUTION_EPS,
+    ),
+)
+if should_build_versioned_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER, compact_attribution_figure_stems, compact_signature):
+    compact_attribution = load_cached_table(
+        "compact_wave_attribution_metrics",
+        compact_signature,
+        output_filename="wave_attribution_metrics.csv",
+        required_columns=("metric_name", "variable", "wave_band", "condition", "wind_unique"),
     )
+    if compact_attribution is None:
+        if kelvin_cloud_summary is None:
+            kelvin_cloud_summary = compute_kelvin_cloud_decomposition()
+        if intense_precip_attribution is None:
+            intense_precip_attribution = compute_intense_precip_wave_attribution(percentile=95.0)
+            if save and len(intense_precip_attribution) > 0:
+                intense_precip_attribution.to_csv(os.path.join(save_loc, "intense_precip_wave_attribution.csv"), index=False)
+
+        compact_attribution = build_compact_wave_attribution_table(
+            wave_metrics,
+            kelvin_cloud_summary=kelvin_cloud_summary,
+            intense_attribution_df=intense_precip_attribution,
+        )
+        if len(compact_attribution) > 0:
+            write_cached_table("compact_wave_attribution_metrics", compact_attribution, compact_signature)
     if len(compact_attribution) > 0:
         print("\nCompact wave attribution metrics")
         print(compact_attribution.to_string(index=False))
         if save:
             compact_attribution.to_csv(os.path.join(save_loc, "wave_attribution_metrics.csv"), index=False)
         plot_compact_wave_attribution(compact_attribution)
+        write_figure_output_metadata(
+            WAVE_ATTRIBUTION_FIGURE_NUMBER,
+            compact_attribution_figure_stems,
+            compact_signature,
+        )
         print("Done with figure: compact_wave_attribution_metrics")
     else:
         print("Skipping compact wave attribution: no source metrics were available")

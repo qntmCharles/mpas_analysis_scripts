@@ -10,6 +10,39 @@ import scipy.interpolate as intp
 import xarray as xr
 
 
+DEFAULT_SIMULATION_PARENT_DIR = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on"
+
+
+def simulation_parent_dir(root_dir=None):
+    """Return the parent directory containing the simulation subdirectories."""
+    return os.path.abspath(
+        os.environ.get("MPAS_SIMULATION_ROOT", root_dir or DEFAULT_SIMULATION_PARENT_DIR)
+    )
+
+
+def diagnostic_cache_dir(*parts, root_dir=None):
+    """Return a diagnostic cache path beside the source simulations."""
+    base = os.path.abspath(
+        os.environ.get("MPAS_DIAGNOSTIC_CACHE_ROOT", simulation_parent_dir(root_dir))
+    )
+    return os.path.join(base, *parts)
+
+
+def unique_existing_order(paths):
+    """Deduplicate path lists without changing their priority order."""
+    out = []
+    seen = set()
+    for path in paths:
+        if path is None:
+            continue
+        norm = os.path.abspath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(path)
+    return out
+
+
 ISOBARIC_DIM_LEVEL_VAR = {
     "nIsoLevelsT": "t_iso_levels",
     "nIsoLevelsU": "u_iso_levels",

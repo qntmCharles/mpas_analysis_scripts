@@ -47,7 +47,7 @@ save_loc = '/home/cwp29/tmp/mpas/crf_on/final/mean_state/'
 #   12: olrtoa_maps
 #   13: ke_latheight
 #   14: eke_latpres
-#   15: global_energy_budget
+#   15: moved to global_atmospheric_energy_budget_diagnostics.py
 #   16: temperature_wind_latheight, w_rh_latheight, tem_latheight
 #   17: mslp_maps
 #   18: scalar_constituents_latheight
@@ -96,57 +96,6 @@ RD = 287.0
 CP = 1004.0
 P0_PA = 100000.0
 G = 9.80665
-LV = 2.5e6
-
-ENERGY_BUDGET_TERMS = {
-    "net_toa": r"Net TOA/system",
-    "net_surface_rad": r"Net surface radiation",
-    "atm_rad": r"Atmospheric radiation",
-    "surface_turbulent": r"LH + SH",
-    "atm_column_input": r"Atmospheric net",
-    "surface_net_input": r"Surface/SST net",
-    "precip_latent_heating": r"$L_v P$",
-}
-
-ENERGY_BUDGET_ORDER = list(ENERGY_BUDGET_TERMS)
-
-
-def global_area_mean(da, lat_dim="latitude", lon_dim="longitude"):
-    dims = [dim for dim in (lat_dim, lon_dim) if dim in da.dims]
-    if lat_dim not in da.dims:
-        raise ValueError(f"Cannot area-average {da.name}: missing {lat_dim!r} dimension")
-    weights = np.cos(np.deg2rad(da[lat_dim]))
-    return da.weighted(weights).mean(dim=dims, skipna=True)
-
-
-def time_days_since_start(da, origin=None):
-    times = da.Time.values
-    if np.issubdtype(times.dtype, np.number):
-        days = np.asarray(times, dtype=float) * dt / 24.0
-        origin_day = float(origin) * dt / 24.0 if origin is not None else days[0]
-    elif np.issubdtype(times.dtype, np.datetime64):
-        origin_time = origin if origin is not None else times[0]
-        days = (times - origin_time) / np.timedelta64(1, "D")
-        days = np.asarray(days, dtype=float)
-        origin_day = 0.0
-    else:
-        times = pd.to_datetime(times)
-        origin_time = pd.to_datetime(origin) if origin is not None else times[0]
-        days = np.asarray((times - origin_time) / pd.Timedelta(days=1), dtype=float)
-        origin_day = 0.0
-    return days - origin_day
-
-
-def cumulative_energy_mj_m2(ts, origin=None):
-    t_days = time_days_since_start(ts, origin=origin)
-    flux = np.asarray(ts.values, dtype=float)
-    cumulative = np.zeros_like(flux, dtype=float)
-    if flux.size > 1:
-        increments = 0.5 * (flux[1:] + flux[:-1]) * np.diff(t_days) * 86400.0 / 1e6
-        cumulative[1:] = np.cumsum(increments)
-    return t_days, cumulative
-
-
 def isobaric_eddy_kinetic_energy(ds):
     missing = [v for v in ("uzonal_isobaric", "umeridional_isobaric") if v not in ds.data_vars]
     if missing:
@@ -175,55 +124,6 @@ def symmetric_contour_levels(fields, ndiv=11, fallback=1.0):
     if not np.isfinite(vmax) or vmax <= 0:
         vmax = fallback
     return symmetric_levels(vmax, ndiv=ndiv)
-
-
-def global_energy_budget_fields(ds):
-    """
-    Return 2-D energy-budget terms in W m-2.
-
-    Positive TOA and surface radiative terms are downward.  Surface turbulent
-    fluxes are positive upward into the atmosphere, so atmospheric net is
-    atmospheric radiation plus LH+SH, and surface net is surface radiation
-    minus LH+SH.
-    """
-    required = ["swdnt", "swupt", "lwdnt", "lwupt", "swdnb", "swupb", "lwdnb", "lwupb"]
-    missing = [v for v in required if v not in ds.data_vars]
-    if missing:
-        raise ValueError(f"Missing radiation variables for global energy budget: {missing}")
-
-    net_toa_sw = finite_or_nan(ds.swdnt) - finite_or_nan(ds.swupt)
-    net_toa_lw = finite_or_nan(ds.lwdnt) - finite_or_nan(ds.lwupt)
-    net_sfc_sw = finite_or_nan(ds.swdnb) - finite_or_nan(ds.swupb)
-    net_sfc_lw = finite_or_nan(ds.lwdnb) - finite_or_nan(ds.lwupb)
-
-    net_toa = net_toa_sw + net_toa_lw
-    net_surface_rad = net_sfc_sw + net_sfc_lw
-    atm_rad = net_toa - net_surface_rad
-
-    if all(v in ds.data_vars for v in ("lh", "hfx")):
-        surface_turbulent = finite_or_nan(ds.lh) + finite_or_nan(ds.hfx)
-    else:
-        surface_turbulent = xr.zeros_like(atm_rad)
-        surface_turbulent.attrs["note"] = "lh/hfx missing; set to zero"
-
-    precip = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
-    precip_latent_heating = finite_or_nan(precip) * LV / 86400.0
-
-    fields = {
-        "net_toa": net_toa,
-        "net_surface_rad": net_surface_rad,
-        "atm_rad": atm_rad,
-        "surface_turbulent": surface_turbulent,
-        "atm_column_input": atm_rad + surface_turbulent,
-        "surface_net_input": net_surface_rad - surface_turbulent,
-        "precip_latent_heating": precip_latent_heating,
-    }
-
-    for name, field in fields.items():
-        field.name = name
-        field.attrs["units"] = "W m-2"
-
-    return fields
 
 
 def latlon_time_mean_field(ds, candidates, level_index=0, scale=1.0, name=None, hemispheric_parity=None):
@@ -379,6 +279,21 @@ def symmetric_percentile_levels(fields, percentile=99.0, ndiv=10, fallback=1.0):
     return symmetric_levels(vmax, ndiv=ndiv)
 
 
+def field_for_level_limits(field, spec):
+    min_height = spec.get("level_min_height_m")
+    if min_height is None or "z" not in field.coords:
+        return field
+
+    limited = field.where(field.z >= min_height, drop=True)
+    if limited.sizes.get("z", 0) == 0:
+        return field
+    return limited
+
+
+def fields_for_level_limits(fields, spec):
+    return [field_for_level_limits(field, spec) for field in fields]
+
+
 def latlon_contour_levels(fields, symmetric=False, n=21, fallback=1.0):
     if symmetric:
         return symmetric_contour_levels(fields, ndiv=n-1, fallback=fallback)
@@ -465,6 +380,7 @@ LATHEIGHT_TEM_SPECS = [
         "raw_percentile": 99.0,
         "diff_fallback": 0.5,
         "diff_percentile": 99.0,
+        "level_min_height_m": 1000.0,
         "hemispheric_parity": "even",
     },
     {
@@ -477,6 +393,7 @@ LATHEIGHT_TEM_SPECS = [
         "raw_percentile": 99.0,
         "diff_fallback": 0.002,
         "diff_percentile": 99.0,
+        "level_min_height_m": 1000.0,
         "hemispheric_parity": "even",
     },
     {
@@ -489,6 +406,7 @@ LATHEIGHT_TEM_SPECS = [
         "raw_percentile": 99.0,
         "diff_fallback": 0.5,
         "diff_percentile": 99.0,
+        "level_min_height_m": 1000.0,
         "hemispheric_parity": "odd",
     },
 ]
@@ -601,8 +519,6 @@ needed_vars = [
     "uReconstructZonal", "uReconstructMeridional",
     "cldfrac", "olrtoa", "zgrid", "pressure", "vorticity", "ke",
     "EPFd", "wres", "vres",
-    "lwdnt", "lwdnb", "lwupb", "lwupt", "swdnt", "swdnb", "swupb", "swupt",
-    "lh", "hfx"
 ]
 
 check_vars = ['t_isobaric']
@@ -1595,16 +1511,17 @@ if should_run_figure(16):
 
         for row, (spec, fields_by_sim) in enumerate(latheight_entries):
             raw_fields = list(fields_by_sim.values())
+            raw_level_fields = fields_for_level_limits(raw_fields, spec)
             if spec.get("raw_percentile") is not None and spec.get("raw_symmetric", False):
                 raw_levels = symmetric_percentile_levels(
-                    raw_fields,
+                    raw_level_fields,
                     percentile=spec.get("raw_percentile", 99.0),
                     ndiv=10,
                     fallback=spec.get("raw_fallback", 1.0),
                 )
             else:
                 raw_levels = latlon_contour_levels(
-                    raw_fields,
+                    raw_level_fields,
                     symmetric=spec.get("raw_symmetric", False),
                     fallback=spec.get("raw_fallback", 1.0),
                 )
@@ -1615,10 +1532,11 @@ if should_run_figure(16):
                     continue
                 control_interp = control_field.interp(z=field.z, latitude=field.latitude)
                 diff_fields[i] = (field - control_interp).load()
+            diff_level_fields = fields_for_level_limits(list(diff_fields.values()), spec)
 
             if diff_fields and spec.get("diff_percentile") is not None:
                 diff_levels = symmetric_percentile_levels(
-                    list(diff_fields.values()),
+                    diff_level_fields,
                     percentile=spec.get("diff_percentile", 99.0),
                     ndiv=10,
                     fallback=spec.get("diff_fallback", 1.0),
@@ -1626,7 +1544,7 @@ if should_run_figure(16):
             else:
                 diff_levels = (
                     symmetric_contour_levels(
-                        list(diff_fields.values()),
+                        diff_level_fields,
                         ndiv=10,
                         fallback=spec.get("diff_fallback", 1.0),
                     )
@@ -2159,112 +2077,3 @@ if should_run_figure(14):
         print("Done with figure: comp_eke_latpres")
     else:
         print("Skipping EKE latitude-pressure plot: no simulations had the required winds")
-
-# In[ ]:
-
-# Global energy budget time series from TOA/surface fluxes and surface turbulent fluxes
-
-if should_run_figure(15):
-    budget_entries = []
-    budget_summary_rows = []
-    budget_timeseries_rows = []
-
-    for i, ds in enumerate(dss):
-        try:
-            fields = global_energy_budget_fields(ds)
-        except ValueError as e:
-            print(f"Skipping global energy budget for {sim_names[i]}: {e}")
-            continue
-
-        time_origin = ds.Time.values[0]
-        series = {}
-        cumulative = {}
-        for key in ENERGY_BUDGET_ORDER:
-            ts = global_area_mean(fields[key]).load()
-            t_days, cum = cumulative_energy_mj_m2(ts, origin=time_origin)
-            values = np.asarray(ts.values, dtype=float)
-            series[key] = ts
-            cumulative[key] = cum
-
-            budget_summary_rows.append({
-                "simulation": sim_names[i],
-                "term": key,
-                "label": ENERGY_BUDGET_TERMS[key],
-                "mean_w_m2": float(np.nanmean(values)),
-                "std_w_m2": float(np.nanstd(values)),
-                "final_cumulative_mj_m2": float(cum[-1]) if cum.size else np.nan,
-            })
-
-            for time_index, (time_day, flux, cumulative_energy) in enumerate(zip(t_days, values, cum)):
-                budget_timeseries_rows.append({
-                    "simulation": sim_names[i],
-                    "term": key,
-                    "label": ENERGY_BUDGET_TERMS[key],
-                    "time_index": time_index,
-                    "time_days": float(time_day),
-                    "flux_w_m2": float(flux),
-                    "cumulative_mj_m2": float(cumulative_energy),
-                })
-
-        budget_entries.append((i, series, cumulative, time_origin))
-
-    if budget_entries:
-        budget_df = pd.DataFrame(budget_summary_rows)
-        budget_ts_df = pd.DataFrame(budget_timeseries_rows)
-        if save:
-            budget_df.to_csv(os.path.join(save_loc, "global_energy_budget_summary.csv"), index=False)
-            budget_ts_df.to_csv(os.path.join(save_loc, "global_energy_budget_timeseries.csv"), index=False)
-
-        print("Global energy budget means (W m-2) and cumulative uptake (MJ m-2):")
-        print(budget_df.pivot(index="simulation", columns="term", values="mean_w_m2"))
-
-        nrows = len(budget_entries)
-        fig, ax = plt.subplots(nrows, 3, figsize=(12, 3.1*nrows), constrained_layout=True, sharex="col")
-        if nrows == 1:
-            ax = np.array([ax])
-
-        balance_terms = ["net_toa", "atm_column_input", "surface_net_input"]
-        component_terms = ["atm_rad", "surface_turbulent", "net_surface_rad", "precip_latent_heating"]
-        line_styles = {
-            "net_toa": dict(color="k", lw=1.6, ls="-"),
-            "atm_column_input": dict(color="tab:blue", lw=1.3, ls="-"),
-            "surface_net_input": dict(color="tab:orange", lw=1.3, ls="-"),
-            "atm_rad": dict(color="tab:purple", lw=1.2, ls="-"),
-            "surface_turbulent": dict(color="tab:red", lw=1.2, ls="-"),
-            "net_surface_rad": dict(color="tab:green", lw=1.2, ls="-"),
-            "precip_latent_heating": dict(color="0.45", lw=1.0, ls=":"),
-        }
-
-        for row, (i, series, cumulative, time_origin) in enumerate(budget_entries):
-            annotate_panel_label(ax[row, 0], sim_names[i])
-
-            for key in balance_terms:
-                t_days = time_days_since_start(series[key], origin=time_origin)
-                ax[row, 0].plot(t_days, series[key].values, label=ENERGY_BUDGET_TERMS[key], **line_styles[key])
-                ax[row, 1].plot(t_days, cumulative[key], label=ENERGY_BUDGET_TERMS[key], **line_styles[key])
-
-            for key in component_terms:
-                t_days = time_days_since_start(series[key], origin=time_origin)
-                ax[row, 2].plot(t_days, series[key].values, label=ENERGY_BUDGET_TERMS[key], **line_styles[key])
-
-            for col in range(3):
-                ax[row, col].axhline(0, color="0.35", lw=0.7)
-                if row < nrows - 1:
-                    ax[row, col].set_xticklabels([])
-
-            ax[row, 0].set_ylabel(r"Flux (W m$^{-2}$)")
-            ax[row, 1].set_ylabel(r"Cumulative (MJ m$^{-2}$)")
-            ax[row, 2].set_ylabel(r"Flux (W m$^{-2}$)")
-
-        ax[0, 0].set_title("Global imbalance")
-        ax[0, 1].set_title("Cumulative uptake")
-        ax[0, 2].set_title("Budget components")
-
-        for col in range(3):
-            ax[-1, col].set_xlabel("Time since analysis start (days)")
-            ax[0, col].legend(loc="best", fontsize=7)
-
-        figsave.save(fig, "global_energy_budget_timeseries", number=15)
-        print("Done with figure: comp_global_energy_budget")
-    else:
-        print("Skipping global energy budget: no simulations had the required fluxes")

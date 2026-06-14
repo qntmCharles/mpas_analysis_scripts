@@ -20,6 +20,7 @@ Longitude is periodic both when labelling objects across the seam and when
 measuring distances between centroids.
 """
 
+import json
 import os
 import sys
 import warnings
@@ -42,9 +43,21 @@ from matplotlib import pyplot as plt
 from scipy import ndimage
 
 from diagnostic_helpers import *
+from high_cloud_classification import (
+    CLASSIFICATION_CACHE_VERSION,
+    HighCloudThresholds,
+    cached_classification_is_current as shared_cached_classification_is_current,
+)
 
 from pyflextrkr.gettracks import gettracknumbers as pyflextrkr_gettracknumbers
 from pyflextrkr.tracksingle import trackclouds as pyflextrkr_trackclouds
+
+
+def env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
 # -----------------------------------------------------------------------------
@@ -82,6 +95,31 @@ save_loc = "/home/cwp29/tmp/mpas/crf_on/final/organisation/"
 figures_to_run = []
 figsave = None
 
+# Expensive organisation and persistence tables are cached in save_loc. Metadata
+# must match active settings; older CSV-only caches can be adopted once if their
+# source/simulation columns still fit the current configuration.
+USE_ORGANISATION_METRIC_CACHE = True
+FORCE_RECOMPUTE_ORGANISATION_CACHE = False
+FORCE_RECOMPUTE_PERSISTENCE_CACHE = False
+ALLOW_LEGACY_ORGANISATION_CACHE = False
+
+USE_ORGANISATION_METRIC_CACHE = (
+    USE_ORGANISATION_METRIC_CACHE
+    and not env_flag("DISABLE_ORGANISATION_METRIC_CACHE")
+)
+ALLOW_LEGACY_ORGANISATION_CACHE = (
+    ALLOW_LEGACY_ORGANISATION_CACHE
+    and not env_flag("DISABLE_LEGACY_ORGANISATION_CACHE")
+)
+FORCE_RECOMPUTE_ORGANISATION_CACHE = (
+    FORCE_RECOMPUTE_ORGANISATION_CACHE
+    or env_flag("FORCE_RECOMPUTE_ORGANISATION_CACHE")
+)
+FORCE_RECOMPUTE_PERSISTENCE_CACHE = (
+    FORCE_RECOMPUTE_PERSISTENCE_CACHE
+    or env_flag("FORCE_RECOMPUTE_PERSISTENCE_CACHE")
+)
+
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control", "u_nudge", "T_nudge"]
 latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
@@ -99,16 +137,27 @@ EARTH_RADIUS_KM = 6371.0
 LONGITUDE_PERIOD_DEG = 360.0
 STEFAN_BOLTZMANN = 5.670374419e-8
 
-# MCS-like objects use absolute precipitation and cold-cloud-shield thresholds;
-# p95/p99 are retained as sensitivity tests rather than the default MCS proxy.
-PRECIP_OBJECT_SPECS = [
+# Default object sources are intentionally small because every source is used
+# for Lorg and PyFLEXTRKR tracking. Turn on sensitivity sources only when
+# checking threshold robustness.
+RUN_SENSITIVITY_OBJECT_SOURCES = False
+
+# MCS-like objects use broad absolute rain-rate and cold-cloud-shield
+# thresholds; percentile and very-heavy-rain thresholds are sensitivity tests.
+PRIMARY_PRECIP_OBJECT_SPECS = [
     dict(name="precip_ge_1mmh", label="Precip >= 1 mm h$^{-1}$", threshold=24.0, sense="above"),
+]
+SENSITIVITY_PRECIP_OBJECT_SPECS = [
     dict(name="precip_ge_2mmh", label="Precip >= 2 mm h$^{-1}$", threshold=48.0, sense="above"),
     dict(name="precip_ge_8mmh", label="Precip >= 8 mm h$^{-1}$", threshold=192.0, sense="above"),
     dict(name="precip_p95", label="Precip p95 sensitivity", percentile=95.0, sense="above"),
     dict(name="precip_p99", label="Precip p99 sensitivity", percentile=99.0, sense="above"),
 ]
-OLR_OBJECT_SPECS = [
+PRECIP_OBJECT_SPECS = PRIMARY_PRECIP_OBJECT_SPECS + (
+    SENSITIVITY_PRECIP_OBJECT_SPECS if RUN_SENSITIVITY_OBJECT_SOURCES else []
+)
+
+PRIMARY_OLR_OBJECT_SPECS = [
     dict(
         name="olr_tb241",
         label=r"OLR $T_b^\ast \leq$ 241 K",
@@ -116,6 +165,8 @@ OLR_OBJECT_SPECS = [
         field="olr",
         sense="below",
     ),
+]
+SENSITIVITY_OLR_OBJECT_SPECS = [
     dict(
         name="olr_tb233",
         label=r"OLR $T_b^\ast \leq$ 233 K",
@@ -125,36 +176,35 @@ OLR_OBJECT_SPECS = [
     ),
     dict(name="olr_cold_p05", label="Cold OLR anomaly p5", percentile=5.0, sense="below"),
 ]
+OLR_OBJECT_SPECS = PRIMARY_OLR_OBJECT_SPECS + (
+    SENSITIVITY_OLR_OBJECT_SPECS if RUN_SENSITIVITY_OBJECT_SOURCES else []
+)
 
 ENABLE_OLR_OBJECTS = True
 ENABLE_CLOUD_OBJECTS = True
-ENABLE_FALLBACK_CLOUD_CLASSIFICATION = True
-SAVE_CLOUD_CLASSIFICATION_CACHE = False
 
-# If convective_pathway_diagnostics.py has written classified high-cloud masks,
-# this script uses those masks rather than rebuilding the decomposition.
+# The refined high-cloud diagnostic is the single producer of cloud classes.
+# Organisation diagnostics fail if that shared cache is missing or stale.
 CLOUD_CLASSIFICATION_CACHE_DIRS = [
-    "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/classification_cache",
-    "/home/cwp29/tmp/mpas/crf_on/final/convective_pathways/classification_cache",
-    os.path.join(save_loc, "classification_cache"),
+    diagnostic_cache_dir("classification_cache", root_dir=root_dir),
 ]
 
-CLOUD_OBJECT_KEYS = [
-    "high_cloud_mask",
+CLOUD_OBJECT_KEYS_PRIMARY = [
+    "active_deep_convection_high_cloud_mask",
+    "convectively_generated_high_cloud_mask",
+]
+CLOUD_OBJECT_KEYS_SENSITIVITY = [
     "column_connected_mask",
-    "deep_convective_high_cloud_mask",
-    "anvil_high_cloud_mask",
-    # Classified passive high-cloud masks are retained for cloud-regime
-    # fractions elsewhere, but are not included in SOURCE_ORDER by default
-    # because Lorg/track "convective organisation" is not well defined for
-    # detached cirrus-like or nonprecipitating high cloud.
+    "high_cloud_mask",
     "cirrus_like_high_cloud_mask",
+    "unclassified_high_cloud_mask",
     "nonprecipitating_high_cloud_mask",
 ]
+CLOUD_OBJECT_KEYS = CLOUD_OBJECT_KEYS_PRIMARY + (
+    CLOUD_OBJECT_KEYS_SENSITIVITY if RUN_SENSITIVITY_OBJECT_SOURCES else []
+)
 
-# Fallback cloud decomposition thresholds. These mirror the definitions used in
-# convective_pathway_diagnostics.py and equatorial_wave_diagnostics.py. They are
-# only used if no precomputed/cached cloud-type masks are available.
+# Shared high-cloud thresholds used to validate the refined classification cache.
 CF_THRESH = 0.05
 Z_HIGH = 12.0
 Z_LOW_MIN = 2.0
@@ -180,9 +230,13 @@ CONDITION_NBINS = 4
 # Persistence follows the core PyFLEXTRKR overlap tracker (Feng et al., 2023):
 # adjacent objects are linked by bidirectional overlap, with split/merge branches
 # recorded separately from the continuously tracked largest branch.
-PYFLEXTRKR_WORK_DIR = os.path.join(save_loc, "pyflextrkr_tracking")
+PYFLEXTRKR_WORK_DIR = diagnostic_cache_dir("pyflextrkr_tracking", root_dir=root_dir)
 PYFLEXTRKR_NMAXLINKS = 50
 PYFLEXTRKR_FILLVAL = -9999
+FORCE_RECOMPUTE_PYFLEXTRKR_CACHE = (
+    FORCE_RECOMPUTE_PERSISTENCE_CACHE
+    or env_flag("FORCE_RECOMPUTE_PYFLEXTRKR_CACHE")
+)
 TRACK_MIN_OVERLAP_FRACTION = 0.50
 TRACK_MIN_AREA_KM2 = 800.0
 TRACK_MIN_LIFETIME_STEPS_FOR_SUMMARY = 1
@@ -203,17 +257,6 @@ VAR_ALIASES = {
     "i_rainnc": ["i_rainnc"],
     "olr": ["olr", "olrtoa", "OLR"],
     "pw": ["pw", "precipw", "prw"],
-    "cldfrac": ["cldfrac", "cloud_fraction", "cl"],
-    "zgrid": ["zgrid"],
-    "high_cloud_mask": ["high_cloud_mask"],
-    "column_connected_mask": [
-        "column_connected_mask",
-        "column_connected_high_cloud_mask",
-    ],
-    "deep_convective_high_cloud_mask": ["deep_convective_high_cloud_mask"],
-    "anvil_high_cloud_mask": ["anvil_high_cloud_mask"],
-    "cirrus_like_high_cloud_mask": ["cirrus_like_high_cloud_mask"],
-    "nonprecipitating_high_cloud_mask": ["nonprecipitating_high_cloud_mask"],
 }
 
 SOURCE_LABELS = {
@@ -227,26 +270,16 @@ SOURCE_LABELS = {
     "olr_cold_p05": "Cold OLR anomaly p5",
     "high_cloud_mask": "High cloud",
     "column_connected_mask": "Column-connected high cloud",
-    "deep_convective_high_cloud_mask": "Deep convective high cloud",
-    "anvil_high_cloud_mask": "Anvil high cloud",
+    "active_deep_convection_high_cloud_mask": "Active deep convection",
+    "convectively_generated_high_cloud_mask": "Convectively generated high cloud",
+    "unclassified_high_cloud_mask": "Ambiguous/unclassified high cloud",
     "cirrus_like_high_cloud_mask": "Cirrus-like high cloud",
     "nonprecipitating_high_cloud_mask": "Nonprecipitating high cloud",
 }
 
-SOURCE_ORDER = [
-    "precip_ge_1mmh",
-    "precip_ge_2mmh",
-    "precip_ge_8mmh",
-    "olr_tb241",
-    "olr_tb233",
-    "olr_cold_p05",
-    "deep_convective_high_cloud_mask",
-    "column_connected_mask",
-    "high_cloud_mask",
-    "anvil_high_cloud_mask",
-    "precip_p95",
-    "precip_p99",
-]
+SOURCE_ORDER = [spec["name"] for spec in PRECIP_OBJECT_SPECS]
+SOURCE_ORDER += [spec["name"] for spec in OLR_OBJECT_SPECS]
+SOURCE_ORDER += CLOUD_OBJECT_KEYS
 
 needed_vars = sorted(
     set(
@@ -257,9 +290,6 @@ needed_vars = sorted(
         + VAR_ALIASES["precip"]
         + VAR_ALIASES["olr"]
         + VAR_ALIASES["pw"]
-        + VAR_ALIASES["cldfrac"]
-        + VAR_ALIASES["zgrid"]
-        + sum((VAR_ALIASES[key] for key in CLOUD_OBJECT_KEYS), [])
     )
 )
 
@@ -280,6 +310,415 @@ def save_figure(number, fig, stem, dpi=300):
     if figsave is None:
         figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
     return figsave.save(fig, stem, number=number, dpi=dpi)
+
+
+# -----------------------------------------------------------------------------
+# Metric/persistence caches
+# -----------------------------------------------------------------------------
+
+METRIC_CACHE_VERSION = "organisation_metrics_v2"
+TRACK_PERSISTENCE_CACHE_VERSION = "pyflextrkr_track_persistence_v2"
+PATTERN_PERSISTENCE_CACHE_VERSION = "shifted_pattern_persistence_v1"
+
+ORGANISATION_CACHE_FILES = {
+    "metric_metadata": "organisation_metric_cache_metadata.json",
+    "track_metadata": "organisation_track_persistence_cache_metadata.json",
+    "pattern_metadata": "organisation_pattern_persistence_cache_metadata.json",
+    "thresholds": "organisation_object_thresholds.csv",
+    "timeseries": "organisation_lorg_timeseries.csv",
+    "summary": "organisation_lorg_summary.csv",
+    "tracked_objects": "organisation_tracked_objects.csv",
+    "track_lifetimes": "organisation_track_lifetimes.csv",
+    "long_lived_contribution": "organisation_long_lived_contribution.csv",
+    "pattern_persistence": "equatorial_shifted_pattern_autocorrelation.csv",
+}
+
+EMPTY_CACHE_COLUMNS = {
+    "tracked_objects": [
+        "node_id",
+        "source",
+        "source_label",
+        "simulation",
+        "Time",
+        "time_index",
+        "time_days",
+        "dt_hours",
+        "domain_area_km2",
+        "scene_convective_area_fraction",
+        "scene_precip_area_rate",
+        "label",
+        "area_km2",
+        "precip_area_rate",
+        "track_id",
+        "tracking_method",
+    ],
+    "track_lifetimes": [
+        "source",
+        "source_label",
+        "simulation",
+        "track_id",
+        "first_time_index",
+        "last_time_index",
+        "lifetime_hours",
+        "n_timesteps",
+        "mean_area_km2",
+        "max_area_km2",
+        "mean_tropical_precip",
+        "mean_convective_area_fraction",
+    ],
+    "long_lived_contribution": [
+        "source",
+        "source_label",
+        "simulation",
+        "Time",
+        "time_days",
+        "threshold_hours",
+        "tropical_mean_precip",
+        "convective_area_fraction",
+        "long_lived_area_fraction_of_domain",
+        "long_lived_area_fraction_of_objects",
+        "long_lived_precip_fraction_of_objects",
+    ],
+    "pattern_persistence": [
+        "simulation",
+        "field",
+        "field_label",
+        "lag_days",
+        "autocorrelation",
+    ],
+}
+
+
+def organisation_cache_path(name):
+    return os.path.join(save_loc, ORGANISATION_CACHE_FILES[name])
+
+
+def jsonable_value(value):
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (list, tuple)):
+        return [jsonable_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): jsonable_value(v) for k, v in value.items()}
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def object_spec_signature(specs):
+    keys = ("name", "field", "threshold", "percentile", "sense")
+    return [
+        {key: jsonable_value(spec[key]) for key in keys if key in spec}
+        for spec in specs
+    ]
+
+
+def base_data_cache_signature():
+    return dict(
+        root_dir=root_dir,
+        data_locs=list(data_locs),
+        latlon_file=list(latlon_file),
+        sim_names=list(sim_names),
+        ndays=int(ndays),
+        dt=float(dt),
+        analysis_end_date=analysis_end_date,
+        time_format=time_format,
+        tropical_lat_bounds=list(TROPICAL_LAT_BOUNDS),
+    )
+
+
+def object_definition_cache_signature():
+    signature = base_data_cache_signature()
+    signature.update(
+        source_order=list(SOURCE_ORDER),
+        precip_object_specs=object_spec_signature(PRECIP_OBJECT_SPECS),
+        olr_object_specs=object_spec_signature(OLR_OBJECT_SPECS),
+        cloud_object_keys=list(CLOUD_OBJECT_KEYS),
+        run_sensitivity_object_sources=bool(RUN_SENSITIVITY_OBJECT_SOURCES),
+        enable_olr_objects=bool(ENABLE_OLR_OBJECTS),
+        enable_cloud_objects=bool(ENABLE_CLOUD_OBJECTS),
+        cloud_classification_source="refined_high_cloud_classification_diagnostics.py",
+        cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
+        shared_cloud_thresholds=dict(
+            cf_thresh=float(CF_THRESH),
+            z_high=float(Z_HIGH),
+            z_low_min=float(Z_LOW_MIN),
+            z_low_max=float(Z_LOW_MAX),
+            z_mid_min=float(Z_MID_MIN),
+            z_mid_max=float(Z_MID_MAX),
+            z_upper_min=float(Z_UPPER_MIN),
+            p_deep=float(P_DEEP),
+            p_weak=float(P_WEAK),
+            max_clear_gap=jsonable_value(MAX_CLEAR_GAP),
+            classifier="shared 3-D hydrometeor-aware high-cloud classification",
+        ),
+        threshold_sample_limits=jsonable_value(THRESHOLD_SAMPLE_LIMITS),
+        min_object_cells=int(MIN_OBJECT_CELLS),
+        min_object_area_km2=float(MIN_OBJECT_AREA_KM2),
+    )
+    return signature
+
+
+def metric_cache_signature():
+    signature = object_definition_cache_signature()
+    signature.update(
+        cache_version=METRIC_CACHE_VERSION,
+        pair_distance_nbins=int(PAIR_DISTANCE_NBINS),
+        reference_realizations=int(REFERENCE_REALIZATIONS),
+        reference_random_seed=int(REFERENCE_RANDOM_SEED),
+        min_objects_for_lorg=int(MIN_OBJECTS_FOR_LORG),
+    )
+    return signature
+
+
+def track_persistence_cache_signature():
+    signature = object_definition_cache_signature()
+    signature.update(
+        cache_version=TRACK_PERSISTENCE_CACHE_VERSION,
+        pyflextrkr_nmaxlinks=int(PYFLEXTRKR_NMAXLINKS),
+        pyflextrkr_fillval=int(PYFLEXTRKR_FILLVAL),
+        track_min_overlap_fraction=float(TRACK_MIN_OVERLAP_FRACTION),
+        track_min_area_km2=float(TRACK_MIN_AREA_KM2),
+        track_min_lifetime_steps_for_summary=int(TRACK_MIN_LIFETIME_STEPS_FOR_SUMMARY),
+        long_lived_thresholds_hours=[float(v) for v in LONG_LIVED_THRESHOLDS_HOURS],
+    )
+    return signature
+
+
+def pattern_persistence_cache_signature():
+    signature = base_data_cache_signature()
+    signature.update(
+        cache_version=PATTERN_PERSISTENCE_CACHE_VERSION,
+        persistence_lat_bounds=list(PERSISTENCE_LAT_BOUNDS),
+        persistence_max_lag_days=float(PERSISTENCE_MAX_LAG_DAYS),
+        persistence_max_lon_shift_cells=int(PERSISTENCE_MAX_LON_SHIFT_CELLS),
+    )
+    return signature
+
+
+def cache_force_enabled(kind):
+    if kind == "metric":
+        return FORCE_RECOMPUTE_ORGANISATION_CACHE
+    return FORCE_RECOMPUTE_PERSISTENCE_CACHE
+
+
+def read_cache_metadata(name):
+    path = organisation_cache_path(name)
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_cache_metadata(name, signature):
+    if not save:
+        return
+    os.makedirs(save_loc, exist_ok=True)
+    path = organisation_cache_path(name)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(jsonable_value(signature), handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp_path, path)
+
+
+def cache_metadata_status(name, signature, kind, label):
+    if not USE_ORGANISATION_METRIC_CACHE:
+        return "miss"
+    if cache_force_enabled(kind):
+        print(f"Ignoring cached {label}: force recompute is enabled.")
+        return "miss"
+    try:
+        cached = read_cache_metadata(name)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Ignoring cached {label}: could not read metadata ({exc}).")
+        return "miss"
+    if cached is None:
+        if ALLOW_LEGACY_ORGANISATION_CACHE:
+            print(f"Checking legacy cached {label}: metadata file is missing.")
+            return "legacy"
+        return "miss"
+
+    signature = jsonable_value(signature)
+    changed = [
+        key
+        for key in sorted(set(cached) | set(signature))
+        if cached.get(key) != signature.get(key)
+    ]
+    if changed:
+        shown = ", ".join(changed[:8])
+        suffix = "" if len(changed) <= 8 else ", ..."
+        print(f"Ignoring cached {label}: metadata changed ({shown}{suffix}).")
+        return "miss"
+    return "match"
+
+
+def read_cache_table(name):
+    path = organisation_cache_path(name)
+    if not os.path.exists(path):
+        return None
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=EMPTY_CACHE_COLUMNS.get(name, []))
+
+
+def write_cache_table(name, df):
+    if not save or df is None:
+        return
+    os.makedirs(save_loc, exist_ok=True)
+    if len(df.columns) == 0:
+        df = pd.DataFrame(columns=EMPTY_CACHE_COLUMNS.get(name, []))
+    df.to_csv(organisation_cache_path(name), index=False)
+
+
+def frame_has_current_simulations(df, label, require_all=True):
+    if len(df) == 0 or "simulation" not in df.columns:
+        return True
+    expected = set(sim_names)
+    actual = set(df["simulation"].dropna().astype(str).unique())
+    unexpected = actual - expected
+    if unexpected:
+        print(f"Ignoring cached {label}: unexpected simulations {sorted(unexpected)}.")
+        return False
+    if require_all and actual != expected:
+        print(f"Ignoring cached {label}: simulations differ from current configuration.")
+        return False
+    return True
+
+
+def frame_has_only_current_sources(df, label):
+    if len(df) == 0 or "source" not in df.columns:
+        return True
+    expected = set(SOURCE_ORDER)
+    actual = set(df["source"].dropna().astype(str).unique())
+    unexpected = actual - expected
+    if unexpected:
+        print(f"Ignoring cached {label}: unexpected sources {sorted(unexpected)}.")
+        return False
+    return True
+
+
+def organisation_metric_summary(metrics_df):
+    return (
+        metrics_df
+        .groupby(["source", "source_label", "simulation"], as_index=False)
+        [["lorg_km", "object_count", "convective_area_fraction"]]
+        .mean(numeric_only=True)
+    )
+
+
+def load_cached_metric_products():
+    metadata_status = cache_metadata_status(
+        "metric_metadata",
+        metric_cache_signature(),
+        "metric",
+        "organisation metrics",
+    )
+    if metadata_status == "miss":
+        return None
+
+    metrics_df = read_cache_table("timeseries")
+    if metrics_df is None:
+        return None
+    if len(metrics_df) == 0:
+        print("Ignoring cached organisation metrics: time series table is empty.")
+        return None
+    if not frame_has_current_simulations(metrics_df, "organisation metrics"):
+        return None
+    if not frame_has_only_current_sources(metrics_df, "organisation metrics"):
+        return None
+
+    threshold_table = read_cache_table("thresholds")
+    if threshold_table is None:
+        threshold_table = pd.DataFrame()
+    summary = read_cache_table("summary")
+    if summary is None or len(summary) == 0:
+        summary = organisation_metric_summary(metrics_df)
+
+    if metadata_status == "legacy":
+        write_cache_metadata("metric_metadata", metric_cache_signature())
+    print(f"Using cached organisation metrics from {save_loc}")
+    return threshold_table, metrics_df, summary
+
+
+def write_metric_cache(threshold_table, metrics_df, summary):
+    write_cache_table("thresholds", threshold_table)
+    write_cache_table("timeseries", metrics_df)
+    write_cache_table("summary", summary)
+    write_cache_metadata("metric_metadata", metric_cache_signature())
+
+
+def load_cached_track_persistence_products():
+    metadata_status = cache_metadata_status(
+        "track_metadata",
+        track_persistence_cache_signature(),
+        "persistence",
+        "track persistence metrics",
+    )
+    if metadata_status == "miss":
+        return None
+
+    missing = [
+        name
+        for name in ("tracked_objects", "track_lifetimes", "long_lived_contribution")
+        if not os.path.exists(organisation_cache_path(name))
+    ]
+    if missing:
+        print(f"Ignoring cached track persistence metrics: missing {', '.join(missing)}.")
+        return None
+
+    objects_df = read_cache_table("tracked_objects")
+    tracks_df = read_cache_table("track_lifetimes")
+    contribution_df = read_cache_table("long_lived_contribution")
+    for label, frame in (
+        ("tracked objects", objects_df),
+        ("track lifetimes", tracks_df),
+        ("long-lived contribution", contribution_df),
+    ):
+        if not frame_has_current_simulations(frame, label, require_all=False):
+            return None
+        if not frame_has_only_current_sources(frame, label):
+            return None
+
+    if metadata_status == "legacy":
+        write_cache_metadata("track_metadata", track_persistence_cache_signature())
+    print(f"Using cached track persistence metrics from {save_loc}")
+    return objects_df, tracks_df, contribution_df
+
+
+def write_track_persistence_cache(objects_df, tracks_df, contribution_df):
+    write_cache_table("tracked_objects", objects_df)
+    write_cache_table("track_lifetimes", tracks_df)
+    write_cache_table("long_lived_contribution", contribution_df)
+    write_cache_metadata("track_metadata", track_persistence_cache_signature())
+
+
+def load_cached_pattern_persistence():
+    metadata_status = cache_metadata_status(
+        "pattern_metadata",
+        pattern_persistence_cache_signature(),
+        "persistence",
+        "pattern persistence metrics",
+    )
+    if metadata_status == "miss":
+        return None
+    persistence_df = read_cache_table("pattern_persistence")
+    if persistence_df is None:
+        return None
+    if not frame_has_current_simulations(persistence_df, "pattern persistence metrics"):
+        return None
+    if metadata_status == "legacy":
+        write_cache_metadata("pattern_metadata", pattern_persistence_cache_signature())
+    print(f"Using cached pattern persistence metrics from {save_loc}")
+    return persistence_df
+
+
+def write_pattern_persistence_cache(persistence_df):
+    write_cache_table("pattern_persistence", persistence_df)
+    write_cache_metadata("pattern_metadata", pattern_persistence_cache_signature())
 
 
 # -----------------------------------------------------------------------------
@@ -770,7 +1209,41 @@ def pyflextrkr_track_filename_with_seconds(epoch_seconds):
 
 def pyflextrkr_work_path(source_name, sim_name):
     safe_sim = sim_name.replace(" ", "_").replace("/", "_")
-    return os.path.join(PYFLEXTRKR_WORK_DIR, source_name, safe_sim)
+    source_cache_name = source_name
+    if source_name in CLOUD_OBJECT_KEYS:
+        source_cache_name = f"{source_name}_{CLASSIFICATION_CACHE_VERSION}"
+    safe_source = source_cache_name.replace(" ", "_").replace("/", "_")
+    return os.path.join(PYFLEXTRKR_WORK_DIR, safe_source, safe_sim)
+
+
+def pyflextrkr_tracknumbers_filename(basetimes):
+    startdate = pd.to_datetime(float(basetimes[0]), unit="s").strftime("%Y%m%d.%H%M")
+    enddate = pd.to_datetime(float(basetimes[-1]), unit="s").strftime("%Y%m%d.%H%M")
+    return f"tracknumbers_{startdate}_{enddate}.nc"
+
+
+def pyflextrkr_tracknumbers_path(work_path, basetimes):
+    return os.path.join(work_path, "stats", pyflextrkr_tracknumbers_filename(basetimes))
+
+
+def expected_pyflextrkr_cloudid_files(tracking_path, basetimes):
+    return [
+        os.path.join(tracking_path, f"cloudid_{datestr}_{timestr}.nc")
+        for datestr, timestr in (pyflextrkr_timestamp_strings(basetime) for basetime in basetimes)
+    ]
+
+
+def expected_pyflextrkr_track_files(tracking_path, basetimes):
+    return [
+        os.path.join(tracking_path, pyflextrkr_track_filename_with_seconds(basetimes[it + 1]))
+        for it in range(len(basetimes) - 1)
+    ]
+
+
+def expected_pyflextrkr_files_available(tracking_path, basetimes):
+    expected = expected_pyflextrkr_cloudid_files(tracking_path, basetimes)
+    expected.extend(expected_pyflextrkr_track_files(tracking_path, basetimes))
+    return bool(expected) and all(os.path.exists(path) for path in expected)
 
 
 def clear_generated_pyflextrkr_files(tracking_path):
@@ -825,55 +1298,7 @@ def write_pyflextrkr_cloudid_files(labels_by_time, mask, work_path):
     return files, basetimes, tracking_path
 
 
-def assign_pyflextrkr_track_ids(labels_by_time, objects_df, mask, source_name, sim_name):
-    if len(labels_by_time) < 2:
-        raise ValueError("at least two scenes are required for PyFLEXTRKR tracking")
-
-    work_path = pyflextrkr_work_path(source_name, sim_name)
-    stats_path = os.path.join(work_path, "stats")
-    os.makedirs(stats_path, exist_ok=True)
-    files, basetimes, tracking_path = write_pyflextrkr_cloudid_files(labels_by_time, mask, work_path)
-    max_label = max(int(np.nanmax(labels)) if np.asarray(labels).size else 0 for labels in labels_by_time)
-    config = dict(
-        tracking_outpath=tracking_path + os.sep,
-        stats_outpath=stats_path + os.sep,
-        cloudid_filebase="cloudid_",
-        singletrack_filebase="track_",
-        tracknumbers_filebase="tracknumbers_",
-        feature_varname="feature_number",
-        nfeature_varname="nfeatures",
-        featuresize_varname="npix_feature",
-        timegap=1.5 * median_time_step_days(mask) * 24.0,
-        nmaxlinks=PYFLEXTRKR_NMAXLINKS,
-        othresh=TRACK_MIN_OVERLAP_FRACTION,
-        maxnclouds=max(PYFLEXTRKR_NMAXLINKS, max_label + 2),
-        start_basetime=float(basetimes[0]),
-        end_basetime=float(basetimes[-1]),
-        startdate=pd.to_datetime(float(basetimes[0]), unit="s").strftime("%Y%m%d.%H%M"),
-        enddate=pd.to_datetime(float(basetimes[-1]), unit="s").strftime("%Y%m%d.%H%M"),
-        fillval=PYFLEXTRKR_FILLVAL,
-    )
-
-    old_cwd = os.getcwd()
-    try:
-        os.chdir(tracking_path)
-        for it in range(len(files) - 1):
-            pyflextrkr_trackclouds(
-                (os.path.basename(files[it]), os.path.basename(files[it + 1])),
-                (basetimes[it], basetimes[it + 1]),
-                config,
-            )
-            short_name = os.path.join(tracking_path, pyflextrkr_track_filename(basetimes[it + 1]))
-            seconds_name = os.path.join(tracking_path, pyflextrkr_track_filename_with_seconds(basetimes[it + 1]))
-            if os.path.exists(seconds_name):
-                os.remove(seconds_name)
-            if os.path.exists(short_name):
-                os.replace(short_name, seconds_name)
-    finally:
-        os.chdir(old_cwd)
-
-    tracknumbers_file = pyflextrkr_gettracknumbers(config)
-
+def attach_pyflextrkr_track_ids(tracknumbers_file, objects_df):
     ds = xr.open_dataset(tracknumbers_file, mask_and_scale=False, decode_times=False, concat_characters=True)
     track_numbers = np.asarray(ds["track_numbers"].squeeze().values)
     track_status = np.asarray(ds["track_status"].squeeze().values)
@@ -919,6 +1344,75 @@ def assign_pyflextrkr_track_ids(labels_by_time, objects_df, mask, source_name, s
     objects_df["pyflextrkr_object_label"] = objects_df["label"].astype(int)
     objects_df["tracking_method"] = "pyflextrkr"
     return objects_df
+
+
+def assign_pyflextrkr_track_ids(labels_by_time, objects_df, mask, source_name, sim_name):
+    if len(labels_by_time) < 2:
+        raise ValueError("at least two scenes are required for PyFLEXTRKR tracking")
+
+    work_path = pyflextrkr_work_path(source_name, sim_name)
+    stats_path = os.path.join(work_path, "stats")
+    os.makedirs(stats_path, exist_ok=True)
+    tracking_path = os.path.join(work_path, "tracking")
+    basetimes = epoch_seconds_from_time_values(mask.Time.values)
+    max_label = max(int(np.nanmax(labels)) if np.asarray(labels).size else 0 for labels in labels_by_time)
+    config = dict(
+        tracking_outpath=tracking_path + os.sep,
+        stats_outpath=stats_path + os.sep,
+        cloudid_filebase="cloudid_",
+        singletrack_filebase="track_",
+        tracknumbers_filebase="tracknumbers_",
+        feature_varname="feature_number",
+        nfeature_varname="nfeatures",
+        featuresize_varname="npix_feature",
+        timegap=1.5 * median_time_step_days(mask) * 24.0,
+        nmaxlinks=PYFLEXTRKR_NMAXLINKS,
+        othresh=TRACK_MIN_OVERLAP_FRACTION,
+        maxnclouds=max(PYFLEXTRKR_NMAXLINKS, max_label + 2),
+        start_basetime=float(basetimes[0]),
+        end_basetime=float(basetimes[-1]),
+        startdate=pd.to_datetime(float(basetimes[0]), unit="s").strftime("%Y%m%d.%H%M"),
+        enddate=pd.to_datetime(float(basetimes[-1]), unit="s").strftime("%Y%m%d.%H%M"),
+        fillval=PYFLEXTRKR_FILLVAL,
+    )
+
+    tracknumbers_file = pyflextrkr_tracknumbers_path(work_path, basetimes)
+    if FORCE_RECOMPUTE_PYFLEXTRKR_CACHE and os.path.exists(tracknumbers_file):
+        os.remove(tracknumbers_file)
+
+    if not FORCE_RECOMPUTE_PYFLEXTRKR_CACHE and os.path.exists(tracknumbers_file):
+        print(f"Using cached PyFLEXTRKR track numbers for {sim_name} {source_name}: {tracknumbers_file}")
+        return attach_pyflextrkr_track_ids(tracknumbers_file, objects_df)
+
+    if (
+        not FORCE_RECOMPUTE_PYFLEXTRKR_CACHE
+        and expected_pyflextrkr_files_available(tracking_path, basetimes)
+    ):
+        print(f"Using cached PyFLEXTRKR cloudid/track files for {sim_name} {source_name}: {tracking_path}")
+        tracknumbers_file = pyflextrkr_gettracknumbers(config)
+        return attach_pyflextrkr_track_ids(tracknumbers_file, objects_df)
+
+    files, basetimes, tracking_path = write_pyflextrkr_cloudid_files(labels_by_time, mask, work_path)
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(tracking_path)
+        for it in range(len(files) - 1):
+            pyflextrkr_trackclouds(
+                (os.path.basename(files[it]), os.path.basename(files[it + 1])),
+                (basetimes[it], basetimes[it + 1]),
+                config,
+            )
+            short_name = os.path.join(tracking_path, pyflextrkr_track_filename(basetimes[it + 1]))
+            seconds_name = os.path.join(tracking_path, pyflextrkr_track_filename_with_seconds(basetimes[it + 1]))
+            if os.path.exists(seconds_name):
+                os.remove(seconds_name)
+            if os.path.exists(short_name):
+                os.replace(short_name, seconds_name)
+    finally:
+        os.chdir(old_cwd)
+
+    tracknumbers_file = pyflextrkr_gettracknumbers(config)
+    return attach_pyflextrkr_track_ids(tracknumbers_file, objects_df)
 
 
 def build_track_tables(mask, fields, source_name, sim_name):
@@ -1134,16 +1628,27 @@ def build_track_persistence_metrics(masks_by_run, fields_by_run):
 # -----------------------------------------------------------------------------
 
 
-def existing_cloud_masks_from_dataset(ds, precip_ref):
-    masks = {}
-    for key in CLOUD_OBJECT_KEYS:
-        name = find_var(ds, key, required=False)
-        if name is None:
-            continue
-        da = ds[name]
-        da = select_common_time(da, precip_ref)
-        masks[key] = da.fillna(False).astype(bool)
-    return masks
+def has_primary_cloud_masks(masks):
+    return all(key in masks for key in CLOUD_OBJECT_KEYS_PRIMARY)
+
+
+def classification_thresholds():
+    return HighCloudThresholds(
+        cf_thresh=CF_THRESH,
+        z_high_km=Z_HIGH,
+        low_cloud_min_km=Z_LOW_MIN,
+        low_cloud_max_km=Z_LOW_MAX,
+        mid_cloud_min_km=Z_MID_MIN,
+        mid_cloud_max_km=Z_MID_MAX,
+        upper_cloud_min_km=Z_UPPER_MIN,
+        max_clear_gap_km=MAX_CLEAR_GAP,
+        surface_precip_deep_mm_day=P_DEEP,
+        surface_precip_weak_mm_day=P_WEAK,
+    )
+
+
+def cached_classification_is_current(cached):
+    return shared_cached_classification_is_current(cached, classification_thresholds())
 
 
 def cached_classification_path(sim_name):
@@ -1158,182 +1663,41 @@ def cached_classification_path(sim_name):
 def cloud_masks_from_cache(sim_name, precip_ref):
     path = cached_classification_path(sim_name)
     if path is None:
-        return {}
+        checked = [
+            os.path.join(directory, f"{sim_name.replace(' ', '_')}_classified_high_cloud.nc")
+            for directory in CLOUD_CLASSIFICATION_CACHE_DIRS
+        ]
+        raise FileNotFoundError(
+            f"{sim_name}: required shared high-cloud classification cache is missing. "
+            f"Run refined_high_cloud_classification_diagnostics.py first. Checked: {checked}"
+        )
 
     print(f"Using cached high-cloud classification for {sim_name}: {path}")
     cached = xr.open_dataset(path, chunks={})
+    if not cached_classification_is_current(cached):
+        cached.close()
+        raise RuntimeError(f"{sim_name}: stale high-cloud classification cache: {path}")
+    missing = [key for key in CLOUD_OBJECT_KEYS if key not in cached.data_vars]
+    if missing:
+        cached.close()
+        raise RuntimeError(
+            f"{sim_name}: high-cloud classification cache lacks required shared variables {missing}: {path}"
+        )
     masks = {}
     for key in CLOUD_OBJECT_KEYS:
-        if key not in cached.data_vars:
-            continue
         da = cached[key]
         da = select_common_time(da, precip_ref)
         masks[key] = da.fillna(False).astype(bool)
     return masks
 
 
-def get_cloud_fraction(ds):
-    name = find_var(ds, "cldfrac", required=False)
-    if name is None:
-        return None
-    cf = finite_or_nan(ds[name])
-    zdim = vertical_dim(cf)
-    if zdim != "z":
-        cf = cf.rename({zdim: "z"})
-    if "z" not in cf.coords:
-        warnings.warn("Cloud fraction has no usable z coordinate; cloud-object Lorg will be skipped.")
-        return None
-    zvals = np.asarray(cf.z.values, dtype=float)
-    if zvals.size != cf.sizes["z"] or not np.all(np.isfinite(zvals)):
-        warnings.warn("Cloud fraction z coordinate is not usable; cloud-object Lorg will be skipped.")
-        return None
-    if np.nanmax(zvals) < 100.0:
-        cf = cf.assign_coords(z=cf.z * 1000.0)
-    return cf
-
-
-def available_cloud_fraction_times(cf):
-    if "Time" not in cf.dims:
-        return None
-    indexers = {dim: 0 for dim in cf.dims if dim != "Time"}
-    valid = cf.isel(indexers).notnull().load()
-    return valid.Time.values[np.asarray(valid.values, dtype=bool)]
-
-
-def z_in_km(da):
-    zvals = np.asarray(da.z.values, dtype=float)
-    return xr.DataArray(
-        zvals / 1000.0 if np.nanmax(np.abs(zvals)) > 100.0 else zvals,
-        dims=("z",),
-        coords={"z": da.z},
-        name="z_km",
-    )
-
-
-def any_cloud_in_layer(cloudy, z_km, zmin, zmax):
-    return cloudy.where((z_km >= zmin) & (z_km < zmax), drop=True).any(dim="z")
-
-
-def rolling_or_dilated_max(mask, lat_radius=ANVIL_RADIUS_DEG, lon_radius=ANVIL_RADIUS_DEG, time_radius=ANVIL_TIME_STEPS):
-    x = mask.astype(np.int8)
-    rolling_kwargs = {}
-    if "Time" in x.dims and time_radius > 0:
-        rolling_kwargs["Time"] = 2 * int(time_radius) + 1
-    if "latitude" in x.dims and lat_radius > 0 and x.sizes.get("latitude", 0) > 1:
-        dlat = float(np.nanmedian(np.abs(np.diff(x.latitude.values))))
-        rolling_kwargs["latitude"] = 2 * int(np.ceil(lat_radius / dlat)) + 1
-    if "longitude" in x.dims and lon_radius > 0 and x.sizes.get("longitude", 0) > 1:
-        dlon = float(np.nanmedian(np.abs(np.diff(x.longitude.values))))
-        rolling_kwargs["longitude"] = 2 * int(np.ceil(lon_radius / dlon)) + 1
-
-    if not rolling_kwargs:
-        return mask
-    return x.rolling(**rolling_kwargs, center=True, min_periods=1).max() >= 1
-
-
-def classify_high_cloud_masks(cldfrac, precip):
-    """
-    Fallback high-cloud decomposition used only when precomputed categories are
-    unavailable. The categories mirror convective_pathway_diagnostics.py.
-    """
-    cf = cldfrac
-    valid_times = available_cloud_fraction_times(cf)
-    if valid_times is not None:
-        cf = cf.sel(Time=valid_times)
-    if "Time" in cf.dims and "Time" in precip.dims:
-        common_time = cf.Time.to_index().intersection(precip.Time.to_index())
-        if len(common_time) == 0:
-            return {}
-        cf = cf.sel(Time=common_time)
-        precip = precip.sel(Time=common_time)
-    cf, pr = xr.align(cf, precip, join="inner")
-    z_km = z_in_km(cf)
-
-    cloudy = cf >= CF_THRESH
-    cloud_top_height = z_km.where(cloudy).max(dim="z", skipna=True)
-    high_cloud_fraction = cf.where(z_km >= Z_HIGH).mean(dim="z", skipna=True)
-    high_cloud_mask = ((cloud_top_height >= Z_HIGH) | (high_cloud_fraction >= CF_THRESH)).fillna(False)
-    high_cloud_mask.name = "high_cloud_mask"
-
-    low_cloud = any_cloud_in_layer(cloudy, z_km, Z_LOW_MIN, Z_LOW_MAX)
-    mid_cloud = any_cloud_in_layer(cloudy, z_km, Z_MID_MIN, Z_MID_MAX)
-    upper_cloud = any_cloud_in_layer(cloudy, z_km, Z_UPPER_MIN, max(float(z_km.max()), Z_HIGH + 0.1))
-
-    gap_ok = xr.ones_like(high_cloud_mask, dtype=bool)
-    if MAX_CLEAR_GAP is not None and MAX_CLEAR_GAP > 0:
-        slab_starts = np.arange(Z_LOW_MIN, Z_HIGH, MAX_CLEAR_GAP)
-        for z0 in slab_starts:
-            z1 = min(z0 + MAX_CLEAR_GAP, max(float(z_km.max()), Z_HIGH))
-            if z1 <= z0:
-                continue
-            gap_ok = gap_ok & any_cloud_in_layer(cloudy, z_km, z0, z1 + 1.0e-6)
-
-    column_connected = (high_cloud_mask & low_cloud & mid_cloud & upper_cloud & gap_ok).fillna(False)
-    column_connected.name = "column_connected_high_cloud_mask"
-
-    deep_convective = (high_cloud_mask & column_connected & (pr >= P_DEEP)).fillna(False)
-    deep_convective.name = "deep_convective_high_cloud_mask"
-
-    near_deep_core = rolling_or_dilated_max(
-        deep_convective,
-        lat_radius=ANVIL_RADIUS_DEG,
-        lon_radius=ANVIL_RADIUS_DEG,
-        time_radius=ANVIL_TIME_STEPS,
-    ).fillna(False)
-
-    anvil = (high_cloud_mask & ~deep_convective & near_deep_core).fillna(False)
-    anvil.name = "anvil_high_cloud_mask"
-
-    cirrus_like = (high_cloud_mask & ~column_connected & ~near_deep_core & (pr <= P_WEAK)).fillna(False)
-    cirrus_like.name = "cirrus_like_high_cloud_mask"
-
-    nonprecipitating = (high_cloud_mask & (pr <= P_WEAK)).fillna(False)
-    nonprecipitating.name = "nonprecipitating_high_cloud_mask"
-
-    return {
-        "high_cloud_mask": high_cloud_mask,
-        "column_connected_mask": column_connected,
-        "deep_convective_high_cloud_mask": deep_convective,
-        "anvil_high_cloud_mask": anvil,
-        "cirrus_like_high_cloud_mask": cirrus_like,
-        "nonprecipitating_high_cloud_mask": nonprecipitating,
-    }
-
-
-def maybe_write_cloud_cache(sim_name, masks):
-    if not SAVE_CLOUD_CLASSIFICATION_CACHE or not masks:
-        return
-    cache_dir = CLOUD_CLASSIFICATION_CACHE_DIRS[-1]
-    os.makedirs(cache_dir, exist_ok=True)
-    path = os.path.join(cache_dir, f"{sim_name.replace(' ', '_')}_classified_high_cloud.nc")
-    tmp_path = path + ".tmp"
-    xr.Dataset(masks).to_netcdf(tmp_path)
-    os.replace(tmp_path, path)
-
-
 def cloud_type_masks(ds, fields, sim_name):
     if not ENABLE_CLOUD_OBJECTS:
         return {}
 
-    masks = existing_cloud_masks_from_dataset(ds, fields["precip"])
-    if masks:
-        print(f"Using in-dataset cloud-type masks for {sim_name}: {', '.join(sorted(masks))}")
-        return masks
-
     masks = cloud_masks_from_cache(sim_name, fields["precip"])
-    if masks:
-        return masks
-
-    if not ENABLE_FALLBACK_CLOUD_CLASSIFICATION:
-        return {}
-
-    cf = get_cloud_fraction(ds)
-    if cf is None:
-        return {}
-
-    print(f"Building fallback high-cloud classification for {sim_name}")
-    masks = classify_high_cloud_masks(cf, fields["precip"])
-    maybe_write_cloud_cache(sim_name, masks)
+    if not has_primary_cloud_masks(masks):
+        raise RuntimeError(f"{sim_name}: shared high-cloud classification cache lacks primary cloud-object masks")
     return masks
 
 
@@ -1935,7 +2299,7 @@ def load_datasets():
             ndays=ndays,
             end_date=analysis_end_date,
             chunks=latlon_chunks,
-            add_cldfrac_file=True,
+            add_cldfrac_file=False,
         )
         ds = standardize_latlon_dataset(ds, needed_vars)
         print(ds)
@@ -1985,42 +2349,66 @@ def build_all_metrics(dss, fields_by_run, threshold_table, masks_by_run=None):
 
 def main():
     os.makedirs(save_loc, exist_ok=True)
-    dss = load_datasets()
-    fields_by_run = [build_fields(ds) for ds in dss]
 
-    threshold_table = build_threshold_table(fields_by_run)
-    if len(threshold_table) > 0:
-        print("\nOrganisation object thresholds")
-        print(threshold_table.to_string(index=False))
-        if save:
-            threshold_table.to_csv(os.path.join(save_loc, "organisation_object_thresholds.csv"), index=False)
+    dss = None
+    fields_by_run = None
+    masks_by_run = None
 
-    masks_by_run = build_masks_by_run(dss, fields_by_run, threshold_table)
-    metrics_df = build_all_metrics(dss, fields_by_run, threshold_table, masks_by_run=masks_by_run)
-    if len(metrics_df) == 0:
-        print("No organisation metrics were computed.")
-        return
+    def ensure_fields():
+        nonlocal dss, fields_by_run
+        if fields_by_run is None:
+            dss = load_datasets()
+            fields_by_run = [build_fields(ds) for ds in dss]
+        return dss, fields_by_run
 
-    objects_df, tracks_df, contribution_df = build_track_persistence_metrics(masks_by_run, fields_by_run)
+    def ensure_masks(threshold_table):
+        nonlocal masks_by_run
+        if masks_by_run is None:
+            dss_local, fields_local = ensure_fields()
+            masks_by_run = build_masks_by_run(dss_local, fields_local, threshold_table)
+        return masks_by_run
+
+    metric_products = load_cached_metric_products()
+    if metric_products is None:
+        dss, fields_by_run = ensure_fields()
+        threshold_table = build_threshold_table(fields_by_run)
+        if len(threshold_table) > 0:
+            print("\nOrganisation object thresholds")
+            print(threshold_table.to_string(index=False))
+
+        masks_by_run = ensure_masks(threshold_table)
+        metrics_df = build_all_metrics(dss, fields_by_run, threshold_table, masks_by_run=masks_by_run)
+        if len(metrics_df) == 0:
+            print("No organisation metrics were computed.")
+            return
+
+        summary = organisation_metric_summary(metrics_df)
+        write_metric_cache(threshold_table, metrics_df, summary)
+    else:
+        threshold_table, metrics_df, summary = metric_products
+        if len(threshold_table) > 0:
+            print("\nCached organisation object thresholds")
+            print(threshold_table.to_string(index=False))
+
+    objects_df = pd.DataFrame()
+    tracks_df = pd.DataFrame()
+    contribution_df = pd.DataFrame()
+    track_persistence_needed = should_run_any([6, 7, 8, 9])
+    if track_persistence_needed:
+        track_products = load_cached_track_persistence_products()
+        if track_products is None:
+            if len(threshold_table) == 0:
+                _, fields_by_run = ensure_fields()
+                threshold_table = build_threshold_table(fields_by_run)
+            masks_by_run = ensure_masks(threshold_table)
+            _, fields_by_run = ensure_fields()
+            objects_df, tracks_df, contribution_df = build_track_persistence_metrics(masks_by_run, fields_by_run)
+            write_track_persistence_cache(objects_df, tracks_df, contribution_df)
+        else:
+            objects_df, tracks_df, contribution_df = track_products
 
     print("\nOrganisation metric summary")
-    summary = (
-        metrics_df
-        .groupby(["source", "source_label", "simulation"], as_index=False)
-        [["lorg_km", "object_count", "convective_area_fraction"]]
-        .mean(numeric_only=True)
-    )
     print(summary.to_string(index=False))
-
-    if save:
-        metrics_df.to_csv(os.path.join(save_loc, "organisation_lorg_timeseries.csv"), index=False)
-        summary.to_csv(os.path.join(save_loc, "organisation_lorg_summary.csv"), index=False)
-        if len(objects_df) > 0:
-            objects_df.to_csv(os.path.join(save_loc, "organisation_tracked_objects.csv"), index=False)
-        if len(tracks_df) > 0:
-            tracks_df.to_csv(os.path.join(save_loc, "organisation_track_lifetimes.csv"), index=False)
-        if len(contribution_df) > 0:
-            contribution_df.to_csv(os.path.join(save_loc, "organisation_long_lived_contribution.csv"), index=False)
 
     if should_run_figure(1):
         plot_lorg_timeseries(metrics_df)
@@ -2066,9 +2454,11 @@ def main():
             "Track-mean convective area fraction",
         )
     if should_run_figure(10):
-        persistence_df = compute_persistence(fields_by_run)
-        if save and len(persistence_df) > 0:
-            persistence_df.to_csv(os.path.join(save_loc, "equatorial_shifted_pattern_autocorrelation.csv"), index=False)
+        persistence_df = load_cached_pattern_persistence()
+        if persistence_df is None:
+            _, fields_by_run = ensure_fields()
+            persistence_df = compute_persistence(fields_by_run)
+            write_pattern_persistence_cache(persistence_df)
         if len(persistence_df) > 0:
             plot_shifted_pattern_autocorrelation(persistence_df)
 
