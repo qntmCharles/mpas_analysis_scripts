@@ -1,8 +1,2 @@
-diagnostics/__pycache__/diagnostic_helpers.cpython-311.pyc
-diagnostics/__pycache__/equatorial_wave_diagnostics.cpython-311.pyc
-diagnostic_logs/equatorial_wave_diagnostics.log
-diagnostic_logs/jet_variability_diagnostics.log
-diagnostic_logs/matched_pattern_response.log
-diagnostic_logs/mean_state_diagnostics.log
-diagnostic_logs/symmetry_convection_diagnostics.log
-diagnostic_logs/thermal_wind_scaled_response.log
+*.pyc
+*.log
