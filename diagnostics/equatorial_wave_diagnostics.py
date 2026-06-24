@@ -72,7 +72,7 @@ except ModuleNotFoundError:
 # -----------------------------------------------------------------------------
 
 save = True
-save_loc = "/home/cwp29/tmp/mpas/crf_on/final/waves/"
+save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/waves/")
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -89,13 +89,13 @@ save_loc = "/home/cwp29/tmp/mpas/crf_on/final/waves/"
 #       plus period-axis and wavenumber-phase-speed variants
 #   10: kelvin_cloud_decomposition
 #   11: compact_wave_attribution_metrics
-figures_to_run = []
+figures_to_run = [9]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 # Restart/resume controls.  With the default full run, existing figure files are
 # treated as completed products; set this to False if you explicitly want to
 # redraw figures from cached/intermediate data.
-skip_existing_figures = True
+skip_existing_figures = False
 force_recompute_caches = False
 
 # Figure 8 is deliberately excluded from the default list because it filters
@@ -231,8 +231,8 @@ eddy_flux_levels = [70, 100, 250, 850]
 
 spectrum_field = "Precip"
 spectrum_lat_bounds = filter_lat_bounds
-spectrum_segment_days = 96
-spectrum_overlap_days = 60
+spectrum_segment_days = 48
+spectrum_overlap_days = 30
 spectrum_wavenumber_limits = (-30, 16)
 spectrum_frequency_limits = (0, 0.6)
 spectrum_period_reference_days = [3.0, 6.0, 30.0]
@@ -325,10 +325,7 @@ def should_build_figure(number, stems):
 
 
 def save_figure(number, fig, stem):
-    """Save both numbered project-style figures and exact task filenames."""
-    figsave.save(fig, stem, number=number)
-    if save and should_run_figure(number):
-        fig.savefig(os.path.join(save_loc, f"{stem}.png"), dpi=figsave.dpi)
+    return figsave.save(fig, stem, number=number)
 
 
 def jsonable_value(value):
@@ -2050,17 +2047,21 @@ def plot_attribution_heatmap(table, value_col, stem, title, vmin=None, vmax=None
         max_abs = np.nanmax(np.abs(values)) if np.any(np.isfinite(values)) else 1.0
         if not np.isfinite(max_abs) or max_abs == 0:
             max_abs = 1.0
-        vmin, vmax = -max_abs, max_abs
+    else:
+        max_abs = max(abs(vmin), abs(vmax))
+    levels = symmetric_levels(max_abs, ndiv=11)
+    cmap = difference_cmap(levels)
+    norm = colors.BoundaryNorm(levels, cmap.N)
     fig, ax = plt.subplots(figsize=(0.55 * len(field_order) + 4.0, 0.5 * len(wave_order) + 2.5),
                            constrained_layout=True)
-    im = ax.imshow(values, cmap="bwr", vmin=vmin, vmax=vmax, aspect="auto")
+    im = ax.imshow(values, cmap=cmap, norm=norm, aspect="auto")
     ax.set_xticks(np.arange(len(field_order)))
     ax.set_xticklabels(field_order, rotation=35, ha="right")
     ax.set_yticks(np.arange(len(wave_order)))
     ax.set_yticklabels(wave_order)
     ax.set_title(title)
     ax.grid(False)
-    fig.colorbar(im, ax=ax, label=value_col)
+    add_symmetric_colorbar(fig, im, ax, levels, label=value_col)
     save_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER, fig, stem)
 
 
@@ -2552,13 +2553,13 @@ if should_build_figure(1, "wave_filtered_hovmollers_precip"):
     for i in range(len(dss)):
         for j, wname in enumerate(wave_names):
             wav = fields[(i, wname)]
-            im = ax[i, j].contourf(wav.longitude, wav.Time, wav.values, levels=levels, cmap="bwr", extend="both")
+            im = ax[i, j].contourf(wav.longitude, wav.Time, wav.values, levels=levels, cmap=difference_cmap(levels), extend="both")
             if i == 0:
                 ax[i, j].set_title(wave_label(wname))
             if j == 0:
                 ax[i, j].set_ylabel(sim_names[i])
             else:
-                ax[i, j].set_yticklabels([])
+                ax[i, j].tick_params(labelleft=False)
             if i == len(dss) - 1:
                 ax[i, j].set_xlabel("Longitude")
             annotate_panel_label(ax[i, j], sim_names[i] if j == 0 else wave_label(wname))
@@ -2665,7 +2666,7 @@ if should_build_figure(2, "wave_power_fractions_and_ratios") and wave_metrics is
                          color=cols[i])
         ax[0, j].set_title(field)
         ax[0, j].set_xticks(x)
-        ax[0, j].set_xticklabels([])
+        ax[0, j].tick_params(labelbottom=False)
         ax[1, j].set_xticks(x)
         ax[1, j].set_xticklabels([wave_label(w) for w in wave_names], rotation=35, ha="right")
         ax[1, j].axhline(1, color="0.6", lw=0.7)
@@ -3210,7 +3211,7 @@ if should_build_figure(
         "symmetric_antisymmetric_wave_spectra_phase_speed",
     ],
 ):
-    spec_levels = np.linspace(0, 2.5, 26)
+    spec_levels = np.linspace(0, 3.0, 26)
     spec_cmap, spec_norm = make_spectrum_cmap(spec_levels)
 
     components = ("symmetric", "antisymmetric")

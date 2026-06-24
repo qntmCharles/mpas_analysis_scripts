@@ -446,7 +446,7 @@ for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
 
 CPTs = np.array(CPTs)
 
-spec_levels = np.linspace(0, 2.5, 26)
+spec_levels = np.linspace(0, 3.0, 26)
 spec_cmap, spec_norm = make_spectrum_cmap(spec_levels)
 spec_diff_levels = symmetric_levels(1.5, ndiv=7)
 spec_diff_norm = make_diff_norm(spec_diff_levels)
@@ -564,7 +564,7 @@ fig.colorbar(sym_spec_im, ax=ax[-1], location='bottom', shrink=0.5, label="Norma
 fig2.colorbar( sym_diff_im if sym_diff_im is not None else sym_spec_im, ax=ax2[-1], location='bottom', shrink=0.5, label=r"Difference in excess normalised power above 1" )
 
 figsave.save(fig, "spectra", number=1)
-if save: fig2.savefig(save_loc+'comp_spectra_diff.png', dpi=300)
+figsave.save(fig2, "spectra_diff", number=1)
 print("Done with figure: comp_spectra")
 
 # Latitude-height section of zonal-mean cloud fraction
@@ -663,7 +663,7 @@ if im3 is not None:
     fig2.colorbar(im3, ax=ax2[1:], location='right', label='Cloud-fraction difference')
 
 figsave.save(fig, "cldfrac_latheight", number=2)
-if save: fig2.savefig(save_loc+'comp_cldfrac_latheight_diff.png', dpi=300)
+figsave.save(fig2, "cldfrac_latheight_diff", number=2)
 print("Done with figure: comp_cldfrac_latheight")
 
 # Diagnostic: how much does zgrid vary horizontally?

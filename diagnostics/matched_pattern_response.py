@@ -26,7 +26,7 @@ except ModuleNotFoundError:
 
 
 save = True
-save_loc = "/home/cwp29/tmp/mpas/crf_on/matched_pattern/"
+save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/matched_pattern/")
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -444,9 +444,10 @@ for domain_name, result in projection_results.items():
     levels = symmetric_levels(max_abs, ndiv=16)
 
     fig, ax = plt.subplots(1, 3, figsize=(11, 3.3), constrained_layout=True, sharex=True, sharey=True)
-    im0 = ax[0].contourf(target_plot.latitude, target_plot.pres, target_plot, levels=levels, cmap="bwr", extend="both")
-    im1 = ax[1].contourf(projection_plot.latitude, projection_plot.pres, projection_plot, levels=levels, cmap="bwr", extend="both")
-    im2 = ax[2].contourf(residual_plot.latitude, residual_plot.pres, residual_plot, levels=levels, cmap="bwr", extend="both")
+    cmap = difference_cmap(levels)
+    im0 = ax[0].contourf(target_plot.latitude, target_plot.pres, target_plot, levels=levels, cmap=cmap, extend="both")
+    im1 = ax[1].contourf(projection_plot.latitude, projection_plot.pres, projection_plot, levels=levels, cmap=cmap, extend="both")
+    im2 = ax[2].contourf(residual_plot.latitude, residual_plot.pres, residual_plot, levels=levels, cmap=cmap, extend="both")
 
     titles = [
         r"$\Delta T_u$",
@@ -506,9 +507,10 @@ for domain_name, result in projection_results.items():
         levels = symmetric_levels(max_abs, ndiv=16)
 
         fig, ax = plt.subplots(1, 3, figsize=(11, 3.3), constrained_layout=True, sharex=True, sharey=True)
-        im0 = ax[0].contourf(dXu.latitude, dXu.pres, dXu, levels=levels, cmap="bwr", extend="both")
-        im1 = ax[1].contourf(projection.latitude, projection.pres, projection, levels=levels, cmap="bwr", extend="both")
-        im2 = ax[2].contourf(residual.latitude, residual.pres, residual, levels=levels, cmap="bwr", extend="both")
+        cmap = difference_cmap(levels)
+        im0 = ax[0].contourf(dXu.latitude, dXu.pres, dXu, levels=levels, cmap=cmap, extend="both")
+        im1 = ax[1].contourf(projection.latitude, projection.pres, projection, levels=levels, cmap=cmap, extend="both")
+        im2 = ax[2].contourf(residual.latitude, residual.pres, residual, levels=levels, cmap=cmap, extend="both")
 
         titles = [
             r"$\Delta X_u$",

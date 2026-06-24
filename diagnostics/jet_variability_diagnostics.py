@@ -44,7 +44,7 @@ except ModuleNotFoundError:
 # -----------------------------------------------------------------------------
 
 save = True
-save_loc = "/home/cwp29/tmp/mpas/crf_on/final/jet_variability/"
+save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/jet_variability/")
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -961,7 +961,7 @@ if should_run_figure(1) and fixed_level:
     all_u = np.concatenate([np.ravel(v.values) for v in fixed_level.values()])
     vmax = np.nanpercentile(np.abs(all_u[np.isfinite(all_u)]), 98) if np.isfinite(all_u).any() else 1.0
     vmax = max(vmax, 1.0)
-    levels = np.linspace(-vmax, vmax, 25)
+    levels = symmetric_levels(vmax, ndiv=23)
 
     fig, ax = plt.subplots(len(fixed_level), 1, figsize=(10, 2.8 * len(fixed_level)), sharex=True, sharey=True)
     ax = np.atleast_1d(ax)
@@ -974,7 +974,7 @@ if should_run_figure(1) and fixed_level:
             u.latitude,
             u.transpose("latitude", "Time").values,
             levels=levels,
-            cmap="RdBu_r",
+            cmap=difference_cmap(levels, cmap="RdBu_r"),
             extend="both",
         )
         if np.nanmin(u.values) < 0.0 < np.nanmax(u.values):
@@ -1038,7 +1038,7 @@ if should_run_figure(3) and annular_results:
     pattern_values = np.concatenate([np.ravel(result["eof"].values) for result in annular_results.values()])
     vmax = np.nanpercentile(np.abs(pattern_values[np.isfinite(pattern_values)]), 98) if np.isfinite(pattern_values).any() else 1.0
     vmax = max(vmax, 0.5)
-    levels = np.linspace(-vmax, vmax, 25)
+    levels = symmetric_levels(vmax, ndiv=23)
 
     fig, ax = plt.subplots(len(dss), len(hemispheres), figsize=(4.4 * len(hemispheres), 2.8 * len(dss)), squeeze=False)
     im = None
@@ -1055,7 +1055,7 @@ if should_run_figure(3) and annular_results:
                 eof.pres,
                 eof.values,
                 levels=levels,
-                cmap="RdBu_r",
+                cmap=difference_cmap(levels, cmap="RdBu_r"),
                 extend="both",
             )
             axis.contour(eof.latitude, eof.pres, eof.values, levels=[0.0], colors="k", linewidths=0.8)
@@ -1091,11 +1091,13 @@ if should_run_figure(4) and annular_results:
             ax[1, col].plot(ac.lag_days.values, ac.values, color=cols[i], lw=1.4)
         ax[0, col].axhline(0, color="0.3", lw=0.7)
         ax[0, col].set_title(f"{hemisphere} zonal index")
-        ax[0, col].set_ylabel("Index")
+        if col == 0:
+            ax[0, col].set_ylabel("Index")
         ax[1, col].axhline(0, color="0.3", lw=0.7)
         ax[1, col].axhline(autocorr_efold_threshold, color="0.3", lw=0.8, ls=":")
         ax[1, col].set_xlabel("Lag (days)")
-        ax[1, col].set_ylabel("Autocorrelation")
+        if col == 0:
+            ax[1, col].set_ylabel("Autocorrelation")
         ax[1, col].set_ylim(-0.4, 1.05)
     ax[0, 0].legend(loc="upper right", frameon=False)
     fig.suptitle("Annular-mode zonal indices and persistence")
@@ -1220,7 +1222,7 @@ if should_run_figure(6) and jet_structure_fields:
                 diff.z.values / 1000.0,
                 diff.values,
                 levels=diff_levels,
-                cmap="bwr",
+                cmap=difference_cmap(diff_levels),
                 extend="both",
             )
             if i != 0 and np.nanmin(diff.values) < 0.0 < np.nanmax(diff.values):
@@ -1237,14 +1239,13 @@ if should_run_figure(6) and jet_structure_fields:
                 axis = ax[row, i]
                 draw_subtropical_search_boxes(axis)
                 annotate_panel_label(axis, sim_names[i] if row == 0 else control_diff_label(sim_names, i))
-                set_latheight_labels(axis, xlabel=(row == 1))
+                set_latheight_labels(axis, xlabel=(row == 1), ylabel=(i == 0))
                 axis.set_xlim(-70, 70)
                 axis.set_ylim(
                     jet_structure_plot_height_bounds[0] / 1000.0,
                     jet_structure_plot_height_bounds[1] / 1000.0,
                 )
                 if i != 0:
-                    axis.set_ylabel("")
                     axis.tick_params(labelleft=False)
                 if row == 0:
                     axis.tick_params(labelbottom=False)

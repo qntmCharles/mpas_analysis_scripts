@@ -26,7 +26,7 @@ from tropopause import *
 from diagnostic_helpers import *
 
 save = True
-save_loc = '/home/cwp29/tmp/mpas/crf_on/final/thermal_wind/'
+save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/thermal_wind/')
 
 # Set to [] or None to run all figures.  Otherwise list the numbered figures
 # to regenerate, e.g. [4, 5, 6] for the scaled-residual lat-lon maps.
@@ -594,21 +594,22 @@ if should_run_figure(1):
         corr = pattern_corr_latheight(du_obs_metric, du_tw_metric, z_bounds=TW_metric_z_bounds)
         thermal_wind_metric_rows.append([sim_names[i], rms_obs, rms_tw, rms_resid, corr])
 
-        im_obs = ax[i, 0].contourf(du_obs.latitude, du_obs.z / 1000.0, du_obs * 1000.0, levels=levels, cmap="bwr", extend="both")
-        im_tw = ax[i, 1].contourf(du_tw.latitude, du_tw.z / 1000.0, du_tw * 1000.0, levels=levels, cmap="bwr", extend="both")
-        im_resid = ax[i, 2].contourf(tw_resid.latitude, tw_resid.z / 1000.0, tw_resid * 1000.0, levels=levels, cmap="bwr", extend="both")
+        cmap = difference_cmap(levels)
+        im_obs = ax[i, 0].contourf(du_obs.latitude, du_obs.z / 1000.0, du_obs * 1000.0, levels=levels, cmap=cmap, extend="both")
+        im_tw = ax[i, 1].contourf(du_tw.latitude, du_tw.z / 1000.0, du_tw * 1000.0, levels=levels, cmap=cmap, extend="both")
+        im_resid = ax[i, 2].contourf(tw_resid.latitude, tw_resid.z / 1000.0, tw_resid * 1000.0, levels=levels, cmap=cmap, extend="both")
 
         for j in range(3):
             ax[i, j].plot(zds.latitude.values, CPTs[i][0] / 1000.0, color="k", lw=1, ls=":")
             add_tw_equator_guides(ax[i, j], lat=5.0)
             annotate_panel_label(ax[i, j], sim_names[i])
-            set_latheight_labels(ax[i, j], xlabel=(i == len(dss_zm) - 1))
+            set_latheight_labels(ax[i, j], xlabel=(i == len(dss_zm) - 1), ylabel=(j == 0))
             ax[i, j].set_xlim(-60, 60)
             ax[i, j].set_ylim(0, 25)
             if j != 0:
-                ax[i, j].set_ylabel("")
+                ax[i, j].tick_params(labelleft=False)
             if i < len(dss_zm) - 1:
-                ax[i, j].set_xticklabels([])
+                ax[i, j].tick_params(labelbottom=False)
 
     ax[0, 0].set_title(r"Observed $\partial u/\partial z$")
     ax[0, 1].set_title("TW-implied shear")
@@ -658,21 +659,22 @@ if should_run_figure(13):
         corr = pattern_corr_latheight(dTdy_obs_metric, dTdy_tw_metric, z_bounds=TW_metric_z_bounds)
         thermal_wind_temperature_gradient_metric_rows.append([sim_names[i], rms_obs, rms_tw, rms_resid, corr])
 
-        im_obs = ax[i, 0].contourf(dTdy_obs.latitude, dTdy_obs.z / 1000.0, dTdy_obs * 1e6, levels=levels, cmap="bwr", extend="both")
-        im_tw = ax[i, 1].contourf(dTdy_tw.latitude, dTdy_tw.z / 1000.0, dTdy_tw * 1e6, levels=levels, cmap="bwr", extend="both")
-        im_resid = ax[i, 2].contourf(dTdy_resid.latitude, dTdy_resid.z / 1000.0, dTdy_resid * 1e6, levels=levels, cmap="bwr", extend="both")
+        cmap = difference_cmap(levels)
+        im_obs = ax[i, 0].contourf(dTdy_obs.latitude, dTdy_obs.z / 1000.0, dTdy_obs * 1e6, levels=levels, cmap=cmap, extend="both")
+        im_tw = ax[i, 1].contourf(dTdy_tw.latitude, dTdy_tw.z / 1000.0, dTdy_tw * 1e6, levels=levels, cmap=cmap, extend="both")
+        im_resid = ax[i, 2].contourf(dTdy_resid.latitude, dTdy_resid.z / 1000.0, dTdy_resid * 1e6, levels=levels, cmap=cmap, extend="both")
 
         for j in range(3):
             ax[i, j].plot(zds.latitude.values, CPTs[i][0] / 1000.0, color="k", lw=1, ls=":")
             add_tw_equator_guides(ax[i, j], lat=5.0)
             annotate_panel_label(ax[i, j], sim_names[i])
-            set_latheight_labels(ax[i, j], xlabel=(i == len(dss_zm) - 1))
+            set_latheight_labels(ax[i, j], xlabel=(i == len(dss_zm) - 1), ylabel=(j == 0))
             ax[i, j].set_xlim(-60, 60)
             ax[i, j].set_ylim(0, 25)
             if j != 0:
-                ax[i, j].set_ylabel("")
+                ax[i, j].tick_params(labelleft=False)
             if i < len(dss_zm) - 1:
-                ax[i, j].set_xticklabels([])
+                ax[i, j].tick_params(labelbottom=False)
 
     ax[0, 0].set_title(r"Observed $\partial T/\partial y$")
     ax[0, 1].set_title("TW-implied T gradient")
@@ -780,20 +782,19 @@ if should_run_figure(14):
                     field.z.values / 1000.0,
                     field.values,
                     levels=levels,
-                    cmap="bwr",
+                    cmap=difference_cmap(diff_levels),
                     extend="both",
                 )
 
             axis.plot(dss_zm[i].latitude.values, CPTs[i][0] / 1000.0, color="k", lw=1, ls=":")
             add_tw_equator_guides(axis, lat=5.0)
             annotate_panel_label(axis, control_diff_label(sim_names, i))
-            set_latheight_labels(axis, xlabel=(row == nrows - 1))
+            set_latheight_labels(axis, xlabel=(row == nrows - 1), ylabel=(i == 0))
             axis.set_xlim(-60, 60)
             axis.set_ylim(0, 25)
             if i == 0:
                 axis.set_ylabel(f"{spec['label']}\nHeight (km)")
             else:
-                axis.set_ylabel("")
                 axis.tick_params(labelleft=False)
             if row < nrows - 1:
                 axis.tick_params(labelbottom=False)
@@ -927,9 +928,10 @@ for fig_num, var, label, max_abs, fname in surface_residual_specs:
         gridspec_kw={"width_ratios": [1, 1, 1, 0.8]}
     )
     levels = symmetric_levels(max_abs, ndiv=13)
-    im0 = ax[0].contourf(dXu.longitude, dXu.latitude, dXu, levels=levels, cmap="bwr", extend="both")
-    im1 = ax[1].contourf(dXT.longitude, dXT.latitude, dXT, levels=levels, cmap="bwr", extend="both")
-    im2 = ax[2].contourf(resid.longitude, resid.latitude, resid, levels=levels, cmap="bwr", extend="both")
+    cmap = difference_cmap(levels)
+    im0 = ax[0].contourf(dXu.longitude, dXu.latitude, dXu, levels=levels, cmap=cmap, extend="both")
+    im1 = ax[1].contourf(dXT.longitude, dXT.latitude, dXT, levels=levels, cmap=cmap, extend="both")
+    im2 = ax[2].contourf(resid.longitude, resid.latitude, resid, levels=levels, cmap=cmap, extend="both")
 
     dXu_zm = dXu.mean(dim="longitude", skipna=True)
     dXT_zm = dXT.mean(dim="longitude", skipna=True)
@@ -984,12 +986,15 @@ for fig_num, var, label, max_abs, fname in latheight_residual_specs:
     levels = symmetric_levels(max_abs, ndiv=13)
 
     fig, ax = plt.subplots(1, 3, figsize=(11, 3.3), constrained_layout=True, sharex=True, sharey=True)
-    im0 = ax[0].contourf(dXu.latitude, dXu.z / 1000.0, dXu, levels=levels, cmap="bwr", extend="both")
-    im1 = ax[1].contourf(dXT.latitude, dXT.z / 1000.0, dXT, levels=levels, cmap="bwr", extend="both")
-    im2 = ax[2].contourf(resid.latitude, resid.z / 1000.0, resid, levels=levels, cmap="bwr", extend="both")
+    cmap = difference_cmap(levels)
+    im0 = ax[0].contourf(dXu.latitude, dXu.z / 1000.0, dXu, levels=levels, cmap=cmap, extend="both")
+    im1 = ax[1].contourf(dXT.latitude, dXT.z / 1000.0, dXT, levels=levels, cmap=cmap, extend="both")
+    im2 = ax[2].contourf(resid.latitude, resid.z / 1000.0, resid, levels=levels, cmap=cmap, extend="both")
 
     for j, a in enumerate(ax):
-        set_latheight_labels(a)
+        set_latheight_labels(a, ylabel=(j == 0))
+        if j != 0:
+            a.tick_params(labelleft=False)
         a.set_xlim(-60, 60)
         a.set_ylim(0, 25)
         if j != 0:
@@ -1036,9 +1041,10 @@ if should_run_figure(11):
     lat2d_T = np.broadcast_to(dN2_T.latitude.values[None, :], dN2_T.shape)
     z2d_T = np.broadcast_to(dN2_T.z.values[:, None], dN2_T.shape)
 
-    im0 = ax[0].contourf(lat2d, z2d / 1000.0, dN2_u.values * 1e4, levels=levels, cmap="bwr", extend="both")
-    im1 = ax[1].contourf(lat2d_T, z2d_T / 1000.0, dN2_T.values * 1e4, levels=levels, cmap="bwr", extend="both")
-    im2 = ax[2].contourf(lat2d, z2d / 1000.0, dN2_resid.values * 1e4, levels=levels, cmap="bwr", extend="both")
+    cmap = difference_cmap(levels)
+    im0 = ax[0].contourf(lat2d, z2d / 1000.0, dN2_u.values * 1e4, levels=levels, cmap=cmap, extend="both")
+    im1 = ax[1].contourf(lat2d_T, z2d_T / 1000.0, dN2_T.values * 1e4, levels=levels, cmap=cmap, extend="both")
+    im2 = ax[2].contourf(lat2d, z2d / 1000.0, dN2_resid.values * 1e4, levels=levels, cmap=cmap, extend="both")
 
     ax[0].plot(dss_zm[1].latitude.values, CPTs[1][0] / 1000.0, color="k", lw=1, ls=":")
     ax[1].plot(dss_zm[2].latitude.values, CPTs[2][0] / 1000.0, color="k", lw=1, ls=":")
@@ -1048,8 +1054,10 @@ if should_run_figure(11):
     ax[1].set_title(r"$\Delta N^2$")
     ax[2].set_title(r"$\Delta N^2_u - \alpha \Delta N^2_T$")
     annotate_scaled_residual_labels(ax)
-    for a in ax:
-        set_latheight_labels(a)
+    for j, a in enumerate(ax):
+        set_latheight_labels(a, ylabel=(j == 0))
+        if j != 0:
+            a.tick_params(labelleft=False)
         a.set_xlim(-60, 60)
         a.set_ylim(0, 25)
     fig.suptitle(f"Scaled thermal residual for static stability; alpha={alpha_TTL:.2f}")
@@ -1098,9 +1106,10 @@ if should_run_figure(12):
         lat2d_T = np.broadcast_to(dcld_T.latitude.values[None, :], dcld_T.shape)
         z2d_T = np.broadcast_to(dcld_T.z.values[:, None], dcld_T.shape)
 
-        im0 = ax[0].contourf(lat2d, z2d / 1000.0, dcld_u.values, levels=levels, cmap="bwr", extend="both")
-        im1 = ax[1].contourf(lat2d_T, z2d_T / 1000.0, dcld_T.values, levels=levels, cmap="bwr", extend="both")
-        im2 = ax[2].contourf(lat2d, z2d / 1000.0, dcld_resid.values, levels=levels, cmap="bwr", extend="both")
+        cmap = difference_cmap(levels)
+        im0 = ax[0].contourf(lat2d, z2d / 1000.0, dcld_u.values, levels=levels, cmap=cmap, extend="both")
+        im1 = ax[1].contourf(lat2d_T, z2d_T / 1000.0, dcld_T.values, levels=levels, cmap=cmap, extend="both")
+        im2 = ax[2].contourf(lat2d, z2d / 1000.0, dcld_resid.values, levels=levels, cmap=cmap, extend="both")
 
         ax[0].plot(dss_zm[1].latitude.values, CPTs[1][0] / 1000.0, color="k", lw=1, ls=":")
         ax[1].plot(dss_zm[2].latitude.values, CPTs[2][0] / 1000.0, color="k", lw=1, ls=":")
@@ -1110,8 +1119,10 @@ if should_run_figure(12):
         ax[1].set_title(r"$\Delta$cldfrac")
         ax[2].set_title(r"$\Delta C_u - \alpha \Delta C_T$")
         annotate_scaled_residual_labels(ax)
-        for a in ax:
-            set_latheight_labels(a)
+        for j, a in enumerate(ax):
+            set_latheight_labels(a, ylabel=(j == 0))
+            if j != 0:
+                a.tick_params(labelleft=False)
             a.set_xlim(-60, 60)
             a.set_ylim(0, 25)
         fig.suptitle(f"Scaled thermal residual for cloud fraction; alpha={alpha_TTL:.2f}")

@@ -69,7 +69,7 @@ def env_flag(name, default=False):
 # -----------------------------------------------------------------------------
 
 save = True
-save_loc = "/home/cwp29/tmp/mpas/crf_on/final/convective_lifecycle/"
+save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/convective_lifecycle/")
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -1419,8 +1419,18 @@ def select_onset_events(track_time, tracks_df, source_name, sim_name):
 # -----------------------------------------------------------------------------
 
 
-def anomaly(da):
-    out = da - da.mean(dim="Time", skipna=True) if "Time" in da.dims else da - da.mean(skipna=True)
+def anomaly(da, label=None):
+    if "Time" in da.dims:
+        baseline = da.mean(dim="Time", skipna=True)
+        if getattr(baseline, "chunks", None) is not None:
+            progress(f"Computing reusable anomaly baseline for {label or da.name or 'field'}")
+            baseline = baseline.compute()
+        out = da - baseline
+    else:
+        baseline = da.mean(skipna=True)
+        if getattr(baseline, "chunks", None) is not None:
+            baseline = baseline.compute()
+        out = da - baseline
     out.attrs.update(getattr(da, "attrs", {}))
     return out
 
@@ -1481,17 +1491,41 @@ def prepare_composite_fields(fields, sim_name):
     specs = {}
     specs["precip"] = dict(da=fields["precip"], label="Precipitation", units="mm day$^{-1}$", cmap="YlGnBu", anomaly=False)
     if "pw" in fields:
-        specs["pw_anom"] = dict(da=anomaly(fields["pw"]), label="PW anomaly", units=fields["pw"].attrs.get("units", ""), cmap="BrBG", anomaly=True)
+        specs["pw_anom"] = dict(
+            da=anomaly(fields["pw"], f"{sim_name} PW"),
+            label="PW anomaly",
+            units=fields["pw"].attrs.get("units", ""),
+            cmap="BrBG",
+            anomaly=True,
+        )
     if "column_connected_mask" in fields:
         specs["column_connected"] = dict(da=fields["column_connected_mask"].astype(float), label="Column-connected high cloud", units="fraction", cmap="YlGnBu", anomaly=False)
     if "cloud_top_height" in fields:
         specs["cloud_top_height"] = dict(da=fields["cloud_top_height"], label="Cloud-top height", units="km", cmap="magma", anomaly=False)
     if "N2_TTL" in fields:
-        specs["N2_TTL_anom"] = dict(da=anomaly(fields["N2_TTL"]), label=r"$N^2_{TTL}$ anomaly", units="s$^{-2}$", cmap="PuOr_r", anomaly=True)
+        specs["N2_TTL_anom"] = dict(
+            da=anomaly(fields["N2_TTL"], f"{sim_name} N2_TTL"),
+            label=r"$N^2_{TTL}$ anomaly",
+            units="s$^{-2}$",
+            cmap="PuOr_r",
+            anomaly=True,
+        )
     if "u_TTL" in fields:
-        specs["u_TTL_anom"] = dict(da=anomaly(fields["u_TTL"]), label=r"$u_{TTL}$ anomaly", units="m s$^{-1}$", cmap="RdBu_r", anomaly=True)
+        specs["u_TTL_anom"] = dict(
+            da=anomaly(fields["u_TTL"], f"{sim_name} u_TTL"),
+            label=r"$u_{TTL}$ anomaly",
+            units="m s$^{-1}$",
+            cmap="RdBu_r",
+            anomaly=True,
+        )
     if "dudz_TTL" in fields:
-        specs["dudz_TTL_anom"] = dict(da=anomaly(fields["dudz_TTL"]), label=r"$du/dz_{TTL}$ anomaly", units="s$^{-1}$", cmap="RdBu_r", anomaly=True)
+        specs["dudz_TTL_anom"] = dict(
+            da=anomaly(fields["dudz_TTL"], f"{sim_name} dudz_TTL"),
+            label=r"$du/dz_{TTL}$ anomaly",
+            units="s$^{-1}$",
+            cmap="RdBu_r",
+            anomaly=True,
+        )
 
     kelvin = filter_wave_latmean(fields, sim_name, WAVE_FILTER_FIELD, "Kelvin", KELVIN_FILTER)
     if kelvin is not None:
@@ -1615,6 +1649,84 @@ def composite_lag_scalar(da, events, lag_days, lag_steps):
     )
 
 
+def composite_lag_products(da, events, lag_days, lag_steps, rel_lon_grid=REL_LON_GRID):
+    hov_sums = np.zeros((len(lag_steps), len(rel_lon_grid)), dtype=float)
+    hov_sums2 = np.zeros_like(hov_sums)
+    hov_counts = np.zeros_like(hov_sums)
+    scalar_sums = np.zeros(len(lag_steps), dtype=float)
+    scalar_sums2 = np.zeros_like(scalar_sums)
+    scalar_counts = np.zeros_like(scalar_sums)
+    no_longitude = "longitude" not in da.dims
+
+    for event in events.itertuples(index=False):
+        center_lon = float(event.center_lon)
+        for ilag, step in enumerate(lag_steps):
+            it = int(event.onset_time_index) + int(step)
+            if it < 0 or it >= da.sizes.get("Time", 0):
+                continue
+
+            x = da.isel(Time=it)
+            x = lat_window_mean(x, float(event.centroid_lat)).load()
+            if "longitude" in x.dims:
+                vals = lon_series_relative_to_event(x, center_lon, rel_lon_grid)
+                rel_lon = ((x.longitude.values.astype(float) - center_lon + 180.0) % 360.0) - 180.0
+                mask = np.abs(rel_lon) <= FINGERPRINT_LON_WINDOW_DEG
+                scalar_value = (
+                    float(x.isel(longitude=mask).mean(dim="longitude", skipna=True).values)
+                    if np.any(mask)
+                    else np.nan
+                )
+            else:
+                scalar_value = float(x.values)
+                vals = np.full(len(rel_lon_grid), scalar_value, dtype=float)
+
+            ok = np.isfinite(vals)
+            hov_sums[ilag, ok] += vals[ok]
+            hov_sums2[ilag, ok] += vals[ok] ** 2
+            hov_counts[ilag, ok] += 1.0
+
+            if np.isfinite(scalar_value):
+                scalar_sums[ilag] += scalar_value
+                scalar_sums2[ilag] += scalar_value ** 2
+                scalar_counts[ilag] += 1.0
+
+    hov_mean = np.full_like(hov_sums, np.nan)
+    np.divide(hov_sums, hov_counts, out=hov_mean, where=hov_counts > 0)
+    hov_var = np.full_like(hov_sums, np.nan)
+    hov_valid = hov_counts > 1
+    hov_var[hov_valid] = (hov_sums2[hov_valid] - hov_sums[hov_valid] ** 2 / hov_counts[hov_valid]) / (hov_counts[hov_valid] - 1)
+    hov_stderr = np.full_like(hov_sums, np.nan)
+    hov_stderr[hov_valid] = np.sqrt(hov_var[hov_valid] / hov_counts[hov_valid])
+    hov = xr.Dataset(
+        data_vars=dict(
+            mean=(("lag_days", "relative_longitude"), hov_mean),
+            count=(("lag_days", "relative_longitude"), hov_counts),
+            stderr=(("lag_days", "relative_longitude"), hov_stderr),
+        ),
+        coords=dict(lag_days=lag_days, relative_longitude=rel_lon_grid),
+        attrs=dict(no_longitude=bool(no_longitude)),
+    )
+
+    scalar_mean = np.full_like(scalar_sums, np.nan)
+    np.divide(scalar_sums, scalar_counts, out=scalar_mean, where=scalar_counts > 0)
+    scalar_var = np.full_like(scalar_sums, np.nan)
+    scalar_valid = scalar_counts > 1
+    scalar_var[scalar_valid] = (
+        scalar_sums2[scalar_valid] - scalar_sums[scalar_valid] ** 2 / scalar_counts[scalar_valid]
+    ) / (scalar_counts[scalar_valid] - 1)
+    scalar_stderr = np.full_like(scalar_sums, np.nan)
+    scalar_stderr[scalar_valid] = np.sqrt(scalar_var[scalar_valid] / scalar_counts[scalar_valid])
+    scalar = xr.Dataset(
+        data_vars=dict(
+            mean=("lag_days", scalar_mean),
+            count=("lag_days", scalar_counts),
+            stderr=("lag_days", scalar_stderr),
+        ),
+        coords=dict(lag_days=lag_days),
+    )
+    return hov, scalar
+
+
 def event_centred_patch(da, event, it, rel_lat_grid=SPATIAL_REL_LAT_GRID, rel_lon_grid=SPATIAL_REL_LON_GRID):
     if not {"latitude", "longitude"}.issubset(da.dims):
         return None
@@ -1699,10 +1811,10 @@ def plot_hovmoller_group(composites, specs, var_names, stem_suffix):
         vmin = finite_percentile(sim_arrays, 2.0, default=0.0)
         if spec.get("anomaly", False):
             lim = finite_percentile([np.abs(a) for a in sim_arrays], 98.0, default=1.0)
-            levels = np.linspace(-lim, lim, 17)
+            levels = symmetric_levels(lim, ndiv=15)
             cmap = spec.get("cmap", "RdBu_r")
         else:
-            levels = np.linspace(vmin, vmax, 17)
+            levels = nice_levels(vmin, vmax, n=17)
             cmap = spec.get("cmap", "YlGnBu")
         diff_arrays = []
         if var in composites["control"]:
@@ -1711,7 +1823,7 @@ def plot_hovmoller_group(composites, specs, var_names, stem_suffix):
                 if var in composites[sim]:
                     diff_arrays.append((composites[sim][var]["hov"].mean - ctrl).values)
         diff_lim = finite_percentile([np.abs(a) for a in diff_arrays], 98.0, default=1.0)
-        diff_levels = np.linspace(-diff_lim, diff_lim, 17)
+        diff_levels = symmetric_levels(diff_lim, ndiv=15)
 
         for c, label in enumerate(cols_to_plot):
             a = ax[r, c]
@@ -1721,7 +1833,8 @@ def plot_hovmoller_group(composites, specs, var_names, stem_suffix):
                     a.set_axis_off()
                     continue
                 ds = composites[sim][var]["hov"]
-                im = a.contourf(ds.relative_longitude, ds.lag_days, ds.mean, levels=levels, cmap=cmap, extend="both")
+                plot_cmap = difference_cmap(levels, cmap=cmap) if spec.get("anomaly", False) else cmap
+                im = a.contourf(ds.relative_longitude, ds.lag_days, ds.mean, levels=levels, cmap=plot_cmap, extend="both")
                 if r == 0:
                     n = int(composites[sim]["event_count"])
                     a.set_title(f"{sim}\nN={n}", fontsize=9)
@@ -1731,7 +1844,7 @@ def plot_hovmoller_group(composites, specs, var_names, stem_suffix):
                     a.set_axis_off()
                     continue
                 ds = composites[sim][var]["hov"].mean - composites["control"][var]["hov"].mean
-                im = a.contourf(ds.relative_longitude, ds.lag_days, ds, levels=diff_levels, cmap="RdBu_r", extend="both")
+                im = a.contourf(ds.relative_longitude, ds.lag_days, ds, levels=diff_levels, cmap=difference_cmap(diff_levels, cmap="RdBu_r"), extend="both")
                 if r == 0:
                     a.set_title(label, fontsize=9)
             a.axhline(0.0, color="0.2", lw=0.7)
@@ -1812,8 +1925,12 @@ def plot_fingerprint_summary(composites, specs, var_names):
         a.axvline(0.0, color="0.25", lw=0.8)
         a.axhline(0.0, color="0.75", lw=0.5)
         a.set_title(spec["label"], fontsize=10)
-        a.set_ylabel("normalised")
-        a.set_xlabel("Lag (days)")
+        if k % ncols == 0:
+            a.set_ylabel("normalised")
+        else:
+            a.tick_params(labelleft=False)
+        if a.get_subplotspec().is_last_row():
+            a.set_xlabel("Lag (days)")
     for a in ax.flat[len(var_names):]:
         a.set_axis_off()
     handles, labels = ax.flat[0].get_legend_handles_labels()
@@ -1862,12 +1979,12 @@ def plot_spatial_composites(spatial_products, specs, var_names):
             arrays.extend([ds.mean.values for ds in spatial_products[sim][var].values()])
         if specs[var].get("anomaly", False):
             lim = finite_percentile([np.abs(a) for a in arrays], 98.0, default=1.0)
-            levels = np.linspace(-lim, lim, 17)
+            levels = symmetric_levels(lim, ndiv=15)
             cmap = specs[var].get("cmap", "RdBu_r")
         else:
             vmin = finite_percentile(arrays, 2.0, default=0.0)
             vmax = finite_percentile(arrays, 98.0, default=1.0)
-            levels = np.linspace(vmin, vmax, 17)
+            levels = nice_levels(vmin, vmax, n=17)
             cmap = specs[var].get("cmap", "YlGnBu")
 
         fig, ax = plt.subplots(
@@ -2244,11 +2361,18 @@ def main():
                     continue
                 da = specs_by_run[sim_name][var]["da"]
                 progress(f"{sim_name}: compositing {var}")
+                progress(f"{sim_name}: {var} lag-longitude and scalar composites")
+                hov, scalar = composite_lag_products(da, events, lag_days, lag_steps)
                 composites[sim_name][var] = {
-                    "hov": composite_lag_lon(da, events, lag_days, lag_steps),
-                    "scalar": composite_lag_scalar(da, events, lag_days, lag_steps),
+                    "hov": hov,
+                    "scalar": scalar,
                 }
-                if include_spatial and {"latitude", "longitude"}.issubset(da.dims) and var in ("precip", "pw_anom", "column_connected", "cloud_top_height", "N2_TTL_anom"):
+                if (
+                    include_spatial
+                    and {"latitude", "longitude"}.issubset(da.dims)
+                    and var in ("precip", "pw_anom", "column_connected", "cloud_top_height", "N2_TTL_anom")
+                ):
+                    progress(f"{sim_name}: {var} spatial composites")
                     spatial_products[sim_name][var] = composite_spatial(da, events, SPATIAL_LAGS_DAYS, step_days)
         write_composite_cache(source_name, spec_keys, include_spatial, composites, spatial_products)
     else:

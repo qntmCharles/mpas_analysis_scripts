@@ -64,7 +64,7 @@ def env_flag(name, default=False):
 # -----------------------------------------------------------------------------
 
 save = True
-save_loc = "/home/cwp29/tmp/mpas/crf_on/final/significance_bootstrap/"
+save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/significance_bootstrap/")
 
 # Figure numbers:
 #   1: mean-state lat-height block-resampled response maps
@@ -993,7 +993,7 @@ def plot_latheight_bootstrap(spec, diff_by_comparison):
         z_km = z_values_m(ds.mean_response) / 1000.0
         last_im = ax.contourf(
             ds.latitude, z_km, ds.mean_response,
-            levels=levels, cmap="bwr", extend="both"
+            levels=levels, cmap=difference_cmap(levels), extend="both"
         )
         robust = ds.robust.where(np.isfinite(ds.mean_response), False)
         ax.contourf(

@@ -30,6 +30,7 @@ DEFAULT_SIMULATION_ROOT = Path(
 DEFAULT_DIAGNOSTIC_CACHE_ROOT = Path(
     os.environ.get("MPAS_DIAGNOSTIC_CACHE_ROOT", str(DEFAULT_SIMULATION_ROOT))
 )
+DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
 MODULE_SEARCH_DIRS = [
     DIAGNOSTICS_DIR,
     ANALYSIS_DIR,
@@ -110,6 +111,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable per-diagnostic log files.",
     )
+    parser.add_argument(
+        "--figure-root",
+        "--figure-dir",
+        dest="figure_root",
+        type=Path,
+        help=(
+            "Override the diagnostics' default figure/output root. Each script "
+            "keeps its usual relative subdirectory under this root."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -153,13 +164,15 @@ def print_script_list(scripts: list[str]) -> None:
         print(f"{index:2d}. {script}")
 
 
-def child_environment() -> dict[str, str]:
+def child_environment(args: argparse.Namespace) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("MPAS_SIMULATION_ROOT", str(DEFAULT_SIMULATION_ROOT))
     env.setdefault("MPAS_DIAGNOSTIC_CACHE_ROOT", str(DEFAULT_DIAGNOSTIC_CACHE_ROOT))
     env.setdefault("MPLCONFIGDIR", str(Path("/tmp") / f"matplotlib-{os.getuid()}"))
     env.setdefault("XDG_CACHE_HOME", str(DEFAULT_DIAGNOSTIC_CACHE_ROOT / f"xdg-cache-{os.getuid()}"))
+    if args.figure_root:
+        env[DIAGNOSTIC_OUTPUT_ROOT_ENV] = str(args.figure_root.expanduser().resolve())
 
     Path(env["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
     Path(env["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
@@ -240,7 +253,7 @@ def run_script(script: str, args: argparse.Namespace) -> int:
     script_path = DIAGNOSTICS_DIR / script
     command = [args.python, "-u", str(script_path)]
     command_text = shlex.join(command)
-    env = child_environment()
+    env = child_environment(args)
 
     start = datetime.now()
     print(f"\n[{start:%Y-%m-%d %H:%M:%S}] Starting {script}", flush=True)
@@ -309,6 +322,8 @@ def main() -> int:
         print("Logging disabled (--no-log).")
     elif args.log_dir:
         print(f"Logs will be written to: {args.log_dir}")
+    if args.figure_root:
+        print(f"Figures/output will be written under: {args.figure_root.expanduser().resolve()}")
 
     if args.dry_run:
         print("\nDry run only; no diagnostics were executed.")

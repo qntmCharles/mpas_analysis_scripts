@@ -35,7 +35,7 @@ from diagnostic_helpers import *
 silence_hdf5_error_stack()
 
 save = True
-save_loc = "/home/cwp29/tmp/mpas/crf_on/final/global_atmospheric_energy_budget/"
+save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/global_atmospheric_energy_budget/")
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -528,7 +528,8 @@ def plot_timeseries(entries, figsave):
                     **styles.get(term, {}),
                 )
             ax[row, col].axhline(0.0, color="0.35", lw=0.7)
-            ax[row, col].set_ylabel(r"W m$^{-2}$")
+            if col == 0:
+                ax[row, col].set_ylabel(r"W m$^{-2}$")
 
     ax[0, 0].set_title("System fluxes, surface separate")
     ax[0, 1].set_title("Atmospheric closure")
@@ -583,7 +584,8 @@ def plot_cumulative(entries, figsave):
                     **styles.get(term, {}),
                 )
             ax[row, col].axhline(0.0, color="0.35", lw=0.7)
-            ax[row, col].set_ylabel(r"MJ m$^{-2}$")
+            if col == 0:
+                ax[row, col].set_ylabel(r"MJ m$^{-2}$")
 
     ax[0, 0].set_title("Cumulative atmospheric closure")
     ax[0, 1].set_title("Residual after adding storage terms")

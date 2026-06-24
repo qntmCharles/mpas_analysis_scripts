@@ -51,7 +51,7 @@ except ModuleNotFoundError:
 # -----------------------------------------------------------------------------
 
 save = True
-save_loc = "/home/cwp29/tmp/mpas/crf_on/final/convective_pathways/"
+save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/convective_pathways/")
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -217,10 +217,7 @@ def run_all_figures():
 
 
 def save_figure(number, fig, stem):
-    """Save both project-style numbered and task-requested exact filenames."""
-    figsave.save(fig, stem, number=number)
-    if save and should_run_figure(number):
-        fig.savefig(os.path.join(save_loc, f"{stem}.png"), dpi=300)
+    return figsave.save(fig, stem, number=number)
 
 
 def progress(message):

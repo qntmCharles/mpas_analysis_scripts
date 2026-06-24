@@ -551,7 +551,7 @@ figsave.save(fig, "duration_dist", number=6)
 # In[ ]:
 
 
-spec_levels = np.linspace(0, 2.5, 26)
+spec_levels = np.linspace(0, 3.0, 26)
 
 fig, ax = plt.subplots(len(data_locs), 2, figsize=(8, 8), constrained_layout=True)
 

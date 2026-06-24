@@ -52,7 +52,7 @@ from high_cloud_classification import (
 # -----------------------------------------------------------------------------
 
 save = True
-save_loc = "/home/cwp29/tmp/mpas/crf_on/final/high_cloud_refined/"
+save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/high_cloud_refined/")
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -230,9 +230,7 @@ def should_run_any(numbers):
 def save_figure(number, fig, stem):
     if figsave is None:
         raise RuntimeError("FigureSaver has not been initialised")
-    figsave.save(fig, stem, number=number)
-    if save and should_run_figure(number):
-        fig.savefig(os.path.join(save_loc, f"{stem}.png"), dpi=300)
+    return figsave.save(fig, stem, number=number)
 
 
 def progress(message):
@@ -1297,7 +1295,7 @@ def plot_residual_diagnostics(fields_by_run, classifications):
         sharex=False,
         sharey=False,
     )
-    levels = np.linspace(-0.12, 0.12, 17)
+    levels = symmetric_levels(0.12, ndiv=15)
     last_im = None
 
     for r, (target_key, target_label, _source) in enumerate(RESIDUAL_TARGET_SPECS):
@@ -1308,7 +1306,7 @@ def plot_residual_diagnostics(fields_by_run, classifications):
             row_maps.append(m)
         row_abs = np.nanpercentile(np.abs(np.concatenate([np.ravel(m.values) for m in row_maps])), 98)
         row_abs = float(row_abs) if np.isfinite(row_abs) and row_abs > 0 else 0.05
-        row_levels = np.linspace(-max(0.03, row_abs), max(0.03, row_abs), 17)
+        row_levels = symmetric_levels(max(0.03, row_abs), ndiv=15)
 
         for c, sim_name in enumerate(sim_names):
             a = ax[r, c]
@@ -1318,7 +1316,7 @@ def plot_residual_diagnostics(fields_by_run, classifications):
                 m.latitude,
                 m,
                 levels=row_levels,
-                cmap="RdBu_r",
+                cmap=difference_cmap(row_levels, cmap="RdBu_r"),
                 extend="both",
             )
             if r == 0:
@@ -1576,7 +1574,7 @@ def plot_class_map(ax, class_code, focus_lon, focus_lat):
     ax.set_xlim(float(focus_lon) - 0.5 * SNAPSHOT_LON_WINDOW_DEG, float(focus_lon) + 0.5 * SNAPSHOT_LON_WINDOW_DEG)
     ax.set_ylim(*SNAPSHOT_LAT_BOUNDS)
     ax.set_xlabel("Longitude")
-    ax.set_yticklabels([])
+    ax.tick_params(labelleft=False)
     ax.set_title("Class mask")
     return im
 
@@ -1688,6 +1686,8 @@ def plot_validation_snapshots(dss, fields_by_run, classifications):
             cf_snapshot = select_time_value(cf, snap_time)
             last_cf_im = plot_cloud_slice(ax_lon, cf_snapshot, class_code, precip, focus_lat, focus_lon, "longitude")
             last_cf_im = plot_cloud_slice(ax_lat, cf_snapshot, class_code, precip, focus_lat, focus_lon, "latitude")
+            ax_lat.set_ylabel("")
+            ax_lat.tick_params(labelleft=False)
 
         if i == 0:
             ax_rain.set_title(f"Rain rate; black line P >= {P_DEEP:g}")

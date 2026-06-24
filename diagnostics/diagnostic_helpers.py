@@ -5,12 +5,15 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from matplotlib import colors, pyplot as plt
+from matplotlib import colors, pyplot as plt, ticker
 import scipy.interpolate as intp
 import xarray as xr
 
 
 DEFAULT_SIMULATION_PARENT_DIR = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on"
+DEFAULT_DIAGNOSTIC_OUTPUT_ROOT = "/home/cwp29/tmp/mpas/crf_on"
+DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
+DIAGNOSTIC_FIGURE_ROOT_ENV = "MPAS_DIAGNOSTIC_FIGURE_ROOT"
 
 
 def simulation_parent_dir(root_dir=None):
@@ -26,6 +29,29 @@ def diagnostic_cache_dir(*parts, root_dir=None):
         os.environ.get("MPAS_DIAGNOSTIC_CACHE_ROOT", simulation_parent_dir(root_dir))
     )
     return os.path.join(base, *parts)
+
+
+def diagnostic_output_dir(default_save_loc, root_dir=DEFAULT_DIAGNOSTIC_OUTPUT_ROOT):
+    """Return a diagnostic output directory, optionally remapped under an override root."""
+    override_root = os.environ.get(DIAGNOSTIC_OUTPUT_ROOT_ENV) or os.environ.get(DIAGNOSTIC_FIGURE_ROOT_ENV)
+    if not override_root:
+        return default_save_loc
+
+    default_path = os.path.abspath(os.path.expanduser(str(default_save_loc)))
+    default_root = os.path.abspath(os.path.expanduser(str(root_dir)))
+    override_root = os.path.abspath(os.path.expanduser(override_root))
+
+    override_rel = os.path.relpath(default_path, override_root)
+    if override_rel == "." or (
+        override_rel != os.pardir and not override_rel.startswith(os.pardir + os.sep)
+    ):
+        return default_path.rstrip(os.sep) + os.sep
+
+    rel_path = os.path.relpath(default_path, default_root)
+    if rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep):
+        rel_path = os.path.basename(default_path.rstrip(os.sep))
+
+    return os.path.join(override_root, rel_path) + os.sep
 
 
 def unique_existing_order(paths):
@@ -553,15 +579,18 @@ def interp_like_control(field, control_field):
     return control_field.interp(pres=field.pres, latitude=field.latitude)
 
 
-def set_latheight_labels(ax, xlabel=True):
+def set_latheight_labels(ax, xlabel=True, ylabel=True):
     ax.set_xlim(-90, 90)
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(30))
     if xlabel:
         ax.set_xlabel("Latitude (degrees)")
-    ax.set_ylabel("Height (km)")
+    if ylabel:
+        ax.set_ylabel("Height (km)")
 
 
 def set_latpres_axis(ax, xlabel=True, ylabel=True, xlim=(-60, 60), ylim=(1000, 50)):
     ax.set_xlim(*xlim)
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(30))
     ax.set_yscale("log")
     ax.set_ylim(*ylim)
     if xlabel:
@@ -586,8 +615,44 @@ def control_diff_label(sim_names, i, control=0):
     return sim_names[i] if i == control else f"{sim_names[i]} - {sim_names[control]}"
 
 
+def _nice_step(value):
+    """Round a positive interval up to a familiar 1, 2, 2.5, 5 sequence."""
+    if not np.isfinite(value) or value <= 0:
+        return 1.0
+    exponent = np.floor(np.log10(value))
+    fraction = value / 10.0 ** exponent
+    nice_fraction = next(candidate for candidate in (1.0, 2.0, 2.5, 5.0, 10.0) if fraction <= candidate)
+    return nice_fraction * 10.0 ** exponent
+
+
+def nice_levels(vmin, vmax, n=17):
+    """Return outward-rounded linear contour boundaries with readable increments."""
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        vmin, vmax = 0.0, 1.0
+    if vmax < vmin:
+        vmin, vmax = vmax, vmin
+    if np.isclose(vmin, vmax, rtol=1.0e-12, atol=0.0):
+        width = abs(vmin) * 0.1 if vmin else 1.0
+        vmin, vmax = vmin - width, vmax + width
+    step = _nice_step((vmax - vmin) / max(int(n) - 1, 1))
+    lo = np.floor(vmin / step) * step
+    hi = np.ceil(vmax / step) * step
+    return np.arange(lo, hi + 0.5 * step, step)
+
+
+def positive_levels(maximum, n=17):
+    return nice_levels(0.0, maximum, n=n)
+
+
 def symmetric_levels(max_abs, ndiv=11):
-    return np.linspace(-max_abs, max_abs, ndiv + 1)
+    """Readable symmetric levels with one interval centred on zero."""
+    if not np.isfinite(max_abs) or max_abs <= 0:
+        max_abs = 1.0
+    ndiv = max(int(ndiv), 3)
+    if ndiv % 2 == 0:
+        ndiv += 1
+    step = _nice_step(float(max_abs) / (ndiv / 2.0))
+    return (np.arange(ndiv + 1) - ndiv / 2.0) * step
 
 
 def format_colorbar_tick(value):
@@ -598,9 +663,9 @@ def format_colorbar_tick(value):
 
 def symmetric_colorbar_ticks(levels, nticks=5):
     max_abs = float(np.nanmax(np.abs(levels)))
-    ticks = np.linspace(-max_abs, max_abs, nticks)
-    ticks[np.isclose(ticks, 0.0, atol=1e-12)] = 0.0
-    return ticks
+    ticks = ticker.MaxNLocator(nbins=nticks, symmetric=True).tick_values(-max_abs, max_abs)
+    ticks = ticks[np.abs(ticks) <= max_abs + 1.0e-12]
+    return ticks if ticks.size >= 3 else np.array([-max_abs, 0.0, max_abs])
 
 
 def add_symmetric_colorbar(fig, mappable, ax, levels, label, location="right", nticks=5, **kwargs):
@@ -612,6 +677,22 @@ def add_symmetric_colorbar(fig, mappable, ax, levels, label, location="right", n
 
 def make_diff_norm(levels):
     return colors.BoundaryNorm(levels, plt.get_cmap("bwr").N)
+
+
+def difference_cmap(levels, cmap="bwr"):
+    """Discrete diverging colormap with the zero-containing interval in white."""
+    levels = np.asarray(levels, dtype=float)
+    base = plt.get_cmap(cmap)
+    n_intervals = len(levels) - 1
+    rgba = base(np.linspace(0.0, 1.0, n_intervals))
+    centre = np.flatnonzero((levels[:-1] < 0.0) & (levels[1:] > 0.0))
+    if centre.size:
+        rgba[centre] = (1.0, 1.0, 1.0, 1.0)
+    out = colors.ListedColormap(rgba, name=f"{base.name}_white_zero")
+    out.set_under(base(0.0))
+    out.set_over(base(1.0))
+    out.set_bad(base.get_bad())
+    return out
 
 
 def make_spectrum_cmap(levels):
@@ -645,7 +726,7 @@ def all_figures_requested(figures_to_run):
 
 class FigureSaver:
     def __init__(self, save_loc, enabled=True, start=1, dpi=300, figures_to_run=None):
-        self.save_loc = save_loc
+        self.save_loc = diagnostic_output_dir(save_loc)
         self.enabled = enabled
         self.index = start
         self.dpi = dpi

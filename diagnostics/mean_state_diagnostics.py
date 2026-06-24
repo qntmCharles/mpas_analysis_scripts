@@ -28,7 +28,7 @@ from diagnostic_helpers import *
 silence_hdf5_error_stack()
 
 save = True
-save_loc = '/home/cwp29/tmp/mpas/crf_on/final/mean_state/'
+save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/mean_state/')
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -116,7 +116,7 @@ def positive_contour_levels(fields, n=21, fallback=1.0):
     vmax = np.nanmax([np.nanmax(field.values) for field in fields])
     if not np.isfinite(vmax) or vmax <= 0:
         vmax = fallback
-    return np.linspace(0.0, vmax, n)
+    return positive_levels(vmax, n=n)
 
 
 def symmetric_contour_levels(fields, ndiv=11, fallback=1.0):
@@ -224,7 +224,7 @@ def positive_percentile_levels(fields, percentile=99.5, n=21, fallback=1.0):
     ])
     if not np.isfinite(vmax) or vmax <= 0:
         vmax = fallback
-    return np.linspace(0.0, vmax, n)
+    return positive_levels(vmax, n=n)
 
 
 def positive_log_levels(fields, percentile=99.5, n=21, vmin=1.0e-4, fallback=1.0):
@@ -309,7 +309,7 @@ def latlon_contour_levels(fields, symmetric=False, n=21, fallback=1.0):
         vmin -= half_width
         vmax += half_width
 
-    return np.linspace(vmin, vmax, n)
+    return nice_levels(vmin, vmax, n=n)
 
 
 LATHEIGHT_MEAN_STATE_SPECS = [
@@ -737,8 +737,8 @@ if should_run_figure(3):
         ax[i, 1].plot(zds.latitude.values, CPTs[i][1]/100., color='k', lw=1, ls=':')
 
     for j in range(ax.shape[0]-1):
-        ax[j, 0].set_xticklabels([])
-        ax[j, 1].set_xticklabels([])
+        ax[j, 0].tick_params(labelbottom=False)
+        ax[j, 1].tick_params(labelbottom=False)
 
     ax[-1, 0].set_xlabel("Latitude (degrees)")
     ax[-1, 1].set_xlabel("Latitude (degrees)")
@@ -814,15 +814,37 @@ if should_run_any([5, 6]):
 
     # In[ ]:
 
+
+DISTRIBUTION_TROPICAL_LAT_BOUNDS = (-10.0, 10.0)
+DISTRIBUTION_DOMAIN_STYLES = (("Global", "-"), ("10S-10N", "--"))
+
+
+def global_and_tropical_values(da):
+    """Load a field once and return full-domain and 10S-10N values."""
+    lat_name = "latitude" if "latitude" in da.dims else "lat"
+    values = np.asarray(da.values)
+    lat = np.asarray(da[lat_name].values)
+    lo, hi = DISTRIBUTION_TROPICAL_LAT_BOUNDS
+    tropical = np.compress((lat >= lo) & (lat <= hi), values, axis=da.get_axis_num(lat_name))
+    return values, tropical
+
+
+def relative_frequency(values, bins, value_range, smooth):
+    h, edges = np.histogram(values, bins=bins, range=value_range)
+    h = uniform_filter1d(h.astype(float), size=smooth)
+    scale = h[0] if h[0] > 0 else np.nanmax(h)
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+    return 0.5 * (edges[1:] + edges[:-1]), h / scale
+
 if should_run_figure(5):
     # Normalised rainfall intensity distribution
-    from scipy.ndimage import uniform_filter1d
-
     fig, ax = plt.subplots(1, 3, figsize=(8, 3), constrained_layout=True, sharey=True)
 
-    h, bins = np.histogram(imerg_pr, bins=300, range=(0, 300))
-    h = uniform_filter1d(h, size=10)
-    ax[0].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color='k', ls=':', label='IMERG (Obs)')
+    imerg_values = global_and_tropical_values(imerg_pr)
+    for (domain, linestyle), values in zip(DISTRIBUTION_DOMAIN_STYLES, imerg_values):
+        x, h = relative_frequency(values, bins=300, value_range=(0, 300), smooth=10)
+        ax[0].plot(x, h, color='k', ls=linestyle, label=f'IMERG (Obs), {domain}')
     ax[0].set_yscale('log')
 
     for s, ds in enumerate(dss):
@@ -838,15 +860,14 @@ if should_run_figure(5):
                     precip_var.Time.diff("Time") / np.timedelta64(1, "D")
                 )
                 precip_rate = precip_var.diff("Time") / dt_days
-            h, bins = np.histogram(precip_rate.values, bins=300, range=(0, 300))
-            h = uniform_filter1d(h, size=10)
-            if i == 0:
-                ax[i].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color=cols[s], label=sim_names[s])
-            else:
-                ax[i].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color=cols[s])
+            domain_values = global_and_tropical_values(precip_rate)
+            for (domain, linestyle), values in zip(DISTRIBUTION_DOMAIN_STYLES, domain_values):
+                x, h = relative_frequency(values, bins=300, value_range=(0, 300), smooth=10)
+                label = f"{sim_names[s]}, {domain}" if i == 0 else None
+                ax[i].plot(x, h, color=cols[s], ls=linestyle, label=label)
             ax[i].set_yscale('log')
 
-    fig.legend(loc='outside lower center', ncol=5)
+    fig.legend(loc='outside lower center', ncol=4)
 
     for a in ax:
         a.set_xlim(0, 300)
@@ -886,9 +907,11 @@ def calculate_rain_durations(pr_var, thresh):
 if should_run_figure(6):
     fig, ax = plt.subplots(1, 3, figsize=(8, 3), constrained_layout=True, sharey=True)
 
-    h, bins = np.histogram(calculate_rain_durations(imerg_pr, 5), bins=59, range=(1, 60))
-    h = uniform_filter1d(h, size=5)
-    ax[0].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color='k', ls=':', label='IMERG (Obs)')
+    imerg_values = global_and_tropical_values(imerg_pr)
+    for (domain, linestyle), values in zip(DISTRIBUTION_DOMAIN_STYLES, imerg_values):
+        durations = calculate_rain_durations(values, 5)
+        x, h = relative_frequency(durations, bins=59, value_range=(1, 60), smooth=5)
+        ax[0].plot(x, h, color='k', ls=linestyle, label=f'IMERG (Obs), {domain}')
     ax[0].set_yscale('log')
 
     for s, ds in enumerate(dss):
@@ -904,19 +927,19 @@ if should_run_figure(6):
                     precip_var.Time.diff("Time") / np.timedelta64(1, "D")
                 )
                 precip_rate = precip_var.diff("Time") / dt_days
-            h, bins = np.histogram(calculate_rain_durations(precip_rate.values, 5), bins=59, range=(1, 60))
-            h = uniform_filter1d(h, size=5)
-            if i == 0:
-                ax[i].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color=cols[s], label=sim_names[s])
-            else:
-                ax[i].plot(0.5*(bins[1:] + bins[:-1]), h/h[0], color=cols[s])
+            domain_values = global_and_tropical_values(precip_rate)
+            for (domain, linestyle), values in zip(DISTRIBUTION_DOMAIN_STYLES, domain_values):
+                durations = calculate_rain_durations(values, 5)
+                x, h = relative_frequency(durations, bins=59, value_range=(1, 60), smooth=5)
+                label = f"{sim_names[s]}, {domain}" if i == 0 else None
+                ax[i].plot(x, h, color=cols[s], ls=linestyle, label=label)
             ax[i].set_yscale('log')
 
     for a in ax:
         a.set_xlim(1, 60)
         a.set_xlabel("Duration (days)")
 
-    fig.legend(loc='outside lower center', ncol=5)
+    fig.legend(loc='outside lower center', ncol=4)
 
     ax[0].set_title("Total")
     ax[0].set_ylabel("Normalised frequency")
@@ -932,7 +955,8 @@ if should_run_figure(7):
     spec_levels = np.linspace(0, 5, 26)
     spec_cmap, spec_norm = make_spectrum_cmap(spec_levels)
     spec_diff_levels = symmetric_levels(2.0, ndiv=11)
-    spec_diff_norm = make_diff_norm(spec_diff_levels)
+    spec_diff_cmap = difference_cmap(spec_diff_levels)
+    spec_diff_norm = colors.BoundaryNorm(spec_diff_levels, spec_diff_cmap.N)
 
     fig, ax = plt.subplots(len(data_locs), 2, figsize=(8, 8), constrained_layout=True)
     fig2, ax2 = plt.subplots(len(data_locs), 2, figsize=(8, 8), constrained_layout=True)
@@ -1000,8 +1024,8 @@ if should_run_figure(7):
             sym_diff = sym_excess - c_sym_excess
             asym_diff = asym_excess - c_asym_excess
 
-            sym_diff_im = ax2[d, 0].pcolormesh( wn, f, sym_diff.T, cmap='bwr', norm=spec_diff_norm, shading='auto' )
-            asym_diff_im = ax2[d, 1].pcolormesh( wn, f, asym_diff.T, cmap='bwr', norm=spec_diff_norm, shading='auto' )
+            sym_diff_im = ax2[d, 0].pcolormesh( wn, f, sym_diff.T, cmap=spec_diff_cmap, norm=spec_diff_norm, shading='auto' )
+            asym_diff_im = ax2[d, 1].pcolormesh( wn, f, asym_diff.T, cmap=spec_diff_cmap, norm=spec_diff_norm, shading='auto' )
 
         freq, wavenum = genDispersionCurves()
 
@@ -1022,10 +1046,10 @@ if should_run_figure(7):
                 if d == len(data_locs)-1:
                     a.set_xlabel('Zonal wavenumber')
                 else:
-                    a.set_xticklabels([])
+                    a.tick_params(labelbottom=False)
 
             axes[d, 0].set_ylabel('Frequency (day$^{-1}$)')
-            axes[d, 1].set_yticklabels([])
+            axes[d, 1].tick_params(labelleft=False)
             axes[d, 0].axvline(0, color='k', ls='--')
             axes[d, 1].axvline(0, color='k', ls='--')
             annotate_panel_label(axes[d, 0], sim_names[d])
@@ -1099,7 +1123,7 @@ if should_run_figure(8):
 
         annotate_panel_label(ax[d], sim_names[d])
         if d > 0:
-            ax[d].set_yticklabels([])
+            ax[d].tick_params(labelleft=False)
 
     ax[0].set_ylabel("time (days)")
 
@@ -1112,9 +1136,10 @@ if should_run_figure(8):
     print("Done with figure: comp_hovmoller")
 
 if should_run_figure(9):
+    height_anomaly_levels = symmetric_levels(1.0, ndiv=19)
     # Diagnostic: how much does zgrid vary horizontally?
 
-    fig, ax = plt.subplots(len(dss), 2, figsize=(8, 3.2*len(dss)), constrained_layout=True, sharex='col')
+    fig, ax = plt.subplots(len(dss), 2, figsize=(8, 3.2*len(dss)), constrained_layout=True, sharex='col', sharey='row')
 
     if len(dss) == 1:
         ax = np.array([ax])
@@ -1156,14 +1181,14 @@ if should_run_figure(9):
             ds.latitude.values,
             zmean / 1000.,
             z_anom / 1000.,
-            levels=np.linspace(-1.0, 1.0, 21),
-            cmap='bwr',
+            levels=height_anomaly_levels,
+            cmap=difference_cmap(height_anomaly_levels),
             extend='both'
         )
         annotate_panel_label(ax[i, 1], sim_names[i])
         if i == len(dss) - 1:
             ax[i, 1].set_xlabel("Latitude (degrees)")
-        ax[i, 1].set_ylabel("Height (km)")
+        ax[i, 1].tick_params(labelleft=False)
 
         # optional: print a simple summary
         print(sim_names[i])
@@ -1171,7 +1196,7 @@ if should_run_figure(9):
         print("max horizontal range at a level (km):", np.nanmax(zmax - zmin) / 1000.)
 
     # one colourbar for the anomaly panels
-    add_symmetric_colorbar(fig, im, ax[:, 1], np.linspace(-1.0, 1.0, 21), label='Height anomaly from global mean (km)')
+    add_symmetric_colorbar(fig, im, ax[:, 1], height_anomaly_levels, label='Height anomaly from global mean (km)')
 
     figsave.save(fig, "zgrid_horizontal_variation", number=9)
 
@@ -1220,7 +1245,7 @@ if should_run_figure(10):
         annotate_panel_label(ax[i], sim_names[i])
         set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
         if i < len(dss)-1:
-            ax[i].set_xticklabels([])
+            ax[i].tick_params(labelbottom=False)
 
         if i == 0:
             control_cldfrac = cldfrac.copy()
@@ -1244,7 +1269,7 @@ if should_run_figure(10):
             im3 = ax2[i].contourf(
                 lat2d, z2d / 1000.0, cldfrac_diff,
                 levels=symmetric_levels(0.1, ndiv=11),
-                cmap='bwr',
+                cmap=difference_cmap(symmetric_levels(0.1, ndiv=11)),
                 extend='both'
             )
 
@@ -1252,7 +1277,7 @@ if should_run_figure(10):
         annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
         set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
         if i < len(dss)-1:
-            ax2[i].set_xticklabels([])
+            ax2[i].tick_params(labelbottom=False)
 
     fig.colorbar(im, ax=ax, location='right', label='Cloud fraction')
     fig2.colorbar(im2, ax=ax2[0], location='right', label='Cloud fraction')
@@ -1286,14 +1311,14 @@ if should_run_figure(11):
             vort, lat2d, z2d = lat_height_mesh(vort, zmid, zds.latitude.values)
 
             vmax = np.nanmax(np.abs(vort.values))
-            levels = np.linspace(-vmax, vmax, 21)
+            levels = symmetric_levels(vmax, ndiv=19)
 
             im = ax[i].contourf(lat2d, z2d/1000., vort.values, levels=levels, cmap='coolwarm', extend='both')
             ax[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
             annotate_panel_label(ax[i], sim_names[i])
             set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
             if i < len(dss)-1:
-                ax[i].set_xticklabels([])
+                ax[i].tick_params(labelbottom=False)
 
             if i == 0:
                 control_vort = vort
@@ -1303,13 +1328,13 @@ if should_run_figure(11):
                 diff = vort - c_vort
                 dmax = np.nanmax(np.abs(diff.values))
                 dlevels = symmetric_levels(dmax, ndiv=11)
-                im3 = ax2[i].contourf(lat2d, z2d/1000., diff.values, levels=dlevels, cmap='bwr', extend='both')
+                im3 = ax2[i].contourf(lat2d, z2d/1000., diff.values, levels=dlevels, cmap=difference_cmap(dlevels), extend='both')
 
             ax2[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
             annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
             set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
             if i < len(dss)-1:
-                ax2[i].set_xticklabels([])
+                ax2[i].tick_params(labelbottom=False)
 
     add_symmetric_colorbar(fig, im, ax, levels, label='Vorticity (s$^{-1}$)')
     fig2.colorbar(im2, ax=ax2[0], location='right', label='Vorticity (s$^{-1}$)')
@@ -1361,8 +1386,16 @@ if should_run_figure(12):
         ax_profile.plot(olr_zonal_mean.values, olr_zonal_mean.latitude.values,
                         color=olr_cols[i], label=sim_names[i])
 
-        h, b = np.histogram(olr.values.ravel(), bins=bins)
-        ax3.plot(0.5 * (b[1:] + b[:-1]), h / h.sum(), color=olr_cols[i], label=sim_names[i])
+        domain_values = global_and_tropical_values(olr)
+        for (domain, linestyle), values in zip(DISTRIBUTION_DOMAIN_STYLES, domain_values):
+            h, b = np.histogram(values, bins=bins)
+            ax3.plot(
+                0.5 * (b[1:] + b[:-1]),
+                h / h.sum(),
+                color=olr_cols[i],
+                ls=linestyle,
+                label=f"{sim_names[i]}, {domain}",
+            )
 
         im = ax[i].contourf(
             ds.longitude.values,
@@ -1386,7 +1419,7 @@ if should_run_figure(12):
                 extend='both'
             )
         else:
-            ax[i].set_yticklabels([])
+            ax[i].tick_params(labelleft=False)
             control_interp = control_olr.interp(latitude=olr_mean.latitude, longitude=olr_mean.longitude)
             olr_diff = (olr_mean - control_interp).load()
             im3 = ax2[i].contourf(
@@ -1394,7 +1427,7 @@ if should_run_figure(12):
                 ds.latitude.values,
                 olr_diff.values,
                 levels=symmetric_levels(20.0, ndiv=11),
-                cmap='bwr',
+                cmap=difference_cmap(symmetric_levels(20.0, ndiv=11)),
                 extend='both'
             )
             olr_diff_zonal_mean = olr_diff.mean(dim="longitude", skipna=True)
@@ -1408,7 +1441,7 @@ if should_run_figure(12):
             ax2_profile.plot(np.zeros_like(olr_zonal_mean.values), olr_zonal_mean.latitude.values,
                              color=olr_cols[i], label=sim_names[i])
         else:
-            ax2[i].set_yticklabels([])
+            ax2[i].tick_params(labelleft=False)
 
     ax_profile.axhline(0, color="0.3", lw=0.6)
     ax_profile.set_title("Longitude mean")
@@ -1556,7 +1589,7 @@ if should_run_figure(16):
             for i in range(ncols):
                 field = fields_by_sim.get(i)
                 for axes in (ax[row, i], ax2[row, i]):
-                    set_latheight_labels(axes, xlabel=(row == nrows-1))
+                    set_latheight_labels(axes, xlabel=(row == nrows-1), ylabel=(i == 0))
                     if i == 0:
                         axes.set_ylabel(f"{spec['label']}\nHeight (km)")
                     else:
@@ -1599,7 +1632,7 @@ if should_run_figure(16):
                         diff_z2d / 1000.0,
                         diff_plot.values,
                         levels=diff_levels,
-                        cmap="bwr",
+                        cmap=difference_cmap(diff_levels),
                         extend="both",
                     )
                 ax2[row, i].plot(dss_zm[i].latitude.values, CPTs[i][0]/1000.0, color="k", lw=1, ls=":")
@@ -1730,7 +1763,7 @@ if should_run_figure(17):
                     diff.latitude.values,
                     diff.values,
                     levels=diff_levels,
-                    cmap="bwr",
+                    cmap=difference_cmap(diff_levels),
                     extend="both",
                 )
                 diff_zonal_mean = diff.mean(dim="longitude", skipna=True).load()
@@ -1866,7 +1899,7 @@ if should_run_figure(18):
             for i in range(ncols):
                 field = fields_by_sim.get(i)
                 for axes in (ax[row, i], ax2[row, i]):
-                    set_latheight_labels(axes, xlabel=(row == nrows-1))
+                    set_latheight_labels(axes, xlabel=(row == nrows-1), ylabel=(i == 0))
                     if i == 0:
                         axes.set_ylabel(f"{spec['symbol']}\nHeight (km)")
                     else:
@@ -1910,7 +1943,7 @@ if should_run_figure(18):
                         z2d / 1000.0,
                         diff.values,
                         levels=diff_levels,
-                        cmap="bwr",
+                        cmap=difference_cmap(diff_levels),
                         extend="both",
                     )
 
@@ -1959,25 +1992,27 @@ if should_run_figure(13):
             zmid = height_from_zm_latlon(zds)
             ke, lat2d, z2d = lat_height_mesh(ke, zmid, zds.latitude.values)
 
-            im = ax[i].contourf(lat2d, z2d/1000., ke.values, levels=np.linspace(0, np.nanmax(ke.values), 21), cmap='YlGnBu', extend='max')
+            ke_levels = positive_levels(np.nanmax(ke.values), n=21)
+            im = ax[i].contourf(lat2d, z2d/1000., ke.values, levels=ke_levels, cmap='YlGnBu', extend='max')
             ax[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
             annotate_panel_label(ax[i], sim_names[i])
             set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
             if i < len(dss)-1:
-                ax[i].set_xticklabels([])
+                ax[i].tick_params(labelbottom=False)
 
             if i == 0:
                 control_ke = ke
-                im2 = ax2[i].contourf(lat2d, z2d/1000., ke.values, levels=np.linspace(0, np.nanmax(ke.values), 21), cmap='YlGnBu', extend='max')
+                im2 = ax2[i].contourf(lat2d, z2d/1000., ke.values, levels=ke_levels, cmap='YlGnBu', extend='max')
             else:
                 c_ke = control_ke.interp(z=ke.z, latitude=ke.latitude)
-                im3 = ax2[i].contourf(lat2d, z2d/1000., (ke - c_ke).values, levels=symmetric_levels(100.0, ndiv=11), cmap='bwr', extend='both')
+                ke_diff_levels = symmetric_levels(100.0, ndiv=11)
+                im3 = ax2[i].contourf(lat2d, z2d/1000., (ke - c_ke).values, levels=ke_diff_levels, cmap=difference_cmap(ke_diff_levels), extend='both')
 
             ax2[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
             annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
             set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
             if i < len(dss)-1:
-                ax2[i].set_xticklabels([])
+                ax2[i].tick_params(labelbottom=False)
 
     fig.colorbar(im, ax=ax, location='right', label=r'Kinetic energy (m$^2$ s$^{-2}$)')
     fig2.colorbar(im2, ax=ax2[0], location='right', label=r'Kinetic energy (m$^2$ s$^{-2}$)')
@@ -2038,7 +2073,7 @@ if should_run_figure(14):
             annotate_panel_label(ax[row], sim_names[i])
             set_latpres_axis(ax[row], xlabel=(row == nrows-1), ylabel=True, xlim=(-90, 90), ylim=(1000, 50))
             if row < nrows-1:
-                ax[row].set_xticklabels([])
+                ax[row].tick_params(labelbottom=False)
 
             if row == 0:
                 im2 = ax2[row].contourf(
@@ -2057,7 +2092,7 @@ if should_run_figure(14):
                     eke.pres.values,
                     diff.values,
                     levels=diff_levels,
-                    cmap="bwr",
+                    cmap=difference_cmap(diff_levels),
                     extend="both"
                 )
 
@@ -2065,7 +2100,7 @@ if should_run_figure(14):
             annotate_panel_label(ax2[row], control_diff_label(sim_names, i, control=control_index))
             set_latpres_axis(ax2[row], xlabel=(row == nrows-1), ylabel=True, xlim=(-90, 90), ylim=(1000, 50))
             if row < nrows-1:
-                ax2[row].set_xticklabels([])
+                ax2[row].tick_params(labelbottom=False)
 
         fig.colorbar(im, ax=ax, location="right", label=r"Eddy kinetic energy (m$^2$ s$^{-2}$)")
         fig2.colorbar(im2, ax=ax2[0], location="right", label=r"Eddy kinetic energy (m$^2$ s$^{-2}$)")

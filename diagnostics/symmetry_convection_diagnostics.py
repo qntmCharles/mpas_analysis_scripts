@@ -25,7 +25,7 @@ from tropopause import *
 from diagnostic_helpers import *
 
 save = True
-save_loc = '/home/cwp29/tmp/mpas/crf_on/final/convection/'
+save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/convection/')
 
 # Set to [] or None to run all figures.  Otherwise list the numbered figures
 # to regenerate, e.g. [18] for the conditional cloud diagnostics.
@@ -858,14 +858,14 @@ if should_run_figure(3):
             vmax = vv if vmax is None else max(vmax, vv)
         if vmax == 0 or not np.isfinite(vmax):
             vmax = 1.0
-        levels_hov = np.linspace(-vmax, vmax, 21)
+        levels_hov = symmetric_levels(vmax, ndiv=19)
         for i, x in enumerate(fields):
-            im = ax[j, i].contourf(x.longitude, x.Time, x.values, levels=levels_hov, cmap="bwr", extend="both")
+            im = ax[j, i].contourf(x.longitude, x.Time, x.values, levels=levels_hov, cmap=difference_cmap(levels_hov), extend="both")
             annotate_panel_label(ax[j, i], sim_names[i])
             if i == 0:
                 ax[j, i].set_ylabel(f"{label}\ntime")
             else:
-                ax[j, i].set_yticklabels([])
+                ax[j, i].tick_params(labelleft=False)
             if j == len(hov_vars)-1:
                 ax[j, i].set_xlabel("Longitude")
         add_symmetric_colorbar(fig, im, ax[j, :], levels_hov, label=f"{label}' ({units})")
@@ -898,7 +898,7 @@ if should_run_figure(4):
         annotate_panel_label(ax[i], sim_names[i])
         set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
         if i < len(dss)-1:
-            ax[i].set_xticklabels([])
+            ax[i].tick_params(labelbottom=False)
 
         if i == 0:
             control_N2 = N2
@@ -906,12 +906,13 @@ if should_run_figure(4):
         else:
             cN2 = control_N2.interp(z=N2.z, latitude=N2.latitude)
             diff = (N2 - cN2) * 1e4
-            im3 = ax2[i].contourf(lat2d, z2d/1000., diff.values, levels=symmetric_levels(1.0, ndiv=12), cmap="bwr", extend="both")
+            n2_diff_levels = symmetric_levels(1.0, ndiv=12)
+            im3 = ax2[i].contourf(lat2d, z2d/1000., diff.values, levels=n2_diff_levels, cmap=difference_cmap(n2_diff_levels), extend="both")
         ax2[i].plot(zds.latitude.values, CPTs[i][0]/1000., color="k", lw=1, ls=":")
         annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
         set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
         if i < len(dss)-1:
-            ax2[i].set_xticklabels([])
+            ax2[i].tick_params(labelbottom=False)
 
     fig.colorbar(im, ax=ax, location="right", label=r"$N^2$ ($10^{-4}$ s$^{-2}$)")
     fig2.colorbar(im2, ax=ax2[0], location="right", label=r"$N^2$ ($10^{-4}$ s$^{-2}$)")
@@ -967,7 +968,7 @@ if should_run_figure(5):
             annotate_panel_label(ax[i], sim_names[i])
             set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
             if i < len(dss)-1:
-                ax[i].set_xticklabels([])
+                ax[i].tick_params(labelbottom=False)
 
             if i == 0:
                 control_shear = shear
@@ -975,12 +976,12 @@ if should_run_figure(5):
             else:
                 cshear = control_shear.interp(z=shear.z, latitude=shear.latitude)
                 diff = (shear - cshear) * 1000.0
-                im3 = ax2[i].contourf(lat2d, z2d/1000., diff.values, levels=shear_diff_levels, cmap="bwr", extend="both")
+                im3 = ax2[i].contourf(lat2d, z2d/1000., diff.values, levels=shear_diff_levels, cmap=difference_cmap(shear_diff_levels), extend="both")
             ax2[i].plot(zds.latitude.values, CPTs[i][0]/1000., color="k", lw=1, ls=":")
             annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
             set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
             if i < len(dss)-1:
-                ax2[i].set_xticklabels([])
+                ax2[i].tick_params(labelbottom=False)
 
         add_symmetric_colorbar(fig, im, ax, shear_levels, label=r"$\partial u / \partial z$ (m s$^{-1}$ km$^{-1}$)")
         add_symmetric_colorbar(fig2, im2, ax2[0], shear_levels, label=r"$\partial u / \partial z$ (m s$^{-1}$ km$^{-1}$)")
@@ -1069,15 +1070,16 @@ if should_run_figure(7):
                 control_hc = hc
                 im2 = ax2[i].contourf(hc.longitude, hc.latitude, hc.values, levels=np.linspace(0, 1, 21), cmap="binary", extend="max")
             else:
-                ax[i].set_yticklabels([])
+                ax[i].tick_params(labelleft=False)
                 c = control_hc.interp(latitude=hc.latitude, longitude=hc.longitude)
-                im3 = ax2[i].contourf(hc.longitude, hc.latitude, (hc - c).values, levels=symmetric_levels(0.15, ndiv=12), cmap="bwr", extend="both")
+                high_cloud_diff_levels = symmetric_levels(0.15, ndiv=12)
+                im3 = ax2[i].contourf(hc.longitude, hc.latitude, (hc - c).values, levels=high_cloud_diff_levels, cmap=difference_cmap(high_cloud_diff_levels), extend="both")
             annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
             ax2[i].set_xlabel("Longitude")
             if i == 0:
                 ax2[i].set_ylabel("Latitude")
             else:
-                ax2[i].set_yticklabels([])
+                ax2[i].tick_params(labelleft=False)
 
         fig.colorbar(im, ax=ax[-1], location="right", label="Cloud fraction above 12 km")
         fig2.colorbar(im2, ax=ax2[0], location="right", label="Cloud fraction above 12 km")
@@ -1404,7 +1406,7 @@ if should_run_figure(14):
             # Use a common absolute colour scale from the control where possible.
             q0, _, _ = condensate_latheight(dss[0], dss_zm[0], varlist)
             vmax = safe_nanpercentile(q0.values, 99.5, default=1e-4)
-            levs = np.linspace(0, vmax, 21)
+            levs = positive_levels(vmax, n=21)
 
             for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
                 q, lat2d, z2d = condensate_latheight(ds, zds, varlist)
@@ -1414,7 +1416,7 @@ if should_run_figure(14):
                 annotate_panel_label(ax[i], sim_names[i])
                 set_latheight_labels(ax[i], xlabel=(i == len(dss) - 1))
                 if i < len(dss) - 1:
-                    ax[i].set_xticklabels([])
+                    ax[i].tick_params(labelbottom=False)
 
                 if i == 0:
                     control_q = q
@@ -1423,13 +1425,14 @@ if should_run_figure(14):
                     c = control_q.interp(z=q.z, latitude=q.latitude, kwargs={"fill_value": np.nan})
                     diff = q - c
                     dmax = safe_nanpercentile(np.abs(diff.values), 99.0, default=max(vmax * 0.25, 1e-6))
-                    im3 = ax2[i].contourf(lat2d, z2d / 1000.0, diff.values, levels=symmetric_levels(dmax, ndiv=11), cmap="bwr", extend="both")
+                    q_diff_levels = symmetric_levels(dmax, ndiv=11)
+                    im3 = ax2[i].contourf(lat2d, z2d / 1000.0, diff.values, levels=q_diff_levels, cmap=difference_cmap(q_diff_levels), extend="both")
 
                 add_cpt_height(ax2[i], i)
                 annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
                 set_latheight_labels(ax2[i], xlabel=(i == len(dss) - 1))
                 if i < len(dss) - 1:
-                    ax2[i].set_xticklabels([])
+                    ax2[i].tick_params(labelbottom=False)
 
             fig.colorbar(im, ax=ax, location="right", label=cbar_label)
             fig2.colorbar(im2, ax=ax2[0], location="right", label=cbar_label)

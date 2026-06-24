@@ -65,7 +65,7 @@ def env_flag(name, default=False):
 # -----------------------------------------------------------------------------
 
 save = True
-save_loc = "/home/cwp29/tmp/mpas/crf_on/final/organisation/"
+save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/organisation/")
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -1857,6 +1857,7 @@ def plot_lorg_timeseries(metrics_df):
     fig, ax = source_axis_grid(sources)
     for si, source in enumerate(sources):
         axis = ax.ravel()[si]
+        ncols = ax.shape[1]
         sub_source = metrics_df[metrics_df.source == source]
         for i, sim_name in enumerate(sim_names):
             sub = sub_source[sub_source.simulation == sim_name]
@@ -1865,8 +1866,10 @@ def plot_lorg_timeseries(metrics_df):
             axis.plot(sub.time_days, sub.lorg_km, color=cols[i], lw=1.2, label=sim_name)
         axis.axhline(0.0, color="0.6", lw=0.8)
         axis.set_title(source_label(source))
-        axis.set_xlabel("Time since analysis start (days)")
-        axis.set_ylabel("Lorg (km)")
+        if si + ncols >= len(sources):
+            axis.set_xlabel("Time since analysis start (days)")
+        if si % ncols == 0:
+            axis.set_ylabel("Lorg (km)")
         axis.grid(alpha=0.2)
     ax.ravel()[0].legend(loc="best")
     fig.suptitle("Lorg: instantaneous spatial aggregation from all object-pair distances")
@@ -1921,7 +1924,8 @@ def plot_lorg_distribution(metrics_df):
         ax[si, 0].axvline(0.0, color="0.6", lw=0.8)
         ax[si, 1].axhline(0.0, color="0.6", lw=0.8)
         ax[si, 0].set_ylabel(f"{source_label(source)}\nPDF")
-        ax[si, 0].set_xlabel("Lorg (km)")
+        if si == nrows - 1:
+            ax[si, 0].set_xlabel("Lorg (km)")
         ax[si, 1].set_ylabel("Lorg (km)")
         ax[si, 0].grid(alpha=0.2)
         ax[si, 1].grid(alpha=0.2, axis="y")
@@ -2022,6 +2026,7 @@ def plot_conditional_lorg(metrics_df, condition_key, number, stem, xlabel):
     fig, ax = source_axis_grid(sources)
     for si, source in enumerate(sources):
         axis = ax.ravel()[si]
+        ncols = ax.shape[1]
         sub_source = summary[summary.source == source]
         if len(sub_source) == 0:
             axis.set_visible(False)
@@ -2032,8 +2037,10 @@ def plot_conditional_lorg(metrics_df, condition_key, number, stem, xlabel):
             axis.fill_between(sub.bin_center, sub.lorg_p25, sub.lorg_p75, color=cols[i], alpha=0.12, linewidth=0)
         axis.axhline(0.0, color="0.6", lw=0.8)
         axis.set_title(source_label(source))
-        axis.set_xlabel(xlabel)
-        axis.set_ylabel("Lorg (km)")
+        if si + ncols >= len(sources):
+            axis.set_xlabel(xlabel)
+        if si % ncols == 0:
+            axis.set_ylabel("Lorg (km)")
         axis.grid(alpha=0.2)
     ax.ravel()[0].legend(loc="best")
     fig.suptitle("Conditional Lorg: organisation compared at fixed convective amount")
@@ -2090,6 +2097,7 @@ def plot_long_lived_contribution(contribution_df):
     fig, ax = source_axis_grid(sources, height_per_row=3.2)
     for si, source in enumerate(sources):
         axis = ax.ravel()[si]
+        ncols = ax.shape[1]
         sub_source = contribution_df[contribution_df.source == source]
         for i, sim_name in enumerate(sim_names):
             sub = (
@@ -2106,8 +2114,10 @@ def plot_long_lived_contribution(contribution_df):
             axis.plot(sub.threshold_hours, sub.precip_fraction, color=cols[i], marker="s", lw=1.1, ls="--")
         axis.set_ylim(0, 1)
         axis.set_title(source_label(source))
-        axis.set_xlabel("Minimum track lifetime (h)")
-        axis.set_ylabel("Fraction in long-lived tracks")
+        if si + ncols >= len(sources):
+            axis.set_xlabel("Minimum track lifetime (h)")
+        if si % ncols == 0:
+            axis.set_ylabel("Fraction in long-lived tracks")
         axis.grid(alpha=0.2)
     ax.ravel()[0].legend(loc="best")
     fig.suptitle("Long-lived organised contribution: area solid, precipitation dashed")
@@ -2170,6 +2180,7 @@ def plot_conditional_track_lifetime(tracks_df, condition_key, number, stem, xlab
     fig, ax = source_axis_grid(sources)
     for si, source in enumerate(sources):
         axis = ax.ravel()[si]
+        ncols = ax.shape[1]
         sub_source = summary[summary.source == source]
         if len(sub_source) == 0:
             axis.set_visible(False)
@@ -2179,8 +2190,10 @@ def plot_conditional_track_lifetime(tracks_df, condition_key, number, stem, xlab
             axis.plot(sub.bin_center, sub.lifetime_mean, color=cols[i], marker="o", lw=1.5, label=sim_name)
             axis.fill_between(sub.bin_center, sub.lifetime_p25, sub.lifetime_p75, color=cols[i], alpha=0.12, linewidth=0)
         axis.set_title(source_label(source))
-        axis.set_xlabel(xlabel)
-        axis.set_ylabel("Track lifetime (h)")
+        if si + ncols >= len(sources):
+            axis.set_xlabel(xlabel)
+        if si % ncols == 0:
+            axis.set_ylabel("Track lifetime (h)")
         axis.grid(alpha=0.2)
     ax.ravel()[0].legend(loc="best")
     fig.suptitle("Conditional persistence: track lifetime at fixed convective amount")
@@ -2275,7 +2288,8 @@ def plot_shifted_pattern_autocorrelation(persistence_df):
         axis.axvline(0.0, color="0.6", lw=0.8)
         axis.set_title(sub_field.field_label.iloc[0])
         axis.set_xlabel("Lag (days)")
-        axis.set_ylabel("Pattern autocorrelation")
+        if fj == 0:
+            axis.set_ylabel("Pattern autocorrelation")
         axis.grid(alpha=0.2)
     ax[0, 0].legend(loc="best")
     fig.suptitle(
