@@ -40,14 +40,14 @@ MODULE_SEARCH_DIRS = [
 DEFAULT_SCRIPT_ORDER = [
     "mean_state_diagnostics.py",
     "global_atmospheric_energy_budget_diagnostics.py",
+    "refined_high_cloud_classification_diagnostics.py",
     "symmetry_convection_diagnostics.py",
     "thermal_wind_scaled_response.py",
     "matched_pattern_response.py",
-    "refined_high_cloud_classification_diagnostics.py",
-    "equatorial_wave_diagnostics.py",
     "convective_pathway_diagnostics.py",
-    "convective_lifecycle_composite_diagnostics.py",
     "convective_organisation_diagnostics.py",
+    "convective_lifecycle_composite_diagnostics.py",
+    "equatorial_wave_diagnostics.py",
     "significance_bootstrap_diagnostics.py",
     "jet_variability_diagnostics.py",
 ]

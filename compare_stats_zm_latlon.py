@@ -60,16 +60,17 @@ def run_all_figures():
 #sim_names = ['crf on', 'crf off']
 
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
-data_locs = ['control', 'u_nudge', 'T_nudge']
+data_locs = ['control_new', 'u_nudge', 'T_nudge']
 latlon_file = ['latlon.2000-*.nc', 'latlon.2000-*.nc', 'latlon.2000-*.nc']
 zm_latlon_file = ['zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc']
 sim_names = ['control', 'nudged u', 'nudged T']
 
 cols = ['k', 'b', 'r']
 
-# Use final 'ndays' of data
+# Use ndays of data ending at a fixed analysis date
 ndays = 10
 dt = 6
+analysis_end_date = '2000-11-21'
 
 time_format = 'time' #or 'int'
 
@@ -82,16 +83,15 @@ def load_latlon_dataset(
     latlon_pattern="latlon.2000-*.nc",
     diag_file="latlon_diag.nc",
     hist_file="latlon_hist.nc",
-    cldfrac_file="cldfrac.nc",
     time_format="int",
     dt=6,
     ndays=None,
+    end_date=None,
     chunks=None,
     prefer_pattern=False,
 ):
     diag_path = os.path.join(data_dir, diag_file)
     hist_path = os.path.join(data_dir, hist_file)
-    cldfrac_path = os.path.join(data_dir, cldfrac_file)
     latlon_files = sorted(glob.glob(os.path.join(data_dir, latlon_pattern)))
 
     # Open lazily; rechunk later if needed.  For pre-computed zonal means,
@@ -129,18 +129,9 @@ def load_latlon_dataset(
             ntime = ndays * int(24 / dt)
             ds = ds.isel(Time=slice(-ntime, None))
         else:
-            t_end = pd.to_datetime(ds.Time.max().item())
+            t_end = pd.to_datetime(end_date) if end_date is not None else pd.to_datetime(ds.Time.max().item())
             t_start = t_end - pd.Timedelta(days=ndays)
             ds = ds.sel(Time=slice(t_start, t_end))
-
-    # Add cldfrac only for matching times, without a full merge
-    if os.path.exists(cldfrac_path):
-        ds_cld = xr.open_dataset(cldfrac_path, chunks={})
-
-        if "cldfrac" in ds_cld:
-            # align cldfrac to ds.Time; missing times become NaN
-            cldfrac = ds_cld["cldfrac"].reindex(Time=ds.Time)
-            ds = ds.assign(cldfrac=cldfrac)
 
     # Rechunk only at the end
     if chunks is not None:
@@ -290,6 +281,7 @@ for i, d in enumerate(data_locs):
         latlon_pattern=latlon_file[i],
         time_format=time_format,
         ndays=ndays,
+        end_date=analysis_end_date,
         chunks={"Time": -1}
     )
     ds = standardize_latlon_dataset(ds, needed_vars)
@@ -299,6 +291,7 @@ for i, d in enumerate(data_locs):
         latlon_pattern=zm_latlon_file[i],
         time_format=time_format,
         ndays=ndays,
+        end_date=analysis_end_date,
         chunks={"Time": -1},
         prefer_pattern=True
     )
@@ -820,12 +813,11 @@ fig, ax = plt.subplots(len(dss), 1, figsize=(8, 3.5*len(dss)), constrained_layou
 if len(dss) == 1:
     ax = [ax]
 
-for i, ds in enumerate(dss):
-    # cldfrac is not in zm_latlon, so use full lat/lon and compute the zonal mean here.
-    cldfrac = ds.cldfrac.mean(dim=("Time", "longitude"))
+for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
+    cldfrac = zds.cldfrac.mean(dim="Time")
     cldfrac = model_lat_field(cldfrac)
-    zmid = midlevel_height_from_latlon(ds)
-    cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, ds.latitude.values)
+    zmid = height_from_zm_latlon(zds)
+    cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, zds.latitude.values)
 
     im = ax[i].contourf(lat2d, z2d / 1000.0, cldfrac.values, levels=np.linspace(0, 1, 21), cmap='binary', extend='max')
     ax[i].plot(ds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')

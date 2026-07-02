@@ -89,7 +89,8 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/waves/")
 #       plus period-axis and wavenumber-phase-speed variants
 #   10: kelvin_cloud_decomposition
 #   11: compact_wave_attribution_metrics
-figures_to_run = [9]
+#   12: kelvin_conditioned_cloud_top_pressure
+figures_to_run = [9, 10, 11, 12]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 # Restart/resume controls.  With the default full run, existing figure files are
@@ -103,7 +104,7 @@ force_recompute_caches = False
 # have run and cached their filtered fields.
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
-data_locs = ["control", "u_nudge", "T_nudge"]
+data_locs = ["control_new", "u_nudge", "T_nudge"]
 latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
 zm_latlon_file = ["zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
@@ -127,26 +128,17 @@ filter_avg_lat = True
 
 TROPICAL_LAT_BOUNDS = (-20.0, 20.0)
 
-# Kelvin-conditioned high-cloud decomposition thresholds.  These mirror the
-# definitions in convective_pathway_diagnostics.py so the cloud categories mean
-# the same thing across the two analyses.
-Z_HIGH_KM = 12.0
-LOW_CLOUD_ZMIN_KM = 2.0
-LOW_CLOUD_ZMAX_KM = 5.0
-MID_CLOUD_ZMIN_KM = 5.0
-MID_CLOUD_ZMAX_KM = 10.0
-UPPER_CLOUD_ZMIN_KM = 10.0
-MAX_CLEAR_GAP_KM = 3.0
-
+# Kelvin-conditioned high-cloud decomposition thresholds. These are the shared
+# coarse-grid precipitation-regime definitions owned by
+# refined_high_cloud_classification_diagnostics.py.
+P_HIGH_HPA = 440.0
 CLOUD_FRAC_THRESH = 0.05
-PRECIP_DEEP_THRESH_MM_DAY = 5.0
-PRECIP_WEAK_THRESH_MM_DAY = 1.0
-
-ANVIL_RADIUS_DEG = 5.0
-ANVIL_TIME_STEPS = 1
+PRECIP_MIN_MM_DAY = 1.0
+CONVECTIVE_FRACTION_THRESHOLD = 0.50
 ACTIVE_KELVIN_AMP_THRESH = 1.0
 KELVIN_CLOUD_FIGURE_NUMBER = 10
 WAVE_ATTRIBUTION_FIGURE_NUMBER = 11
+KELVIN_CLOUD_DEPTH_FIGURE_NUMBER = 12
 ATTRIBUTION_EPS = 1.0e-12
 
 KELVIN_CLOUD_CONDITIONS = ("all", "active_kelvin", "positive_phase", "negative_phase")
@@ -159,20 +151,20 @@ KELVIN_CLOUD_CONDITION_LABELS = {
 
 KELVIN_CLOUD_CATEGORIES = (
     ("total_high_cloud", "Total high cloud", "high_cloud_mask"),
-    ("active_deep_convection_high_cloud", "Active deep convection", "active_deep_convection_high_cloud_mask"),
-    ("convectively_generated_high_cloud", "Convectively generated high cloud", "convectively_generated_high_cloud_mask"),
-    ("cirrus_like_high_cloud", "Cirrus-like high cloud", "cirrus_like_high_cloud_mask"),
-    ("unclassified_high_cloud", "Ambiguous/unclassified", "unclassified_high_cloud_mask"),
+    ("convective_precipitating_high_cloud", "Convective precipitating", "convective_precipitating_high_cloud_mask"),
+    ("stratiform_precipitating_high_cloud", "Stratiform precipitating", "stratiform_precipitating_high_cloud_mask"),
+    ("nonprecipitating_high_cloud", "Non-precipitating", "nonprecipitating_high_cloud_mask"),
+    ("unclassified_high_cloud", "Invalid/unclassified", "unclassified_high_cloud_mask"),
 )
 KELVIN_CLOUD_PLOT_CATEGORIES = (
-    "active_deep_convection_high_cloud",
-    "convectively_generated_high_cloud",
-    "cirrus_like_high_cloud",
+    "convective_precipitating_high_cloud",
+    "stratiform_precipitating_high_cloud",
+    "nonprecipitating_high_cloud",
 )
 KELVIN_CLOUD_CONTRIBUTION_CATEGORIES = (
-    "active_deep_convection_high_cloud",
-    "convectively_generated_high_cloud",
-    "cirrus_like_high_cloud",
+    "convective_precipitating_high_cloud",
+    "stratiform_precipitating_high_cloud",
+    "nonprecipitating_high_cloud",
     "unclassified_high_cloud",
 )
 
@@ -554,7 +546,6 @@ for i, d in enumerate(data_locs):
         ndays=ndays,
         end_date=analysis_end_date,
         chunks=latlon_chunks,
-        add_cldfrac_file=True,
     )
     ds = standardize_latlon_dataset(ds, needed_vars)
 
@@ -566,7 +557,6 @@ for i, d in enumerate(data_locs):
         end_date=analysis_end_date,
         chunks=zm_chunks,
         prefer_pattern=True,
-        add_cldfrac_file=False,
     )
     zds = standardize_latlon_dataset(zds, needed_vars)
 
@@ -657,13 +647,6 @@ def parse_cldfrac_height_km(field_name):
     return float(text)
 
 
-def available_cldfrac_times(cf):
-    """Return times with actual cloud-fraction data after any reindexing."""
-    indexers = {dim: 0 for dim in cf.dims if dim != "Time"}
-    valid = cf.isel(indexers).notnull().load()
-    return valid.Time.values[np.asarray(valid.values, dtype=bool)]
-
-
 def sel_common_times(da, ref):
     common = da.Time.to_index().intersection(ref.Time.to_index())
     return da.sel(Time=common)
@@ -682,63 +665,22 @@ def get_cldfrac_field(ds, field_name):
     if height_km is None:
         out = cf.mean(dim="z", skipna=True)
         out.name = "cldfrac"
-        return out.sel(Time=available_cldfrac_times(cf))
+        return out
 
     if "z" not in cf.coords:
         raise ValueError(f"Cannot select {field_name}: cldfrac has no height coordinate")
     out = cf.sel(z=height_km * 1000.0, method="nearest")
     out.name = field_name
     out.attrs["selected_height_km"] = height_km
-    return out.sel(Time=available_cldfrac_times(cf))
-
-
-def z_km_from_cldfrac(cldfrac):
-    if "z" not in cldfrac.coords:
-        raise ValueError("cldfrac has no geometric-height z coordinate")
-    zvals = np.asarray(cldfrac.z.values, dtype=float)
-    zvals = zvals / 1000.0 if np.nanmax(np.abs(zvals)) > 100.0 else zvals
-    return xr.DataArray(zvals, dims=("z",), coords={"z": cldfrac.z}, name="z_km")
-
-
-def any_cloud_in_layer(cloudy, z_km, zmin, zmax):
-    return cloudy.where((z_km >= zmin) & (z_km < zmax), drop=True).any(dim="z")
-
-
-def rolling_or_dilated_max(
-    mask,
-    lat_radius=ANVIL_RADIUS_DEG,
-    lon_radius=ANVIL_RADIUS_DEG,
-    time_radius=ANVIL_TIME_STEPS,
-):
-    """Centred time/lat/lon dilation matching convective_pathway_diagnostics.py."""
-    x = mask.astype(np.int8)
-    rolling_kwargs = {}
-    if "Time" in x.dims and time_radius > 0:
-        rolling_kwargs["Time"] = 2 * int(time_radius) + 1
-    if "latitude" in x.dims and lat_radius > 0 and x.sizes.get("latitude", 0) > 1:
-        dlat = float(np.nanmedian(np.abs(np.diff(x.latitude.values))))
-        rolling_kwargs["latitude"] = 2 * int(np.ceil(lat_radius / dlat)) + 1
-    if "longitude" in x.dims and lon_radius > 0 and x.sizes.get("longitude", 0) > 1:
-        dlon = float(np.nanmedian(np.abs(np.diff(x.longitude.values))))
-        rolling_kwargs["longitude"] = 2 * int(np.ceil(lon_radius / dlon)) + 1
-
-    if not rolling_kwargs:
-        return mask
-    return x.rolling(**rolling_kwargs, center=True, min_periods=1).max() >= 1
+    return out
 
 
 def classification_thresholds():
     return HighCloudThresholds(
         cf_thresh=CLOUD_FRAC_THRESH,
-        z_high_km=Z_HIGH_KM,
-        low_cloud_min_km=LOW_CLOUD_ZMIN_KM,
-        low_cloud_max_km=LOW_CLOUD_ZMAX_KM,
-        mid_cloud_min_km=MID_CLOUD_ZMIN_KM,
-        mid_cloud_max_km=MID_CLOUD_ZMAX_KM,
-        upper_cloud_min_km=UPPER_CLOUD_ZMIN_KM,
-        max_clear_gap_km=MAX_CLEAR_GAP_KM,
-        surface_precip_deep_mm_day=PRECIP_DEEP_THRESH_MM_DAY,
-        surface_precip_weak_mm_day=PRECIP_WEAK_THRESH_MM_DAY,
+        high_cloud_top_pressure_hpa=P_HIGH_HPA,
+        surface_precip_min_mm_day=PRECIP_MIN_MM_DAY,
+        convective_fraction_threshold=CONVECTIVE_FRACTION_THRESHOLD,
     )
 
 
@@ -747,10 +689,11 @@ def cached_classification_is_current(cached):
 
 
 REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS = (
+    "cloud_top_pressure",
     "high_cloud_mask",
-    "active_deep_convection_high_cloud_mask",
-    "convectively_generated_high_cloud_mask",
-    "cirrus_like_high_cloud_mask",
+    "convective_precipitating_high_cloud_mask",
+    "stratiform_precipitating_high_cloud_mask",
+    "nonprecipitating_high_cloud_mask",
     "unclassified_high_cloud_mask",
 )
 
@@ -767,11 +710,7 @@ def classification_dict_from_dataset(ds):
 
 def classification_cache_names(sim_name):
     safe = sim_name.replace(" ", "_")
-    return [
-        f"{safe}_classified_high_cloud.nc",
-        f"{safe.lower()}_classified_high_cloud.nc",
-        f"{safe_name(sim_name)}_classified_high_cloud.nc",
-    ]
+    return [f"{safe}_classified_high_cloud.nc"]
 
 
 def open_shared_high_cloud_classification(sim_name, precip_ref):
@@ -1437,6 +1376,7 @@ def kelvin_cloud_decomposition_signature():
     return cache_signature(
         "kelvin_cloud_decomposition",
         extra=dict(
+            schema_version="kelvin-cloud-ctp-v2",
             conditions=list(KELVIN_CLOUD_CONDITIONS),
             categories=jsonable_value(KELVIN_CLOUD_CATEGORIES),
             tropical_lat_bounds=jsonable_value(TROPICAL_LAT_BOUNDS),
@@ -1467,18 +1407,8 @@ def compute_kelvin_cloud_decomposition():
         output_filename="kelvin_cloud_decomposition_phase_composites.csv",
         required_columns=("simulation", "variable", "signed_kelvin_sigma_bin", "mean"),
     )
-    needs_full_plot_tables = (
-        should_run_figure(KELVIN_CLOUD_FIGURE_NUMBER)
-        and not figure_outputs_current(
-            KELVIN_CLOUD_FIGURE_NUMBER,
-            [
-                "kelvin_cloud_decomposition_latitude",
-                "kelvin_cloud_decomposition_bars",
-                "kelvin_cloud_decomposition_phase_composites",
-                "kelvin_cloud_decomposition_contribution_to_high_cloud_change",
-            ],
-            signature,
-        )
+    needs_full_plot_tables = should_run_any(
+        [KELVIN_CLOUD_FIGURE_NUMBER, KELVIN_CLOUD_DEPTH_FIGURE_NUMBER]
     )
     if scalar_cached is not None and (
         not needs_full_plot_tables
@@ -1613,6 +1543,33 @@ def compute_kelvin_cloud_decomposition():
                             count=cnum,
                         )
                     )
+            for category, label, mask_name in KELVIN_CLOUD_CATEGORIES[1:4]:
+                ctp = classif["cloud_top_pressure"].where(classif[mask_name].astype(bool))
+                y = latitude_mean_lon_time(ctp, lat_bounds=filter_lat_bounds)
+                x_aligned, y = xr.align(x, y, join="inner")
+                xc, ym, y25, y75, count = binned_mean_1d(
+                    x_aligned.values,
+                    y.values,
+                    phase_bins,
+                    min_count=20,
+                )
+                for xx, yy, lo, hi, cnum in zip(xc, ym, y25, y75, count):
+                    phase_rows.append(
+                        dict(
+                            simulation=sim,
+                            simulation_index=i,
+                            variable=f"{category}_cloud_top_pressure",
+                            variable_label=f"{label} cloud-top pressure",
+                            units="hPa",
+                            signed_kelvin_sigma_bin=xx,
+                            mean=yy,
+                            p25=lo,
+                            p75=hi,
+                            count=cnum,
+                        )
+                    )
+        except (FileNotFoundError, RuntimeError):
+            raise
         except Exception as exc:
             print(f"Skipping Kelvin cloud decomposition for {sim}: {exc}")
 
@@ -1647,8 +1604,8 @@ def compute_kelvin_cloud_decomposition():
                 )
             summary_ds = xr.merge(summary_pieces, compat="override")
             summary_ds.attrs.update(
-                description="Kelvin-conditioned cloud categories from the shared 3-D hydrometeor-aware high-cloud classification",
-                classification_reference="diagnostics/convective_pathway_diagnostics.py",
+                description="Kelvin-conditioned cloud categories from the shared coarse-grid precipitation-regime classification",
+                classification_reference="diagnostics/refined_high_cloud_classification_diagnostics.py",
                 active_kelvin_amp_threshold_sigma=ACTIVE_KELVIN_AMP_THRESH,
             )
             summary_ds.to_netcdf(os.path.join(save_loc, "kelvin_cloud_decomposition_summary.nc"))
@@ -1783,9 +1740,9 @@ def plot_kelvin_cloud_decomposition_bars(summary):
         return
     categories = (
         "total_high_cloud",
-        "active_deep_convection_high_cloud",
-        "convectively_generated_high_cloud",
-        "cirrus_like_high_cloud",
+        "convective_precipitating_high_cloud",
+        "stratiform_precipitating_high_cloud",
+        "nonprecipitating_high_cloud",
     )
     category_labels = dict((key, label) for key, label, _ in KELVIN_CLOUD_CATEGORIES)
     fig, ax = plt.subplots(1, len(KELVIN_CLOUD_CONDITIONS), figsize=(4.0 * len(KELVIN_CLOUD_CONDITIONS), 4.0),
@@ -1821,9 +1778,9 @@ def plot_kelvin_cloud_decomposition_phase_composites(summary):
         "OLR",
         "PW",
         "total_high_cloud",
-        "active_deep_convection_high_cloud",
-        "convectively_generated_high_cloud",
-        "cirrus_like_high_cloud",
+        "convective_precipitating_high_cloud",
+        "stratiform_precipitating_high_cloud",
+        "nonprecipitating_high_cloud",
     ]
     variable_order = [v for v in variable_order if v in set(phase.variable)]
     if len(variable_order) == 0:
@@ -1851,14 +1808,51 @@ def plot_kelvin_cloud_decomposition_phase_composites(summary):
     save_figure(KELVIN_CLOUD_FIGURE_NUMBER, fig, "kelvin_cloud_decomposition_phase_composites")
 
 
+def plot_kelvin_cloud_top_pressure(summary):
+    phase = summary["phase"]
+    categories = KELVIN_CLOUD_CATEGORIES[1:4]
+    for category, label, _mask_name in categories:
+        variable = f"{category}_cloud_top_pressure"
+        sub = phase[phase.variable == variable]
+        if len(sub) == 0:
+            continue
+        fig, ax = plt.subplots(1, 1, figsize=(6.5, 4.0), constrained_layout=True)
+        for i, sim in enumerate(sim_names):
+            values = sub[sub.simulation == sim].sort_values("signed_kelvin_sigma_bin")
+            if len(values) == 0:
+                continue
+            ax.plot(values.signed_kelvin_sigma_bin, values["mean"], color=cols[i], lw=1.8, label=sim)
+            ax.fill_between(
+                values.signed_kelvin_sigma_bin,
+                values.p25,
+                values.p75,
+                color=cols[i],
+                alpha=0.12,
+                linewidth=0,
+            )
+        ax.axvline(0.0, color="0.65", lw=0.7)
+        ax.set_xlabel(r"Signed Kelvin precipitation anomaly, $P'_K / \sigma_K$")
+        ax.set_ylabel("Cloud-top pressure (hPa)")
+        ax.invert_yaxis()
+        ax.grid(alpha=0.2)
+        ax.legend(frameon=False)
+        ax.set_title(label)
+        save_figure(
+            KELVIN_CLOUD_DEPTH_FIGURE_NUMBER,
+            fig,
+            f"kelvin_cloud_top_pressure_{category}",
+        )
+        plt.close(fig)
+
+
 def plot_kelvin_cloud_contribution_to_change(summary):
     scalar = summary["scalar"]
     if len(scalar) == 0:
         return
     colors_by_category = {
-        "active_deep_convection_high_cloud": "tab:purple",
-        "convectively_generated_high_cloud": "tab:orange",
-        "cirrus_like_high_cloud": "tab:green",
+        "convective_precipitating_high_cloud": "tab:purple",
+        "stratiform_precipitating_high_cloud": "tab:orange",
+        "nonprecipitating_high_cloud": "tab:green",
         "unclassified_high_cloud": "0.55",
     }
     category_labels = dict((key, label) for key, label, _ in KELVIN_CLOUD_CATEGORIES)
@@ -1977,7 +1971,7 @@ def build_compact_wave_attribution_table(wave_metrics_df, kelvin_cloud_summary=N
                             condition,
                             values,
                             "fraction",
-                            "Shared 3-D high-cloud category fraction conditioned on Kelvin-filtered precipitation",
+                            "Shared coarse-grid precipitation-regime high-cloud fraction conditioned on Kelvin-filtered precipitation",
                         )
                     )
 
@@ -2083,9 +2077,9 @@ def plot_attribution_summary_bars(table):
         ("Kelvin OLR variance", "wave_variance_fraction", "OLR", "Kelvin", "all"),
         ("Kelvin PW variance", "wave_variance_fraction", "PW", "Kelvin", "all"),
         ("Kelvin cldfrac variance", "wave_variance_fraction", "cldfrac", "Kelvin", "all"),
-        ("Active-K active deep convection", "cloud_category_fraction", "active_deep_convection_high_cloud", "Kelvin", "active_kelvin"),
-        ("Active-K convectively generated high cloud", "cloud_category_fraction", "convectively_generated_high_cloud", "Kelvin", "active_kelvin"),
-        ("Active-K cirrus-like high cloud", "cloud_category_fraction", "cirrus_like_high_cloud", "Kelvin", "active_kelvin"),
+        ("Active-K convective precipitating", "cloud_category_fraction", "convective_precipitating_high_cloud", "Kelvin", "active_kelvin"),
+        ("Active-K stratiform precipitating", "cloud_category_fraction", "stratiform_precipitating_high_cloud", "Kelvin", "active_kelvin"),
+        ("Active-K non-precipitating high cloud", "cloud_category_fraction", "nonprecipitating_high_cloud", "Kelvin", "active_kelvin"),
         ("AD sym cldfrac variance", "wave_variance_fraction", "cldfrac", "AD sym", "all"),
         ("AD antisym cldfrac variance", "wave_variance_fraction", "cldfrac", "AD antisym", "all"),
         ("ER cldfrac variance", "wave_variance_fraction", "cldfrac", "ER", "all"),
@@ -3412,11 +3406,10 @@ if should_build_figure(
 # 10. Kelvin-filtered cloud decomposition
 # -----------------------------------------------------------------------------
 # WHAT TO LOOK FOR:
-#   * Active deep-convection high-cloud anomalies imply more vertically
-#     connected precipitating convection.
-#   * Convectively generated or cirrus-like anomalies point more toward
-#     detrainment, cloud lifetime, radiative feedback, or upper-level wave
-#     modulation.
+#   * Convective-precipitating high-cloud anomalies identify changes in the
+#     native MPAS convective-rain regime.
+#   * Stratiform-precipitating or non-precipitating anomalies identify broader
+#     cloud-regime changes without assigning unresolved life-cycle histories.
 
 kelvin_cloud_summary = None
 kelvin_cloud_figure_stems = [
@@ -3424,6 +3417,10 @@ kelvin_cloud_figure_stems = [
     "kelvin_cloud_decomposition_bars",
     "kelvin_cloud_decomposition_phase_composites",
     "kelvin_cloud_decomposition_contribution_to_high_cloud_change",
+]
+kelvin_cloud_depth_figure_stems = [
+    f"kelvin_cloud_top_pressure_{category}"
+    for category, _label, _mask_name in KELVIN_CLOUD_CATEGORIES[1:4]
 ]
 compact_attribution_figure_stems = [
     "wave_attribution_heatmap_wind_unique",
@@ -3433,8 +3430,14 @@ compact_attribution_figure_stems = [
 ]
 kelvin_cloud_figure_signature = kelvin_cloud_decomposition_signature()
 needs_kelvin_cloud_figure = (
-    should_run_figure(KELVIN_CLOUD_FIGURE_NUMBER)
-    and not figure_outputs_current(KELVIN_CLOUD_FIGURE_NUMBER, kelvin_cloud_figure_stems, kelvin_cloud_figure_signature)
+    (
+        should_run_figure(KELVIN_CLOUD_FIGURE_NUMBER)
+        and not figure_outputs_current(KELVIN_CLOUD_FIGURE_NUMBER, kelvin_cloud_figure_stems, kelvin_cloud_figure_signature)
+    )
+    or (
+        should_run_figure(KELVIN_CLOUD_DEPTH_FIGURE_NUMBER)
+        and not figure_outputs_current(KELVIN_CLOUD_DEPTH_FIGURE_NUMBER, kelvin_cloud_depth_figure_stems, kelvin_cloud_figure_signature)
+    )
 )
 if needs_kelvin_cloud_figure:
     kelvin_cloud_summary = compute_kelvin_cloud_decomposition()
@@ -3456,6 +3459,20 @@ if should_build_versioned_figure(
         print("Done with figure: kelvin_cloud_decomposition")
     else:
         print("Skipping Kelvin cloud decomposition plots: no valid shared classification diagnostics were built")
+
+if should_build_versioned_figure(
+    KELVIN_CLOUD_DEPTH_FIGURE_NUMBER,
+    kelvin_cloud_depth_figure_stems,
+    kelvin_cloud_figure_signature,
+) and kelvin_cloud_summary is not None:
+    if len(kelvin_cloud_summary["phase"]) > 0:
+        plot_kelvin_cloud_top_pressure(kelvin_cloud_summary)
+        write_figure_output_metadata(
+            KELVIN_CLOUD_DEPTH_FIGURE_NUMBER,
+            kelvin_cloud_depth_figure_stems,
+            kelvin_cloud_figure_signature,
+        )
+        print("Done with figure: kelvin_conditioned_cloud_top_pressure")
 
 
 # -----------------------------------------------------------------------------

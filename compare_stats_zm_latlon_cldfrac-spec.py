@@ -60,7 +60,7 @@ def run_all_figures():
 #sim_names = ['crf on', 'crf off']
 
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
-data_locs = ['control', 'u_nudge', 'T_nudge']
+data_locs = ['control_new', 'u_nudge', 'T_nudge']
 latlon_file = ['latlon.2000-*.nc', 'latlon.2000-*.nc', 'latlon.2000-*.nc']
 zm_latlon_file = ['zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc']
 sim_names = ['control', 'nudged u', 'nudged T']
@@ -83,18 +83,15 @@ def load_latlon_dataset(
     latlon_pattern="latlon.2000-*.nc",
     diag_file="latlon_diag.nc",
     hist_file="latlon_hist.nc",
-    cldfrac_file="cldfrac.nc",
     time_format="int",
     dt=6,
     ndays=None,
     end_date=None,
     chunks=None,
     prefer_pattern=False,
-    add_cldfrac_file=True,
 ):
     diag_path = os.path.join(data_dir, diag_file)
     hist_path = os.path.join(data_dir, hist_file)
-    cldfrac_path = os.path.join(data_dir, cldfrac_file)
     latlon_files = sorted(glob.glob(os.path.join(data_dir, latlon_pattern)))
 
     # Open lazily; rechunk later if needed.  For pre-computed zonal means,
@@ -135,49 +132,6 @@ def load_latlon_dataset(
             t_end = pd.to_datetime(end_date) if end_date is not None else pd.to_datetime(ds.Time.max().item())
             t_start = t_end - pd.Timedelta(days=ndays)
             ds = ds.sel(Time=slice(t_start, t_end))
-
-    if add_cldfrac_file and "cldfrac" not in ds.data_vars and os.path.exists(cldfrac_path):
-        ds_cld = xr.open_dataset(cldfrac_path, chunks={})
-    
-        if "cldfrac" in ds_cld:
-            # Align cldfrac to ds.Time; missing times become NaN.
-            cldfrac = ds_cld["cldfrac"].reindex(Time=ds.Time)
-    
-            # Standardise the model-level dimension name to "z".
-            if "nVertLevels" in cldfrac.dims:
-                cldfrac = cldfrac.rename({"nVertLevels": "z"})
-            elif "nVertLevelsP1" in cldfrac.dims:
-                raise ValueError("cldfrac appears to be on interface levels, not mid-levels")
-            elif "z" not in cldfrac.dims:
-                raise ValueError(f"Could not find vertical dimension in cldfrac dims {cldfrac.dims}")
-    
-            # Replace cldfrac.z with a geometric-height coordinate.
-            #
-            # zgrid in the full latlon files is interface height:
-            #     zgrid(nVertLevelsP1, latitude, longitude)
-            #
-            # A dimension coordinate must be 1D, so use the horizontal-mean
-            # mid-level height as the z coordinate.
-            if "zgrid" not in ds.data_vars:
-                raise ValueError("Cannot assign geometric z coordinate to cldfrac: zgrid is missing")
-    
-            zgrid_mean = ds.zgrid.mean(dim=("latitude", "longitude"))
-    
-            z_lower = zgrid_mean.isel(nVertLevelsP1=slice(0, -1)).values
-            z_upper = zgrid_mean.isel(nVertLevelsP1=slice(1, None)).values
-            zmid = 0.5 * (z_lower + z_upper)
-    
-            if cldfrac.sizes["z"] != zmid.size:
-                raise ValueError(
-                    f"cldfrac has {cldfrac.sizes['z']} vertical levels, "
-                    f"but zgrid implies {zmid.size} mid-levels"
-                )
-    
-            cldfrac = cldfrac.assign_coords(z=("z", zmid))
-            cldfrac["z"].attrs["units"] = "m"
-            cldfrac["z"].attrs["long_name"] = "geometric height of layer midpoints"
-    
-            ds = ds.assign(cldfrac=cldfrac)
 
     # Rechunk only at the end
     if chunks is not None:
@@ -340,7 +294,6 @@ for i, d in enumerate(data_locs):
         end_date=analysis_end_date,
         chunks={"Time": -1},
         prefer_pattern=True,
-        add_cldfrac_file=False
     )
     zds = standardize_latlon_dataset(zds, needed_vars)
 
@@ -579,43 +532,11 @@ if len(dss) == 1:
 im = im2 = im3 = None
 control_cldfrac = None
 
-def hemispheric_symmetrise_lat(da, lat_dim="latitude"):
-    """
-    Average a latitude field with its hemispherically flipped version.
-
-    Assumes the latitude grid is symmetric and ordered monotonically, e.g.
-    -89.75 ... 89.75. The returned DataArray keeps the original latitude
-    coordinate.
-    """
-    flipped = da.isel({lat_dim: slice(None, None, -1)})
-    flipped = flipped.assign_coords({lat_dim: da[lat_dim].values})
-    return 0.5 * (da + flipped)
-
 for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-    if "cldfrac" in zds.data_vars:
-        # Newer zm_latlon files may contain precomputed zonal-mean cloud fraction
-        # with dimensions (Time, z, latitude).
-        cldfrac = zds.cldfrac.mean(dim="Time")
-        zmid = height_from_zm_latlon(zds)
-        cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, zds.latitude.values)
-        lat_for_cpt = zds.latitude.values
-
-    elif "cldfrac" in ds.data_vars:
-        # Older runs have no cldfrac in latlon/zm_latlon, but do have a separate
-        # cldfrac.nc.  That file is attached only to the full latlon dataset, so
-        # compute the zonal mean here.
-        cldfrac = ds.cldfrac.mean(dim=("Time", "longitude"))
-        cldfrac = model_lat_field(cldfrac)
-        
-        if i == 0:
-            cldfrac = hemispheric_symmetrise_lat(cldfrac)
-        
-        zmid = midlevel_height_from_latlon(ds)
-        cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, ds.latitude.values)
-        lat_for_cpt = ds.latitude.values
-    else:
-        print(f"Skipping cloud-fraction plot for {sim_names[i]}: no cldfrac in zm_latlon, latlon, or cldfrac.nc")
-        continue
+    cldfrac = zds.cldfrac.mean(dim="Time")
+    zmid = height_from_zm_latlon(zds)
+    cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, zds.latitude.values)
+    lat_for_cpt = zds.latitude.values
 
     im = ax[i].contourf(lat2d, z2d / 1000.0, cldfrac.values, levels=np.linspace(0, 1, 21), cmap='binary', extend='max')
     ax[i].plot(lat_for_cpt, CPTs[i][0]/1000., color='k', lw=1, ls=':')

@@ -23,6 +23,10 @@ from wavenumber_frequency_functions import *
 from matplotlib import colors
 from tropopause import *
 from diagnostic_helpers import *
+from high_cloud_classification import (
+    HighCloudThresholds,
+    cached_classification_is_current,
+)
 
 save = True
 save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/convection/')
@@ -89,10 +93,16 @@ dask.config.set({'array.slicing.split_large_chunks': True})
 #sim_names = ['crf on', 'crf off']
 
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
-data_locs = ['control', 'u_nudge', 'T_nudge']
+data_locs = ['control_new', 'u_nudge', 'T_nudge']
 latlon_file = ['latlon.2000-*.nc', 'latlon.2000-*.nc', 'latlon.2000-*.nc']
 zm_latlon_file = ['zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc']
 sim_names = ['control', 'nudged u', 'nudged T']
+
+CF_THRESH = 0.05
+P_HIGH_HPA = 440.0
+P_PRECIP_MIN = 1.0
+CONVECTIVE_FRACTION = 0.50
+classification_cache_dir = diagnostic_cache_dir("classification_cache", root_dir=root_dir)
 
 cols = ['k', 'b', 'r']
 
@@ -175,7 +185,6 @@ for i, d in enumerate(data_locs):
         end_date=analysis_end_date,
         chunks=zm_chunks,
         prefer_pattern=True,
-        add_cldfrac_file=False
     )
     zds = standardize_latlon_dataset(zds, needed_vars)
 
@@ -332,23 +341,62 @@ def cldfrac_full_with_z(ds):
         cf = cf.assign_coords(z=("z", zmid.values))
     return cf
 
-def high_cloud_fraction(ds, zmin=12000.0):
-    """Mean cloud fraction above zmin using full lat/lon cldfrac, if available."""
-    cf = cldfrac_full_with_z(ds)
-    if cf is None:
-        return None
-    return cf.where(cf.z >= zmin).mean(dim="z", skipna=True)
+_classification_cache = {}
 
-def cloud_top_height(ds, thresh=0.05):
-    """Column cloud-top height in m from full lat/lon cldfrac, if available."""
-    cf = cldfrac_full_with_z(ds)
-    if cf is None:
-        return None
-    z3d = xr.DataArray(cf.z.values, dims=("z",), coords={"z": cf.z})
-    top = z3d.where(cf > thresh).max(dim="z", skipna=True)
-    top.name = "cloud_top_height"
-    top.attrs["units"] = "m"
-    return top
+
+def classification_thresholds():
+    return HighCloudThresholds(
+        cf_thresh=CF_THRESH,
+        high_cloud_top_pressure_hpa=P_HIGH_HPA,
+        surface_precip_min_mm_day=P_PRECIP_MIN,
+        convective_fraction_threshold=CONVECTIVE_FRACTION,
+    )
+
+
+def shared_high_cloud_classification(ds):
+    """Load the mandatory shared classification; never rebuild or fall back."""
+    try:
+        index = next(i for i, candidate in enumerate(dss) if candidate is ds)
+    except StopIteration as exc:
+        raise ValueError("Dataset is not one of the configured simulations") from exc
+    if index in _classification_cache:
+        return _classification_cache[index]
+
+    path = os.path.join(
+        classification_cache_dir,
+        f"{sim_names[index].replace(' ', '_')}_classified_high_cloud.nc",
+    )
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{sim_names[index]}: required shared high-cloud classification is missing: {path}. "
+            "Run refined_high_cloud_classification_diagnostics.py first."
+        )
+    cached = xr.open_dataset(path, chunks={})
+    if not cached_classification_is_current(cached, classification_thresholds()):
+        cached.close()
+        raise RuntimeError(f"{sim_names[index]}: stale high-cloud classification cache: {path}")
+    required = (
+        "cloud_top_pressure",
+        "cloud_top_height",
+        "high_cloud_fraction",
+        "high_cloud_mask",
+    )
+    missing = [name for name in required if name not in cached.data_vars]
+    if missing:
+        cached.close()
+        raise RuntimeError(f"{sim_names[index]}: shared classification lacks {missing}: {path}")
+    _classification_cache[index] = cached
+    print(f"Using shared high-cloud classification for {sim_names[index]}: {path}")
+    return cached
+
+
+def high_cloud_fraction(ds):
+    return finite_or_nan(shared_high_cloud_classification(ds).high_cloud_fraction)
+
+
+def cloud_top_height(ds):
+    """Cloud-top height in km from the mandatory shared classification."""
+    return finite_or_nan(shared_high_cloud_classification(ds).cloud_top_height)
 
 def sample_flatten(*arrays, max_points=300000):
     """Flatten matching DataArrays/arrays and take a deterministic stride sample."""
@@ -437,7 +485,7 @@ def time_aligned_fields(ds):
         fields["CAPE"] = sel_time_like(ds.cape, pr)
     if "cin" in ds:
         fields["CIN"] = sel_time_like(ds.cin, pr)
-    hc = high_cloud_fraction(ds, zmin=12000.0)
+    hc = high_cloud_fraction(ds)
     if hc is not None:
         fields["High cloud"] = sel_time_like(hc, pr)
     # Do not add R_atm here: it is a compound field made from eight fluxes,
@@ -587,25 +635,6 @@ def get_latheight_field_from_zm(zds, var, hemispheric_parity="even"):
     zmid = height_from_zm_latlon(zds)
     return lat_height_mesh(x, zmid, zds.latitude.values)
 
-def get_cldfrac_latheight(ds, zds, i=None, hemisym_control=False):
-    """Return cloud fraction as (z, latitude), plus matching mesh arrays."""
-    if "cldfrac" in zds.data_vars:
-        cld = finite_or_nan(zds.cldfrac).mean(dim="Time")
-        cld = hemispheric_fold(cld, parity="even")
-        zmid = height_from_zm_latlon(zds)
-        cld, lat2d, z2d = lat_height_mesh(cld, zmid, zds.latitude.values)
-        return cld, lat2d, z2d, zds.latitude.values
-
-    if "cldfrac" in ds.data_vars:
-        cld = finite_or_nan(ds.cldfrac).mean(dim=("Time", "longitude"))
-        cld = model_lat_field(cld)
-        cld = hemispheric_fold(cld, parity="even")
-        zmid = midlevel_height_from_latlon(ds)
-        cld, lat2d, z2d = lat_height_mesh(cld, zmid, ds.latitude.values)
-        return cld, lat2d, z2d, ds.latitude.values
-
-    raise ValueError("No cldfrac available")
-
 def condensate_latheight(ds, zds, varlist):
     """Return time-mean zonal-mean condensate in g/kg as (z, latitude)."""
     available_zm = [v for v in varlist if v in zds.data_vars]
@@ -625,24 +654,6 @@ def condensate_latheight(ds, zds, varlist):
         return lat_height_mesh(q, zmid, ds.latitude.values)
 
     raise ValueError(f"None of {varlist} found")
-
-def cloud_top_latheight_from_cldfrac(cld, threshold=0.01):
-    """
-    Cloud-top proxy from a zonal-mean cloud-fraction section.
-    Returns one height per latitude, in km.
-    """
-    vals = cld.values
-    zvals = cld.z.values
-    out = np.full(vals.shape[1], np.nan)
-    for j in range(vals.shape[1]):
-        idx = np.where(vals[:, j] > threshold)[0]
-        if idx.size > 0:
-            out[j] = zvals[idx[-1]] / 1000.0
-    return xr.DataArray(out, dims=("latitude",), coords={"latitude": cld.latitude}, name="cloud_top")
-
-def high_cloud_fraction_from_cldfrac(cld, zmin_km=10.0, zmax_km=18.0):
-    mask = (cld.z / 1000.0 >= zmin_km) & (cld.z / 1000.0 <= zmax_km)
-    return cld.where(mask, drop=True).mean(dim="z")
 
 def atmospheric_radiative_heating_proxy(ds):
     """
@@ -1041,12 +1052,12 @@ if should_run_figure(6):
 # What to look for:
 #   * More high cloud / higher cloud tops at fixed or similar rainfall suggests
 #     a cloud-depth/radiative pathway rather than simply more precipitation.
-#   * If this block skips, it means full lat/lon cldfrac was not loaded.
+#   * These fields come from the mandatory shared classification cache.
 
 if should_run_figure(7):
     hc_fields = []
     for ds in dss:
-        hc = high_cloud_fraction(ds, zmin=12000.0)
+        hc = high_cloud_fraction(ds)
         hc_fields.append(hemispheric_fold(hc.mean(dim="Time"), parity="even") if hc is not None else None)
 
     if any(h is not None for h in hc_fields):
@@ -1081,8 +1092,8 @@ if should_run_figure(7):
             else:
                 ax2[i].tick_params(labelleft=False)
 
-        fig.colorbar(im, ax=ax[-1], location="right", label="Cloud fraction above 12 km")
-        fig2.colorbar(im2, ax=ax2[0], location="right", label="Cloud fraction above 12 km")
+        fig.colorbar(im, ax=ax[-1], location="right", label="High-cloud fraction (cloud top <= 440 hPa)")
+        fig2.colorbar(im2, ax=ax2[0], location="right", label="High-cloud fraction (cloud top <= 440 hPa)")
         if im3 is not None:
             add_symmetric_colorbar(fig2, im3, ax2[1:], symmetric_levels(0.15, ndiv=12), label="High-cloud difference")
         save_figure(7, fig, "high_cloud_maps")
@@ -1093,17 +1104,15 @@ if should_run_figure(8):
     cth_available = False
     fig, ax = plt.subplots(figsize=(7, 3.5), constrained_layout=True)
     for i, ds in enumerate(dss):
-        cth = cloud_top_height(ds, thresh=0.05)
-        if cth is None:
-            continue
+        cth = cloud_top_height(ds)
         cth_available = True
-        vals = tropics(cth, latmax=10).values.ravel() / 1000.0
+        vals = tropics(cth, latmax=10).values.ravel()
         vals = vals[np.isfinite(vals)]
         h, b = np.histogram(vals, bins=np.linspace(0, 22, 45), density=True)
         h = uniform_filter1d(h, size=3)
         ax.plot(0.5*(b[1:]+b[:-1]), h, color=cols[i], label=sim_names[i])
     if cth_available:
-        ax.set_xlabel("Tropical cloud-top height thresholded at cldfrac > 0.05 (km)")
+        ax.set_xlabel("Tropical cloud-top height from shared classification (km)")
         ax.set_ylabel("Probability density")
         ax.legend(loc="best")
         save_figure(8, fig, "cloud_top_height_hist")
@@ -1447,10 +1456,10 @@ if should_run_figure(14):
             print(f"Skipping {outname}: {e}")
 
 # ============================================================
-# 6. Cloud-top proxy and high-cloud fraction from zonal-mean cloud fraction
+# 6. Cloud-top height and high-cloud fraction from the shared classification
 # ============================================================
 # What to look for:
-#   - Higher tropical cloud tops / more 10-18 km cloud in T_nudge would support
+#   - Higher tropical cloud tops / more high cloud in T_nudge would support
 #     a UTLS-temperature/cloud-depth interpretation.
 
 if should_run_figure(15):
@@ -1461,13 +1470,16 @@ if should_run_figure(15):
         control_ctop = None
         control_hcld = None
 
-        for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-            cld, lat2d, z2d, lat_for_cpt = get_cldfrac_latheight(ds, zds, i=i, hemisym_control=True)
-            ctop = cloud_top_latheight_from_cldfrac(cld, threshold=0.01)
-            hcld = high_cloud_fraction_from_cldfrac(cld, zmin_km=10.0, zmax_km=18.0)
+        for i, ds in enumerate(dss):
+            ctop = hemispheric_fold(
+                cloud_top_height(ds).mean(dim=("Time", "longitude")), parity="even"
+            )
+            hcld = hemispheric_fold(
+                high_cloud_fraction(ds).mean(dim=("Time", "longitude")), parity="even"
+            )
 
-            ax[0].plot(cld.latitude, ctop, color=cols[i], label=sim_names[i])
-            ax[1].plot(cld.latitude, hcld, color=cols[i], label=sim_names[i])
+            ax[0].plot(ctop.latitude, ctop, color=cols[i], label=sim_names[i])
+            ax[1].plot(hcld.latitude, hcld, color=cols[i], label=sim_names[i])
 
             if i == 0:
                 control_ctop = ctop
@@ -1478,8 +1490,8 @@ if should_run_figure(15):
                 ax2[0].plot(cld.latitude, ctop - control_ctop.interp(latitude=ctop.latitude), color=cols[i], label=sim_names[i])
                 ax2[1].plot(cld.latitude, hcld - control_hcld.interp(latitude=hcld.latitude), color=cols[i], label=sim_names[i])
 
-        ax[0].set_ylabel("Cloud-top proxy (km)")
-        ax[1].set_ylabel("High cloud fraction\n10-18 km")
+        ax[0].set_ylabel("Cloud-top height (km)")
+        ax[1].set_ylabel("High cloud fraction\ncloud top <= 440 hPa")
         ax2[0].set_ylabel(r"$\Delta$ cloud top (km)")
         ax2[1].set_ylabel(r"$\Delta$ high cloud")
 
@@ -1556,24 +1568,20 @@ if should_run_figure(17):
         ax[0].plot(xc, ym, color=cols[i], label=sim_names[i])
         ax[0].fill_between(xc, y25, y75, color=cols[i], alpha=0.15)
 
-        # A cheaper cloud-top conditional: pair latitude-mean precipitation with the
-        # zonal-mean cloud-top proxy.  This is not a gridpoint joint distribution;
-        # it asks how the mean cloud-top changes across latitudinal rain regimes.
-        try:
-            cld, _, _, _ = get_cldfrac_latheight(ds, zds, i=i, hemisym_control=True)
-            ctop_lat = cloud_top_latheight_from_cldfrac(cld, threshold=0.01)
-            pr_lat = pr.mean(dim=("Time", "longitude"))
-            pr_lat = hemispheric_fold(pr_lat, parity="even")
-            pr_lat, ctop_lat = xr.align(pr_lat, ctop_lat, join="inner")
-            xc2, ym2, y252, y752, count2 = binned_statistic_1d(pr_lat.values, ctop_lat.values, precip_bins, min_count=2)
-            ax[1].plot(xc2, ym2, color=cols[i], label=sim_names[i])
-        except ValueError:
-            pass
+        ctop_lat = hemispheric_fold(
+            cloud_top_height(ds).mean(dim=("Time", "longitude")), parity="even"
+        )
+        pr_lat = hemispheric_fold(pr.mean(dim=("Time", "longitude")), parity="even")
+        pr_lat, ctop_lat = xr.align(pr_lat, ctop_lat, join="inner")
+        xc2, ym2, y252, y752, count2 = binned_statistic_1d(
+            pr_lat.values, ctop_lat.values, precip_bins, min_count=2
+        )
+        ax[1].plot(xc2, ym2, color=cols[i], label=sim_names[i])
 
     ax[0].set_xlabel(r"Precipitation (mm day$^{-1}$)")
     ax[0].set_ylabel(r"OLR (W m$^{-2}$)")
     ax[1].set_xlabel(r"Latitude-mean precipitation (mm day$^{-1}$)")
-    ax[1].set_ylabel("Cloud-top proxy (km)")
+    ax[1].set_ylabel("Cloud-top height (km)")
     for a in ax:
         a.grid(alpha=0.2)
     ax[0].legend(loc="best")
@@ -1594,11 +1602,8 @@ if should_run_figure(18):
     cin_bins_cloud = np.linspace(-500, 100, 41)
 
     for i, ds in enumerate(dss):
-        cth = cloud_top_height(ds, thresh=0.05)
-        hcld = high_cloud_fraction(ds, zmin=12000.0)
-        if cth is None and hcld is None:
-            print(f"Skipping conditional cloud diagnostics for {sim_names[i]}: full lat/lon cldfrac unavailable")
-            continue
+        cth = cloud_top_height(ds)
+        hcld = high_cloud_fraction(ds)
 
         pr = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
         fields = {"Precip": pr}
@@ -1610,7 +1615,7 @@ if should_run_figure(18):
             fields["CIN"] = finite_or_nan(ds.cin).sel(Time=pr.Time)
 
         if cth is not None:
-            cth_km = finite_or_nan(cth).sel(Time=pr.Time) / 1000.0
+            cth_km = finite_or_nan(cth).sel(Time=pr.Time)
             panel_plotted[0] |= plot_binned_conditional_curve(
                 ax[0], fields["Precip"], cth_km, precip_bins_cloud, cols[i],
                 label=sim_names[i], min_count=30, latmax=20
@@ -1640,10 +1645,10 @@ if should_run_figure(18):
 
     labels = [
         (r"Precipitation (mm day$^{-1}$)", "Cloud-top height (km)", "CTH vs precip"),
-        (r"Precipitation (mm day$^{-1}$)", "High-cloud fraction\nabove 12 km", "High cloud vs precip"),
+        (r"Precipitation (mm day$^{-1}$)", "High-cloud fraction\ncloud top <= 440 hPa", "High cloud vs precip"),
         (r"Precipitable water (kg m$^{-2}$)", "Cloud-top height (km)", "CTH vs PW"),
-        (r"CAPE (J kg$^{-1}$)", "High-cloud fraction\nabove 12 km", "High cloud vs CAPE"),
-        (r"CIN (J kg$^{-1}$)", "High-cloud fraction\nabove 12 km", "High cloud vs CIN"),
+        (r"CAPE (J kg$^{-1}$)", "High-cloud fraction\ncloud top <= 440 hPa", "High cloud vs CAPE"),
+        (r"CIN (J kg$^{-1}$)", "High-cloud fraction\ncloud top <= 440 hPa", "High cloud vs CIN"),
     ]
     for j, (xlabel, ylabel, title) in enumerate(labels):
         ax[j].set_xlabel(xlabel)
@@ -1731,27 +1736,8 @@ if should_run_figure(20):
         ax[1].plot(get_time_values(pw_trop, dt=dt), pw_trop, color=cols[i])
         ax[2].plot(get_time_values(olr_trop, dt=dt), olr_trop, color=cols[i])
 
-        try:
-            if "cldfrac" in zds.data_vars:
-                cld_ts = finite_or_nan(zds.cldfrac).sel(latitude=slice(-20, 20))
-                z = height_from_zm_latlon(zds)
-            elif "cldfrac" in ds.data_vars:
-                cld_ts = finite_or_nan(ds.cldfrac).sel(latitude=slice(-20, 20)).mean(dim="longitude")
-                lev_dim = vertical_dim(cld_ts)
-                if lev_dim != "z":
-                    cld_ts = cld_ts.rename({lev_dim: "z"})
-                z = midlevel_height_from_latlon(ds, latitude_sel=slice(-20, 20), mean_latitude=True)
-            else:
-                cld_ts = None
-                z = None
-
-            if cld_ts is not None:
-                zvals = z.values / 1000.0
-                mask = (zvals >= 10.0) & (zvals <= 18.0)
-                high_cld_ts = cld_ts.isel(z=np.where(mask)[0]).mean(dim=[d for d in cld_ts.dims if d not in ("Time",)])
-                ax[3].plot(get_time_values(high_cld_ts, dt=dt), high_cld_ts, color=cols[i])
-        except Exception as e:
-            print(f"Skipping high-cloud time series for {sim_names[i]}: {e}")
+        high_cld_ts = tropical_mean_latlon(high_cloud_fraction(ds))
+        ax[3].plot(get_time_values(high_cld_ts, dt=dt), high_cld_ts, color=cols[i])
 
         hydro = [v for v in ["qc", "qr", "qi", "qs", "qg"] if v in ds.data_vars]
         if len(hydro) > 0:
@@ -1762,7 +1748,7 @@ if should_run_figure(20):
     ax[0].set_ylabel(r"Rain\n(mm day$^{-1}$)")
     ax[1].set_ylabel("PW")
     ax[2].set_ylabel("OLR")
-    ax[3].set_ylabel("High cloud\n10-18 km")
+    ax[3].set_ylabel("High cloud\nCTP <= 440 hPa")
     ax[4].set_ylabel(r"Mean condensate\n(g kg$^{-1}$)")
     ax[4].set_xlabel("Time")
     fig.legend(loc="outside lower center", ncol=len(dss))

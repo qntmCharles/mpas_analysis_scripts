@@ -91,7 +91,7 @@ figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
-data_locs = ["control", "u_nudge", "T_nudge"]
+data_locs = ["control_new", "u_nudge", "T_nudge"]
 latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
 zm_latlon_file = ["zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
@@ -130,7 +130,7 @@ DEEP_TROPICS_LAT_BOUNDS = (-10.0, 10.0)
 WAVE_FILTER_LAT_BOUNDS = (-10.0, 10.0)
 
 TTL_Z_BOUNDS_M = (14000.0, 18000.0)
-HIGH_CLOUD_Z_BOUNDS_M = (12000.0, 18000.0)
+UPPER_TROPOSPHERE_Z_BOUNDS_M = (12000.0, 18000.0)
 
 PRECIP_STRONG_THRESHOLD = 5.0
 PRECIP_WEAK_THRESHOLD = 1.0
@@ -195,17 +195,11 @@ ORGANISATION_TRACK_METRIC_SPECS = [
 # the across-time chunk-consistency check; it is not invoking a separate
 # PyFLEXTRKR statistical test.
 
-# Cloud-type thresholds copied from convective_pathway_diagnostics.py.
+# Shared coarse-grid precipitation-regime cloud thresholds.
 CF_THRESH = 0.05
-Z_HIGH_KM = 12.0
-Z_LOW_MIN_KM = 2.0
-Z_LOW_MAX_KM = 5.0
-Z_MID_MIN_KM = 5.0
-Z_MID_MAX_KM = 10.0
-Z_UPPER_MIN_KM = 10.0
-P_DEEP = 5.0
-P_WEAK = 1.0
-MAX_CLEAR_GAP_KM = 3.0
+P_HIGH_HPA = 440.0
+P_PRECIP_MIN = 1.0
+CONVECTIVE_FRACTION_THRESHOLD = 0.50
 CLOUD_CLASSIFICATION_CACHE_DIRS = [
     diagnostic_cache_dir("classification_cache", root_dir=root_dir),
 ]
@@ -224,7 +218,7 @@ COMPARISONS = [
 LATHEIGHT_DOMAINS = {
     "DeepTropics_TTL_14_18km": dict(lat_bounds=DEEP_TROPICS_LAT_BOUNDS, z_bounds=TTL_Z_BOUNDS_M),
     "Tropics_TTL_14_18km": dict(lat_bounds=TROPICAL_LAT_BOUNDS, z_bounds=TTL_Z_BOUNDS_M),
-    "Tropics_highcloud_12_18km": dict(lat_bounds=TROPICAL_LAT_BOUNDS, z_bounds=HIGH_CLOUD_Z_BOUNDS_M),
+    "Tropics_upper_troposphere_12_18km": dict(lat_bounds=TROPICAL_LAT_BOUNDS, z_bounds=UPPER_TROPOSPHERE_Z_BOUNDS_M),
 }
 
 MATCHED_PATTERN_DOMAINS = {
@@ -774,7 +768,6 @@ for i, d in enumerate(data_locs):
         ndays=ndays,
         end_date=analysis_end_date,
         chunks=latlon_chunks,
-        add_cldfrac_file=True,
     )
     ds = standardize_latlon_dataset(ds, needed_vars)
 
@@ -786,7 +779,6 @@ for i, d in enumerate(data_locs):
         end_date=analysis_end_date,
         chunks=zm_chunks,
         prefer_pattern=True,
-        add_cldfrac_file=False,
     )
     zds = standardize_latlon_dataset(zds, needed_vars)
 
@@ -871,21 +863,6 @@ def zm_vertical_velocity(zds):
     out = vertical_velocity_from_zm(zds)
     out.name = "vertical_velocity"
     return out
-
-
-def cloud_fraction_time_field(ds, zds):
-    source = None
-    if "cldfrac" in zds.data_vars:
-        source = zds.cldfrac
-    elif "cldfrac" in ds.data_vars:
-        source = ds.cldfrac
-    else:
-        raise ValueError("cldfrac is unavailable")
-    cf = rename_vertical_to_z(finite_or_nan(source))
-    if "z" not in cf.coords:
-        raise ValueError("cldfrac has no geometric z coordinate")
-    cf.name = "cloud_fraction"
-    return cf
 
 
 def field_from_candidates(zds, candidates, name, scale=1.0):
@@ -1544,15 +1521,6 @@ def cloud_profile_blocks(cf):
     return xr.concat(blocks, dim=xr.IndexVariable("block", np.arange(len(blocks))))
 
 
-def high_cloud_fraction_blocks(cf):
-    high = subset_z_m(cf, HIGH_CLOUD_Z_BOUNDS_M).mean(dim="z", skipna=True)
-    high.name = "high_cloud_fraction"
-    return block_scalar_values(
-        subset_latitude(high, TROPICAL_LAT_BOUNDS),
-        lambda xb: weighted_mean_dims(xb, [dim for dim in ("Time", "latitude", "longitude") if dim in xb.dims]),
-    )
-
-
 def plot_cloud_profile_diffs(profile_diffs):
     if not should_run_figure(3) or not profile_diffs:
         return
@@ -1576,15 +1544,9 @@ def plot_cloud_profile_diffs(profile_diffs):
 def classification_thresholds():
     return HighCloudThresholds(
         cf_thresh=CF_THRESH,
-        z_high_km=Z_HIGH_KM,
-        low_cloud_min_km=Z_LOW_MIN_KM,
-        low_cloud_max_km=Z_LOW_MAX_KM,
-        mid_cloud_min_km=Z_MID_MIN_KM,
-        mid_cloud_max_km=Z_MID_MAX_KM,
-        upper_cloud_min_km=Z_UPPER_MIN_KM,
-        max_clear_gap_km=MAX_CLEAR_GAP_KM,
-        surface_precip_deep_mm_day=P_DEEP,
-        surface_precip_weak_mm_day=P_WEAK,
+        high_cloud_top_pressure_hpa=P_HIGH_HPA,
+        surface_precip_min_mm_day=P_PRECIP_MIN,
+        convective_fraction_threshold=CONVECTIVE_FRACTION_THRESHOLD,
     )
 
 
@@ -1595,12 +1557,10 @@ def cached_classification_is_current(cached):
 REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS = (
     "high_cloud_fraction",
     "high_cloud_mask",
-    "column_connected_mask",
-    "active_deep_convection_high_cloud_mask",
-    "convectively_generated_high_cloud_mask",
-    "cirrus_like_high_cloud_mask",
-    "unclassified_high_cloud_mask",
+    "convective_precipitating_high_cloud_mask",
+    "stratiform_precipitating_high_cloud_mask",
     "nonprecipitating_high_cloud_mask",
+    "unclassified_high_cloud_mask",
 )
 
 
@@ -1631,7 +1591,7 @@ def cloud_masks_from_cache(sim_name, precip_ref):
             if "Time" in da.dims and "Time" in precip_ref.dims:
                 common = da.Time.to_index().intersection(precip_ref.Time.to_index())
                 da = da.sel(Time=common)
-            if key.endswith("_mask") or key == "column_connected_mask":
+            if key.endswith("_mask"):
                 da = da.fillna(False).astype(bool)
             out[key] = da
         print(f"Using cached high-cloud classification for {sim_name}: {path}")
@@ -1657,20 +1617,11 @@ def run_cloud_response(precip_by_run):
         "cloud_response",
         extra=dict(
             tropical_lat_bounds=list(TROPICAL_LAT_BOUNDS),
-            high_cloud_z_bounds_m=list(HIGH_CLOUD_Z_BOUNDS_M),
+            upper_troposphere_z_bounds_m=list(UPPER_TROPOSPHERE_Z_BOUNDS_M),
             cloud_thresholds=dict(
-                cf_thresh=float(CF_THRESH),
-                z_high_km=float(Z_HIGH_KM),
-                z_low_min_km=float(Z_LOW_MIN_KM),
-                z_low_max_km=float(Z_LOW_MAX_KM),
-                z_mid_min_km=float(Z_MID_MIN_KM),
-                z_mid_max_km=float(Z_MID_MAX_KM),
-                z_upper_min_km=float(Z_UPPER_MIN_KM),
-                p_deep=float(P_DEEP),
-                p_weak=float(P_WEAK),
-                max_clear_gap_km=jsonable_value(MAX_CLEAR_GAP_KM),
+                **vars(classification_thresholds()),
                 cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
-                classifier="shared 3-D hydrometeor-aware high-cloud classification",
+                classifier="shared coarse-grid precipitation-regime high-cloud classification",
             ),
         ),
     )
@@ -1689,8 +1640,6 @@ def run_cloud_response(precip_by_run):
         for i in range(len(dss)):
             cf = get_cloud_fraction(dss_zm[i])
             if cf is None:
-                cf = get_cloud_fraction(dss[i])
-            if cf is None:
                 raise ValueError(f"cldfrac unavailable for {sim_names[i]}")
             cf_by_run[i] = cf
 
@@ -1702,16 +1651,7 @@ def run_cloud_response(precip_by_run):
         plot_cloud_profile_diffs(profile_diffs)
         profile_rows = diff_datasets_to_profile_table(profile_diffs)
 
-        high_values_by_run = {i: high_cloud_fraction_blocks(cf_by_run[i]) for i in range(len(dss))}
-        append_bootstrap_metric_rows(
-            scalar_metric_rows,
-            high_values_by_run,
-            "cloud_depth_response",
-            "cloud_fraction",
-            "tropical_high_cloud_fraction_12_18km",
-            units="fraction",
-        )
-        record_implemented("high-cloud fraction and vertical cloud-fraction profile block-consistency metrics")
+        record_implemented("vertical cloud-fraction profile block-consistency metrics")
     except Exception as exc:
         record_failure("cloud fraction profile/depth bootstrap", exc)
 
@@ -1727,12 +1667,10 @@ def run_cloud_response(precip_by_run):
         for key in (
             "high_cloud_fraction",
             "high_cloud_mask",
-            "column_connected_mask",
-            "active_deep_convection_high_cloud_mask",
-            "convectively_generated_high_cloud_mask",
-            "cirrus_like_high_cloud_mask",
-            "unclassified_high_cloud_mask",
+            "convective_precipitating_high_cloud_mask",
+            "stratiform_precipitating_high_cloud_mask",
             "nonprecipitating_high_cloud_mask",
+            "unclassified_high_cloud_mask",
         ):
             values_by_run = {i: block_area_fraction_values(class_by_run[i][key]) for i in range(len(dss))}
             append_bootstrap_metric_rows(
@@ -1743,7 +1681,7 @@ def run_cloud_response(precip_by_run):
                 key,
                 units="fraction",
             )
-        record_implemented("cloud-class fraction block-consistency metrics, including passive high-cloud classes as cloud-regime checks rather than organisation checks")
+        record_implemented("coarse-grid precipitation-regime high-cloud fraction block-consistency metrics")
     except Exception as exc:
         record_failure("cloud-type classification bootstrap", exc)
         record_todo(
@@ -1856,8 +1794,8 @@ def run_conditional_precipitation_states(precip_by_run):
 ORGANISATION_SOURCE_ORDER = [
     "precip_ge_1mmh",
     "olr_tb241",
-    "active_deep_convection_high_cloud_mask",
-    "convectively_generated_high_cloud_mask",
+    "convective_precipitating_high_cloud_mask",
+    "stratiform_precipitating_high_cloud_mask",
     # Sensitivity-only sources from convective_organisation_diagnostics.py.
     "precip_ge_2mmh",
     "precip_ge_8mmh",
@@ -1865,16 +1803,15 @@ ORGANISATION_SOURCE_ORDER = [
     "precip_p99",
     "olr_tb233",
     "olr_cold_p05",
-    "column_connected_mask",
     "high_cloud_mask",
 ]
 ORGANISATION_EXCLUDED_SOURCES = {
-    "cirrus_like_high_cloud_mask",
     "nonprecipitating_high_cloud_mask",
+    "unclassified_high_cloud_mask",
 }
 ORGANISATION_CONTEXT_SOURCES = {
     "high_cloud_mask",
-    "convectively_generated_high_cloud_mask",
+    "stratiform_precipitating_high_cloud_mask",
 }
 
 

@@ -50,7 +50,7 @@ figures_to_run = [14]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
-data_locs = ['control', 'u_nudge', 'T_nudge']
+data_locs = ['control_new', 'u_nudge', 'T_nudge']
 latlon_file = ['latlon.2000-*.nc', 'latlon.2000-*.nc', 'latlon.2000-*.nc']
 zm_latlon_file = ['zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc']
 sim_names = ['control', 'nudged u', 'nudged T']
@@ -138,7 +138,6 @@ for i, d in enumerate(data_locs):
         end_date=analysis_end_date,
         chunks={"Time": -1},
         prefer_pattern=True,
-        add_cldfrac_file=False
     )
     zds = standardize_latlon_dataset(zds, needed_vars)
 
@@ -1073,21 +1072,13 @@ if should_run_figure(11):
 
 if should_run_figure(12):
     def get_zm_cldfrac_for_run(i):
-        """Return time-mean zonal-mean cldfrac as (z, latitude), following the existing script's logic."""
-        ds = dss[i]
+        """Return time-mean zonal-mean cldfrac as (z, latitude)."""
         zds = dss_zm[i]
-        if "cldfrac" in zds.data_vars:
-            cld = zds.cldfrac.mean(dim="Time")
-            cld = hemispheric_fold(cld, parity="even")
-            zmid = height_from_zm_latlon(zds)
-            cld, _, _ = lat_height_mesh(cld, zmid, zds.latitude.values)
-            return cld
-        if "cldfrac" in ds.data_vars:
-            cld = ds.cldfrac.mean(dim=("Time", "longitude"))
-            cld = model_lat_field(cld)
-            cld = hemispheric_fold(cld, parity="even")
-            return cld
-        return None
+        cld = zds.cldfrac.mean(dim="Time")
+        cld = hemispheric_fold(cld, parity="even")
+        zmid = height_from_zm_latlon(zds)
+        cld, _, _ = lat_height_mesh(cld, zmid, zds.latitude.values)
+        return cld
 
     cld_control = get_zm_cldfrac_for_run(0)
     cld_u = get_zm_cldfrac_for_run(1)

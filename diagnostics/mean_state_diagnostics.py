@@ -493,7 +493,7 @@ SCALAR_CONSTITUENT_GROUPS = [
 #sim_names = ['crf on', 'crf off']
 
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
-data_locs = ['control', 'u_nudge', 'T_nudge']
+data_locs = ['control_new', 'u_nudge', 'T_nudge']
 latlon_file = ['latlon.2000-*.nc', 'latlon.2000-*.nc', 'latlon.2000-*.nc']
 zm_latlon_file = ['zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc']
 sim_names = ['control', 'nudged u', 'nudged T']
@@ -577,7 +577,6 @@ for i, d in enumerate(data_locs):
         end_date=analysis_end_date,
         chunks=zm_chunks,
         prefer_pattern=True,
-        add_cldfrac_file=False
     )
     zds = standardize_latlon_dataset(zds, needed_vars)
 
@@ -1216,29 +1215,11 @@ if should_run_figure(10):
     control_cldfrac = None
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        if "cldfrac" in zds.data_vars:
-            # Newer zm_latlon files may contain precomputed zonal-mean cloud fraction
-            # with dimensions (Time, z, latitude).
-            cldfrac = zds.cldfrac.mean(dim="Time")
-            cldfrac = hemispheric_fold(cldfrac, parity="even")
-            zmid = height_from_zm_latlon(zds)
-            cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, zds.latitude.values)
-            lat_for_cpt = zds.latitude.values
-
-        elif "cldfrac" in ds.data_vars:
-            # Older runs have no cldfrac in latlon/zm_latlon, but do have a separate
-            # cldfrac.nc.  That file is attached only to the full latlon dataset, so
-            # compute the zonal mean here.
-            cldfrac = ds.cldfrac.mean(dim=("Time", "longitude"))
-            cldfrac = model_lat_field(cldfrac)
-            cldfrac = hemispheric_fold(cldfrac, parity="even")
-
-            zmid = midlevel_height_from_latlon(ds)
-            cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, ds.latitude.values)
-            lat_for_cpt = ds.latitude.values
-        else:
-            print(f"Skipping cloud-fraction plot for {sim_names[i]}: no cldfrac in zm_latlon, latlon, or cldfrac.nc")
-            continue
+        cldfrac = zds.cldfrac.mean(dim="Time")
+        cldfrac = hemispheric_fold(cldfrac, parity="even")
+        zmid = height_from_zm_latlon(zds)
+        cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, zds.latitude.values)
+        lat_for_cpt = zds.latitude.values
 
         im = ax[i].contourf(lat2d, z2d / 1000.0, cldfrac.values, levels=np.linspace(0, 1, 21), cmap='binary', extend='max')
         ax[i].plot(lat_for_cpt, CPTs[i][0]/1000., color='k', lw=1, ls=':')

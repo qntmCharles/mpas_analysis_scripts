@@ -132,18 +132,15 @@ def load_latlon_dataset(
     latlon_pattern="latlon.2000-*.nc",
     diag_file="latlon_diag.nc",
     hist_file="latlon_hist.nc",
-    cldfrac_file="cldfrac.nc",
     time_format="int",
     dt=6,
     ndays=None,
     end_date=None,
     chunks=None,
     prefer_pattern=False,
-    add_cldfrac_file=True,
 ):
     diag_path = os.path.join(data_dir, diag_file)
     hist_path = os.path.join(data_dir, hist_file)
-    cldfrac_path = os.path.join(data_dir, cldfrac_file)
     latlon_files = sorted(glob.glob(os.path.join(data_dir, latlon_pattern)))
 
     if prefer_pattern and latlon_files:
@@ -170,12 +167,6 @@ def load_latlon_dataset(
         else:
             t_end = pd.to_datetime(end_date) if end_date is not None else pd.to_datetime(ds.Time.max().item())
             ds = ds.sel(Time=slice(t_end - pd.Timedelta(days=ndays), t_end))
-
-    if add_cldfrac_file and "cldfrac" not in ds.data_vars and os.path.exists(cldfrac_path):
-        ds_cld = xr.open_dataset(cldfrac_path, chunks={})
-        if "cldfrac" in ds_cld:
-            cldfrac = ds_cld["cldfrac"].reindex(Time=ds.Time)
-            ds = ds.assign(cldfrac=cldfrac)
 
     ds = standardize_cldfrac_vertical_coordinate(ds)
 

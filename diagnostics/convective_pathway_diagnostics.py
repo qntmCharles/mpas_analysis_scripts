@@ -11,9 +11,9 @@ u-nudged, and T-nudged experiments are better explained by:
   * direct or balanced UTLS thermal/static-stability changes; or
   * wind/shear/wave effects, especially in organised equatorial disturbances.
 
-The high-cloud diagnostics deliberately separate active deep convection,
-convectively generated high cloud, and cirrus-like high cloud.  High cloud
-above 12 km is not automatically interpreted as deep precipitating convection.
+The high-cloud diagnostics deliberately separate convective precipitating convection,
+stratiform precipitating high cloud, and non-precipitating high cloud.  High cloud
+with a high cloud top is not automatically interpreted as deep precipitating convection.
 """
 
 import os
@@ -57,18 +57,19 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/convective_p
 #
 # Figure numbers:
 #   1: conditional_highcloud_vs_precip
-#   2: conditional_cloudtop_vs_precip_pw
+#   2: conditional_cloudtop_pressure_vs_precip_pw
 #   3: conditional_precip_pw_by_wave_amplitude_and_phase
 #   4: residual_highcloud_thermo_controls
 #   5: cloud_classification_summary
 #   6: cloud_classification_mean_maps
 #   7: cloud_classification_snapshots
-#   8: conditional_cirrus_like_highcloud_pw_by_lagged_precip
+#   8: conditional_nonprecipitating_highcloud_pw_by_lagged_precip
+#   9: wave_conditioned_cloud_classes_and_cloud_top_pressure
 figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
-data_locs = ["control", "u_nudge", "T_nudge"]
+data_locs = ["control_new", "u_nudge", "T_nudge"]
 latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
 zm_latlon_file = ["zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
@@ -86,15 +87,9 @@ WAVE_FILTER_LAT_BOUNDS = (-10.0, 10.0)
 # High-cloud classification thresholds.  Keep these near the top so threshold
 # sensitivity tests do not require editing the classification logic.
 CF_THRESH = 0.05
-Z_HIGH = 12.0       # km
-Z_LOW_MIN = 2.0     # km
-Z_LOW_MAX = 5.0     # km
-Z_MID_MIN = 5.0     # km
-Z_MID_MAX = 10.0    # km
-Z_UPPER_MIN = 10.0  # km
-P_DEEP = 5.0        # mm day-1
-P_WEAK = 1.0        # mm day-1
-MAX_CLEAR_GAP = 3.0 # km
+P_HIGH_HPA = 440.0
+P_PRECIP_MIN = 1.0
+CONVECTIVE_FRACTION = 0.50
 LAGGED_PRECIP_TIME_STEPS = 1
 
 # Conditional sampling and binning controls.  These diagnostics use high-time
@@ -188,19 +183,17 @@ WAVE_PHASE_THRESHOLD_STD = 0.5
 
 CLOUD_CATEGORY_SPECS = [
     ("high_cloud_mask", "Total high cloud", "0.25"),
-    ("column_connected_mask", "Column-connected", "tab:blue"),
-    ("active_deep_convection_high_cloud_mask", "Active deep convection", "tab:purple"),
-    ("convectively_generated_high_cloud_mask", "Convectively generated high cloud", "tab:orange"),
-    ("cirrus_like_high_cloud_mask", "Cirrus-like high cloud", "tab:green"),
-    ("unclassified_high_cloud_mask", "Ambiguous/unclassified", "0.55"),
-    ("nonprecipitating_high_cloud_mask", "Nonprecip high cloud", "tab:red"),
+    ("convective_precipitating_high_cloud_mask", "Convective precipitating", "tab:red"),
+    ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating", "tab:blue"),
+    ("nonprecipitating_high_cloud_mask", "Non-precipitating", "tab:green"),
+    ("unclassified_high_cloud_mask", "Invalid/unclassified", "0.55"),
 ]
 
 MAP_CATEGORY_SPECS = [
     ("high_cloud_mask", "Total high cloud"),
-    ("column_connected_mask", "Column-connected"),
-    ("convectively_generated_high_cloud_mask", "Convectively generated"),
-    ("cirrus_like_high_cloud_mask", "Cirrus-like"),
+    ("convective_precipitating_high_cloud_mask", "Convective precipitating"),
+    ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating"),
+    ("nonprecipitating_high_cloud_mask", "Non-precipitating"),
 ]
 
 
@@ -330,15 +323,9 @@ def time_aligned_field(ds, key, ref, required=False):
 def classification_thresholds():
     return HighCloudThresholds(
         cf_thresh=CF_THRESH,
-        z_high_km=Z_HIGH,
-        low_cloud_min_km=Z_LOW_MIN,
-        low_cloud_max_km=Z_LOW_MAX,
-        mid_cloud_min_km=Z_MID_MIN,
-        mid_cloud_max_km=Z_MID_MAX,
-        upper_cloud_min_km=Z_UPPER_MIN,
-        max_clear_gap_km=MAX_CLEAR_GAP,
-        surface_precip_deep_mm_day=P_DEEP,
-        surface_precip_weak_mm_day=P_WEAK,
+        high_cloud_top_pressure_hpa=P_HIGH_HPA,
+        surface_precip_min_mm_day=P_PRECIP_MIN,
+        convective_fraction_threshold=CONVECTIVE_FRACTION,
     )
 
 
@@ -351,13 +338,15 @@ def cached_classification_is_current(cached):
 
 
 REQUIRED_CLASSIFICATION_VARS = (
+    "cloud_top_pressure",
+    "cloud_top_height",
     "high_cloud_fraction",
     "high_cloud_mask",
-    "active_deep_convection_high_cloud_mask",
-    "convectively_generated_high_cloud_mask",
-    "cirrus_like_high_cloud_mask",
+    "precipitating_high_cloud_mask",
+    "convective_precipitating_high_cloud_mask",
+    "stratiform_precipitating_high_cloud_mask",
+    "nonprecipitating_high_cloud_mask",
     "unclassified_high_cloud_mask",
-    "distance_to_active_convection_km",
 )
 
 
@@ -399,12 +388,10 @@ def print_class_coverage(classifications):
             continue
         for key in (
             "high_cloud_mask",
-            "column_connected_mask",
-            "active_deep_convection_high_cloud_mask",
-            "convectively_generated_high_cloud_mask",
-            "cirrus_like_high_cloud_mask",
-            "unclassified_high_cloud_mask",
+            "convective_precipitating_high_cloud_mask",
+            "stratiform_precipitating_high_cloud_mask",
             "nonprecipitating_high_cloud_mask",
+            "unclassified_high_cloud_mask",
         ):
             rows.append(
                 dict(
@@ -443,9 +430,9 @@ def class_overlap_sanity(classifications):
     progress("Computing high-cloud class overlap/denominator sanity checks")
     rows = []
     exclusive_keys = [
-        "active_deep_convection_high_cloud_mask",
-        "convectively_generated_high_cloud_mask",
-        "cirrus_like_high_cloud_mask",
+        "convective_precipitating_high_cloud_mask",
+        "stratiform_precipitating_high_cloud_mask",
+        "nonprecipitating_high_cloud_mask",
         "unclassified_high_cloud_mask",
     ]
     for sim_name, classif in classifications.items():
@@ -455,7 +442,7 @@ def class_overlap_sanity(classifications):
         high_frac = weighted_area_time_mean(high, TROPICAL_LAT_BOUNDS)
         rows.append(dict(simulation=sim_name, metric="high_cloud_denominator", value=high_frac))
 
-        for key in exclusive_keys + ["column_connected_mask", "nonprecipitating_high_cloud_mask"]:
+        for key in exclusive_keys + ["precipitating_high_cloud_mask"]:
             mask = classif[key].astype(bool)
             rows.append(dict(simulation=sim_name, metric=f"{key}_coverage", value=weighted_area_time_mean(mask, TROPICAL_LAT_BOUNDS)))
             rows.append(dict(simulation=sim_name, metric=f"{key}_within_high_cloud", value=weighted_area_time_mean(mask & high, TROPICAL_LAT_BOUNDS) / high_frac if high_frac > 0 else np.nan))
@@ -1026,6 +1013,115 @@ def filter_latmean_wave(fields, sim_index, field_key, wave_name):
     return wave
 
 
+def wave_conditioned_cloud_table(fields_by_run, classifications_by_run):
+    rows = []
+    class_specs = [
+        ("convective_precipitating_high_cloud_mask", "Convective precipitating"),
+        ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating"),
+        ("nonprecipitating_high_cloud_mask", "Non-precipitating"),
+    ]
+    condition_specs = [
+        ("suppressed", lambda phase: phase <= -WAVE_PHASE_THRESHOLD_STD),
+        ("neutral", lambda phase: np.abs(phase) < WAVE_PHASE_THRESHOLD_STD),
+        ("active", lambda phase: phase >= WAVE_PHASE_THRESHOLD_STD),
+    ]
+    for wave_name in WAVE_BANDS_FOR_FIG3:
+        for i, (fields, sim_name) in enumerate(zip(fields_by_run, sim_names)):
+            classif = classifications_by_run.get(sim_name)
+            if classif is None:
+                continue
+            field_key = WAVE_FILTER_FIELD if WAVE_FILTER_FIELD in fields else "precip"
+            wave = filter_latmean_wave(fields, i, field_key, wave_name)
+            sigma = float(wave.std(dim=("Time", "longitude"), skipna=True).values)
+            if not np.isfinite(sigma) or sigma <= 0.0:
+                continue
+            phase = active_phase_sign(field_key) * wave / sigma
+            for condition, selector in condition_specs:
+                condition_mask = selector(phase)
+                for class_key, class_label in class_specs:
+                    mask, condition_aligned = xr.align(
+                        classif[class_key].astype(float), condition_mask, join="inner"
+                    )
+                    fraction = weighted_area_time_mean(mask.where(condition_aligned))
+                    ctp, class_bool, condition_ctp = xr.align(
+                        classif["cloud_top_pressure"],
+                        classif[class_key].astype(bool),
+                        condition_mask,
+                        join="inner",
+                    )
+                    mean_ctp = weighted_area_time_mean(
+                        ctp.where(class_bool & condition_ctp)
+                    )
+                    rows.append(
+                        dict(
+                            wave=wave_name,
+                            wave_label=wave_label(wave_name),
+                            simulation=sim_name,
+                            condition=condition,
+                            class_key=class_key,
+                            class_label=class_label,
+                            conditional_area_fraction=fraction,
+                            mean_cloud_top_pressure_hpa=mean_ctp,
+                            denominator="tropical area-time within wave condition",
+                        )
+                    )
+    return pd.DataFrame(rows)
+
+
+def plot_wave_conditioned_cloud_diagnostics(table):
+    if len(table) == 0:
+        return
+    table.to_csv(
+        os.path.join(save_loc, "wave_conditioned_cloud_classes_and_cloud_top_pressure.csv"),
+        index=False,
+    )
+    conditions = ["suppressed", "neutral", "active"]
+    classes = list(table.class_key.drop_duplicates())
+    labels = {
+        key: table.loc[table.class_key == key, "class_label"].iloc[0]
+        for key in classes
+    }
+    x = np.arange(len(classes))
+    width = 0.8 / len(sim_names)
+    for wave_name in WAVE_BANDS_FOR_FIG3:
+        wave_table = table[table.wave == wave_name]
+        if len(wave_table) == 0:
+            continue
+        for metric, ylabel, stem, invert in (
+            ("conditional_area_fraction", "Conditional tropical area-time fraction", "class_fraction", False),
+            ("mean_cloud_top_pressure_hpa", "Mean cloud-top pressure (hPa)", "cloud_top_pressure", True),
+        ):
+            fig, axes = plt.subplots(
+                1, len(conditions), figsize=(12.5, 3.8), constrained_layout=True, sharey=True
+            )
+            for c, condition in enumerate(conditions):
+                ax = axes[c]
+                sub = wave_table[wave_table.condition == condition]
+                for i, sim_name in enumerate(sim_names):
+                    values = []
+                    for class_key in classes:
+                        row = sub[(sub.simulation == sim_name) & (sub.class_key == class_key)]
+                        values.append(float(row[metric].iloc[0]) if len(row) else np.nan)
+                    ax.bar(
+                        x + (i - (len(sim_names) - 1) / 2) * width,
+                        values,
+                        width,
+                        color=cols[i],
+                        label=sim_name if c == 0 else None,
+                    )
+                ax.set_title(condition.title())
+                ax.set_xticks(x)
+                ax.set_xticklabels([labels[key] for key in classes], rotation=25, ha="right")
+                ax.grid(axis="y", alpha=0.2)
+                if invert:
+                    ax.invert_yaxis()
+            axes[0].set_ylabel(ylabel)
+            axes[0].legend(frameon=False)
+            fig.suptitle(f"{wave_label(wave_name)}-conditioned high cloud")
+            save_figure(9, fig, f"wave_conditioned_{stem}_{wave_name}")
+            plt.close(fig)
+
+
 # -----------------------------------------------------------------------------
 # Residual model helpers
 # -----------------------------------------------------------------------------
@@ -1125,12 +1221,12 @@ def feature_matrix_from_values(feature_keys, values):
 def residual_target_da(classif, target_key):
     if target_key == "total":
         return classif["high_cloud_fraction"].clip(min=0.0, max=1.0)
-    if target_key == "active":
-        return classif["active_deep_convection_high_cloud_mask"].astype(float)
-    if target_key == "generated":
-        return classif["convectively_generated_high_cloud_mask"].astype(float)
-    if target_key == "cirrus":
-        return classif["cirrus_like_high_cloud_mask"].astype(float)
+    if target_key == "convective":
+        return classif["convective_precipitating_high_cloud_mask"].astype(float)
+    if target_key == "stratiform":
+        return classif["stratiform_precipitating_high_cloud_mask"].astype(float)
+    if target_key == "nonprecipitating":
+        return classif["nonprecipitating_high_cloud_mask"].astype(float)
     raise ValueError(target_key)
 
 
@@ -1196,7 +1292,6 @@ for i, d in enumerate(data_locs):
             ndays=ndays,
             end_date=analysis_end_date,
             chunks=latlon_chunks,
-            add_cldfrac_file=False,
         )
     ds = standardize_latlon_dataset(ds, needed_vars)
     progress(f"{sim_names[i]}: lat-lon dataset ready with {len(ds.data_vars)} variables")
@@ -1210,7 +1305,6 @@ for i, d in enumerate(data_locs):
         end_date=analysis_end_date,
         chunks=zm_chunks,
         prefer_pattern=True,
-        add_cldfrac_file=False,
     )
     zds = standardize_latlon_dataset(zds, needed_vars)
     progress(f"{sim_names[i]}: zonal-mean dataset ready with {len(zds.data_vars)} variables")
@@ -1258,9 +1352,9 @@ if should_run_any([1, 2, 4, 5, 6, 7, 8]):
 #     denominator for class-fraction diagnostics.
 #   * The zonal curves show whether a class response is confined to the equator,
 #     flanks, or broad tropical belt.
-#   * Cirrus-like means high, shallow or weakly precipitating, and separated
-#     from active deep convection by the shared object/distance classifier. It
-#     does not by itself prove radiatively passive cirrus.
+#   * Non-precipitating means high cloud with total rainc+rainnc below the shared
+#     precipitation threshold; it is a precipitation regime, not a detailed
+#     microphysical cloud-type claim.
 
 if should_run_figure(5):
     progress("Starting Figure 5: cloud_classification_summary")
@@ -1388,8 +1482,8 @@ if should_run_figure(6):
 # -----------------------------------------------------------------------------
 # WHAT TO LOOK FOR:
 #   * Snapshots are a sanity check on whether the masks look meteorologically
-#     sensible: active deep convection should be compact, convectively generated
-#     cloud should lie near or downstream of active objects, and cirrus-like
+#     sensible: convective precipitating convection should be compact, stratiform precipitating
+#     cloud should lie near or downstream of active objects, and non-precipitating
 #     masks should be separated by construction.
 
 if should_run_figure(7):
@@ -1399,9 +1493,9 @@ if should_run_figure(7):
     else:
         snapshot_specs = [
             ("high_cloud_mask", "Total high cloud"),
-            ("active_deep_convection_high_cloud_mask", "Active deep convection"),
-            ("convectively_generated_high_cloud_mask", "Convectively generated"),
-            ("cirrus_like_high_cloud_mask", "Cirrus-like"),
+            ("convective_precipitating_high_cloud_mask", "Convective precipitating"),
+            ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating"),
+            ("nonprecipitating_high_cloud_mask", "Non-precipitating"),
         ]
         fig, ax = plt.subplots(
             len(sim_names), len(snapshot_specs),
@@ -1458,12 +1552,12 @@ if should_run_figure(7):
 #     thermal/static-stability pathway.
 #   * If u-nudged remains distinct from T-nudged at fixed N2_TTL, this supports
 #     a wind/shear/wave pathway.
-#   * If the signal is mainly cirrus-like or convectively generated high cloud
-#     rather than active deep convection, do not interpret it as simply deeper
+#   * If the signal is mainly non-precipitating or stratiform precipitating high cloud
+#     rather than convective precipitating convection, do not interpret it as simply deeper
 #     precipitating convection.
-#   * Cirrus-like high cloud is not plotted against local precipitation here
+#   * Non-precipitating is not plotted against local precipitation here
 #     because weak local precipitation is part of that category definition.
-#     Cirrus-like and nonprecipitating high cloud are diagnosed in the
+#     Non-precipitating and nonprecipitating high cloud are diagnosed in the
 #     classification summary figures and should be interpreted as
 #     occurrence/lifetime/proximity information, not as a local rain-rate
 #     response curve.
@@ -1502,9 +1596,9 @@ if should_run_figure(1):
                 )
 
             response_specs = [
-                ("total high cloud", lambda c: c["high_cloud_fraction"], "High-cloud fraction above 12 km"),
-                ("column-connected", lambda c: c["column_connected_mask"].astype(float), "Column-connected high-cloud probability"),
-                ("convectively generated", lambda c: c["convectively_generated_high_cloud_mask"].astype(float), "Convectively generated high-cloud probability"),
+                ("total high cloud", lambda c: c["high_cloud_fraction"], "High-cloud fraction, cloud top <= 440 hPa"),
+                ("convective precipitating", lambda c: c["convective_precipitating_high_cloud_mask"].astype(float), "Convective-precipitating high-cloud probability"),
+                ("stratiform precipitating", lambda c: c["stratiform_precipitating_high_cloud_mask"].astype(float), "Stratiform precipitating high-cloud probability"),
             ]
 
             labels = condition_labels(cond_edges, condition_label)
@@ -1578,21 +1672,19 @@ if should_run_figure(1):
 
 
 # -----------------------------------------------------------------------------
-# Figure 2. Cloud-top height vs precipitation, conditioned on PW
+# Figure 2. Cloud-top pressure vs precipitation, conditioned on PW
 # -----------------------------------------------------------------------------
 # Interpretation:
-#   * Higher cloud tops in u-nudged at fixed precipitation and PW imply altered
+#   * Lower cloud-top pressure in u-nudged at fixed precipitation and PW implies altered
 #     vertical cloud expression independent of local rain rate and moisture.
-#   * If the increase appears only for column-connected cloud, it suggests
-#     deeper precipitating convection.
-#   * If it appears mainly outside active deep convection, it suggests changes
-#     in convectively generated or cirrus-like cloud lifetime, detrainment, or
+#   * A difference between convective and stratiform curves distinguishes the
+#     strong-rain/ascent convective pathway from weaker precipitating high cloud.
+#   * If it appears mainly outside convective precipitation, it suggests changes
+#     in stratiform precipitating or non-precipitating cloud lifetime, detrainment, or
 #     upper-level cloud-radiative effects.
-#   * Cirrus-like high cloud is intentionally not conditioned on local
-#     precipitation here because P_WEAK is part of its definition.
 
 if should_run_figure(2):
-    progress("Starting Figure 2: conditional_cloudtop_vs_precip_pw")
+    progress("Starting Figure 2: conditional_cloudtop_pressure_vs_precip_pw")
     if not all("pw" in f for f in fields_by_run):
         print("Skipping Figure 2: PW is unavailable in at least one run.")
     elif not any(classifications_by_run.get(sim_name) is not None for sim_name in sim_names):
@@ -1605,8 +1697,8 @@ if should_run_figure(2):
 
         class_specs = [
             ("all high", "high_cloud_mask", "-", "All high cloud"),
-            ("active deep", "active_deep_convection_high_cloud_mask", "--", "Active deep convection"),
-            ("convectively generated", "convectively_generated_high_cloud_mask", ":", "Convectively generated high cloud"),
+            ("convective precipitating", "convective_precipitating_high_cloud_mask", "--", "Convective precipitating"),
+            ("stratiform precipitating", "stratiform_precipitating_high_cloud_mask", ":", "Stratiform precipitating"),
         ]
 
         labels = condition_labels(pw_edges, "PW")
@@ -1624,24 +1716,24 @@ if should_run_figure(2):
                     continue
                 fields = fields_by_run[i]
                 vals, weights = sample_matching_arrays(
-                    fields["precip"], fields["pw"], classif["cloud_top_height"], classif["high_cloud_mask"].astype(float),
-                    classif["active_deep_convection_high_cloud_mask"].astype(float),
-                    classif["convectively_generated_high_cloud_mask"].astype(float),
+                    fields["precip"], fields["pw"], classif["cloud_top_pressure"], classif["high_cloud_mask"].astype(float),
+                    classif["convective_precipitating_high_cloud_mask"].astype(float),
+                    classif["stratiform_precipitating_high_cloud_mask"].astype(float),
                     lat_bounds=TROPICAL_LAT_BOUNDS,
                     **PLOT_SAMPLE_LIMITS,
                 )
-                pr_v, pw_v, cth_v, high_v, active_v, generated_v = vals
+                pr_v, pw_v, ctp_v, high_v, active_v, generated_v = vals
                 cond_mask = (pw_v >= lo) & (pw_v <= hi if c == n_condition_bins - 1 else pw_v < hi)
 
                 masks = {
                     "high_cloud_mask": high_v >= 0.5,
-                    "active_deep_convection_high_cloud_mask": active_v >= 0.5,
-                    "convectively_generated_high_cloud_mask": generated_v >= 0.5,
+                    "convective_precipitating_high_cloud_mask": active_v >= 0.5,
+                    "stratiform_precipitating_high_cloud_mask": generated_v >= 0.5,
                 }
                 for class_label, mask_key, linestyle, _pretty in class_specs:
                     valid = cond_mask & masks[mask_key]
                     centres, mean, count = weighted_binned_mean(
-                        pr_v[valid], cth_v[valid], precip_bins,
+                        pr_v[valid], ctp_v[valid], precip_bins,
                         weights=weights[valid],
                         min_count=MIN_BIN_COUNT,
                     )
@@ -1658,8 +1750,8 @@ if should_run_figure(2):
 
                 high_den = (high_v >= 0.5) & cond_mask
                 for frac_label, numerator, linestyle in [
-                    ("active-deep fraction", active_v >= 0.5, "--"),
-                    ("convectively generated fraction", generated_v >= 0.5, ":"),
+                    ("convective fraction", active_v >= 0.5, "--"),
+                    ("stratiform precipitating fraction", generated_v >= 0.5, ":"),
                 ]:
                     centres, frac, count = weighted_binned_fraction(
                         pr_v, numerator, precip_bins,
@@ -1685,29 +1777,28 @@ if should_run_figure(2):
                 ax[rr, c].grid(alpha=0.2)
                 add_low_count_note(ax[rr, c])
 
-        ax[0, 0].set_ylabel("Mean cloud-top height (km)")
+        for c in range(n_condition_bins):
+            ax[0, c].invert_yaxis()
+        ax[0, 0].set_ylabel("Mean cloud-top pressure (hPa)")
         ax[1, 0].set_ylabel("Fraction of high-cloud samples\n(denominator: all high cloud)")
         ax[0, 0].legend(loc="best", fontsize=7)
         ax[1, 0].legend(loc="best", fontsize=7)
-        fig.suptitle("Cloud-top height and high-cloud class fractions at fixed PW")
-        save_figure(2, fig, "conditional_cloudtop_vs_precip_pw")
-        count_rows_to_frame(count_rows, "conditional_cloudtop_vs_precip_pw")
-        progress("Done with figure: conditional_cloudtop_vs_precip_pw")
+        fig.suptitle("Cloud-top pressure and high-cloud class fractions at fixed PW")
+        save_figure(2, fig, "conditional_cloudtop_pressure_vs_precip_pw")
+        count_rows_to_frame(count_rows, "conditional_cloudtop_pressure_vs_precip_pw")
+        progress("Done with figure: conditional_cloudtop_pressure_vs_precip_pw")
 
 
 # -----------------------------------------------------------------------------
-# Figure 8. Cirrus-like/nonprecipitating high cloud vs PW by lagged precipitation
+# Figure 8. Non-precipitating high cloud vs PW by lagged precipitation
 # -----------------------------------------------------------------------------
 # Interpretation:
-#   * This avoids plotting cirrus-like cloud against current local precipitation,
-#     because P_WEAK is part of the cirrus-like/nonprecipitating definitions.
-#   * A stronger cirrus-like occurrence after previous-timestep rain suggests
-#     convective production/lifetime effects. Occurrence without lagged rain is
-#     a better separated-cirrus candidate, but still not proof of optically thin
-#     or radiatively passive cirrus.
+#   * This avoids plotting non-precipitating cloud against current local precipitation.
+#   * A stronger non-precipitating occurrence after previous-timestep rain suggests
+#     a precipitation-memory or detrainment effect.
 
 if should_run_figure(8):
-    progress("Starting Figure 8: conditional_cirrus_like_highcloud_pw_by_lagged_precip")
+    progress("Starting Figure 8: conditional_nonprecipitating_highcloud_pw_by_lagged_precip")
     if not all("pw" in f for f in fields_by_run):
         print("Skipping Figure 8: PW is unavailable in at least one run.")
     elif not any(classifications_by_run.get(sim_name) is not None for sim_name in sim_names):
@@ -1717,12 +1808,11 @@ if should_run_figure(8):
             fields_by_run, classifications_by_run, "pw", PW_NBINS
         )
         target_specs = [
-            ("cirrus-like", "cirrus_like_high_cloud_mask", "Cirrus-like high-cloud occurrence"),
-            ("nonprecipitating high", "nonprecipitating_high_cloud_mask", "Nonprecipitating high-cloud occurrence"),
+            ("non-precipitating", "nonprecipitating_high_cloud_mask", "Non-precipitating high-cloud occurrence"),
         ]
         lag_specs = [
-            (f"previous P <= {P_WEAK:g}", "weak_lagged_precip", lambda lag: lag <= P_WEAK),
-            (f"previous P >= {P_DEEP:g}", "strong_lagged_precip", lambda lag: lag >= P_DEEP),
+            (f"previous P < {P_PRECIP_MIN:g}", "dry_lagged_precip", lambda lag: lag < P_PRECIP_MIN),
+            (f"previous P >= {P_PRECIP_MIN:g}", "wet_lagged_precip", lambda lag: lag >= P_PRECIP_MIN),
         ]
         fig, ax = plt.subplots(
             len(target_specs), len(lag_specs),
@@ -1781,12 +1871,12 @@ if should_run_figure(8):
                     ax[r, c].set_xlabel(r"PW (kg m$^{-2}$)")
         ax[0, 0].legend(loc="best")
         fig.suptitle(
-            "Cirrus-like/nonprecipitating high cloud vs PW split by previous-timestep precipitation\n"
+            "Non-precipitating high cloud vs PW split by previous-timestep precipitation\n"
             "Current local precipitation is not used as the conditioning axis"
         )
-        save_figure(8, fig, "conditional_cirrus_like_highcloud_pw_by_lagged_precip")
-        count_rows_to_frame(count_rows, "conditional_cirrus_like_highcloud_pw_by_lagged_precip")
-        progress("Done with figure: conditional_cirrus_like_highcloud_pw_by_lagged_precip")
+        save_figure(8, fig, "conditional_nonprecipitating_highcloud_pw_by_lagged_precip")
+        count_rows_to_frame(count_rows, "conditional_nonprecipitating_highcloud_pw_by_lagged_precip")
+        progress("Done with figure: conditional_nonprecipitating_highcloud_pw_by_lagged_precip")
 
 
 # -----------------------------------------------------------------------------
@@ -1923,6 +2013,22 @@ if should_run_figure(3):
 
 
 # -----------------------------------------------------------------------------
+# Figure 9. Wave-conditioned cloud classes and cloud-top pressure
+# -----------------------------------------------------------------------------
+
+if should_run_figure(9):
+    progress("Starting Figure 9: wave_conditioned_cloud_classes_and_cloud_top_pressure")
+    if kf_filter is None:
+        print("Skipping Figure 9: waveFilter.kf_filter is unavailable.")
+    else:
+        wave_cloud_table = wave_conditioned_cloud_table(
+            fields_by_run, classifications_by_run
+        )
+        plot_wave_conditioned_cloud_diagnostics(wave_cloud_table)
+        progress("Done with figure: wave_conditioned_cloud_classes_and_cloud_top_pressure")
+
+
+# -----------------------------------------------------------------------------
 # Figure 4. Residual high cloud after removing local thermodynamic controls
 # -----------------------------------------------------------------------------
 # Interpretation:
@@ -1932,9 +2038,9 @@ if should_run_figure(3):
 #     this supports a thermal/static-stability pathway.
 #   * If u-nudged has a distinct residual at fixed N2_TTL, especially organised
 #     by dudz_TTL, this supports a wind/shear/wave pathway.
-#   * Residuals in active deep convection imply deeper or more vertically
-#     connected precipitating convection; residuals in convectively generated or
-#     cirrus-like cloud imply changes in detrainment, lifetime, or upper-level
+#   * Residuals in convective precipitating convection imply deeper or more vertically
+#     connected precipitating convection; residuals in stratiform precipitating or
+#     non-precipitating cloud imply changes in detrainment, lifetime, or upper-level
 #     cloud-radiative feedback rather than simply deeper convective cores.
 
 if should_run_figure(4):
@@ -1951,9 +2057,9 @@ if should_run_figure(4):
 
         target_specs = [
             ("total", "Total high cloud"),
-            ("active", "Active deep convection"),
-            ("generated", "Convectively generated high cloud"),
-            ("cirrus", "Cirrus-like high cloud"),
+            ("convective", "Convective precipitating"),
+            ("stratiform", "Stratiform precipitating"),
+            ("nonprecipitating", "Non-precipitating"),
         ]
 
         residual_samples = {}

@@ -20,6 +20,7 @@ Longitude is periodic both when labelling objects across the seam and when
 measuring distances between centroids.
 """
 
+import glob
 import json
 import os
 import sys
@@ -39,7 +40,8 @@ import dask
 import numpy as np
 import pandas as pd
 import xarray as xr
-from matplotlib import pyplot as plt
+from matplotlib import animation, colors as mpl_colors, pyplot as plt
+from matplotlib.patches import Patch
 from scipy import ndimage
 
 from diagnostic_helpers import *
@@ -80,6 +82,9 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/organisation
 #   8: PyFLEXTRKR-method track lifetime conditioned on tropical-mean precipitation
 #   9: PyFLEXTRKR-method track lifetime conditioned on convective area fraction
 #   10: propagation-aware pattern autocorrelation
+#   11: PyFLEXTRKR cloud-object and track validation snapshots
+#   12: separate per-simulation classification and PyFLEXTRKR tracking movies
+#   13: PyFLEXTRKR track-step continuity validation
 #
 # WHAT TO LOOK FOR:
 #   * Robust Lorg or object-count changes at fixed tropical precipitation imply
@@ -92,6 +97,12 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/organisation
 #   * PyFLEXTRKR is used here to define overlap-based tracks and merge/split
 #     bookkeeping; the separate block-resampling script tests whether the
 #     resulting metric differences are consistent across time chunks.
+#   * In Figure 11, feature boundaries should follow the plotted rain, cold-OLR,
+#     or cloud masks and numbered paths should move continuously between scenes.
+#   * Figure 12 separates the evolving classification, cloud-object tracks, and
+#     independent precipitation/OLR tracks so each movie answers one question.
+#   * Figure 13 exposes implausible centroid jumps quantitatively rather than
+#     relying only on visual inspection of paths.
 figures_to_run = []
 figsave = None
 
@@ -121,7 +132,7 @@ FORCE_RECOMPUTE_PERSISTENCE_CACHE = (
 )
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
-data_locs = ["control", "u_nudge", "T_nudge"]
+data_locs = ["control_new", "u_nudge", "T_nudge"]
 latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
 cols = ["k", "b", "r"]
@@ -190,33 +201,37 @@ CLOUD_CLASSIFICATION_CACHE_DIRS = [
 ]
 
 CLOUD_OBJECT_KEYS_PRIMARY = [
-    "active_deep_convection_high_cloud_mask",
-    "convectively_generated_high_cloud_mask",
+    "convective_precipitating_high_cloud_mask",
+    "stratiform_precipitating_high_cloud_mask",
+    "nonprecipitating_high_cloud_mask",
 ]
 CLOUD_OBJECT_KEYS_SENSITIVITY = [
-    "column_connected_mask",
     "high_cloud_mask",
-    "cirrus_like_high_cloud_mask",
     "unclassified_high_cloud_mask",
-    "nonprecipitating_high_cloud_mask",
 ]
 CLOUD_OBJECT_KEYS = CLOUD_OBJECT_KEYS_PRIMARY + (
     CLOUD_OBJECT_KEYS_SENSITIVITY if RUN_SENSITIVITY_OBJECT_SOURCES else []
 )
 
+# Figure 11 samples the principal independent object definitions as well as the
+# two precipitation-regime cloud masks. This makes it possible to distinguish a
+# PyFLEXTRKR linkage problem from a problem in the cloud classification itself.
+PYFLEXTRKR_VALIDATION_SOURCES = [
+    "precip_ge_1mmh",
+    "olr_tb241",
+    *CLOUD_OBJECT_KEYS_PRIMARY,
+]
+PYFLEXTRKR_CLASS_SOURCES = list(CLOUD_OBJECT_KEYS_PRIMARY)
+PYFLEXTRKR_CONTEXT_SOURCES = ["precip_ge_1mmh", "olr_tb241"]
+PYFLEXTRKR_MOVIE_MAX_FRAMES = 48
+PYFLEXTRKR_MOVIE_FPS = 4
+PYFLEXTRKR_MOVIE_TRACK_HISTORY_STEPS = 6
+
 # Shared high-cloud thresholds used to validate the refined classification cache.
 CF_THRESH = 0.05
-Z_HIGH = 12.0
-Z_LOW_MIN = 2.0
-Z_LOW_MAX = 5.0
-Z_MID_MIN = 5.0
-Z_MID_MAX = 10.0
-Z_UPPER_MIN = 10.0
-P_DEEP = 5.0
-P_WEAK = 1.0
-MAX_CLEAR_GAP = 3.0
-ANVIL_RADIUS_DEG = 5.0
-ANVIL_TIME_STEPS = 1
+P_HIGH_HPA = 440.0
+P_PRECIP_MIN = 1.0
+CONVECTIVE_FRACTION = 0.50
 
 MIN_OBJECT_CELLS = 1
 MIN_OBJECT_AREA_KM2 = 0.0
@@ -269,17 +284,43 @@ SOURCE_LABELS = {
     "olr_tb233": r"OLR $T_b^\ast \leq$ 233 K",
     "olr_cold_p05": "Cold OLR anomaly p5",
     "high_cloud_mask": "High cloud",
-    "column_connected_mask": "Column-connected high cloud",
-    "active_deep_convection_high_cloud_mask": "Active deep convection",
-    "convectively_generated_high_cloud_mask": "Convectively generated high cloud",
-    "unclassified_high_cloud_mask": "Ambiguous/unclassified high cloud",
-    "cirrus_like_high_cloud_mask": "Cirrus-like high cloud",
-    "nonprecipitating_high_cloud_mask": "Nonprecipitating high cloud",
+    "convective_precipitating_high_cloud_mask": "Convective precipitating high cloud",
+    "stratiform_precipitating_high_cloud_mask": "Stratiform precipitating high cloud",
+    "nonprecipitating_high_cloud_mask": "Non-precipitating high cloud",
+    "unclassified_high_cloud_mask": "Invalid/unclassified high cloud",
 }
 
 SOURCE_ORDER = [spec["name"] for spec in PRECIP_OBJECT_SPECS]
 SOURCE_ORDER += [spec["name"] for spec in OLR_OBJECT_SPECS]
 SOURCE_ORDER += CLOUD_OBJECT_KEYS
+
+CLASSIFICATION_DIAGNOSTIC_KEYS = [
+    "high_cloud_mask",
+    "convective_precipitating_high_cloud_mask",
+    "stratiform_precipitating_high_cloud_mask",
+    "nonprecipitating_high_cloud_mask",
+    "unclassified_high_cloud_mask",
+    "cloud_top_pressure",
+]
+
+PRECIP_RATE_COLS = [
+    [255 / 255.0, 255 / 255.0, 255 / 255.0],
+    [205 / 255.0, 236 / 255.0, 251 / 255.0],
+    [157 / 255.0, 218 / 255.0, 247 / 255.0],
+    [72 / 255.0, 142 / 255.0, 202 / 255.0],
+    [72 / 255.0, 158 / 255.0, 148 / 255.0],
+    [73 / 255.0, 181 / 255.0, 70 / 255.0],
+    [150 / 255.0, 203 / 255.0, 80 / 255.0],
+    [250 / 255.0, 232 / 255.0, 92 / 255.0],
+    [248 / 255.0, 184 / 255.0, 73 / 255.0],
+    [245 / 255.0, 106 / 255.0, 41 / 255.0],
+    [230 / 255.0, 74 / 255.0, 41 / 255.0],
+    [211 / 255.0, 31 / 255.0, 40 / 255.0],
+    [183 / 255.0, 27 / 255.0, 34 / 255.0],
+    [146 / 255.0, 21 / 255.0, 25 / 255.0],
+    [110 / 255.0, 15 / 255.0, 15 / 255.0],
+]
+PRECIP_RATE_LEVELS = np.linspace(0.01, 25.0, len(PRECIP_RATE_COLS))
 
 needed_vars = sorted(
     set(
@@ -312,12 +353,28 @@ def save_figure(number, fig, stem, dpi=300):
     return figsave.save(fig, stem, number=number, dpi=dpi)
 
 
+def precip_rate_cmap_norm():
+    cmap = mpl_colors.LinearSegmentedColormap.from_list(
+        "project_precip_rate", PRECIP_RATE_COLS, N=len(PRECIP_RATE_COLS)
+    )
+    norm = mpl_colors.BoundaryNorm(
+        PRECIP_RATE_LEVELS, ncolors=len(PRECIP_RATE_COLS) - 1
+    )
+    return cmap, norm
+
+
+def feature_label_cmap():
+    cmap = plt.get_cmap("tab20").copy()
+    cmap.set_bad((0.0, 0.0, 0.0, 0.0))
+    return cmap
+
+
 # -----------------------------------------------------------------------------
 # Metric/persistence caches
 # -----------------------------------------------------------------------------
 
-METRIC_CACHE_VERSION = "organisation_metrics_v2"
-TRACK_PERSISTENCE_CACHE_VERSION = "pyflextrkr_track_persistence_v2"
+METRIC_CACHE_VERSION = "organisation_metrics_v3_cloud_regimes"
+TRACK_PERSISTENCE_CACHE_VERSION = "pyflextrkr_track_persistence_v3_cloud_regimes"
 PATTERN_PERSISTENCE_CACHE_VERSION = "shifted_pattern_persistence_v1"
 
 ORGANISATION_CACHE_FILES = {
@@ -441,19 +498,8 @@ def object_definition_cache_signature():
         enable_cloud_objects=bool(ENABLE_CLOUD_OBJECTS),
         cloud_classification_source="refined_high_cloud_classification_diagnostics.py",
         cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
-        shared_cloud_thresholds=dict(
-            cf_thresh=float(CF_THRESH),
-            z_high=float(Z_HIGH),
-            z_low_min=float(Z_LOW_MIN),
-            z_low_max=float(Z_LOW_MAX),
-            z_mid_min=float(Z_MID_MIN),
-            z_mid_max=float(Z_MID_MAX),
-            z_upper_min=float(Z_UPPER_MIN),
-            p_deep=float(P_DEEP),
-            p_weak=float(P_WEAK),
-            max_clear_gap=jsonable_value(MAX_CLEAR_GAP),
-            classifier="shared 3-D hydrometeor-aware high-cloud classification",
-        ),
+        shared_cloud_thresholds=jsonable_value(vars(classification_thresholds())),
+        cloud_classifier="0.5-degree MPAS precipitation-regime classification",
         threshold_sample_limits=jsonable_value(THRESHOLD_SAMPLE_LIMITS),
         min_object_cells=int(MIN_OBJECT_CELLS),
         min_object_area_km2=float(MIN_OBJECT_AREA_KM2),
@@ -1635,15 +1681,9 @@ def has_primary_cloud_masks(masks):
 def classification_thresholds():
     return HighCloudThresholds(
         cf_thresh=CF_THRESH,
-        z_high_km=Z_HIGH,
-        low_cloud_min_km=Z_LOW_MIN,
-        low_cloud_max_km=Z_LOW_MAX,
-        mid_cloud_min_km=Z_MID_MIN,
-        mid_cloud_max_km=Z_MID_MAX,
-        upper_cloud_min_km=Z_UPPER_MIN,
-        max_clear_gap_km=MAX_CLEAR_GAP,
-        surface_precip_deep_mm_day=P_DEEP,
-        surface_precip_weak_mm_day=P_WEAK,
+        high_cloud_top_pressure_hpa=P_HIGH_HPA,
+        surface_precip_min_mm_day=P_PRECIP_MIN,
+        convective_fraction_threshold=CONVECTIVE_FRACTION,
     )
 
 
@@ -1677,17 +1717,20 @@ def cloud_masks_from_cache(sim_name, precip_ref):
     if not cached_classification_is_current(cached):
         cached.close()
         raise RuntimeError(f"{sim_name}: stale high-cloud classification cache: {path}")
-    missing = [key for key in CLOUD_OBJECT_KEYS if key not in cached.data_vars]
+    missing = [
+        key for key in CLASSIFICATION_DIAGNOSTIC_KEYS
+        if key not in cached.data_vars
+    ]
     if missing:
         cached.close()
         raise RuntimeError(
             f"{sim_name}: high-cloud classification cache lacks required shared variables {missing}: {path}"
         )
     masks = {}
-    for key in CLOUD_OBJECT_KEYS:
+    for key in CLASSIFICATION_DIAGNOSTIC_KEYS:
         da = cached[key]
         da = select_common_time(da, precip_ref)
-        masks[key] = da.fillna(False).astype(bool)
+        masks[key] = da.fillna(False).astype(bool) if key.endswith("_mask") else finite_or_nan(da)
     return masks
 
 
@@ -2298,6 +2341,744 @@ def plot_shifted_pattern_autocorrelation(persistence_df):
     save_figure(10, fig, "equatorial_shifted_pattern_autocorrelation")
 
 
+def pyflextrkr_cloudid_files(source_name, sim_name):
+    work_path = pyflextrkr_work_path(source_name, sim_name)
+    return sorted(glob.glob(os.path.join(work_path, "tracking", "cloudid_*.nc")))
+
+
+def plot_pyflextrkr_track_validation(objects_df, fields_by_run):
+    if not should_run_figure(11):
+        return
+    if objects_df is None or len(objects_df) == 0:
+        print("Skipping Figure 11: no PyFLEXTRKR objects are available.")
+        return
+    sources = [source for source in PYFLEXTRKR_VALIDATION_SOURCES if source in set(objects_df.source)]
+    if not sources:
+        print("Skipping Figure 11: no primary PyFLEXTRKR tracks are available.")
+        return
+
+    validation_rows = []
+    precip_cmap, precip_norm = precip_rate_cmap_norm()
+    for source_name in sources:
+        fig, axes = plt.subplots(
+            1,
+            len(sim_names),
+            figsize=(14.5, 4.2),
+            constrained_layout=True,
+            squeeze=False,
+            sharey=True,
+        )
+        last_precip_im = None
+        for c, sim_name in enumerate(sim_names):
+            ax = axes[0, c]
+            sub = objects_df[
+                (objects_df.source == source_name)
+                & (objects_df.simulation == sim_name)
+            ].copy()
+            files = pyflextrkr_cloudid_files(source_name, sim_name)
+            if len(sub) == 0 or not files:
+                ax.text(0.5, 0.5, "No current PyFLEXTRKR scene", transform=ax.transAxes, ha="center", va="center")
+                continue
+            counts = sub.groupby("time_index").size()
+            time_index = int(counts.idxmax())
+            if time_index >= len(files):
+                ax.text(0.5, 0.5, "cloudid/time index mismatch", transform=ax.transAxes, ha="center", va="center")
+                continue
+
+            with xr.open_dataset(files[time_index], decode_times=False, mask_and_scale=False) as cloud:
+                labels = np.asarray(cloud["feature_number"].squeeze().values, dtype=np.int32)
+                lat = np.asarray(cloud["lat"].values, dtype=float)
+                lon = np.asarray(cloud["lon"].values, dtype=float)
+            precip = fields_by_run[c]["precip"].isel(Time=time_index)
+            precip = precip.sel(
+                latitude=xr.DataArray(lat, dims="latitude"),
+                longitude=xr.DataArray(lon, dims="longitude"),
+                method="nearest",
+            ).load()
+            last_precip_im = ax.pcolormesh(
+                lon,
+                lat,
+                precip.clip(min=0.0),
+                cmap=precip_cmap,
+                norm=precip_norm,
+                shading="auto",
+                rasterized=True,
+            )
+            masked_labels = np.ma.masked_where(labels <= 0, labels)
+            ax.pcolormesh(
+                lon,
+                lat,
+                masked_labels,
+                cmap=feature_label_cmap(),
+                shading="auto",
+                alpha=0.30,
+                rasterized=True,
+            )
+            if np.any(labels > 0):
+                ax.contour(lon, lat, (labels > 0).astype(float), levels=[0.5], colors="0.15", linewidths=0.45)
+
+            scene = sub[sub.time_index == time_index].nlargest(12, "area_km2")
+            selected_track_ids = set(scene.track_id.astype(int))
+            history = sub[
+                sub.track_id.isin(selected_track_ids)
+                & (sub.time_index >= time_index - 4)
+                & (sub.time_index <= time_index + 4)
+            ]
+            for track_id, track in history.groupby("track_id"):
+                track = track.sort_values("time_index")
+                x = np.asarray(track.centroid_lon, dtype=float)
+                y = np.asarray(track.centroid_lat, dtype=float)
+                jumps = np.abs(np.diff(x)) > 180.0
+                x_plot = x.astype(float)
+                y_plot = y.astype(float)
+                for jump_index in np.where(jumps)[0]:
+                    x_plot = np.insert(x_plot, jump_index + 1, np.nan)
+                    y_plot = np.insert(y_plot, jump_index + 1, np.nan)
+                ax.plot(x_plot, y_plot, color="k", lw=0.9, alpha=0.8)
+            for record in scene.itertuples(index=False):
+                ax.text(
+                    float(record.centroid_lon),
+                    float(record.centroid_lat),
+                    str(int(record.track_id)),
+                    fontsize=6,
+                    ha="center",
+                    va="center",
+                    bbox=dict(facecolor="white", edgecolor="0.2", alpha=0.75, pad=0.5),
+                )
+                validation_rows.append(
+                    dict(
+                        simulation=sim_name,
+                        source=source_name,
+                        time_index=time_index,
+                        Time=record.Time,
+                        object_label=int(record.label),
+                        track_id=int(record.track_id),
+                        area_km2=float(record.area_km2),
+                        centroid_lat=float(record.centroid_lat),
+                        centroid_lon=float(record.centroid_lon),
+                        cloudid_file=files[time_index],
+                    )
+                )
+            ax.set_xlim(float(lon.min()), float(lon.max()))
+            ax.set_ylim(*TROPICAL_LAT_BOUNDS)
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            ax.set_title(f"{sim_name}\nfeature masks, track IDs, and recent paths")
+
+        if last_precip_im is not None:
+            fig.colorbar(
+                last_precip_im,
+                ax=axes.ravel().tolist(),
+                label=r"Precipitation (mm day$^{-1}$)",
+                shrink=0.86,
+            )
+        fig.suptitle(f"PyFLEXTRKR validation: {source_label(source_name)}")
+        save_figure(
+            11,
+            fig,
+            f"pyflextrkr_track_validation_{source_name}",
+        )
+        plt.close(fig)
+    if validation_rows:
+        pd.DataFrame(validation_rows).to_csv(
+            os.path.join(save_loc, "pyflextrkr_cloud_object_track_validation.csv"),
+            index=False,
+        )
+
+
+def pyflextrkr_track_step_table(objects_df):
+    rows = []
+    if objects_df is None or len(objects_df) == 0:
+        return pd.DataFrame()
+    for (source, simulation, track_id), group in objects_df.groupby(
+        ["source", "simulation", "track_id"]
+    ):
+        # Merge/split bookkeeping can leave more than one branch at a time;
+        # validate continuity on the largest branch used for visual track paths.
+        group = (
+            group.sort_values(["time_index", "area_km2"], ascending=[True, False])
+            .drop_duplicates("time_index")
+            .sort_values("time_index")
+        )
+        if len(group) < 2:
+            continue
+        previous = group.iloc[:-1]
+        current = group.iloc[1:]
+        distance = haversine_distances_km(
+            previous.centroid_lat.to_numpy(),
+            previous.centroid_lon.to_numpy(),
+            current.centroid_lat.to_numpy(),
+            current.centroid_lon.to_numpy(),
+        )
+        time_delta_hours = (
+            pd.to_datetime(current.Time.to_numpy())
+            - pd.to_datetime(previous.Time.to_numpy())
+        ) / pd.Timedelta(hours=1)
+        time_delta_hours = np.asarray(time_delta_hours, dtype=float)
+        area_ratio = np.maximum(
+            current.area_km2.to_numpy() / previous.area_km2.to_numpy(),
+            previous.area_km2.to_numpy() / current.area_km2.to_numpy(),
+        )
+        for index, (dist, hours, ratio) in enumerate(
+            zip(np.asarray(distance), time_delta_hours, area_ratio)
+        ):
+            rows.append(
+                dict(
+                    source=source,
+                    source_label=source_label(source),
+                    simulation=simulation,
+                    track_id=int(track_id),
+                    from_time_index=int(previous.time_index.iloc[index]),
+                    to_time_index=int(current.time_index.iloc[index]),
+                    time_delta_hours=float(hours),
+                    centroid_distance_km=float(dist),
+                    translation_speed_km_h=float(dist / hours) if hours > 0 else np.nan,
+                    area_change_factor=float(ratio),
+                )
+            )
+    return pd.DataFrame(rows)
+
+
+def plot_pyflextrkr_track_step_validation(objects_df):
+    if not should_run_figure(13):
+        return
+    steps = pyflextrkr_track_step_table(objects_df)
+    if len(steps) == 0:
+        raise RuntimeError("Figure 13 requires consecutive PyFLEXTRKR track steps")
+    steps.to_csv(os.path.join(save_loc, "pyflextrkr_track_step_validation.csv"), index=False)
+    summaries = []
+    for (source, simulation), group in steps.groupby(["source", "simulation"]):
+        values = group.translation_speed_km_h.to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        summaries.append(
+            dict(
+                source=source,
+                source_label=source_label(source),
+                simulation=simulation,
+                step_count=int(values.size),
+                median_speed_km_h=float(np.nanmedian(values)) if values.size else np.nan,
+                p95_speed_km_h=float(np.nanpercentile(values, 95)) if values.size else np.nan,
+                max_speed_km_h=float(np.nanmax(values)) if values.size else np.nan,
+                p95_area_change_factor=float(np.nanpercentile(group.area_change_factor, 95)),
+            )
+        )
+    pd.DataFrame(summaries).to_csv(
+        os.path.join(save_loc, "pyflextrkr_track_step_validation_summary.csv"), index=False
+    )
+
+    sources = [source for source in PYFLEXTRKR_VALIDATION_SOURCES if source in set(steps.source)]
+    for source in sources:
+        fig, axes = plt.subplots(
+            1, len(sim_names), figsize=(13.5, 3.7), constrained_layout=True,
+            sharex=True, sharey=True, squeeze=False,
+        )
+        for i, simulation in enumerate(sim_names):
+            ax = axes[0, i]
+            values = steps[
+                (steps.source == source) & (steps.simulation == simulation)
+            ].translation_speed_km_h.to_numpy(dtype=float)
+            values = np.sort(values[np.isfinite(values)])
+            if values.size:
+                y = np.arange(1, values.size + 1) / values.size
+                ax.plot(values, y, color=cols[i], lw=1.7)
+                ax.text(
+                    0.98, 0.05,
+                    f"median {np.nanmedian(values):.1f}\np95 {np.nanpercentile(values, 95):.1f} km h$^{{-1}}$",
+                    transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
+                )
+            ax.set_title(simulation)
+            ax.set_xlabel("Centroid translation speed (km h$^{-1}$)")
+            ax.grid(alpha=0.2)
+        axes[0, 0].set_ylabel("Cumulative fraction of track steps")
+        fig.suptitle(f"PyFLEXTRKR track continuity: {source_label(source)}")
+        save_figure(13, fig, f"pyflextrkr_track_step_continuity_{source}")
+        plt.close(fig)
+
+
+def tracking_grid_field(da, time_index, lat, lon):
+    field = da.isel(Time=time_index) if "Time" in da.dims else da
+    return field.sel(
+        latitude=xr.DataArray(lat, dims="latitude"),
+        longitude=xr.DataArray(lon, dims="longitude"),
+        method="nearest",
+    ).load()
+
+
+def cloud_class_code_for_movie(masks, time_index, lat, lon):
+    template = tracking_grid_field(masks["high_cloud_mask"], time_index, lat, lon)
+    code = np.zeros(template.shape, dtype=np.int8)
+    class_specs = (
+        ("convective_precipitating_high_cloud_mask", 1),
+        ("stratiform_precipitating_high_cloud_mask", 2),
+        ("nonprecipitating_high_cloud_mask", 3),
+        ("unclassified_high_cloud_mask", 4),
+    )
+    for key, value in class_specs:
+        if key in masks:
+            mask = tracking_grid_field(masks[key], time_index, lat, lon)
+            code[np.asarray(mask, dtype=bool)] = value
+    return code
+
+
+def draw_pyflextrkr_movie_object_panel(
+    ax,
+    source_name,
+    sim_objects,
+    cloudid_file,
+    precip_values,
+    time_index,
+    lat,
+    lon,
+):
+    with xr.open_dataset(cloudid_file, decode_times=False, mask_and_scale=False) as cloud:
+        labels = np.asarray(cloud["feature_number"].squeeze().values, dtype=np.int32)
+    precip_cmap, precip_norm = precip_rate_cmap_norm()
+    ax.pcolormesh(
+        lon,
+        lat,
+        np.maximum(precip_values, 0.0),
+        cmap=precip_cmap,
+        norm=precip_norm,
+        shading="auto",
+        rasterized=True,
+    )
+    ax.pcolormesh(
+        lon,
+        lat,
+        np.ma.masked_where(labels <= 0, labels),
+        cmap=feature_label_cmap(),
+        shading="auto",
+        alpha=0.45,
+        rasterized=True,
+    )
+    if np.any(labels > 0):
+        ax.contour(
+            lon,
+            lat,
+            (labels > 0).astype(float),
+            levels=[0.5],
+            colors="0.1",
+            linewidths=0.55,
+        )
+
+    source_objects = sim_objects[sim_objects.source == source_name]
+    scene = source_objects[source_objects.time_index == time_index].nlargest(10, "area_km2")
+    track_ids = set(scene.track_id.astype(int))
+    history = source_objects[
+        source_objects.track_id.isin(track_ids)
+        & (source_objects.time_index >= time_index - PYFLEXTRKR_MOVIE_TRACK_HISTORY_STEPS)
+        & (source_objects.time_index <= time_index)
+    ]
+    for _track_id, track in history.groupby("track_id"):
+        track = track.sort_values("time_index")
+        x = np.asarray(track.centroid_lon, dtype=float)
+        y = np.asarray(track.centroid_lat, dtype=float)
+        if x.size > 1:
+            jumps = np.where(np.abs(np.diff(x)) > 180.0)[0]
+            for jump_index in jumps[::-1]:
+                x = np.insert(x, jump_index + 1, np.nan)
+                y = np.insert(y, jump_index + 1, np.nan)
+        ax.plot(x, y, color="k", lw=1.0, alpha=0.85)
+    for record in scene.itertuples(index=False):
+        ax.text(
+            float(record.centroid_lon),
+            float(record.centroid_lat),
+            str(int(record.track_id)),
+            fontsize=6,
+            ha="center",
+            va="center",
+            bbox=dict(facecolor="white", edgecolor="0.2", alpha=0.78, pad=0.4),
+        )
+    ax.set_title(source_label(source_name), fontsize=9)
+    ax.set_xlim(float(lon.min()), float(lon.max()))
+    ax.set_ylim(*TROPICAL_LAT_BOUNDS)
+
+
+def _plot_legacy_pyflextrkr_overview_movies(objects_df, fields_by_run, masks_by_run):
+    if not should_run_figure(12):
+        return
+    if objects_df is None or len(objects_df) == 0:
+        raise RuntimeError("Figure 12 requires current PyFLEXTRKR object tracks")
+
+    class_colors = ["white", "tab:red", "tab:blue", "tab:green", "0.5"]
+    class_cmap = mpl_colors.ListedColormap(class_colors)
+    class_norm = mpl_colors.BoundaryNorm(np.arange(-0.5, 5.5, 1.0), class_cmap.N)
+    class_legend = [
+        Patch(facecolor=class_colors[1], label="convective precipitating"),
+        Patch(facecolor=class_colors[2], label="stratiform precipitating"),
+        Patch(facecolor=class_colors[3], label="non-precipitating"),
+        Patch(facecolor=class_colors[4], label="invalid/unclassified"),
+    ]
+    manifest_rows = []
+
+    for sim_index, sim_name in enumerate(sim_names):
+        sim_objects = objects_df[objects_df.simulation == sim_name].copy()
+        files_by_source = {
+            source: pyflextrkr_cloudid_files(source, sim_name)
+            for source in PYFLEXTRKR_VALIDATION_SOURCES
+        }
+        missing_sources = [source for source, files in files_by_source.items() if not files]
+        if missing_sources:
+            raise RuntimeError(
+                f"{sim_name}: Figure 12 requires current PyFLEXTRKR files for "
+                f"{missing_sources}"
+            )
+
+        ntime = min(
+            int(fields_by_run[sim_index]["precip"].sizes["Time"]),
+            *(len(files) for files in files_by_source.values()),
+        )
+        counts = (
+            sim_objects[sim_objects.source.isin(PYFLEXTRKR_VALIDATION_SOURCES)]
+            .groupby("time_index")
+            .size()
+        )
+        peak_index = int(counts.idxmax()) if len(counts) else ntime // 2
+        nframes = min(PYFLEXTRKR_MOVIE_MAX_FRAMES, ntime)
+        start = max(0, min(peak_index - nframes // 2, ntime - nframes))
+        frame_indices = list(range(start, start + nframes))
+
+        with xr.open_dataset(
+            files_by_source[PYFLEXTRKR_VALIDATION_SOURCES[0]][frame_indices[0]],
+            decode_times=False,
+            mask_and_scale=False,
+        ) as first_cloud:
+            lat = np.asarray(first_cloud["lat"].values, dtype=float)
+            lon = np.asarray(first_cloud["lon"].values, dtype=float)
+
+        fig, axes = plt.subplots(2, 3, figsize=(15.0, 8.2), constrained_layout=False)
+        fig.subplots_adjust(left=0.055, right=0.985, bottom=0.075, top=0.90, wspace=0.16, hspace=0.24)
+
+        def update(frame_number):
+            time_index = frame_indices[frame_number]
+            for ax in axes.ravel():
+                ax.clear()
+            precip = tracking_grid_field(
+                fields_by_run[sim_index]["precip"], time_index, lat, lon
+            )
+            precip_values = np.asarray(precip, dtype=float)
+            axes[0, 0].pcolormesh(
+                lon,
+                lat,
+                np.log1p(np.maximum(precip_values, 0.0)),
+                cmap="Blues",
+                vmin=0.0,
+                vmax=np.log1p(25.0),
+                shading="auto",
+                rasterized=True,
+            )
+            axes[0, 0].contour(
+                lon,
+                lat,
+                (precip_values >= 24.0).astype(float),
+                levels=[0.5],
+                colors="k",
+                linewidths=0.6,
+            )
+            axes[0, 0].set_title("Total precipitation; black: 1 mm h$^{-1}$", fontsize=9)
+
+            class_code = cloud_class_code_for_movie(
+                masks_by_run[sim_index], time_index, lat, lon
+            )
+            axes[0, 1].pcolormesh(
+                lon,
+                lat,
+                class_code,
+                cmap=class_cmap,
+                norm=class_norm,
+                shading="auto",
+                rasterized=True,
+            )
+            axes[0, 1].set_title("High-cloud precipitation regime", fontsize=9)
+            axes[0, 1].legend(
+                handles=class_legend,
+                loc="lower left",
+                fontsize=6,
+                frameon=True,
+            )
+
+            movie_sources = PYFLEXTRKR_VALIDATION_SOURCES
+            source_axes = [axes[0, 2], axes[1, 0], axes[1, 1], axes[1, 2]]
+            for source_name, ax in zip(movie_sources, source_axes):
+                draw_pyflextrkr_movie_object_panel(
+                    ax,
+                    source_name,
+                    sim_objects,
+                    files_by_source[source_name][time_index],
+                    precip_values,
+                    time_index,
+                    lat,
+                    lon,
+                )
+
+            for row in axes:
+                for ax in row:
+                    ax.set_xlim(float(lon.min()), float(lon.max()))
+                    ax.set_ylim(*TROPICAL_LAT_BOUNDS)
+                    ax.set_xlabel("Longitude")
+                    ax.set_ylabel("Latitude")
+            time_value = fields_by_run[sim_index]["precip"].Time.values[time_index]
+            high_count = int(np.count_nonzero(class_code > 0))
+            fractions = {
+                code: 100.0 * np.count_nonzero(class_code == code) / high_count
+                if high_count else np.nan
+                for code in (1, 2, 3, 4)
+            }
+            fig.suptitle(
+                f"{sim_name} | {pd.to_datetime(time_value)} | "
+                f"high-cloud split: C {fractions[1]:.1f}%, S {fractions[2]:.1f}%, "
+                f"N {fractions[3]:.1f}%, invalid {fractions[4]:.1f}%",
+                fontsize=12,
+            )
+            return []
+
+        movie = animation.FuncAnimation(
+            fig,
+            update,
+            frames=len(frame_indices),
+            interval=1000.0 / PYFLEXTRKR_MOVIE_FPS,
+            blit=False,
+        )
+        safe_sim = sim_name.replace(" ", "_")
+        output_path = os.path.join(
+            save_loc,
+            f"12_pyflextrkr_cloud_classification_overview_{safe_sim}.mp4",
+        )
+        writer = animation.FFMpegWriter(
+            fps=PYFLEXTRKR_MOVIE_FPS,
+            codec="libx264",
+            bitrate=2200,
+            extra_args=[
+                "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                "-pix_fmt",
+                "yuv420p",
+            ],
+            metadata={"title": f"PyFLEXTRKR overview: {sim_name}"},
+        )
+        print(f"Writing PyFLEXTRKR overview movie: {output_path}", flush=True)
+        movie.save(output_path, writer=writer, dpi=120)
+        plt.close(fig)
+        manifest_rows.append(
+            dict(
+                simulation=sim_name,
+                output_file=output_path,
+                frame_count=len(frame_indices),
+                first_time_index=frame_indices[0],
+                last_time_index=frame_indices[-1],
+                fps=PYFLEXTRKR_MOVIE_FPS,
+                sources=",".join(PYFLEXTRKR_VALIDATION_SOURCES),
+            )
+        )
+
+    pd.DataFrame(manifest_rows).to_csv(
+        os.path.join(save_loc, "pyflextrkr_cloud_classification_movie_manifest.csv"),
+        index=False,
+    )
+
+
+def save_pyflextrkr_animation(fig, update, nframes, output_path, title):
+    movie = animation.FuncAnimation(
+        fig,
+        update,
+        frames=nframes,
+        interval=1000.0 / PYFLEXTRKR_MOVIE_FPS,
+        blit=False,
+    )
+    writer = animation.FFMpegWriter(
+        fps=PYFLEXTRKR_MOVIE_FPS,
+        codec="libx264",
+        bitrate=2200,
+        extra_args=[
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+        metadata={"title": title},
+    )
+    print(f"Writing PyFLEXTRKR validation movie: {output_path}", flush=True)
+    movie.save(output_path, writer=writer, dpi=120)
+    plt.close(fig)
+
+
+def plot_pyflextrkr_validation_movies(objects_df, fields_by_run, masks_by_run):
+    if not should_run_figure(12):
+        return
+    if objects_df is None or len(objects_df) == 0:
+        raise RuntimeError("Figure 12 requires current PyFLEXTRKR object tracks")
+
+    precip_cmap, precip_norm = precip_rate_cmap_norm()
+    class_colors = ["white", "tab:red", "tab:blue", "tab:green", "0.5"]
+    class_cmap = mpl_colors.ListedColormap(class_colors)
+    class_norm = mpl_colors.BoundaryNorm(np.arange(-0.5, 5.5, 1.0), class_cmap.N)
+    class_legend = [
+        Patch(facecolor=class_colors[1], label="convective precipitating"),
+        Patch(facecolor=class_colors[2], label="stratiform precipitating"),
+        Patch(facecolor=class_colors[3], label="non-precipitating"),
+        Patch(facecolor=class_colors[4], label="invalid/unclassified"),
+    ]
+    ctp_cmap = plt.get_cmap("magma_r")
+    ctp_norm = mpl_colors.Normalize(vmin=80.0, vmax=P_HIGH_HPA)
+    manifest_rows = []
+
+    for sim_index, sim_name in enumerate(sim_names):
+        sim_objects = objects_df[objects_df.simulation == sim_name].copy()
+        files_by_source = {
+            source: pyflextrkr_cloudid_files(source, sim_name)
+            for source in PYFLEXTRKR_VALIDATION_SOURCES
+        }
+        missing_sources = [source for source, files in files_by_source.items() if not files]
+        if missing_sources:
+            raise RuntimeError(
+                f"{sim_name}: Figure 12 requires current PyFLEXTRKR files for {missing_sources}"
+            )
+        ntime = min(
+            int(fields_by_run[sim_index]["precip"].sizes["Time"]),
+            *(len(files) for files in files_by_source.values()),
+        )
+        counts = (
+            sim_objects[sim_objects.source.isin(PYFLEXTRKR_VALIDATION_SOURCES)]
+            .groupby("time_index")
+            .size()
+        )
+        peak_index = int(counts.idxmax()) if len(counts) else ntime // 2
+        nframes = min(PYFLEXTRKR_MOVIE_MAX_FRAMES, ntime)
+        start = max(0, min(peak_index - nframes // 2, ntime - nframes))
+        frame_indices = list(range(start, start + nframes))
+
+        first_source = PYFLEXTRKR_VALIDATION_SOURCES[0]
+        with xr.open_dataset(
+            files_by_source[first_source][frame_indices[0]],
+            decode_times=False,
+            mask_and_scale=False,
+        ) as first_cloud:
+            lat = np.asarray(first_cloud["lat"].values, dtype=float)
+            lon = np.asarray(first_cloud["lon"].values, dtype=float)
+
+        def finish_axes(axes):
+            for ax in np.atleast_1d(axes).ravel():
+                ax.set_xlim(float(lon.min()), float(lon.max()))
+                ax.set_ylim(*TROPICAL_LAT_BOUNDS)
+                ax.set_xlabel("Longitude")
+                ax.set_ylabel("Latitude")
+
+        def frame_time(time_index):
+            return pd.to_datetime(fields_by_run[sim_index]["precip"].Time.values[time_index])
+
+        safe_sim = sim_name.replace(" ", "_")
+
+        class_fig, class_axes = plt.subplots(1, 3, figsize=(15.0, 4.8), constrained_layout=True)
+        class_fig.colorbar(
+            plt.cm.ScalarMappable(norm=precip_norm, cmap=precip_cmap),
+            ax=class_axes[0], label=r"Precipitation (mm day$^{-1}$)", shrink=0.80,
+        )
+        class_fig.colorbar(
+            plt.cm.ScalarMappable(norm=ctp_norm, cmap=ctp_cmap),
+            ax=class_axes[2], label="Cloud-top pressure (hPa)", shrink=0.80,
+        )
+
+        def update_classification(frame_number):
+            time_index = frame_indices[frame_number]
+            for ax in class_axes:
+                ax.clear()
+            precip = tracking_grid_field(fields_by_run[sim_index]["precip"], time_index, lat, lon)
+            precip_values = np.asarray(precip, dtype=float)
+            class_axes[0].pcolormesh(
+                lon, lat, np.maximum(precip_values, 0.0),
+                cmap=precip_cmap, norm=precip_norm, shading="auto", rasterized=True,
+            )
+            if np.any(precip_values >= 24.0):
+                class_axes[0].contour(
+                    lon, lat, (precip_values >= 24.0).astype(float), levels=[0.5],
+                    colors="k", linewidths=0.6,
+                )
+            class_axes[0].set_title("Precipitation; black: 1 mm h$^{-1}$")
+
+            class_code = cloud_class_code_for_movie(
+                masks_by_run[sim_index], time_index, lat, lon
+            )
+            class_axes[1].pcolormesh(
+                lon, lat, class_code, cmap=class_cmap, norm=class_norm,
+                shading="auto", rasterized=True,
+            )
+            class_axes[1].set_title("Shared high-cloud classification")
+            class_axes[1].legend(handles=class_legend, loc="lower left", fontsize=7)
+
+            ctp = tracking_grid_field(
+                masks_by_run[sim_index]["cloud_top_pressure"], time_index, lat, lon
+            )
+            ctp_values = np.asarray(ctp, dtype=float)
+            ctp_values = np.ma.masked_where(class_code <= 0, ctp_values)
+            class_axes[2].pcolormesh(
+                lon, lat, ctp_values, cmap=ctp_cmap, norm=ctp_norm,
+                shading="auto", rasterized=True,
+            )
+            class_axes[2].set_title("Cloud-top pressure within high cloud")
+            finish_axes(class_axes)
+            class_fig.suptitle(f"{sim_name} | {frame_time(time_index)}")
+            return []
+
+        class_path = os.path.join(save_loc, f"12_cloud_classification_{safe_sim}.mp4")
+        save_pyflextrkr_animation(
+            class_fig, update_classification, len(frame_indices), class_path,
+            f"Cloud classification: {sim_name}",
+        )
+        manifest_rows.append(dict(simulation=sim_name, movie_type="classification", output_file=class_path))
+
+        for movie_type, sources in (
+            ("cloud_object_tracking", PYFLEXTRKR_CLASS_SOURCES),
+            ("independent_object_tracking", PYFLEXTRKR_CONTEXT_SOURCES),
+        ):
+            track_fig, track_axes = plt.subplots(
+                1, len(sources), figsize=(5.0 * len(sources), 4.8),
+                constrained_layout=True, squeeze=False, sharey=True,
+            )
+            track_axes = track_axes[0]
+            track_fig.colorbar(
+                plt.cm.ScalarMappable(norm=precip_norm, cmap=precip_cmap),
+                ax=track_axes.tolist(), label=r"Precipitation (mm day$^{-1}$)", shrink=0.80,
+            )
+
+            def update_tracking(frame_number, axes=track_axes, source_names=tuple(sources), fig=track_fig):
+                time_index = frame_indices[frame_number]
+                precip = tracking_grid_field(
+                    fields_by_run[sim_index]["precip"], time_index, lat, lon
+                )
+                precip_values = np.asarray(precip, dtype=float)
+                for source_name, ax in zip(source_names, axes):
+                    ax.clear()
+                    draw_pyflextrkr_movie_object_panel(
+                        ax, source_name, sim_objects,
+                        files_by_source[source_name][time_index], precip_values,
+                        time_index, lat, lon,
+                    )
+                finish_axes(axes)
+                fig.suptitle(f"{sim_name} | {frame_time(time_index)}")
+                return []
+
+            track_path = os.path.join(save_loc, f"12_{movie_type}_{safe_sim}.mp4")
+            save_pyflextrkr_animation(
+                track_fig, update_tracking, len(frame_indices), track_path,
+                f"{movie_type.replace('_', ' ').title()}: {sim_name}",
+            )
+            manifest_rows.append(dict(simulation=sim_name, movie_type=movie_type, output_file=track_path))
+
+        for row in manifest_rows:
+            if row["simulation"] == sim_name:
+                row.update(
+                    frame_count=len(frame_indices),
+                    first_time_index=frame_indices[0],
+                    last_time_index=frame_indices[-1],
+                    fps=PYFLEXTRKR_MOVIE_FPS,
+                )
+
+    pd.DataFrame(manifest_rows).to_csv(
+        os.path.join(save_loc, "pyflextrkr_cloud_classification_movie_manifest.csv"),
+        index=False,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Driver
 # -----------------------------------------------------------------------------
@@ -2313,7 +3094,6 @@ def load_datasets():
             ndays=ndays,
             end_date=analysis_end_date,
             chunks=latlon_chunks,
-            add_cldfrac_file=False,
         )
         ds = standardize_latlon_dataset(ds, needed_vars)
         print(ds)
@@ -2407,7 +3187,7 @@ def main():
     objects_df = pd.DataFrame()
     tracks_df = pd.DataFrame()
     contribution_df = pd.DataFrame()
-    track_persistence_needed = should_run_any([6, 7, 8, 9])
+    track_persistence_needed = should_run_any([6, 7, 8, 9, 11, 12, 13])
     if track_persistence_needed:
         track_products = load_cached_track_persistence_products()
         if track_products is None:
@@ -2444,7 +3224,7 @@ def main():
             "convective_area_fraction",
             5,
             "conditional_lorg_by_convective_area_fraction",
-            "Convective area fraction",
+            "Tracked-source object area fraction",
         )
 
     if should_run_figure(6):
@@ -2465,7 +3245,7 @@ def main():
             "mean_convective_area_fraction",
             9,
             "conditional_track_lifetime_by_convective_area_fraction",
-            "Track-mean convective area fraction",
+            "Track-mean source-object area fraction",
         )
     if should_run_figure(10):
         persistence_df = load_cached_pattern_persistence()
@@ -2475,6 +3255,15 @@ def main():
             write_pattern_persistence_cache(persistence_df)
         if len(persistence_df) > 0:
             plot_shifted_pattern_autocorrelation(persistence_df)
+    if should_run_figure(11):
+        _, fields_by_run = ensure_fields()
+        plot_pyflextrkr_track_validation(objects_df, fields_by_run)
+    if should_run_figure(12):
+        _, fields_by_run = ensure_fields()
+        masks_by_run = ensure_masks(threshold_table)
+        plot_pyflextrkr_validation_movies(objects_df, fields_by_run, masks_by_run)
+    if should_run_figure(13):
+        plot_pyflextrkr_track_step_validation(objects_df)
 
     print("\nFinished convective_organisation_diagnostics.py")
 

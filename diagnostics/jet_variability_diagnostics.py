@@ -81,7 +81,7 @@ def run_all_figures():
 
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
-data_locs = ["control", "u_nudge", "T_nudge"]
+data_locs = ["control_new", "u_nudge", "T_nudge"]
 latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
 zm_latlon_file = ["zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
@@ -468,7 +468,6 @@ for i, d in enumerate(data_locs):
         ndays=ndays,
         end_date=analysis_end_date,
         chunks=latlon_chunks,
-        add_cldfrac_file=False,
     )
     ds = standardize_latlon_dataset(ds, needed_vars)
     print(ds)
@@ -486,7 +485,6 @@ if should_run_figure(6):
             end_date=analysis_end_date,
             chunks={"Time": -1},
             prefer_pattern=True,
-            add_cldfrac_file=False,
         )
         zds = standardize_latlon_dataset(zds, needed_vars_zm)
         print(zds)

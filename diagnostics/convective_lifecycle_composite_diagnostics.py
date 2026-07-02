@@ -2,11 +2,11 @@
 # coding: utf-8
 
 """
-Convective lifecycle composites centred on tracked deep-convective onset.
+Convective lifecycle composites centred on tracked convective-precipitating onset.
 
 This diagnostic uses existing high-cloud classification caches and
 PyFLEXTRKR-style track outputs where they are available.  Its main event set is
-the first appearance of tracked deep, column-connected high cloud; a
+the first appearance of tracked convective-precipitating high cloud; a
 precipitation-only onset set is retained as a sensitivity option.
 
 # WHAT TO LOOK FOR:
@@ -21,6 +21,7 @@ precipitation-only onset set is retained as a sensitivity option.
 """
 
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -81,6 +82,7 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/convective_l
 #   5: wave-convection phase-locking diagnostics
 #   6: track-property lifecycle statistics
 #   7: mechanistic synthesis figure
+#   8: cloud-top-pressure lifecycle validation
 figures_to_run = []
 figsave = None
 
@@ -94,7 +96,7 @@ FORCE_RECOMPUTE_LIFECYCLE_CACHE = (
 )
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
-data_locs = ["control", "u_nudge", "T_nudge"]
+data_locs = ["control_new", "u_nudge", "T_nudge"]
 latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
 zm_latlon_file = ["zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
@@ -121,7 +123,7 @@ SPATIAL_LAGS_DAYS = [-2.0, -1.0, 0.0, 1.0, 2.0]
 
 # Event and object filters.  The defaults are deliberately simple so threshold
 # sensitivity can be changed near the top of the file.
-EVENT_SET = "deep"  # "deep" or "all_precip"
+EVENT_SET = "convective"  # "convective" or "all_precip"
 MIN_EVENT_LIFETIME_HOURS = 18.0
 MIN_EVENT_AREA_KM2 = 800.0
 MIN_EVENT_MAX_PRECIP_MM_DAY = 5.0
@@ -135,16 +137,9 @@ MIN_OBJECT_CELLS = 1
 MIN_OBJECT_AREA_KM2 = 0.0
 
 CF_THRESH = 0.05
-Z_HIGH = 12.0       # km
-Z_LOW_MIN = 2.0     # km
-Z_LOW_MAX = 5.0     # km
-Z_MID_MIN = 5.0     # km
-Z_MID_MAX = 10.0    # km
-Z_UPPER_MIN = 10.0  # km
-P_WEAK = 1.0        # mm day-1
-MAX_CLEAR_GAP = 3.0 # km
-ANVIL_RADIUS_DEG = 5.0
-ANVIL_TIME_STEPS = 1
+P_HIGH_HPA = 440.0
+P_PRECIP_MIN = 1.0
+CONVECTIVE_FRACTION = 0.50
 
 EARTH_RADIUS_KM = 6371.0
 LONGITUDE_PERIOD_DEG = 360.0
@@ -230,10 +225,10 @@ def should_run_any(numbers):
 # Store-backed derived-product caches
 # -----------------------------------------------------------------------------
 
-TRACK_EVENT_CACHE_VERSION = "lifecycle_track_events_v1"
-COMPOSITE_CACHE_VERSION = "lifecycle_composites_v1"
+TRACK_EVENT_CACHE_VERSION = "lifecycle_track_events_v2_cloud_top_pressure"
+COMPOSITE_CACHE_VERSION = "lifecycle_composites_v2_cloud_top_pressure"
 PHASE_CACHE_VERSION = "lifecycle_kelvin_phase_v1"
-TRACK_PROPERTY_CACHE_VERSION = "lifecycle_track_properties_v1"
+TRACK_PROPERTY_CACHE_VERSION = "lifecycle_track_properties_v2_cloud_top_pressure"
 
 
 def ensure_cache_dir():
@@ -400,19 +395,61 @@ def read_cache_csv(filename):
         return pd.DataFrame()
 
 
+def netcdf_safe_attribute(value):
+    """Convert metadata to scalar/array types accepted by netCDF4."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bool):
+        return np.int8(value)
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return json.dumps(jsonable_value(value), sort_keys=True)
+    if isinstance(value, (list, tuple, np.ndarray)):
+        array = np.asarray(value)
+        if array.dtype.kind == "b":
+            return array.astype(np.int8)
+        if array.dtype.kind in "SUif":
+            return array
+        return json.dumps(jsonable_value(value), sort_keys=True)
+    if isinstance(value, (str, int, float)):
+        return value
+    return str(value)
+
+
+def netcdf_safe_dataset(ds):
+    """Return a shallow dataset copy whose attributes are NetCDF serializable."""
+    out = ds.copy(deep=False)
+    out.attrs = {key: netcdf_safe_attribute(value) for key, value in ds.attrs.items()}
+    for name in out.variables:
+        out[name].attrs = {
+            key: netcdf_safe_attribute(value)
+            for key, value in ds[name].attrs.items()
+        }
+    return out
+
+
 def write_cache_dataset(ds, filename):
     path = cache_path(filename)
-    tmp = path + ".tmp"
-    ds.to_netcdf(tmp)
-    os.replace(tmp, path)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        netcdf_safe_dataset(ds).to_netcdf(tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def read_cache_dataset(filename):
     path = cache_path(filename)
     if not os.path.exists(path):
         return None
-    with xr.open_dataset(path) as ds:
-        return ds.load()
+    try:
+        with xr.open_dataset(path) as ds:
+            return ds.load()
+    except (OSError, RuntimeError, ValueError) as exc:
+        progress(f"Ignoring unreadable cached dataset {path}: {exc}")
+        return None
 
 
 def track_event_cache_files():
@@ -464,6 +501,94 @@ def composite_cache_filename(sim_name, var, kind, lag_day=None):
     return base + ".nc"
 
 
+def composite_cache_token(source_name, spec_keys, include_spatial):
+    signature = composite_cache_signature(source_name, spec_keys, include_spatial)
+    payload = json.dumps(jsonable_value(signature), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def spatial_composite_expected(var, include_spatial):
+    return include_spatial and var in (
+        "precip",
+        "pw_anom",
+        "stratiform_precipitating",
+        "cloud_top_pressure",
+        "cloud_top_height",
+        "N2_TTL_anom",
+    )
+
+
+def load_cached_composite_product(sim, var, include_spatial, expected_token):
+    hov = read_cache_dataset(composite_cache_filename(sim, var, "hov"))
+    scalar = read_cache_dataset(composite_cache_filename(sim, var, "scalar"))
+    if hov is None or scalar is None:
+        return None
+    if (
+        hov.attrs.get("lifecycle_composite_cache_token") != expected_token
+        or scalar.attrs.get("lifecycle_composite_cache_token") != expected_token
+    ):
+        return None
+
+    spatial = {}
+    if spatial_composite_expected(var, include_spatial):
+        for lag_day in SPATIAL_LAGS_DAYS:
+            ds = read_cache_dataset(
+                composite_cache_filename(sim, var, "spatial", lag_day=lag_day)
+            )
+            if (
+                ds is None
+                or ds.attrs.get("lifecycle_composite_cache_token") != expected_token
+            ):
+                return None
+            spatial[lag_day] = ds
+    return {"hov": hov, "scalar": scalar}, spatial
+
+
+def with_composite_cache_token(ds, token):
+    out = ds.copy(deep=False)
+    out.attrs = dict(ds.attrs)
+    out.attrs["lifecycle_composite_cache_token"] = token
+    return out
+
+
+def write_composite_product_cache(sim, var, product, spatial, cache_token):
+    write_cache_dataset(
+        with_composite_cache_token(product["hov"], cache_token),
+        composite_cache_filename(sim, var, "hov"),
+    )
+    write_cache_dataset(
+        with_composite_cache_token(product["scalar"], cache_token),
+        composite_cache_filename(sim, var, "scalar"),
+    )
+    for lag_day, ds in spatial.items():
+        write_cache_dataset(
+            with_composite_cache_token(ds, cache_token),
+            composite_cache_filename(sim, var, "spatial", lag_day=lag_day),
+        )
+
+
+def write_composite_cache_manifest(
+    source_name,
+    spec_keys,
+    include_spatial,
+    event_counts,
+    available_specs_by_sim,
+):
+    signature = composite_cache_signature(source_name, spec_keys, include_spatial)
+    signature["event_counts"] = {
+        sim: int(event_counts.get(sim, 0)) for sim in sim_names
+    }
+    signature["available_specs_by_sim"] = {
+        sim: list(available_specs_by_sim.get(sim, [])) for sim in sim_names
+    }
+    signature["composite_cache_token"] = composite_cache_token(
+        source_name,
+        spec_keys,
+        include_spatial,
+    )
+    write_cache_metadata(composite_cache_metadata_file(), signature)
+
+
 def load_cached_composites(source_name, spec_keys, include_spatial):
     signature = composite_cache_signature(source_name, spec_keys, include_spatial)
     if not cache_metadata_matches(composite_cache_metadata_file(), signature, "lifecycle composites"):
@@ -471,25 +596,25 @@ def load_cached_composites(source_name, spec_keys, include_spatial):
     metadata = read_cache_metadata(composite_cache_metadata_file()) or {}
     event_counts = metadata.get("event_counts", {})
     available_specs_by_sim = metadata.get("available_specs_by_sim", {})
+    expected_token = composite_cache_token(source_name, spec_keys, include_spatial)
     composites = {}
     spatial_products = {}
     for sim in sim_names:
         composites[sim] = {"event_count": int(event_counts.get(sim, 0))}
         spatial_products[sim] = {}
         for var in available_specs_by_sim.get(sim, spec_keys):
-            hov = read_cache_dataset(composite_cache_filename(sim, var, "hov"))
-            scalar = read_cache_dataset(composite_cache_filename(sim, var, "scalar"))
-            if hov is None or scalar is None:
+            cached = load_cached_composite_product(
+                sim,
+                var,
+                include_spatial,
+                expected_token,
+            )
+            if cached is None:
                 return None
-            composites[sim][var] = {"hov": hov, "scalar": scalar}
-            if include_spatial:
-                spatial_lags = {}
-                for lag_day in SPATIAL_LAGS_DAYS:
-                    ds = read_cache_dataset(composite_cache_filename(sim, var, "spatial", lag_day=lag_day))
-                    if ds is not None:
-                        spatial_lags[lag_day] = ds
-                if spatial_lags:
-                    spatial_products[sim][var] = spatial_lags
+            product, spatial = cached
+            composites[sim][var] = product
+            if spatial:
+                spatial_products[sim][var] = spatial
     progress(f"Using cached lifecycle composites from {ensure_cache_dir()}")
     return composites, spatial_products
 
@@ -497,6 +622,7 @@ def load_cached_composites(source_name, spec_keys, include_spatial):
 def write_composite_cache(source_name, spec_keys, include_spatial, composites, spatial_products):
     event_counts = {}
     available_specs_by_sim = {}
+    cache_token = composite_cache_token(source_name, spec_keys, include_spatial)
     for sim in sim_names:
         event_counts[sim] = int(composites.get(sim, {}).get("event_count", 0))
         available_specs_by_sim[sim] = [
@@ -508,15 +634,20 @@ def write_composite_cache(source_name, spec_keys, include_spatial, composites, s
             product = composites.get(sim, {}).get(var)
             if product is None:
                 continue
-            write_cache_dataset(product["hov"], composite_cache_filename(sim, var, "hov"))
-            write_cache_dataset(product["scalar"], composite_cache_filename(sim, var, "scalar"))
-            if include_spatial:
-                for lag_day, ds in spatial_products.get(sim, {}).get(var, {}).items():
-                    write_cache_dataset(ds, composite_cache_filename(sim, var, "spatial", lag_day=lag_day))
-    signature = composite_cache_signature(source_name, spec_keys, include_spatial)
-    signature["event_counts"] = event_counts
-    signature["available_specs_by_sim"] = available_specs_by_sim
-    write_cache_metadata(composite_cache_metadata_file(), signature)
+            write_composite_product_cache(
+                sim,
+                var,
+                product,
+                spatial_products.get(sim, {}).get(var, {}),
+                cache_token,
+            )
+    write_composite_cache_manifest(
+        source_name,
+        spec_keys,
+        include_spatial,
+        event_counts,
+        available_specs_by_sim,
+    )
 
 
 def phase_cache_files():
@@ -768,15 +899,9 @@ def merge_periodic_longitude_labels(labels):
 def classification_thresholds():
     return HighCloudThresholds(
         cf_thresh=CF_THRESH,
-        z_high_km=Z_HIGH,
-        low_cloud_min_km=Z_LOW_MIN,
-        low_cloud_max_km=Z_LOW_MAX,
-        mid_cloud_min_km=Z_MID_MIN,
-        mid_cloud_max_km=Z_MID_MAX,
-        upper_cloud_min_km=Z_UPPER_MIN,
-        max_clear_gap_km=MAX_CLEAR_GAP,
-        surface_precip_deep_mm_day=DEEP_PRECIP_THRESHOLD_MM_DAY,
-        surface_precip_weak_mm_day=P_WEAK,
+        high_cloud_top_pressure_hpa=P_HIGH_HPA,
+        surface_precip_min_mm_day=P_PRECIP_MIN,
+        convective_fraction_threshold=CONVECTIVE_FRACTION,
     )
 
 
@@ -785,24 +910,20 @@ def cached_classification_is_current(cached):
 
 
 REQUIRED_CLASSIFICATION_VARS = (
+    "cloud_top_pressure",
     "cloud_top_height",
     "high_cloud_fraction",
     "high_cloud_mask",
-    "column_connected_mask",
-    "active_deep_convection_high_cloud_mask",
-    "convectively_generated_high_cloud_mask",
-    "cirrus_like_high_cloud_mask",
+    "convective_precipitating_high_cloud_mask",
+    "stratiform_precipitating_high_cloud_mask",
+    "nonprecipitating_high_cloud_mask",
     "unclassified_high_cloud_mask",
 )
 
 
 def classification_cache_names(sim_name):
     safe = sim_name.replace(" ", "_")
-    return [
-        f"{safe}_classified_high_cloud.nc",
-        f"{safe.lower()}_classified_high_cloud.nc",
-        f"{safe_name(sim_name)}_classified_high_cloud.nc",
-    ]
+    return [f"{safe}_classified_high_cloud.nc"]
 
 
 def open_classification_cache(sim_name, precip_ref):
@@ -828,7 +949,7 @@ def open_classification_cache(sim_name, precip_ref):
             out = {}
             for name in cached.data_vars:
                 da = cached[name]
-                if name.endswith("_mask") or name == "column_connected_mask":
+                if name.endswith("_mask"):
                     da = da.astype(bool)
                 out[name] = select_common_time(da, precip_ref)
             return out
@@ -1009,7 +1130,8 @@ def object_properties_from_labels(labels, lat, lon, area2d, field_slices=None):
                 w = weights[ok]
                 row[f"mean_{key}"] = float(np.average(v[ok], weights=w))
                 row[f"max_{key}"] = float(np.nanmax(v))
-                if key.endswith("_mask") or key in ("column_connected", "deep_convective"):
+                row[f"min_{key}"] = float(np.nanmin(v))
+                if key.endswith("_mask") or key == "stratiform_precipitating":
                     row[f"frac_{key}"] = float(np.average(v[ok] > 0.5, weights=w))
             else:
                 row[f"mean_{key}"] = np.nan
@@ -1060,10 +1182,11 @@ def track_objects_from_mask(mask, fields, source_name, sim_name, onset_flag_fiel
     field_keys = [
         "precip",
         "pw",
+        "cloud_top_pressure",
         "cloud_top_height",
         "high_cloud_fraction",
-        "column_connected_mask",
-        "active_deep_convection_high_cloud_mask",
+        "stratiform_precipitating_high_cloud_mask",
+        "convective_precipitating_high_cloud_mask",
     ]
     available = {key: fields[key] for key in field_keys if key in fields and {"latitude", "longitude"}.issubset(fields[key].dims)}
     align_inputs = [mask] + [available[key] for key in available]
@@ -1130,9 +1253,12 @@ def chararray_to_strings(array):
 
 def find_pyflextrkr_work_path(source_name, sim_name):
     safe_sim = sim_name.replace(" ", "_").replace("/", "_")
-    source_candidates = [source_name]
-    if source_name.endswith("_high_cloud_mask") or source_name in {"high_cloud_mask", "column_connected_mask"}:
-        source_candidates.insert(0, f"{source_name}_{CLASSIFICATION_CACHE_VERSION}")
+    if source_name.endswith("_high_cloud_mask") or source_name == "high_cloud_mask":
+        # Cloud-track directories are classification-versioned by the
+        # organisation diagnostic. Never fall back to unversioned tracks.
+        source_candidates = [f"{source_name}_{CLASSIFICATION_CACHE_VERSION}"]
+    else:
+        source_candidates = [source_name]
     candidates = []
     for root in PYFLEXTRKR_SEARCH_ROOTS:
         for source_candidate in source_candidates:
@@ -1199,7 +1325,7 @@ def load_pyflextrkr_objects(source_name, sim_name, fields):
         lon_da = xr.DataArray(lon, dims=("longitude",), name="longitude")
         area2d = grid_cell_area_km2(lat, lon)
         field_slices = {}
-        for key in ("precip", "pw", "cloud_top_height", "high_cloud_fraction", "column_connected_mask", "active_deep_convection_high_cloud_mask"):
+        for key in ("precip", "pw", "cloud_top_pressure", "cloud_top_height", "high_cloud_fraction", "stratiform_precipitating_high_cloud_mask", "convective_precipitating_high_cloud_mask"):
             if key not in fields or not {"latitude", "longitude"}.issubset(fields[key].dims):
                 continue
             field_slices[key] = fields[key].isel(Time=it).sel(latitude=lat_da, longitude=lon_da, method="nearest").load()
@@ -1255,6 +1381,8 @@ def summarise_tracks(objects_df):
             agg[col] = (col, "mean")
         elif col.startswith("max_"):
             agg[col] = (col, "max")
+        elif col.startswith("min_"):
+            agg[col] = (col, "min")
         elif col.startswith("frac_"):
             agg[col] = (col, "mean")
 
@@ -1304,9 +1432,11 @@ def summarise_tracks(objects_df):
             max_propagation_speed_kmh=float(group.propagation_speed_kmh.max(skipna=True)),
             tracking_method=group.tracking_method.iloc[0],
         )
-        for key in ("precip", "cloud_top_height", "high_cloud_fraction", "pw"):
+        for key in ("precip", "cloud_top_pressure", "cloud_top_height", "high_cloud_fraction", "pw"):
             if f"max_{key}" in group:
                 row[f"max_{key}"] = float(group[f"max_{key}"].max(skipna=True))
+            if f"min_{key}" in group:
+                row[f"min_{key}"] = float(group[f"min_{key}"].min(skipna=True))
             if f"mean_{key}" in group:
                 row[f"mean_{key}"] = float(group[f"mean_{key}"].mean(skipna=True))
         tracks.append(row)
@@ -1318,9 +1448,9 @@ def build_track_tables_for_source(source_name, fields, sim_name):
     if objects_df is not None and len(objects_df) > 0:
         return objects_df, track_time, tracks_df
 
-    if source_name == "active_deep_convection_high_cloud_mask" and "active_deep_convection_high_cloud_mask" in fields:
-        progress(f"{sim_name}: building local overlap tracks for active deep convection")
-        return track_objects_from_mask(fields["active_deep_convection_high_cloud_mask"], fields, source_name, sim_name)
+    if source_name == "convective_precipitating_high_cloud_mask" and "convective_precipitating_high_cloud_mask" in fields:
+        progress(f"{sim_name}: building local overlap tracks for convective precipitating high cloud")
+        return track_objects_from_mask(fields["convective_precipitating_high_cloud_mask"], fields, source_name, sim_name)
 
     if source_name == "precip_ge_1mmh":
         progress(f"{sim_name}: building local overlap tracks for precipitation sensitivity")
@@ -1357,7 +1487,7 @@ def select_onset_events(track_time, tracks_df, source_name, sim_name):
         tracks_df[[
             "source", "simulation", "track_id", "lifetime_hours", "max_area_km2",
             "mean_propagation_speed_kmh", "tracking_method"
-        ] + [c for c in ("max_precip", "max_cloud_top_height", "max_high_cloud_fraction") if c in tracks_df.columns]],
+        ] + [c for c in ("max_precip", "min_cloud_top_pressure", "max_cloud_top_height", "max_high_cloud_fraction") if c in tracks_df.columns]],
         on=["source", "simulation", "track_id"],
         how="left",
         suffixes=("", "_track"),
@@ -1397,6 +1527,7 @@ def select_onset_events(track_time, tracks_df, source_name, sim_name):
                 lifetime_hours=lifetime_hours,
                 max_area_km2=max_area,
                 max_precip=max_precip,
+                min_cloud_top_pressure=float(group.min_cloud_top_pressure.min(skipna=True)) if "min_cloud_top_pressure" in group else np.nan,
                 max_cloud_top_height=float(group.max_cloud_top_height.max(skipna=True)) if "max_cloud_top_height" in group else np.nan,
                 max_high_cloud_fraction=float(group.max_high_cloud_fraction.max(skipna=True)) if "max_high_cloud_fraction" in group else np.nan,
                 mean_propagation_speed_kmh=float(onset.get("mean_propagation_speed_kmh", np.nan)),
@@ -1498,10 +1629,12 @@ def prepare_composite_fields(fields, sim_name):
             cmap="BrBG",
             anomaly=True,
         )
-    if "column_connected_mask" in fields:
-        specs["column_connected"] = dict(da=fields["column_connected_mask"].astype(float), label="Column-connected high cloud", units="fraction", cmap="YlGnBu", anomaly=False)
+    if "stratiform_precipitating_high_cloud_mask" in fields:
+        specs["stratiform_precipitating"] = dict(da=fields["stratiform_precipitating_high_cloud_mask"].astype(float), label="Stratiform precipitating high cloud", units="fraction", cmap="YlGnBu", anomaly=False)
     if "cloud_top_height" in fields:
         specs["cloud_top_height"] = dict(da=fields["cloud_top_height"], label="Cloud-top height", units="km", cmap="magma", anomaly=False)
+    if "cloud_top_pressure" in fields:
+        specs["cloud_top_pressure"] = dict(da=fields["cloud_top_pressure"], label="Cloud-top pressure", units="hPa", cmap="magma_r", anomaly=False)
     if "N2_TTL" in fields:
         specs["N2_TTL_anom"] = dict(
             da=anomaly(fields["N2_TTL"], f"{sim_name} N2_TTL"),
@@ -1911,7 +2044,11 @@ def plot_fingerprint_summary(composites, specs, var_names):
                 lag, val = milestone_lag(ds)
                 marker = "s"
                 name = "maximum cloud depth"
-            elif var == "column_connected":
+            elif var == "cloud_top_pressure":
+                lag, val = milestone_lag(ds, kind="min")
+                marker = "v"
+                name = "minimum cloud-top pressure"
+            elif var == "stratiform_precipitating":
                 lag, val = milestone_lag(ds)
                 marker = "D"
                 name = "maximum high-cloud coverage"
@@ -2107,6 +2244,7 @@ def build_track_property_lifecycle(track_time_by_run, events_by_run, step_days):
         ("area_km2", "object area"),
         ("propagation_speed_kmh", "propagation speed"),
         ("mean_precip", "precipitation intensity"),
+        ("min_cloud_top_pressure", "minimum cloud-top pressure"),
         ("max_cloud_top_height", "cloud-top height"),
         ("mean_high_cloud_fraction", "high-cloud fraction"),
     ]
@@ -2174,8 +2312,40 @@ def plot_track_property_lifecycle(track_summary, tracks_all):
     plt.close(fig)
 
 
+def plot_cloud_top_pressure_lifecycle(track_summary, tracks_all):
+    sub = track_summary[track_summary.property == "min_cloud_top_pressure"]
+    if len(sub) == 0:
+        print("Skipping Figure 8: tracked cloud-top pressure is unavailable.")
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(9.5, 3.8), constrained_layout=True)
+    for i, sim in enumerate(sim_names):
+        values = sub[sub.simulation == sim].sort_values("lag_days")
+        if len(values):
+            axes[0].plot(values.lag_days, values["mean"], color=cols[i], lw=1.7, label=sim)
+            axes[0].fill_between(values.lag_days, values.p25, values.p75, color=cols[i], alpha=0.16)
+        tracks = tracks_all[tracks_all.simulation == sim]
+        if "min_cloud_top_pressure" in tracks:
+            ctp = tracks.min_cloud_top_pressure.to_numpy(dtype=float)
+            ctp = ctp[np.isfinite(ctp)]
+            if ctp.size:
+                axes[1].hist(ctp, bins=np.linspace(50.0, P_HIGH_HPA, 28), histtype="step", density=True, color=cols[i], label=sim)
+    axes[0].axvline(0.0, color="0.25", lw=0.8)
+    axes[0].set_xlabel("Lag from tracked onset (days)")
+    axes[0].set_ylabel("Minimum object cloud-top pressure (hPa)")
+    axes[0].invert_yaxis()
+    axes[1].set_xlabel("Track-minimum cloud-top pressure (hPa)")
+    axes[1].set_ylabel("Density")
+    axes[1].invert_xaxis()
+    for ax in axes:
+        ax.grid(alpha=0.2)
+    axes[0].legend(frameon=False)
+    fig.suptitle("Tracked deep-convection cloud-top pressure evolution")
+    save_figure(8, fig, "tracked_cloud_top_pressure_lifecycle")
+    plt.close(fig)
+
+
 def plot_synthesis(composites, specs, milestone_table, phase_stats):
-    synth_vars = [v for v in ("pw_anom", "precip", "column_connected", "N2_TTL_anom", "dudz_TTL_anom", "kelvin_anom") if v in specs]
+    synth_vars = [v for v in ("pw_anom", "precip", "stratiform_precipitating", "N2_TTL_anom", "dudz_TTL_anom", "kelvin_anom") if v in specs]
     if not synth_vars:
         return
     fig, ax = plt.subplots(len(synth_vars), 1, figsize=(8.8, 1.75 * len(synth_vars)), constrained_layout=True, sharex=True)
@@ -2229,7 +2399,6 @@ def load_datasets():
             ndays=ndays,
             end_date=analysis_end_date,
             chunks=latlon_chunks,
-            add_cldfrac_file=False,
         )
         ds = standardize_latlon_dataset(ds, needed_vars)
         dss.append(ds)
@@ -2242,7 +2411,6 @@ def load_datasets():
             ndays=ndays,
             end_date=analysis_end_date,
             chunks=zm_chunks,
-            add_cldfrac_file=False,
         )
         zds = standardize_latlon_dataset(zds, needed_vars)
         zss.append(zds)
@@ -2261,7 +2429,7 @@ def build_fields(ds, zds, sim_name):
             fields[key] = da
 
     classif = load_required_classification(ds, fields, sim_name)
-    for key in ("cloud_top_height", "high_cloud_fraction", "high_cloud_mask", "column_connected_mask", "active_deep_convection_high_cloud_mask"):
+    for key in ("cloud_top_pressure", "cloud_top_height", "high_cloud_fraction", "high_cloud_mask", "stratiform_precipitating_high_cloud_mask", "convective_precipitating_high_cloud_mask"):
         if key in classif:
             fields[key] = classif[key]
 
@@ -2289,7 +2457,7 @@ def main():
     for sim_name, ds, zds in zip(sim_names, dss, zss):
         fields_by_run.append(build_fields(ds, zds, sim_name))
 
-    source_name = "active_deep_convection_high_cloud_mask" if EVENT_SET == "deep" else "precip_ge_1mmh"
+    source_name = "convective_precipitating_high_cloud_mask" if EVENT_SET == "convective" else "precip_ge_1mmh"
     cached_tables = load_cached_track_event_tables(source_name)
     if cached_tables is None:
         all_objects = []
@@ -2335,7 +2503,7 @@ def main():
     for sim_name, fields in zip(sim_names, fields_by_run):
         specs_by_run[sim_name] = prepare_composite_fields(fields, sim_name)
     spec_keys = []
-    for key in ("precip", "pw_anom", "column_connected", "cloud_top_height", "N2_TTL_anom", "u_TTL_anom", "dudz_TTL_anom", "kelvin_anom"):
+    for key in ("precip", "pw_anom", "stratiform_precipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom", "u_TTL_anom", "dudz_TTL_anom", "kelvin_anom"):
         if any(key in specs_by_run[sim] for sim in sim_names):
             spec_keys.append(key)
     specs = {}
@@ -2346,8 +2514,42 @@ def main():
                 break
 
     include_spatial = should_run_figure(4)
-    cached_composites = load_cached_composites(source_name, spec_keys, include_spatial)
+    expected_composite_token = composite_cache_token(
+        source_name,
+        spec_keys,
+        include_spatial,
+    )
+    composite_signature_valid = cache_metadata_matches(
+        composite_cache_metadata_file(),
+        composite_cache_signature(source_name, spec_keys, include_spatial),
+        "lifecycle composites",
+    )
+    cached_composites = (
+        load_cached_composites(source_name, spec_keys, include_spatial)
+        if composite_signature_valid
+        else None
+    )
     if cached_composites is None:
+        event_counts = {
+            sim: len(events_by_run.get(sim, pd.DataFrame())) for sim in sim_names
+        }
+        available_specs_by_sim = {
+            sim: [
+                var
+                for var in spec_keys
+                if event_counts[sim] > 0 and var in specs_by_run[sim]
+            ]
+            for sim in sim_names
+        }
+        # Write the signature before the expensive loop. Completed per-variable
+        # products can then be resumed after an interrupted run.
+        write_composite_cache_manifest(
+            source_name,
+            spec_keys,
+            include_spatial,
+            event_counts,
+            available_specs_by_sim,
+        )
         composites = {}
         spatial_products = {}
         for sim_name, fields in zip(sim_names, fields_by_run):
@@ -2359,6 +2561,22 @@ def main():
             for var in spec_keys:
                 if var not in specs_by_run[sim_name]:
                     continue
+                if composite_signature_valid:
+                    cached_product = load_cached_composite_product(
+                        sim_name,
+                        var,
+                        include_spatial,
+                        expected_composite_token,
+                    )
+                    if cached_product is not None:
+                        product, spatial = cached_product
+                        composites[sim_name][var] = product
+                        if spatial:
+                            spatial_products[sim_name][var] = spatial
+                        progress(
+                            f"{sim_name}: using cached {var} lifecycle composites"
+                        )
+                        continue
                 da = specs_by_run[sim_name][var]["da"]
                 progress(f"{sim_name}: compositing {var}")
                 progress(f"{sim_name}: {var} lag-longitude and scalar composites")
@@ -2367,19 +2585,39 @@ def main():
                     "hov": hov,
                     "scalar": scalar,
                 }
+                spatial = {}
                 if (
-                    include_spatial
+                    spatial_composite_expected(var, include_spatial)
                     and {"latitude", "longitude"}.issubset(da.dims)
-                    and var in ("precip", "pw_anom", "column_connected", "cloud_top_height", "N2_TTL_anom")
                 ):
                     progress(f"{sim_name}: {var} spatial composites")
-                    spatial_products[sim_name][var] = composite_spatial(da, events, SPATIAL_LAGS_DAYS, step_days)
-        write_composite_cache(source_name, spec_keys, include_spatial, composites, spatial_products)
+                    spatial = composite_spatial(
+                        da,
+                        events,
+                        SPATIAL_LAGS_DAYS,
+                        step_days,
+                    )
+                    spatial_products[sim_name][var] = spatial
+                write_composite_product_cache(
+                    sim_name,
+                    var,
+                    composites[sim_name][var],
+                    spatial,
+                    expected_composite_token,
+                )
+                progress(f"{sim_name}: cached {var} lifecycle composites")
+        write_composite_cache_manifest(
+            source_name,
+            spec_keys,
+            include_spatial,
+            event_counts,
+            available_specs_by_sim,
+        )
     else:
         composites, spatial_products = cached_composites
 
     if should_run_figure(1):
-        first_group = [v for v in ("precip", "pw_anom", "column_connected", "cloud_top_height") if v in specs]
+        first_group = [v for v in ("precip", "pw_anom", "stratiform_precipitating", "cloud_top_pressure", "cloud_top_height") if v in specs]
         second_group = [v for v in ("N2_TTL_anom", "u_TTL_anom", "dudz_TTL_anom", "kelvin_anom") if v in specs]
         if first_group:
             plot_hovmoller_group(composites, specs, first_group, "core")
@@ -2392,11 +2630,11 @@ def main():
         write_csv(milestone_table, "convective_lifecycle_milestones.csv")
 
     if should_run_figure(3):
-        diff_vars = [v for v in ("pw_anom", "precip", "column_connected", "cloud_top_height", "N2_TTL_anom", "dudz_TTL_anom", "kelvin_anom") if v in specs]
+        diff_vars = [v for v in ("pw_anom", "precip", "stratiform_precipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom", "dudz_TTL_anom", "kelvin_anom") if v in specs]
         plot_difference_fingerprints(composites, specs, diff_vars)
 
     if should_run_figure(4):
-        spatial_vars = [v for v in ("precip", "pw_anom", "column_connected", "cloud_top_height", "N2_TTL_anom") if v in specs]
+        spatial_vars = [v for v in ("precip", "pw_anom", "stratiform_precipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom") if v in specs]
         plot_spatial_composites(spatial_products, specs, spatial_vars)
 
     phase_stats = pd.DataFrame()
@@ -2412,7 +2650,7 @@ def main():
     if should_run_figure(5):
         plot_phase_locking(phase_stats, phase_series)
 
-    if should_run_figure(6):
+    if should_run_any([6, 8]):
         cached_lifecycle = load_cached_track_property_lifecycle(source_name, step_days)
         if cached_lifecycle is None:
             lifecycle, track_summary = build_track_property_lifecycle(track_time_by_run, events_by_run, step_days)
@@ -2421,7 +2659,10 @@ def main():
             lifecycle, track_summary = cached_lifecycle
         write_csv(lifecycle, "convective_lifecycle_track_property_samples.csv")
         write_csv(track_summary, "convective_lifecycle_track_property_summary.csv")
-        plot_track_property_lifecycle(track_summary, tracks_all)
+        if should_run_figure(6):
+            plot_track_property_lifecycle(track_summary, tracks_all)
+        if should_run_figure(8):
+            plot_cloud_top_pressure_lifecycle(track_summary, tracks_all)
 
     if should_run_figure(7):
         if len(milestone_table) == 0:
