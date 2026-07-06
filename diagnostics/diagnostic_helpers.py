@@ -195,6 +195,29 @@ def safe_nanpercentile(values, q, default=1.0):
     return out
 
 
+def binned_mean_1d(x, y, bins, min_count=10):
+    """Bin y by x and return bin centres, mean, p25, p75, and counts."""
+    xv = np.asarray(x).ravel()
+    yv = np.asarray(y).ravel()
+    ok = np.isfinite(xv) & np.isfinite(yv)
+    xv = xv[ok]
+    yv = yv[ok]
+    idx = np.digitize(xv, bins) - 1
+    xc = 0.5 * (bins[:-1] + bins[1:])
+    mean = np.full(xc.size, np.nan)
+    p25 = np.full(xc.size, np.nan)
+    p75 = np.full(xc.size, np.nan)
+    count = np.zeros(xc.size, dtype=int)
+    for k in range(xc.size):
+        vals = yv[idx == k]
+        count[k] = vals.size
+        if vals.size >= min_count:
+            mean[k] = np.nanmean(vals)
+            p25[k] = np.nanpercentile(vals, 25)
+            p75[k] = np.nanpercentile(vals, 75)
+    return xc, mean, p25, p75, count
+
+
 def total_precip_accum(ds):
     """Accumulated total precipitation in mm, including MPAS bucket counters."""
     return (

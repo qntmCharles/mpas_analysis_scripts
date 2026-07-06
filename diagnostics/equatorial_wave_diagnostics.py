@@ -16,18 +16,19 @@ particular convectively coupled equatorial wave (CCEW) bands, and whether the
 u-nudged/T-nudged UTLS changes alter the precipitation response to those waves.
 
 The filtering uses Straub/Kiladis-style k-f boxes via the low-level kf_filter.
-For the current wave list this means:
 The current analysis wave list is chosen for this simulation set:
   Kelvin:       k=1..14,    period=2.5..20 d,  equivalent depth=8..90 m
   EIG:          k=1..14,    period=1.8..4.5 d, equivalent depth=8..90 m
-  IG symmetric: k=-15..-1,  period=1.4..2.6 d, equivalent depth=8..90 m
   IG antisym.:  k=-15..-1,  period=1.25..2 d,  equivalent depth=8..90 m
-  AD sym/asym:  k=-28..-4,  period=5..20 d,    no depth constraint
+  Easterly:     k=-28..-6,  period=2.5..7 d,   no depth constraint
   ER:           k=-10..-1,  period=10..40 d,   equivalent depth=8..90 m
 
-AD is a broad westward disturbance filter rather than a single Matsuno normal
-mode, so this script analyzes its symmetric and antisymmetric projections
-separately.
+Wave-phase-conditioned cloud-classification analysis (previously figures 10
+and 12 here) lives in convective_pathway_diagnostics.py, which conditions the
+shared high-cloud classes on Kelvin, Easterly, and ER phase.
+
+The easterly-wave definition follows Rios-Berrios et al. (2023). It is a
+rectangular TD/easterly-wave band rather than a shallow-water normal mode.
 
 The script caches filtered fields as NetCDF files beside the source simulations
 so that figures can be regenerated without re-running the k-f filters.
@@ -51,10 +52,11 @@ import xarray as xr
 import dask
 
 from diagnostic_helpers import *
-from high_cloud_classification import (
-    CLASSIFICATION_CACHE_VERSION as SHARED_HIGH_CLOUD_CLASSIFICATION_VERSION,
-    HighCloudThresholds,
-    cached_classification_is_current as shared_cached_classification_is_current,
+from equatorial_wave_config import (
+    MISSING_EQUIVALENT_DEPTH,
+    WAVE_BOXES,
+    WAVE_LATITUDE_PROJECTION,
+    WAVE_VARIABILITY_FIELDS,
 )
 from wavenumber_frequency_functions import spacetime_power, smooth_wavefreq
 
@@ -78,7 +80,7 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/waves/")
 #
 # Figure numbers:
 #   1:  wave_filtered_hovmollers_precip
-#   2:  wave_power_fractions_and_ratios
+#   2:  wave_power_absolute_and_change
 #   3:  wave_amplitude_lag_correlations
 #   4:  wave_conditioned_precip_olr_pw
 #   5:  intense_precip_wave_attribution
@@ -87,10 +89,12 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/waves/")
 #   8:  wave_filtered_eddy_fluxes_HEAVY
 #   9:  symmetric_antisymmetric_wave_spectra
 #       plus period-axis and wavenumber-phase-speed variants
-#   10: kelvin_cloud_decomposition
 #   11: compact_wave_attribution_metrics
-#   12: kelvin_conditioned_cloud_top_pressure
-figures_to_run = [9, 10, 11, 12]
+#
+# Figures 10 and 12 (Kelvin-conditioned cloud decomposition / cloud-top
+# pressure) moved to convective_pathway_diagnostics.py figure 10, which covers
+# Kelvin, Easterly, and ER phase conditioning.
+figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 # Restart/resume controls.  With the default full run, existing figure files are
@@ -126,54 +130,15 @@ obs_per_day = int(round(24 / dt))
 filter_lat_bounds = (-10, 10)
 filter_avg_lat = True
 
-TROPICAL_LAT_BOUNDS = (-20.0, 20.0)
-
-# Kelvin-conditioned high-cloud decomposition thresholds. These are the shared
-# coarse-grid precipitation-regime definitions owned by
-# refined_high_cloud_classification_diagnostics.py.
-P_HIGH_HPA = 440.0
-CLOUD_FRAC_THRESH = 0.05
-PRECIP_MIN_MM_DAY = 1.0
-CONVECTIVE_FRACTION_THRESHOLD = 0.50
-ACTIVE_KELVIN_AMP_THRESH = 1.0
-KELVIN_CLOUD_FIGURE_NUMBER = 10
 WAVE_ATTRIBUTION_FIGURE_NUMBER = 11
-KELVIN_CLOUD_DEPTH_FIGURE_NUMBER = 12
 ATTRIBUTION_EPS = 1.0e-12
-
-KELVIN_CLOUD_CONDITIONS = ("all", "active_kelvin", "positive_phase", "negative_phase")
-KELVIN_CLOUD_CONDITION_LABELS = {
-    "all": "All times",
-    "active_kelvin": "Active Kelvin",
-    "positive_phase": "Positive Kelvin",
-    "negative_phase": "Negative Kelvin",
-}
-
-KELVIN_CLOUD_CATEGORIES = (
-    ("total_high_cloud", "Total high cloud", "high_cloud_mask"),
-    ("convective_precipitating_high_cloud", "Convective precipitating", "convective_precipitating_high_cloud_mask"),
-    ("stratiform_precipitating_high_cloud", "Stratiform precipitating", "stratiform_precipitating_high_cloud_mask"),
-    ("nonprecipitating_high_cloud", "Non-precipitating", "nonprecipitating_high_cloud_mask"),
-    ("unclassified_high_cloud", "Invalid/unclassified", "unclassified_high_cloud_mask"),
-)
-KELVIN_CLOUD_PLOT_CATEGORIES = (
-    "convective_precipitating_high_cloud",
-    "stratiform_precipitating_high_cloud",
-    "nonprecipitating_high_cloud",
-)
-KELVIN_CLOUD_CONTRIBUTION_CATEGORIES = (
-    "convective_precipitating_high_cloud",
-    "stratiform_precipitating_high_cloud",
-    "nonprecipitating_high_cloud",
-    "unclassified_high_cloud",
-)
 
 # Heavier latitude-resolved filtering in figure 8 can use its own wider band.
 eddy_flux_lat_bounds = (-20, 20)
 
 # Analysis wave bands.  Names with suffixes are unique analysis IDs for parity
 # projections of the same underlying k-f filter.
-wave_names = ["Kelvin", "EIG", "IG_antisym", "AD_sym", "AD_antisym", "ER"]
+wave_names = ["Kelvin", "EIG", "IG_antisym", "Easterly", "ER"]
 
 # Latitude projection by wave.  Choices are:
 #   symmetric:       average over filter_lat_bounds, suitable for even modes
@@ -186,28 +151,15 @@ wave_names = ["Kelvin", "EIG", "IG_antisym", "AD_sym", "AD_antisym", "ER"]
 #   Kelvin and ER are symmetric/even.
 #   EIG is the eastward n=0 inertio-gravity branch, antisymmetric/odd.
 #   IG_sym and IG_antisym separate the westward n=1 and n=2 IG branches.
-#   AD is a broad westward disturbance band, not a single Matsuno normal mode,
-#   so both paired same-sign and odd projections are analyzed.
-wave_latitude_projection = {
-    "Kelvin": "symmetric",
-    "EIG": "antisymmetric",
-    "IG_antisym": "antisymmetric",
-    "AD_sym": "symmetric",
-    "AD_antisym": "antisymmetric",
-    "ER": "symmetric",
-}
+#   Easterly is the direct 10 S--10 N mean used by Rios-Berrios et al. (2023),
+#   without assigning the rectangular TD/easterly-wave box a Matsuno parity.
+wave_latitude_projection = dict(WAVE_LATITUDE_PROJECTION)
 
 # Variables used in the wave diagnostics.  Names are interpreted by
 # get_filter_field(); cldfrac without a height is the vertical mean, cldfrac5km
 # means the nearest cloud-fraction level to 5 km, and pressure-level fields are
 # parsed from names like u850, w500, T100, v850, qv700, RH500.
-power_fields = [
-    "Precip", "OLR", "PW", "cldfrac",
-    "u850", "u250", "u100",
-    "v850", "v250",
-    "w500", "w250",
-    "T250", "T100",
-]
+power_fields = list(WAVE_VARIABILITY_FIELDS)
 
 lag_target_fields = ["Precip", "OLR", "PW", "cldfrac"]
 conditioned_fields = ["Precip", "OLR", "PW", "cldfrac"]
@@ -216,9 +168,8 @@ vertical_profile_fields = ["u", "w", "T", "cldfrac"]
 vertical_profile_levels = [50, 70, 100, 150, 200, 250, 300, 500, 700, 850]
 cldfrac_profile_heights_km = [2, 5, 8, 11, 14, 17, 20]
 
-# Figure 8 keeps latitude resolved, so hemispheric projections such as AD_sym
-# and AD_antisym are not applied there. Use the underlying AD filter once.
-eddy_flux_waves = ["Kelvin", "EIG", "IG_antisym", "AD_sym", "AD_antisym", "ER"]
+# Figure 8 keeps latitude resolved and applies each wave box directly.
+eddy_flux_waves = list(wave_names)
 eddy_flux_levels = [70, 100, 250, 850]
 
 spectrum_field = "Precip"
@@ -236,8 +187,7 @@ spectrum_outline_colors = {
     "EIG": "tab:red",
     "IG_sym": "tab:pink",
     "IG_antisym": "tab:purple",
-    "AD_sym": "tab:green",
-    "AD_antisym": "tab:olive",
+    "Easterly": "tab:green",
     "ER": "tab:blue",
 }
 earth_radius_m = 6.371e6
@@ -246,9 +196,6 @@ earth_radius_m = 6.371e6
 cache_dir = diagnostic_cache_dir("wave_cache", root_dir=root_dir)
 input_cache_dir = os.path.join(cache_dir, "filter_inputs")
 derived_cache_dir = os.path.join(cache_dir, "derived")
-classification_cache_dirs = [
-    diagnostic_cache_dir("classification_cache", root_dir=root_dir),
-]
 os.makedirs(cache_dir, exist_ok=True)
 os.makedirs(input_cache_dir, exist_ok=True)
 os.makedirs(derived_cache_dir, exist_ok=True)
@@ -260,7 +207,6 @@ PRESSURE_FIELD_CACHE_VERSION = "pressure-axis-fixed"
 PRESSURE_FIELD_PREFIXES = ("w", "u", "v", "T", "qv", "RH")
 DERIVED_CACHE_VERSION = "equatorial-wave-derived-v2"
 SPECTRUM_CACHE_VERSION = "equatorial-wave-spectrum-v1"
-CLOUD_CLASSIFICATION_CACHE_VERSION = SHARED_HIGH_CLOUD_CLASSIFICATION_VERSION
 
 # Avoid giant chunks when selecting latitude/longitude subsets.
 dask.config.set({"array.slicing.split_large_chunks": True})
@@ -570,44 +516,7 @@ for i, d in enumerate(data_locs):
 # Wave-box metadata and helper functions
 # -----------------------------------------------------------------------------
 
-# This dictionary drives filtering, labels, phase-speed ranges, and spectrum
-# outlines. AD is a westward disturbance filter rather than a single equatorial
-# normal mode.
-mis = -999.0
-WAVE_BOXES = {
-    "Kelvin": dict(
-        k=(1, 14), period=(2.5, 20.0), depth=(8, 90),
-        label="Kelvin", filter_name="Kelvin", components=("symmetric",),
-    ),
-    "EIG": dict(
-        k=(1, 14), period=(1.8, 4.5), depth=(8, 90),
-        label="EIG", filter_name="IG0", components=("antisymmetric",),
-    ),
-    "IG_sym": dict(
-        k=(-15, -1), period=(1.4, 2.6), depth=(8, 90),
-        label="IG sym", filter_name="IG1", components=("symmetric",),
-    ),
-    "IG_antisym": dict(
-        k=(-15, -1), period=(1.25, 2.0), depth=(8, 90),
-        label="IG antisym", filter_name="IG2", components=("antisymmetric",),
-    ),
-    "AD_sym": dict(
-        k=(-28, -4), period=(5.0, 20.0), depth=(mis, mis),
-        label="AD sym", filter_name="AD", components=("symmetric",),
-    ),
-    "AD_antisym": dict(
-        k=(-28, -4), period=(5.0, 20.0), depth=(mis, mis),
-        label="AD antisym", filter_name="AD", components=("antisymmetric",),
-    ),
-    "AD": dict(
-        k=(-28, -4), period=(5.0, 20.0), depth=(mis, mis),
-        label="AD", filter_name="AD", components=("symmetric", "antisymmetric"),
-    ),
-    "ER": dict(
-        k=(-10, -1), period=(10.0, 40.0), depth=(8, 90),
-        label="ER", filter_name="ER", components=("symmetric",),
-    ),
-}
+mis = MISSING_EQUIVALENT_DEPTH
 
 
 def wave_label(wave_name):
@@ -673,86 +582,6 @@ def get_cldfrac_field(ds, field_name):
     out.name = field_name
     out.attrs["selected_height_km"] = height_km
     return out
-
-
-def classification_thresholds():
-    return HighCloudThresholds(
-        cf_thresh=CLOUD_FRAC_THRESH,
-        high_cloud_top_pressure_hpa=P_HIGH_HPA,
-        surface_precip_min_mm_day=PRECIP_MIN_MM_DAY,
-        convective_fraction_threshold=CONVECTIVE_FRACTION_THRESHOLD,
-    )
-
-
-def cached_classification_is_current(cached):
-    return shared_cached_classification_is_current(cached, classification_thresholds())
-
-
-REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS = (
-    "cloud_top_pressure",
-    "high_cloud_mask",
-    "convective_precipitating_high_cloud_mask",
-    "stratiform_precipitating_high_cloud_mask",
-    "nonprecipitating_high_cloud_mask",
-    "unclassified_high_cloud_mask",
-)
-
-
-def classification_dict_from_dataset(ds):
-    out = {}
-    for name in ds.data_vars:
-        da = ds[name]
-        if int(da.attrs.get("boolean_mask", 0)) == 1 or da.attrs.get("logical_type") == "bool":
-            da = da.astype(bool)
-        out[name] = da
-    return out
-
-
-def classification_cache_names(sim_name):
-    safe = sim_name.replace(" ", "_")
-    return [f"{safe}_classified_high_cloud.nc"]
-
-
-def open_shared_high_cloud_classification(sim_name, precip_ref):
-    checked = []
-    for cache_dir_i in classification_cache_dirs:
-        for fname in classification_cache_names(sim_name):
-            path = os.path.join(cache_dir_i, fname)
-            checked.append(path)
-            if not os.path.exists(path):
-                continue
-            cached = xr.open_dataset(path, chunks={})
-            if not cached_classification_is_current(cached):
-                cached.close()
-                raise RuntimeError(f"{sim_name}: stale high-cloud classification cache: {path}")
-            missing = [
-                name for name in REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS
-                if name not in cached.data_vars
-            ]
-            if missing:
-                cached.close()
-                raise RuntimeError(
-                    f"{sim_name}: high-cloud classification cache lacks required shared variables "
-                    f"{missing}: {path}"
-                )
-            print(f"Using shared high-cloud classification for {sim_name}: {path}")
-            out = classification_dict_from_dataset(cached)
-            if precip_ref is not None:
-                out = {
-                    name: sel_common_times(da, precip_ref) if "Time" in da.dims and "Time" in precip_ref.dims else da
-                    for name, da in out.items()
-                }
-            return out
-    raise FileNotFoundError(
-        f"{sim_name}: required shared high-cloud classification cache is missing. "
-        f"Run refined_high_cloud_classification_diagnostics.py first. Checked: {checked}"
-    )
-
-
-def get_high_cloud_classification_cached(ds, sim_index, precip=None):
-    if precip is None:
-        precip = precip_rate(ds)
-    return open_shared_high_cloud_classification(sim_names[sim_index], precip)
 
 
 def get_filter_field(ds, field_name):
@@ -985,6 +814,8 @@ def wave_cache_matches(wave_da, field_name, wave_name, avgLat, lat_bounds, proje
         and int(avg_attr) == int(avgLat)
         and wave_da.attrs.get("filter_lat_bounds") == lat_bounds_attr(lat_bounds)
         and wave_da.attrs.get("latitude_projection") == projection
+        and wave_da.attrs.get("wave_box")
+        == json.dumps(jsonable_value(WAVE_BOXES[wave_name]), sort_keys=True)
     )
 
 
@@ -1098,6 +929,7 @@ def direct_filtered_wave(ds, sim_index, field_name, wave_name, avgLat, lat_bound
         latitude_projection=projection,
         avgLat=int(avgLat),
         units=field_units(field_name),
+        wave_box=json.dumps(jsonable_value(WAVE_BOXES[wave_name]), sort_keys=True),
     )
     if is_pressure_level_field(field_name):
         wave.attrs["cache_version"] = PRESSURE_FIELD_CACHE_VERSION
@@ -1150,6 +982,7 @@ def projected_filtered_wave(ds, sim_index, field_name, wave_name, lat_bounds, pr
         north_component_bounds=lat_bounds_attr(north_bounds),
         avgLat=1,
         units=field_units(field_name),
+        wave_box=json.dumps(jsonable_value(WAVE_BOXES[wave_name]), sort_keys=True),
     )
     if is_pressure_level_field(field_name):
         wave.attrs["cache_version"] = PRESSURE_FIELD_CACHE_VERSION
@@ -1277,351 +1110,6 @@ def get_dt_days_from_time(da):
     return float(np.median(da.Time.diff("Time") / np.timedelta64(1, "D")))
 
 
-def binned_mean_1d(x, y, bins, min_count=10):
-    xv = np.asarray(x).ravel()
-    yv = np.asarray(y).ravel()
-    ok = np.isfinite(xv) & np.isfinite(yv)
-    xv = xv[ok]
-    yv = yv[ok]
-    idx = np.digitize(xv, bins) - 1
-    xc = 0.5 * (bins[:-1] + bins[1:])
-    mean = np.full(xc.size, np.nan)
-    p25 = np.full(xc.size, np.nan)
-    p75 = np.full(xc.size, np.nan)
-    count = np.zeros(xc.size, dtype=int)
-    for k in range(xc.size):
-        vals = yv[idx == k]
-        count[k] = vals.size
-        if vals.size >= min_count:
-            mean[k] = np.nanmean(vals)
-            p25[k] = np.nanpercentile(vals, 25)
-            p75[k] = np.nanpercentile(vals, 75)
-    return xc, mean, p25, p75, count
-
-
-def subset_latitude(da, lat_bounds):
-    if lat_bounds is None or "latitude" not in da.dims:
-        return da
-    lo, hi = normalise_lat_bounds(lat_bounds)
-    return da.sel(latitude=slice(lo, hi))
-
-
-def weighted_area_time_fraction(da, condition=None, lat_bounds=TROPICAL_LAT_BOUNDS):
-    x = subset_latitude(da.astype(float), lat_bounds)
-    if condition is not None:
-        x, cond = xr.align(x, condition, join="inner")
-        x = x.where(cond)
-    dims = [d for d in ("Time", "latitude", "longitude") if d in x.dims]
-    if "latitude" in x.dims:
-        weights = np.cos(np.deg2rad(x.latitude))
-        return float(x.weighted(weights).mean(dim=dims, skipna=True).values)
-    return float(x.mean(dim=dims, skipna=True).values)
-
-
-def latitude_profile_fraction(da, condition=None, lat_bounds=TROPICAL_LAT_BOUNDS):
-    x = subset_latitude(da.astype(float), lat_bounds)
-    if condition is not None:
-        x, cond = xr.align(x, condition, join="inner")
-        x = x.where(cond)
-    dims = [d for d in ("Time", "longitude") if d in x.dims]
-    out = x.mean(dim=dims, skipna=True)
-    out.name = "fraction"
-    return hemispheric_fold(out, parity="even")
-
-
-def latitude_mean_lon_time(da, lat_bounds=filter_lat_bounds):
-    x = subset_latitude(da.astype(float), lat_bounds)
-    if "latitude" not in x.dims:
-        return x
-    weights = np.cos(np.deg2rad(x.latitude))
-    return x.weighted(weights).mean(dim="latitude", skipna=True)
-
-
-def kelvin_precip_anomaly(ds, sim_index):
-    return get_filtered_wave(
-        ds,
-        sim_index,
-        "Precip",
-        "Kelvin",
-        avgLat=True,
-        lat_bounds=filter_lat_bounds,
-        projection=lat_projection_for_wave("Kelvin"),
-    )
-
-
-def kelvin_condition_masks(kelvin_wave):
-    dims = [d for d in ("Time", "longitude") if d in kelvin_wave.dims]
-    sigma = float(kelvin_wave.std(dim=dims, skipna=True).values)
-    if not np.isfinite(sigma) or sigma <= 0:
-        sigma = np.nan
-    amp = np.abs(kelvin_wave) / sigma
-    amp.name = "kelvin_precip_amplitude_sigma"
-    masks = {
-        "all": xr.ones_like(kelvin_wave, dtype=bool),
-        "active_kelvin": amp >= ACTIVE_KELVIN_AMP_THRESH,
-        "positive_phase": kelvin_wave > 0,
-        "negative_phase": kelvin_wave < 0,
-    }
-    return masks, amp, sigma
-
-
-def category_info(category):
-    for key, label, mask_name in KELVIN_CLOUD_CATEGORIES:
-        if key == category:
-            return label, mask_name
-    raise KeyError(category)
-
-
-def kelvin_cloud_decomposition_signature():
-    return cache_signature(
-        "kelvin_cloud_decomposition",
-        extra=dict(
-            schema_version="kelvin-cloud-ctp-v2",
-            conditions=list(KELVIN_CLOUD_CONDITIONS),
-            categories=jsonable_value(KELVIN_CLOUD_CATEGORIES),
-            tropical_lat_bounds=jsonable_value(TROPICAL_LAT_BOUNDS),
-            phase_bins=jsonable_value(np.linspace(-3.0, 3.0, 25)),
-            active_kelvin_amp_threshold=ACTIVE_KELVIN_AMP_THRESH,
-            cloud_classification_cache_version=CLOUD_CLASSIFICATION_CACHE_VERSION,
-        ),
-    )
-
-
-def compute_kelvin_cloud_decomposition():
-    signature = kelvin_cloud_decomposition_signature()
-    scalar_cached = load_cached_table(
-        "kelvin_cloud_decomposition_scalar",
-        signature,
-        output_filename="kelvin_cloud_decomposition_summary.csv",
-        required_columns=("simulation", "condition", "category", "fraction"),
-    )
-    profiles_cached = load_cached_table(
-        "kelvin_cloud_decomposition_profiles",
-        signature,
-        output_filename="kelvin_cloud_decomposition_latitude_profiles.csv",
-        required_columns=("simulation", "condition", "category", "latitude", "fraction"),
-    )
-    phase_cached = load_cached_table(
-        "kelvin_cloud_decomposition_phase",
-        signature,
-        output_filename="kelvin_cloud_decomposition_phase_composites.csv",
-        required_columns=("simulation", "variable", "signed_kelvin_sigma_bin", "mean"),
-    )
-    needs_full_plot_tables = should_run_any(
-        [KELVIN_CLOUD_FIGURE_NUMBER, KELVIN_CLOUD_DEPTH_FIGURE_NUMBER]
-    )
-    if scalar_cached is not None and (
-        not needs_full_plot_tables
-        or (profiles_cached is not None and phase_cached is not None)
-    ):
-        return {
-            "scalar": scalar_cached,
-            "profiles": profiles_cached if profiles_cached is not None else pd.DataFrame(),
-            "phase": phase_cached if phase_cached is not None else pd.DataFrame(),
-            "classifications": {},
-            "kelvin_waves": {},
-            "conditions": {},
-        }
-
-    scalar_rows = []
-    profile_rows = []
-    phase_rows = []
-    classifications = {}
-    kelvin_waves = {}
-    kelvin_conditions = {}
-    phase_bins = np.linspace(-3.0, 3.0, 25)
-
-    for i, ds in enumerate(dss):
-        sim = sim_names[i]
-        try:
-            pr = precip_rate(ds)
-            classif = get_high_cloud_classification_cached(ds, i, precip=pr)
-            kelvin = kelvin_precip_anomaly(ds, i)
-            masks, amp, sigma = kelvin_condition_masks(kelvin)
-            classifications[sim] = classif
-            kelvin_waves[sim] = kelvin
-            kelvin_conditions[sim] = masks
-
-            for category, label, mask_name in KELVIN_CLOUD_CATEGORIES:
-                da = classif[mask_name].astype(float)
-                for condition in KELVIN_CLOUD_CONDITIONS:
-                    cond = None if condition == "all" else masks[condition]
-                    fraction = weighted_area_time_fraction(
-                        da,
-                        condition=cond,
-                        lat_bounds=TROPICAL_LAT_BOUNDS,
-                    )
-                    scalar_rows.append(
-                        dict(
-                            simulation=sim,
-                            simulation_index=i,
-                            condition=condition,
-                            condition_label=KELVIN_CLOUD_CONDITION_LABELS[condition],
-                            category=category,
-                            category_label=label,
-                            fraction=fraction,
-                            kelvin_sigma_mm_day=sigma,
-                        )
-                    )
-
-                    profile = latitude_profile_fraction(
-                        da,
-                        condition=cond,
-                        lat_bounds=TROPICAL_LAT_BOUNDS,
-                    ).load()
-                    for lat, val in zip(profile.latitude.values, profile.values):
-                        profile_rows.append(
-                            dict(
-                                simulation=sim,
-                                simulation_index=i,
-                                condition=condition,
-                                condition_label=KELVIN_CLOUD_CONDITION_LABELS[condition],
-                                category=category,
-                                category_label=label,
-                                latitude=float(lat),
-                                fraction=float(val),
-                            )
-                        )
-
-            # Signed Kelvin precipitation bins are robust and avoid depending on
-            # a fragile phase estimate. Cloud categories remain raw-mask means.
-            x = kelvin / sigma
-            composite_fields = [
-                ("Precip", "Precip", "Precipitation", field_units("Precip")),
-                ("OLR", "OLR", "OLR", field_units("OLR")),
-                ("PW", "PW", "PW", field_units("PW")),
-            ]
-            for field_name, source, label, units in composite_fields:
-                try:
-                    y = latitude_mean_lon_time(get_filter_field(ds, source), lat_bounds=filter_lat_bounds)
-                    x_aligned, y = xr.align(x, y, join="inner")
-                    xc, ym, y25, y75, count = binned_mean_1d(
-                        x_aligned.values,
-                        y.values,
-                        phase_bins,
-                        min_count=20,
-                    )
-                    for xx, yy, lo, hi, cnum in zip(xc, ym, y25, y75, count):
-                        phase_rows.append(
-                            dict(
-                                simulation=sim,
-                                simulation_index=i,
-                                variable=field_name,
-                                variable_label=label,
-                                units=units,
-                                signed_kelvin_sigma_bin=xx,
-                                mean=yy,
-                                p25=lo,
-                                p75=hi,
-                                count=cnum,
-                            )
-                        )
-                except Exception as exc:
-                    print(f"Skipping Kelvin phase composite for {sim} {field_name}: {exc}")
-
-            for category, label, mask_name in KELVIN_CLOUD_CATEGORIES[:4]:
-                y = latitude_mean_lon_time(classif[mask_name].astype(float), lat_bounds=filter_lat_bounds)
-                x_aligned, y = xr.align(x, y, join="inner")
-                xc, ym, y25, y75, count = binned_mean_1d(
-                    x_aligned.values,
-                    y.values,
-                    phase_bins,
-                    min_count=20,
-                )
-                for xx, yy, lo, hi, cnum in zip(xc, ym, y25, y75, count):
-                    phase_rows.append(
-                        dict(
-                            simulation=sim,
-                            simulation_index=i,
-                            variable=category,
-                            variable_label=label,
-                            units="fraction",
-                            signed_kelvin_sigma_bin=xx,
-                            mean=yy,
-                            p25=lo,
-                            p75=hi,
-                            count=cnum,
-                        )
-                    )
-            for category, label, mask_name in KELVIN_CLOUD_CATEGORIES[1:4]:
-                ctp = classif["cloud_top_pressure"].where(classif[mask_name].astype(bool))
-                y = latitude_mean_lon_time(ctp, lat_bounds=filter_lat_bounds)
-                x_aligned, y = xr.align(x, y, join="inner")
-                xc, ym, y25, y75, count = binned_mean_1d(
-                    x_aligned.values,
-                    y.values,
-                    phase_bins,
-                    min_count=20,
-                )
-                for xx, yy, lo, hi, cnum in zip(xc, ym, y25, y75, count):
-                    phase_rows.append(
-                        dict(
-                            simulation=sim,
-                            simulation_index=i,
-                            variable=f"{category}_cloud_top_pressure",
-                            variable_label=f"{label} cloud-top pressure",
-                            units="hPa",
-                            signed_kelvin_sigma_bin=xx,
-                            mean=yy,
-                            p25=lo,
-                            p75=hi,
-                            count=cnum,
-                        )
-                    )
-        except (FileNotFoundError, RuntimeError):
-            raise
-        except Exception as exc:
-            print(f"Skipping Kelvin cloud decomposition for {sim}: {exc}")
-
-    scalar = pd.DataFrame(scalar_rows)
-    profiles = pd.DataFrame(profile_rows)
-    phase = pd.DataFrame(phase_rows)
-
-    if len(scalar) > 0:
-        write_cached_table("kelvin_cloud_decomposition_scalar", scalar, signature)
-    if len(profiles) > 0:
-        write_cached_table("kelvin_cloud_decomposition_profiles", profiles, signature)
-    if len(phase) > 0:
-        write_cached_table("kelvin_cloud_decomposition_phase", phase, signature)
-
-    if save and len(scalar) > 0:
-        scalar.to_csv(os.path.join(save_loc, "kelvin_cloud_decomposition_summary.csv"), index=False)
-        if len(profiles) > 0:
-            profiles.to_csv(os.path.join(save_loc, "kelvin_cloud_decomposition_latitude_profiles.csv"), index=False)
-        if len(phase) > 0:
-            phase.to_csv(os.path.join(save_loc, "kelvin_cloud_decomposition_phase_composites.csv"), index=False)
-        try:
-            summary_pieces = [
-                xr.Dataset.from_dataframe(
-                    scalar.set_index(["simulation", "condition", "category"])[["fraction"]]
-                ).rename({"fraction": "tropical_mean_fraction"})
-            ]
-            if len(profiles) > 0:
-                summary_pieces.append(
-                    xr.Dataset.from_dataframe(
-                        profiles.set_index(["simulation", "condition", "category", "latitude"])[["fraction"]]
-                    ).rename({"fraction": "latitude_profile_fraction"})
-                )
-            summary_ds = xr.merge(summary_pieces, compat="override")
-            summary_ds.attrs.update(
-                description="Kelvin-conditioned cloud categories from the shared coarse-grid precipitation-regime classification",
-                classification_reference="diagnostics/refined_high_cloud_classification_diagnostics.py",
-                active_kelvin_amp_threshold_sigma=ACTIVE_KELVIN_AMP_THRESH,
-            )
-            summary_ds.to_netcdf(os.path.join(save_loc, "kelvin_cloud_decomposition_summary.nc"))
-        except Exception as exc:
-            print(f"Could not save Kelvin cloud NetCDF summary: {exc}")
-
-    return {
-        "scalar": scalar,
-        "profiles": profiles,
-        "phase": phase,
-        "classifications": classifications,
-        "kelvin_waves": kelvin_waves,
-        "conditions": kelvin_conditions,
-    }
-
-
 def compute_intense_precip_wave_attribution(percentile=95.0):
     signature = cache_signature(
         "intense_precip_wave_attribution",
@@ -1685,231 +1173,6 @@ def compute_intense_precip_wave_attribution(percentile=95.0):
     return out
 
 
-def plot_kelvin_cloud_decomposition_latitude(summary):
-    profiles = summary["profiles"]
-    if len(profiles) == 0:
-        return
-    condition = "active_kelvin"
-    category_labels = dict((key, label) for key, label, _ in KELVIN_CLOUD_CATEGORIES)
-    fig, ax = plt.subplots(
-        len(KELVIN_CLOUD_PLOT_CATEGORIES),
-        2,
-        figsize=(10.5, 2.8 * len(KELVIN_CLOUD_PLOT_CATEGORIES)),
-        constrained_layout=True,
-        sharex=True,
-    )
-    if len(KELVIN_CLOUD_PLOT_CATEGORIES) == 1:
-        ax = ax[None, :]
-
-    for r, category in enumerate(KELVIN_CLOUD_PLOT_CATEGORIES):
-        sub = profiles[(profiles.condition == condition) & (profiles.category == category)]
-        for i, sim in enumerate(sim_names):
-            s = sub[sub.simulation == sim].sort_values("latitude")
-            if len(s) == 0:
-                continue
-            ax[r, 0].plot(s.latitude, s.fraction, color=cols[i], lw=1.8, label=sim if r == 0 else None)
-
-        wide = sub.pivot_table(index="latitude", columns="simulation", values="fraction", aggfunc="mean").sort_index()
-        if all(sim in wide.columns for sim in sim_names):
-            du = wide[sim_names[1]] - wide[sim_names[0]]
-            dT = wide[sim_names[2]] - wide[sim_names[0]]
-            residual = du - dT
-            ax[r, 1].plot(wide.index, du, color=cols[1], lw=1.8, label="nudged u - control" if r == 0 else None)
-            ax[r, 1].plot(wide.index, dT, color=cols[2], lw=1.8, label="nudged T - control" if r == 0 else None)
-            ax[r, 1].plot(wide.index, residual, color="0.15", lw=1.4, ls="--",
-                          label="(nudged u - control) - (nudged T - control)" if r == 0 else None)
-
-        ax[r, 0].set_ylabel(category_labels[category])
-        ax[r, 1].axhline(0, color="0.65", lw=0.7)
-        ax[r, 0].grid(alpha=0.2)
-        ax[r, 1].grid(alpha=0.2)
-
-    ax[0, 0].set_title("Active Kelvin cloud-category fraction")
-    ax[0, 1].set_title("Active Kelvin differences")
-    ax[-1, 0].set_xlabel("Latitude")
-    ax[-1, 1].set_xlabel("Latitude")
-    ax[0, 0].legend(loc="best")
-    ax[0, 1].legend(loc="best", fontsize=8)
-    fig.suptitle("Kelvin-conditioned high-cloud decomposition by latitude")
-    save_figure(KELVIN_CLOUD_FIGURE_NUMBER, fig, "kelvin_cloud_decomposition_latitude")
-
-
-def plot_kelvin_cloud_decomposition_bars(summary):
-    scalar = summary["scalar"]
-    if len(scalar) == 0:
-        return
-    categories = (
-        "total_high_cloud",
-        "convective_precipitating_high_cloud",
-        "stratiform_precipitating_high_cloud",
-        "nonprecipitating_high_cloud",
-    )
-    category_labels = dict((key, label) for key, label, _ in KELVIN_CLOUD_CATEGORIES)
-    fig, ax = plt.subplots(1, len(KELVIN_CLOUD_CONDITIONS), figsize=(4.0 * len(KELVIN_CLOUD_CONDITIONS), 4.0),
-                           constrained_layout=True, sharey=True)
-    if len(KELVIN_CLOUD_CONDITIONS) == 1:
-        ax = [ax]
-    x = np.arange(len(categories))
-    width = 0.8 / len(sim_names)
-    for cj, condition in enumerate(KELVIN_CLOUD_CONDITIONS):
-        sub = scalar[scalar.condition == condition]
-        for i, sim in enumerate(sim_names):
-            vals = []
-            for cat in categories:
-                s = sub[(sub.simulation == sim) & (sub.category == cat)]
-                vals.append(float(s.fraction.iloc[0]) if len(s) else np.nan)
-            ax[cj].bar(x + (i - (len(sim_names)-1)/2) * width, vals, width, color=cols[i], label=sim if cj == 0 else None)
-        ax[cj].set_title(KELVIN_CLOUD_CONDITION_LABELS[condition])
-        ax[cj].set_xticks(x)
-        ax[cj].set_xticklabels([category_labels[c] for c in categories], rotation=30, ha="right")
-        ax[cj].grid(axis="y", alpha=0.2)
-    ax[0].set_ylabel("Tropical area/time fraction")
-    ax[0].legend(loc="best")
-    fig.suptitle("Kelvin-conditioned cloud-category fractions")
-    save_figure(KELVIN_CLOUD_FIGURE_NUMBER, fig, "kelvin_cloud_decomposition_bars")
-
-
-def plot_kelvin_cloud_decomposition_phase_composites(summary):
-    phase = summary["phase"]
-    if len(phase) == 0:
-        return
-    variable_order = [
-        "Precip",
-        "OLR",
-        "PW",
-        "total_high_cloud",
-        "convective_precipitating_high_cloud",
-        "stratiform_precipitating_high_cloud",
-        "nonprecipitating_high_cloud",
-    ]
-    variable_order = [v for v in variable_order if v in set(phase.variable)]
-    if len(variable_order) == 0:
-        return
-    fig, ax = plt.subplots(len(variable_order), 1, figsize=(7.0, 2.2 * len(variable_order)),
-                           constrained_layout=True, sharex=True)
-    if len(variable_order) == 1:
-        ax = [ax]
-    for r, variable in enumerate(variable_order):
-        sub = phase[phase.variable == variable]
-        label = sub.variable_label.iloc[0] if len(sub) else variable
-        units = sub.units.iloc[0] if len(sub) else ""
-        for i, sim in enumerate(sim_names):
-            s = sub[sub.simulation == sim].sort_values("signed_kelvin_sigma_bin")
-            if len(s) == 0:
-                continue
-            ax[r].plot(s.signed_kelvin_sigma_bin, s["mean"], color=cols[i], lw=1.8, label=sim if r == 0 else None)
-            ax[r].fill_between(s.signed_kelvin_sigma_bin, s.p25, s.p75, color=cols[i], alpha=0.10, linewidth=0)
-        ax[r].axvline(0, color="0.65", lw=0.7)
-        ax[r].grid(alpha=0.2)
-        ax[r].set_ylabel(f"{label}\n({units})" if units else label)
-    ax[-1].set_xlabel(r"Signed Kelvin precipitation anomaly, $P'_K / \sigma_K$")
-    ax[0].legend(loc="best")
-    fig.suptitle("Signed Kelvin precipitation composites")
-    save_figure(KELVIN_CLOUD_FIGURE_NUMBER, fig, "kelvin_cloud_decomposition_phase_composites")
-
-
-def plot_kelvin_cloud_top_pressure(summary):
-    phase = summary["phase"]
-    categories = KELVIN_CLOUD_CATEGORIES[1:4]
-    for category, label, _mask_name in categories:
-        variable = f"{category}_cloud_top_pressure"
-        sub = phase[phase.variable == variable]
-        if len(sub) == 0:
-            continue
-        fig, ax = plt.subplots(1, 1, figsize=(6.5, 4.0), constrained_layout=True)
-        for i, sim in enumerate(sim_names):
-            values = sub[sub.simulation == sim].sort_values("signed_kelvin_sigma_bin")
-            if len(values) == 0:
-                continue
-            ax.plot(values.signed_kelvin_sigma_bin, values["mean"], color=cols[i], lw=1.8, label=sim)
-            ax.fill_between(
-                values.signed_kelvin_sigma_bin,
-                values.p25,
-                values.p75,
-                color=cols[i],
-                alpha=0.12,
-                linewidth=0,
-            )
-        ax.axvline(0.0, color="0.65", lw=0.7)
-        ax.set_xlabel(r"Signed Kelvin precipitation anomaly, $P'_K / \sigma_K$")
-        ax.set_ylabel("Cloud-top pressure (hPa)")
-        ax.invert_yaxis()
-        ax.grid(alpha=0.2)
-        ax.legend(frameon=False)
-        ax.set_title(label)
-        save_figure(
-            KELVIN_CLOUD_DEPTH_FIGURE_NUMBER,
-            fig,
-            f"kelvin_cloud_top_pressure_{category}",
-        )
-        plt.close(fig)
-
-
-def plot_kelvin_cloud_contribution_to_change(summary):
-    scalar = summary["scalar"]
-    if len(scalar) == 0:
-        return
-    colors_by_category = {
-        "convective_precipitating_high_cloud": "tab:purple",
-        "stratiform_precipitating_high_cloud": "tab:orange",
-        "nonprecipitating_high_cloud": "tab:green",
-        "unclassified_high_cloud": "0.55",
-    }
-    category_labels = dict((key, label) for key, label, _ in KELVIN_CLOUD_CATEGORIES)
-    conditions = ("all", "active_kelvin")
-    fig, ax = plt.subplots(1, len(conditions), figsize=(8.8, 4.0), constrained_layout=True, sharey=True)
-    if len(conditions) == 1:
-        ax = [ax]
-    x = np.arange(2)
-    run_labels = [f"{sim_names[1]} - control", f"{sim_names[2]} - control"]
-    for cj, condition in enumerate(conditions):
-        sub = scalar[scalar.condition == condition]
-        bottom_pos = np.zeros(2)
-        bottom_neg = np.zeros(2)
-        totals = []
-        for category in KELVIN_CLOUD_CONTRIBUTION_CATEGORIES:
-            vals = []
-            for sim in sim_names[1:]:
-                s_sim = sub[(sub.simulation == sim) & (sub.category == category)]
-                s_ctl = sub[(sub.simulation == sim_names[0]) & (sub.category == category)]
-                vals.append(float(s_sim.fraction.iloc[0] - s_ctl.fraction.iloc[0]) if len(s_sim) and len(s_ctl) else np.nan)
-            vals = np.asarray(vals, dtype=float)
-            bottoms = np.where(vals >= 0, bottom_pos, bottom_neg)
-            ax[cj].bar(
-                x,
-                vals,
-                bottom=bottoms,
-                color=colors_by_category[category],
-                label=category_labels[category] if cj == 0 else None,
-            )
-            bottom_pos += np.where(vals > 0, vals, 0.0)
-            bottom_neg += np.where(vals < 0, vals, 0.0)
-        for sim in sim_names[1:]:
-            s_sim = sub[(sub.simulation == sim) & (sub.category == "total_high_cloud")]
-            s_ctl = sub[(sub.simulation == sim_names[0]) & (sub.category == "total_high_cloud")]
-            totals.append(float(s_sim.fraction.iloc[0] - s_ctl.fraction.iloc[0]) if len(s_sim) and len(s_ctl) else np.nan)
-        ax[cj].scatter(x, totals, color="k", marker="D", zorder=4, label="Total high-cloud anomaly" if cj == 0 else None)
-        ax[cj].axhline(0, color="0.65", lw=0.7)
-        ax[cj].set_xticks(x)
-        ax[cj].set_xticklabels(run_labels, rotation=20, ha="right")
-        ax[cj].set_title(KELVIN_CLOUD_CONDITION_LABELS[condition])
-        ax[cj].grid(axis="y", alpha=0.2)
-    ax[0].set_ylabel("Tropical fraction anomaly")
-    ax[0].legend(loc="best", fontsize=8)
-    fig.suptitle("Contributions to total high-cloud change")
-    save_figure(KELVIN_CLOUD_FIGURE_NUMBER, fig, "kelvin_cloud_decomposition_contribution_to_high_cloud_change")
-
-
-def plot_kelvin_cloud_decomposition(summary):
-    # If nudged T reproduces nudged u category changes, that points to the
-    # thermal/static-stability pathway. Extra u-nudged active-Kelvin anomalies
-    # point instead to wind/shear/wave-filtering effects.
-    plot_kelvin_cloud_decomposition_latitude(summary)
-    plot_kelvin_cloud_decomposition_bars(summary)
-    plot_kelvin_cloud_decomposition_phase_composites(summary)
-    plot_kelvin_cloud_contribution_to_change(summary)
-
-
 def attribution_row(metric_name, variable, wave_band, condition, values_by_sim, units, notes):
     control = float(values_by_sim.get(sim_names[0], np.nan))
     nudged_u = float(values_by_sim.get(sim_names[1], np.nan))
@@ -1938,7 +1201,7 @@ def attribution_row(metric_name, variable, wave_band, condition, values_by_sim, 
     )
 
 
-def build_compact_wave_attribution_table(wave_metrics_df, kelvin_cloud_summary=None, intense_attribution_df=None):
+def build_compact_wave_attribution_table(wave_metrics_df, intense_attribution_df=None):
     rows = []
 
     if wave_metrics_df is not None and len(wave_metrics_df) > 0:
@@ -1955,25 +1218,6 @@ def build_compact_wave_attribution_table(wave_metrics_df, kelvin_cloud_summary=N
                     f"Filtered wave variance divided by total anomaly variance; projection={lat_projection_for_wave(wave)}",
                 )
             )
-
-    if kelvin_cloud_summary is not None:
-        scalar = kelvin_cloud_summary.get("scalar", pd.DataFrame())
-        if len(scalar) > 0:
-            for category, _, _ in KELVIN_CLOUD_CATEGORIES:
-                for condition in KELVIN_CLOUD_CONDITIONS:
-                    sub = scalar[(scalar.category == category) & (scalar.condition == condition)]
-                    values = sub.set_index("simulation")["fraction"].to_dict()
-                    rows.append(
-                        attribution_row(
-                            "cloud_category_fraction",
-                            category,
-                            "Kelvin",
-                            condition,
-                            values,
-                            "fraction",
-                            "Shared coarse-grid precipitation-regime high-cloud fraction conditioned on Kelvin-filtered precipitation",
-                        )
-                    )
 
     if intense_attribution_df is not None and len(intense_attribution_df) > 0:
         for wave, sub in intense_attribution_df.groupby("wave"):
@@ -2026,37 +1270,64 @@ def build_compact_wave_attribution_table(wave_metrics_df, kelvin_cloud_summary=N
     return table
 
 
-def plot_attribution_heatmap(table, value_col, stem, title, vmin=None, vmax=None):
+def plot_attribution_change_heatmaps(table):
+    """Two annotated panels of the wave-power-fraction change from control.
+
+    Panel 1 is the u-nudged change, panel 2 the T-nudged change, on a shared
+    diverging scale. The part of panel 1 missing from panel 2 is the
+    wind/shear-mediated response; no derived quantity is needed to read it.
+    """
     sub = table[(table.metric_name == "wave_variance_fraction") & (table.condition == "all")]
     if len(sub) == 0:
         return
-    pivot = sub.pivot_table(index="wave_band", columns="variable", values=value_col, aggfunc="mean")
-    wave_order = [wave_label(w) for w in wave_names if wave_label(w) in pivot.index]
-    field_order = [f for f in power_fields if f in pivot.columns]
+    panels = [
+        ("delta_u", f"{sim_names[1]} $-$ {sim_names[0]}"),
+        ("delta_T", f"{sim_names[2]} $-$ {sim_names[0]}"),
+    ]
+    pivots = {}
+    wave_order = None
+    field_order = None
+    for value_col, _ in panels:
+        pivot = sub.pivot_table(index="wave_band", columns="variable", values=value_col, aggfunc="mean")
+        if wave_order is None:
+            wave_order = [wave_label(w) for w in wave_names if wave_label(w) in pivot.index]
+            field_order = [f for f in power_fields if f in pivot.columns]
+        # Percentage points of the total anomaly variance.
+        pivots[value_col] = 100.0 * pivot.reindex(index=wave_order, columns=field_order).values.astype(float)
     if len(wave_order) == 0 or len(field_order) == 0:
         return
-    pivot = pivot.reindex(index=wave_order, columns=field_order)
-    values = pivot.values.astype(float)
-    if vmin is None or vmax is None:
-        max_abs = np.nanmax(np.abs(values)) if np.any(np.isfinite(values)) else 1.0
-        if not np.isfinite(max_abs) or max_abs == 0:
-            max_abs = 1.0
-    else:
-        max_abs = max(abs(vmin), abs(vmax))
+    max_abs = np.nanmax([np.nanmax(np.abs(v)) for v in pivots.values()])
+    if not np.isfinite(max_abs) or max_abs == 0:
+        max_abs = 1.0
     levels = symmetric_levels(max_abs, ndiv=11)
     cmap = difference_cmap(levels)
     norm = colors.BoundaryNorm(levels, cmap.N)
-    fig, ax = plt.subplots(figsize=(0.55 * len(field_order) + 4.0, 0.5 * len(wave_order) + 2.5),
-                           constrained_layout=True)
-    im = ax.imshow(values, cmap=cmap, norm=norm, aspect="auto")
-    ax.set_xticks(np.arange(len(field_order)))
-    ax.set_xticklabels(field_order, rotation=35, ha="right")
-    ax.set_yticks(np.arange(len(wave_order)))
-    ax.set_yticklabels(wave_order)
-    ax.set_title(title)
-    ax.grid(False)
-    add_symmetric_colorbar(fig, im, ax, levels, label=value_col)
-    save_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER, fig, stem)
+    fig, axes = plt.subplots(
+        1, len(panels),
+        figsize=(1.1 * len(field_order) * len(panels) + 2.5, 0.55 * len(wave_order) + 2.5),
+        constrained_layout=True, sharey=True,
+    )
+    for ax, (value_col, title) in zip(np.atleast_1d(axes), panels):
+        values = pivots[value_col]
+        im = ax.imshow(values, cmap=cmap, norm=norm, aspect="auto")
+        for r in range(values.shape[0]):
+            for c in range(values.shape[1]):
+                v = values[r, c]
+                if np.isfinite(v):
+                    ax.text(c, r, f"{v:+.2g}", ha="center", va="center", fontsize=7,
+                            color="k" if abs(v) < 0.7 * max_abs else "w")
+        ax.set_xticks(np.arange(len(field_order)))
+        ax.set_xticklabels(field_order, rotation=35, ha="right")
+        ax.set_yticks(np.arange(len(wave_order)))
+        ax.set_yticklabels(wave_order)
+        ax.set_title(title)
+        ax.grid(False)
+    add_symmetric_colorbar(
+        fig, im, np.atleast_1d(axes).ravel(), levels,
+        label="Wave-band variance fraction change (percentage points)",
+    )
+    fig.suptitle("Wave power change from control (u-nudged response absent from the T-nudged panel is wind-mediated)")
+    save_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER, fig, "wave_attribution_change_heatmaps")
 
 
 def find_attribution_selection(table, metric_name, variable, wave_band, condition):
@@ -2077,11 +1348,7 @@ def plot_attribution_summary_bars(table):
         ("Kelvin OLR variance", "wave_variance_fraction", "OLR", "Kelvin", "all"),
         ("Kelvin PW variance", "wave_variance_fraction", "PW", "Kelvin", "all"),
         ("Kelvin cldfrac variance", "wave_variance_fraction", "cldfrac", "Kelvin", "all"),
-        ("Active-K convective precipitating", "cloud_category_fraction", "convective_precipitating_high_cloud", "Kelvin", "active_kelvin"),
-        ("Active-K stratiform precipitating", "cloud_category_fraction", "stratiform_precipitating_high_cloud", "Kelvin", "active_kelvin"),
-        ("Active-K non-precipitating high cloud", "cloud_category_fraction", "nonprecipitating_high_cloud", "Kelvin", "active_kelvin"),
-        ("AD sym cldfrac variance", "wave_variance_fraction", "cldfrac", "AD sym", "all"),
-        ("AD antisym cldfrac variance", "wave_variance_fraction", "cldfrac", "AD antisym", "all"),
+        ("Easterly cldfrac variance", "wave_variance_fraction", "cldfrac", "Easterly", "all"),
         ("ER cldfrac variance", "wave_variance_fraction", "cldfrac", "ER", "all"),
         ("Kelvin T100 variance", "wave_variance_fraction", "T100", "Kelvin", "all"),
         ("Kelvin w500 variance", "wave_variance_fraction", "w500", "Kelvin", "all"),
@@ -2102,44 +1369,26 @@ def plot_attribution_summary_bars(table):
     wind_unique = np.asarray([row.wind_unique for row in rows], dtype=float)
     delta_u = np.asarray([row.delta_u for row in rows], dtype=float)
     fig, ax = plt.subplots(figsize=(max(10.0, 0.8 * len(rows)), 4.5), constrained_layout=True)
-    ax.bar(x - width, delta_T, width, color=cols[2], label=r"$\Delta T$-nudged")
-    ax.bar(x, wind_unique, width, color="0.25", label="wind_unique")
-    ax.bar(x + width, delta_u, width, color=cols[1], label=r"$\Delta u$-nudged")
+    ax.bar(x - width, delta_T, width, color=cols[2],
+           label=f"{sim_names[2]} $-$ control (reproduced by T-nudging)")
+    ax.bar(x, wind_unique, width, color="0.25",
+           label="$\\Delta$u $-$ $\\Delta$T (extra u-nudged response)")
+    ax.bar(x + width, delta_u, width, color=cols[1],
+           label=f"{sim_names[1]} $-$ control (total u-nudged)")
     ax.axhline(0, color="0.65", lw=0.7)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=35, ha="right")
     ax.set_ylabel("Metric anomaly")
     ax.grid(axis="y", alpha=0.2)
     ax.legend(loc="best")
-    ax.set_title("Thermal-like and wind-unique wave/cloud attribution")
+    ax.set_title("Wave-power attribution: T-reproduced vs extra u-nudged response")
     save_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER, fig, "wave_attribution_summary_bars")
 
 
 def plot_compact_wave_attribution(table):
     if len(table) == 0:
         return
-    # Large wind_unique points to a u-nudged response not reproduced by T nudging;
-    # opposite wind_unique/thermal_like signs indicate competing pathways.
-    plot_attribution_heatmap(
-        table,
-        "wind_unique",
-        "wave_attribution_heatmap_wind_unique",
-        "Wind-unique response: (nudged u - control) - (nudged T - control)",
-    )
-    plot_attribution_heatmap(
-        table,
-        "thermal_like",
-        "wave_attribution_heatmap_thermal_like",
-        "Thermal-like response: nudged T - control",
-    )
-    plot_attribution_heatmap(
-        table,
-        "wind_fraction",
-        "wave_attribution_heatmap_wind_fraction",
-        "Bounded wind-fraction attribution",
-        vmin=-1.0,
-        vmax=1.0,
-    )
+    plot_attribution_change_heatmaps(table)
     plot_attribution_summary_bars(table)
 
 
@@ -2522,7 +1771,7 @@ def add_wave_metric_ratios(wave_metrics):
 #   * Which filter bands actually reconstruct coherent propagating precipitation?
 #   * Does u_nudge increase a particular band, or simply broaden all wave-like
 #     variability?
-#   * Kelvin/EIG: eastward streaks. IG/AD/ER: mostly westward or mixed structure.
+#   * Kelvin/EIG: eastward streaks. IG/Easterly/ER: mostly westward structure.
 
 if should_build_figure(1, "wave_filtered_hovmollers_precip"):
     hov_field = "Precip"
@@ -2563,11 +1812,15 @@ if should_build_figure(1, "wave_filtered_hovmollers_precip"):
 
 
 # -----------------------------------------------------------------------------
-# 2. Wave-band variance fractions and nudged/control power ratios
+# 2. Absolute wave-band power and change relative to control
 # -----------------------------------------------------------------------------
 # WHAT TO LOOK FOR:
-#   * A wave-band precipitation fraction tells you how much of the tropical
-#     precip variance is attributable to each filtered band.
+#   * The top row shows which wave bands actually carry strong absolute power
+#     in each field; the total-variance ticks above each bar give the
+#     variance-fraction context.
+#   * The bottom row shows the nudged-run power change in percent. Read the
+#     two rows together: a large percentage change matters most in a band
+#     whose absolute power is non-negligible.
 #   * Compare precipitation with dynamical fields. If u/w/T wave power
 #     increases but precipitation power does not, waves are modified aloft but
 #     weakly coupled to rainfall. If precipitation power increases without a
@@ -2640,7 +1893,7 @@ if should_run_any([2, WAVE_ATTRIBUTION_FIGURE_NUMBER]):
         if save:
             wave_metrics.to_csv(os.path.join(save_loc, "wave_band_variance_metrics.csv"), index=False)
 
-if should_build_figure(2, "wave_power_fractions_and_ratios") and wave_metrics is not None and len(wave_metrics) > 0:
+if should_build_figure(2, "wave_power_absolute_and_change") and wave_metrics is not None and len(wave_metrics) > 0:
     plot_fields = ["Precip", "OLR", "PW", "cldfrac", "u850", "w500", "T100"]
     plot_fields = [f for f in plot_fields if f in set(wave_metrics.field)]
 
@@ -2654,25 +1907,33 @@ if should_build_figure(2, "wave_power_fractions_and_ratios") and wave_metrics is
         width = 0.8 / len(dss)
         for i, sim in enumerate(sim_names):
             s = sub[sub.simulation == sim].set_index("wave").reindex(wave_names)
-            ax[0, j].bar(x + (i - (len(dss)-1)/2) * width, s.wave_fraction.values, width,
+            offset = (i - (len(dss) - 1) / 2) * width
+            # Absolute wave-band power, with the total anomaly variance of the
+            # same latitude projection marked above each bar. Bar height vs
+            # tick shows the variance fraction; coloured vs black bar shows the
+            # nudged/control power change.
+            ax[0, j].bar(x + offset, s.wave_variance.values, width,
                          color=cols[i], label=sim if j == 0 else None)
-            ax[1, j].bar(x + (i - (len(dss)-1)/2) * width, s.power_ratio_to_control.values, width,
-                         color=cols[i])
+            ax[0, j].plot(x + offset, s.total_variance.values, ls="none",
+                          marker="_", ms=3.6 * width * 10, color=cols[i], alpha=0.55,
+                          label="total variance" if (j == 0 and i == 0) else None)
+            if i > 0:
+                pct = 100.0 * (s.power_ratio_to_control.values - 1.0)
+                ax[1, j].bar(x + offset, pct, width, color=cols[i])
         ax[0, j].set_title(field)
         ax[0, j].set_xticks(x)
         ax[0, j].tick_params(labelbottom=False)
         ax[1, j].set_xticks(x)
         ax[1, j].set_xticklabels([wave_label(w) for w in wave_names], rotation=35, ha="right")
-        ax[1, j].axhline(1, color="0.6", lw=0.7)
+        ax[1, j].axhline(0, color="0.6", lw=0.7)
         ax[0, j].set_yscale("log")
-        #ax[1, j].set_yscale("log")
         ax[0, j].grid(alpha=0.2)
         ax[1, j].grid(alpha=0.2)
-    ax[0, 0].set_ylabel("Wave-band variance / total variance")
-    ax[1, 0].set_ylabel("Wave power ratio to control")
-    ax[0, 0].legend(loc="best")
-    figsave.save(fig, "wave_power_fractions_and_ratios", number=2)
-    print("Done with figure: wave_power_fractions_and_ratios")
+    ax[0, 0].set_ylabel("Wave-band variance (field units$^2$)")
+    ax[1, 0].set_ylabel("Wave power change vs control (%)")
+    ax[0, 0].legend(loc="best", fontsize=8)
+    figsave.save(fig, "wave_power_absolute_and_change", number=2)
+    print("Done with figure: wave_power_absolute_and_change")
 
 
 # -----------------------------------------------------------------------------
@@ -2910,7 +2171,7 @@ if should_build_figure(4, "wave_conditioned_precip_olr_pw"):
 # -----------------------------------------------------------------------------
 # WHAT TO LOOK FOR:
 #   * Which wave band is largest at high-precipitation longitudes/times?
-#   * If u_nudge increases intense precipitation only when Kelvin/EIG/IG/AD/ER
+#   * If u_nudge increases intense precipitation only when Kelvin/EIG/IG/Easterly/ER
 #     amplitude is large, that wave band is a candidate mediator.
 
 intense_precip_attribution = None
@@ -3106,7 +2367,7 @@ if should_build_figure(7, "critical_level_phase_speed_profiles"):
 # -----------------------------------------------------------------------------
 # WHAT TO LOOK FOR:
 #   * Kelvin-like waves should be dominated by u/w/T structure rather than
-#     meridional momentum flux.  AD/ER/IG changes in u'v', EKE or vorticity-like
+#     meridional momentum flux. Easterly/ER/IG changes in u'v', EKE or vorticity-like
 #     flow would point to rotational-wave mediation.
 #   * Run this after the cheaper figures, because avgLat=False applies the k-f
 #     filter separately to every retained latitude.
@@ -3403,96 +2664,25 @@ if should_build_figure(
 
 
 # -----------------------------------------------------------------------------
-# 10. Kelvin-filtered cloud decomposition
-# -----------------------------------------------------------------------------
-# WHAT TO LOOK FOR:
-#   * Convective-precipitating high-cloud anomalies identify changes in the
-#     native MPAS convective-rain regime.
-#   * Stratiform-precipitating or non-precipitating anomalies identify broader
-#     cloud-regime changes without assigning unresolved life-cycle histories.
-
-kelvin_cloud_summary = None
-kelvin_cloud_figure_stems = [
-    "kelvin_cloud_decomposition_latitude",
-    "kelvin_cloud_decomposition_bars",
-    "kelvin_cloud_decomposition_phase_composites",
-    "kelvin_cloud_decomposition_contribution_to_high_cloud_change",
-]
-kelvin_cloud_depth_figure_stems = [
-    f"kelvin_cloud_top_pressure_{category}"
-    for category, _label, _mask_name in KELVIN_CLOUD_CATEGORIES[1:4]
-]
-compact_attribution_figure_stems = [
-    "wave_attribution_heatmap_wind_unique",
-    "wave_attribution_heatmap_thermal_like",
-    "wave_attribution_heatmap_wind_fraction",
-    "wave_attribution_summary_bars",
-]
-kelvin_cloud_figure_signature = kelvin_cloud_decomposition_signature()
-needs_kelvin_cloud_figure = (
-    (
-        should_run_figure(KELVIN_CLOUD_FIGURE_NUMBER)
-        and not figure_outputs_current(KELVIN_CLOUD_FIGURE_NUMBER, kelvin_cloud_figure_stems, kelvin_cloud_figure_signature)
-    )
-    or (
-        should_run_figure(KELVIN_CLOUD_DEPTH_FIGURE_NUMBER)
-        and not figure_outputs_current(KELVIN_CLOUD_DEPTH_FIGURE_NUMBER, kelvin_cloud_depth_figure_stems, kelvin_cloud_figure_signature)
-    )
-)
-if needs_kelvin_cloud_figure:
-    kelvin_cloud_summary = compute_kelvin_cloud_decomposition()
-
-if should_build_versioned_figure(
-    KELVIN_CLOUD_FIGURE_NUMBER,
-    kelvin_cloud_figure_stems,
-    kelvin_cloud_figure_signature,
-) and kelvin_cloud_summary is not None:
-    if len(kelvin_cloud_summary["scalar"]) > 0:
-        print("\nKelvin cloud decomposition summary")
-        print(kelvin_cloud_summary["scalar"].to_string(index=False))
-        plot_kelvin_cloud_decomposition(kelvin_cloud_summary)
-        write_figure_output_metadata(
-            KELVIN_CLOUD_FIGURE_NUMBER,
-            kelvin_cloud_figure_stems,
-            kelvin_cloud_figure_signature,
-        )
-        print("Done with figure: kelvin_cloud_decomposition")
-    else:
-        print("Skipping Kelvin cloud decomposition plots: no valid shared classification diagnostics were built")
-
-if should_build_versioned_figure(
-    KELVIN_CLOUD_DEPTH_FIGURE_NUMBER,
-    kelvin_cloud_depth_figure_stems,
-    kelvin_cloud_figure_signature,
-) and kelvin_cloud_summary is not None:
-    if len(kelvin_cloud_summary["phase"]) > 0:
-        plot_kelvin_cloud_top_pressure(kelvin_cloud_summary)
-        write_figure_output_metadata(
-            KELVIN_CLOUD_DEPTH_FIGURE_NUMBER,
-            kelvin_cloud_depth_figure_stems,
-            kelvin_cloud_figure_signature,
-        )
-        print("Done with figure: kelvin_conditioned_cloud_top_pressure")
-
-
-# -----------------------------------------------------------------------------
 # 11. Compact attribution metrics
 # -----------------------------------------------------------------------------
 # WHAT TO LOOK FOR:
-#   * thermal_like is the part reproduced by T nudging.
-#   * wind_unique is the extra u-nudged response not reproduced by T nudging.
-#   * Large cloud/PW/T100/momentum wind_unique without matching precipitation
-#     wind_unique suggests altered coupling and organisation rather than just
+#   * The paired heatmaps show each run's wave-power change from control; the
+#     part of the u-nudged change missing from the T-nudged panel is the
+#     wind/shear-mediated response.
+#   * Large cloud/PW/T100/momentum changes without matching precipitation
+#     changes suggest altered coupling and organisation rather than just
 #     stronger bulk rainfall.
 
+compact_attribution_figure_stems = [
+    "wave_attribution_change_heatmaps",
+    "wave_attribution_summary_bars",
+]
 compact_signature = cache_signature(
     "compact_wave_attribution_metrics",
     extra=dict(
         wave_metric_fields=list(power_fields),
         waves=list(wave_names),
-        kelvin_cloud_conditions=list(KELVIN_CLOUD_CONDITIONS),
-        kelvin_cloud_categories=jsonable_value(KELVIN_CLOUD_CATEGORIES),
-        cloud_classification_cache_version=CLOUD_CLASSIFICATION_CACHE_VERSION,
         intense_precip_percentile=95.0,
         attribution_eps=ATTRIBUTION_EPS,
     ),
@@ -3505,8 +2695,6 @@ if should_build_versioned_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER, compact_attribu
         required_columns=("metric_name", "variable", "wave_band", "condition", "wind_unique"),
     )
     if compact_attribution is None:
-        if kelvin_cloud_summary is None:
-            kelvin_cloud_summary = compute_kelvin_cloud_decomposition()
         if intense_precip_attribution is None:
             intense_precip_attribution = compute_intense_precip_wave_attribution(percentile=95.0)
             if save and len(intense_precip_attribution) > 0:
@@ -3514,7 +2702,6 @@ if should_build_versioned_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER, compact_attribu
 
         compact_attribution = build_compact_wave_attribution_table(
             wave_metrics,
-            kelvin_cloud_summary=kelvin_cloud_summary,
             intense_attribution_df=intense_precip_attribution,
         )
         if len(compact_attribution) > 0:

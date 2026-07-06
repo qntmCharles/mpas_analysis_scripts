@@ -45,6 +45,10 @@ from high_cloud_classification import (
     HighCloudThresholds,
     cached_classification_is_current as shared_cached_classification_is_current,
 )
+from equatorial_wave_config import (
+    WAVE_BOXES as SHARED_WAVE_BOXES,
+    WAVE_LATITUDE_PROJECTION as SHARED_WAVE_LATITUDE_PROJECTION,
+)
 
 try:
     from waveFilter import kf_filter
@@ -149,7 +153,7 @@ WAVENUMBER_FIELDS = ["Precip", "OLR", "PW"]
 WAVENUMBER_LAT_BOUNDS = (-10.0, 10.0)
 WAVENUMBER_MAX_K = 15
 
-WAVE_PROFILE_WAVES = ["Kelvin", "ER", "AD_sym", "AD_antisym"]
+WAVE_PROFILE_WAVES = ["Kelvin", "ER", "Easterly"]
 WAVE_PROFILE_FIELDS = [
     dict(name="u", prefix="u", units="m s-1"),
     dict(name="T", prefix="T", units="K"),
@@ -157,7 +161,7 @@ WAVE_PROFILE_FIELDS = [
 ]
 WAVE_PROFILE_LEVELS_HPA = [100, 150, 200, 250, 300, 500, 700, 850]
 
-WAVE_LAG_WAVES = ["Kelvin", "ER", "AD_sym", "AD_antisym"]
+WAVE_LAG_WAVES = ["Kelvin", "ER", "Easterly"]
 WAVE_LAG_TARGET_FIELDS = ["Precip", "OLR", "PW"]
 WAVE_LAG_MAX_DAYS = 8.0
 WAVE_LAG_BLOCK_DAYS = 30.0
@@ -227,22 +231,13 @@ MATCHED_PATTERN_DOMAINS = {
     "DeepTropics_70_200hPa_10S10N": dict(lat_bounds=(-10.0, 10.0), p_bounds=(70.0, 200.0)),
 }
 
-MIS = -999.0
 WAVE_BOXES = {
-    "Kelvin": dict(k=(1, 14), period=(2.5, 20.0), depth=(8, 90), label="Kelvin", filter_name="Kelvin"),
-    "EIG": dict(k=(1, 14), period=(1.8, 4.5), depth=(8, 90), label="EIG", filter_name="IG0"),
-    "IG_antisym": dict(k=(-15, -1), period=(1.25, 2.0), depth=(8, 90), label="IG antisym", filter_name="IG2"),
-    "AD_sym": dict(k=(-28, -4), period=(5.0, 20.0), depth=(MIS, MIS), label="AD sym", filter_name="AD"),
-    "AD_antisym": dict(k=(-28, -4), period=(5.0, 20.0), depth=(MIS, MIS), label="AD antisym", filter_name="AD"),
-    "ER": dict(k=(-10, -1), period=(10.0, 40.0), depth=(8, 90), label="ER", filter_name="ER"),
+    name: SHARED_WAVE_BOXES[name]
+    for name in ("Kelvin", "EIG", "IG_antisym", "Easterly", "ER")
 }
 WAVE_LATITUDE_PROJECTION = {
-    "Kelvin": "symmetric",
-    "EIG": "antisymmetric",
-    "IG_antisym": "antisymmetric",
-    "AD_sym": "symmetric",
-    "AD_antisym": "antisymmetric",
-    "ER": "symmetric",
+    name: SHARED_WAVE_LATITUDE_PROJECTION[name]
+    for name in WAVE_BOXES
 }
 WAVE_FIELDS = ["Precip", "OLR", "PW"]
 
@@ -1813,6 +1808,9 @@ ORGANISATION_CONTEXT_SOURCES = {
     "high_cloud_mask",
     "stratiform_precipitating_high_cloud_mask",
 }
+ORGANISATION_PRIMARY_TRACK_SOURCE = "convective_precipitating_high_cloud_mask"
+ORGANISATION_TRACK_SENSITIVITY_SOURCES = {"precip_ge_1mmh", "olr_tb241"}
+ORGANISATION_TRACK_CACHE_VERSION = "pyflextrkr_track_persistence_v5_product_contract"
 
 
 def require_current_organisation_metadata(path, label):
@@ -1865,13 +1863,26 @@ def load_organisation_timeseries():
 
 def load_organisation_tracks():
     if not os.path.exists(ORGANISATION_TRACKS_FILE):
-        record_skip(
-            "convective organisation PyFLEXTRKR-method track block-consistency diagnostics "
-            f"({ORGANISATION_TRACKS_FILE} not found; run convective_organisation_diagnostics.py first)"
+        raise FileNotFoundError(
+            "Required convective-organisation PyFLEXTRKR track product is missing: "
+            f"{ORGANISATION_TRACKS_FILE}. Run convective_organisation_diagnostics.py first."
         )
-        return None
 
-    require_current_organisation_metadata(ORGANISATION_TRACK_METADATA_FILE, "organisation track")
+    metadata = require_current_organisation_metadata(
+        ORGANISATION_TRACK_METADATA_FILE, "organisation track"
+    )
+    if metadata.get("cache_version") != ORGANISATION_TRACK_CACHE_VERSION:
+        raise RuntimeError(
+            "Organisation track metadata does not describe the current "
+            f"PyFLEXTRKR product ({metadata.get('cache_version')!r} != "
+            f"{ORGANISATION_TRACK_CACHE_VERSION!r}). Run "
+            "convective_organisation_diagnostics.py first."
+        )
+    if metadata.get("primary_track_source") != ORGANISATION_PRIMARY_TRACK_SOURCE:
+        raise RuntimeError(
+            "Organisation track metadata does not use the classifier's "
+            f"primary convective source {ORGANISATION_PRIMARY_TRACK_SOURCE!r}."
+        )
     df = pd.read_csv(ORGANISATION_TRACKS_FILE)
     required = {"source", "source_label", "simulation", "track_id"}
     missing = sorted(required - set(df.columns))
@@ -1989,6 +2000,10 @@ def note_skipped_organisation_sources(df):
 
 
 def organisation_source_role(source):
+    if source == ORGANISATION_PRIMARY_TRACK_SOURCE:
+        return "primary_convective_objects"
+    if source in ORGANISATION_TRACK_SENSITIVITY_SOURCES:
+        return "object_definition_sensitivity"
     if source in ORGANISATION_CONTEXT_SOURCES:
         return "cloud_context"
     return "convective_proxy"
@@ -2080,6 +2095,7 @@ def plot_organisation_bootstrap_summary(org_df, org_source_labels):
 
 def run_convective_organisation_bootstrap():
     try:
+        tracks = load_organisation_tracks()
         cache_signature = base_bootstrap_cache_signature(
             "convective_organisation",
             extra=dict(
@@ -2090,6 +2106,9 @@ def run_convective_organisation_bootstrap():
                 min_condition_samples=int(ORGANISATION_MIN_CONDITION_SAMPLES),
                 metric_specs=jsonable_value(ORGANISATION_METRIC_SPECS),
                 track_metric_specs=jsonable_value(ORGANISATION_TRACK_METRIC_SPECS),
+                primary_track_source=ORGANISATION_PRIMARY_TRACK_SOURCE,
+                track_sensitivity_sources=sorted(ORGANISATION_TRACK_SENSITIVITY_SOURCES),
+                organisation_track_cache_version=ORGANISATION_TRACK_CACHE_VERSION,
                 excluded_sources=sorted(ORGANISATION_EXCLUDED_SOURCES),
                 cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
             ),
@@ -2194,7 +2213,6 @@ def run_convective_organisation_bootstrap():
                         },
                     )
 
-        tracks = load_organisation_tracks()
         if tracks is not None and len(tracks) > 0:
             note_skipped_organisation_sources(tracks)
             for source in ordered_organisation_sources(tracks):
@@ -2243,6 +2261,7 @@ def run_convective_organisation_bootstrap():
         record_implemented(message)
     except Exception as exc:
         record_failure("convective organisation bootstrap", exc)
+        raise
 
 
 # -----------------------------------------------------------------------------
@@ -2322,6 +2341,9 @@ def project_wave_latitude(da, wave_name):
     if projection == "symmetric":
         x = subset_between(da, "latitude", (lo, hi))
         return weighted_mean_dims(x, ["latitude"]).transpose("Time", "longitude")
+    if projection == "direct":
+        x = subset_between(da, "latitude", (lo, hi))
+        return x.mean(dim="latitude", skipna=True).transpose("Time", "longitude")
 
     half = max(abs(lo), abs(hi))
     north = subset_between(da, "latitude", (0.0, half))

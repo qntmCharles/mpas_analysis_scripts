@@ -39,6 +39,7 @@ from high_cloud_classification import (
     cached_classification_is_current as shared_cached_classification_is_current,
     classification_cache_metadata as shared_classification_cache_metadata,
 )
+from equatorial_wave_config import CORE_WAVE_NAMES, WAVE_BOXES as SHARED_WAVE_BOXES
 
 try:
     from waveFilter import kf_filter
@@ -65,6 +66,7 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/convective_p
 #   7: cloud_classification_snapshots
 #   8: conditional_nonprecipitating_highcloud_pw_by_lagged_precip
 #   9: wave_conditioned_cloud_classes_and_cloud_top_pressure
+#  10: wave_phase_binned_cloud_composites (fine signed-phase bins + latitude profiles)
 figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
@@ -162,24 +164,16 @@ zm_chunks = {"Time": -1}
 dask.config.set({"array.slicing.split_large_chunks": True})
 
 
-# These wave boxes intentionally match the names and Kelvin definition used in
-# equatorial_wave_diagnostics.py.  The low-frequency eastward box is configurable
-# here because no import-safe project-level MJO helper exists; it is labelled as
-# "MJO-like/eastward LF" rather than treated as proof of an aquaplanet MJO.
-MIS = -999.0
-WAVE_BOXES = {
-    "Kelvin": dict(
-        k=(1, 14), period=(2.5, 20.0), depth=(8, 90),
-        label="Kelvin", filter_name="Kelvin",
-    ),
-    "MJO_like": dict(
-        k=(1, 5), period=(30.0, 96.0), depth=(MIS, MIS),
-        label="MJO-like/eastward LF", filter_name="None",
-    ),
-}
-WAVE_BANDS_FOR_FIG3 = ["Kelvin", "MJO_like"]
-WAVE_FILTER_FIELD = "olr"  # falls back to precipitation if OLR is unavailable
+# Shared core wave definitions used by the equatorial-wave and lifecycle
+# diagnostics. Wave activity is defined from filtered precipitation.
+WAVE_BOXES = {name: SHARED_WAVE_BOXES[name] for name in CORE_WAVE_NAMES}
+WAVE_BANDS_FOR_FIG3 = list(CORE_WAVE_NAMES)
+WAVE_FILTER_FIELD = "precip"
 WAVE_PHASE_THRESHOLD_STD = 0.5
+# Fine signed-phase bins for Figure 10 wave-phase composites (ported from the
+# Kelvin-only decomposition previously in equatorial_wave_diagnostics.py).
+WAVE_PHASE_COMPOSITE_BINS = np.linspace(-3.0, 3.0, 25)
+WAVE_PHASE_COMPOSITE_MIN_COUNT = 20
 
 CLOUD_CATEGORY_SPECS = [
     ("high_cloud_mask", "Total high cloud", "0.25"),
@@ -1122,6 +1116,218 @@ def plot_wave_conditioned_cloud_diagnostics(table):
             plt.close(fig)
 
 
+WAVE_PHASE_CLASS_SPECS = [
+    ("convective_precipitating_high_cloud_mask", "Convective precipitating"),
+    ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating"),
+    ("nonprecipitating_high_cloud_mask", "Non-precipitating"),
+]
+
+
+def wave_phase_binned_cloud_tables(fields_by_run, classifications_by_run):
+    """Fine signed-phase composites and active-phase latitude profiles.
+
+    Complements the coarse suppressed/neutral/active split of Figure 9 with
+    24 signed-sigma phase bins, plus latitude profiles of each cloud class
+    under the active-wave condition.
+    """
+    phase_rows = []
+    profile_rows = []
+    bins = WAVE_PHASE_COMPOSITE_BINS
+    for i, (fields, sim_name) in enumerate(zip(fields_by_run, sim_names)):
+        classif = classifications_by_run.get(sim_name)
+        if classif is None:
+            continue
+        # Load the tropical subset of each classification field once per
+        # simulation. The classification cache is opened lazily, so every
+        # binned reduction below would otherwise re-read it from disk.
+        class_masks = {
+            key: subset_lat(classif[key].astype(float), TROPICAL_LAT_BOUNDS).load()
+            for key, _ in WAVE_PHASE_CLASS_SPECS
+        }
+        ctp = subset_lat(classif["cloud_top_pressure"], TROPICAL_LAT_BOUNDS).load()
+        field_key = WAVE_FILTER_FIELD if WAVE_FILTER_FIELD in fields else "precip"
+        for wave_name in WAVE_BANDS_FOR_FIG3:
+            wave = filter_latmean_wave(fields, i, field_key, wave_name)
+            sigma = float(wave.std(dim=("Time", "longitude"), skipna=True).values)
+            if not np.isfinite(sigma) or sigma <= 0.0:
+                continue
+            phase = active_phase_sign(field_key) * wave / sigma
+            active = phase >= WAVE_PHASE_THRESHOLD_STD
+            for class_key, class_label in WAVE_PHASE_CLASS_SPECS:
+                mask = class_masks[class_key]
+                metric_series = [
+                    ("class_fraction", weighted_lat_mean(mask, lat_bounds=WAVE_FILTER_LAT_BOUNDS)),
+                    (
+                        "cloud_top_pressure",
+                        weighted_lat_mean(
+                            ctp.where(mask.astype(bool)), lat_bounds=WAVE_FILTER_LAT_BOUNDS
+                        ),
+                    ),
+                ]
+                for metric, y in metric_series:
+                    phase_aligned, y_aligned = xr.align(phase, y, join="inner")
+                    xc, ym, y25, y75, count = binned_mean_1d(
+                        phase_aligned.values,
+                        y_aligned.values,
+                        bins,
+                        min_count=WAVE_PHASE_COMPOSITE_MIN_COUNT,
+                    )
+                    for xx, yy, lo, hi, cnum in zip(xc, ym, y25, y75, count):
+                        phase_rows.append(
+                            dict(
+                                wave=wave_name,
+                                wave_label=wave_label(wave_name),
+                                simulation=sim_name,
+                                class_key=class_key,
+                                class_label=class_label,
+                                metric=metric,
+                                signed_phase_sigma_bin=xx,
+                                mean=yy,
+                                p25=lo,
+                                p75=hi,
+                                count=cnum,
+                            )
+                        )
+                mask_aligned, active_aligned = xr.align(mask, active, join="inner")
+                profile = mask_aligned.where(active_aligned).mean(
+                    dim=("Time", "longitude"), skipna=True
+                )
+                profile = hemispheric_fold(profile, parity="even")
+                for lat, val in zip(profile.latitude.values, profile.values):
+                    profile_rows.append(
+                        dict(
+                            wave=wave_name,
+                            wave_label=wave_label(wave_name),
+                            simulation=sim_name,
+                            class_key=class_key,
+                            class_label=class_label,
+                            latitude=float(lat),
+                            fraction=float(val),
+                        )
+                    )
+    return pd.DataFrame(phase_rows), pd.DataFrame(profile_rows)
+
+
+def plot_wave_phase_binned_composites(phase_table):
+    if len(phase_table) == 0:
+        return
+    waves = [w for w in WAVE_BANDS_FOR_FIG3 if w in set(phase_table.wave)]
+    for metric, ylabel, stem, invert in (
+        ("class_fraction", "Class area fraction", "wave_phase_binned_class_fraction", False),
+        (
+            "cloud_top_pressure",
+            "Mean cloud-top pressure (hPa)",
+            "wave_phase_binned_cloud_top_pressure",
+            True,
+        ),
+    ):
+        sub_metric = phase_table[phase_table.metric == metric]
+        fig, axes = plt.subplots(
+            len(WAVE_PHASE_CLASS_SPECS),
+            len(waves),
+            figsize=(3.6 * len(waves), 2.7 * len(WAVE_PHASE_CLASS_SPECS)),
+            constrained_layout=True,
+            sharex=True,
+            sharey="row",
+            squeeze=False,
+        )
+        for r, (class_key, class_label) in enumerate(WAVE_PHASE_CLASS_SPECS):
+            for c, wave_name in enumerate(waves):
+                ax = axes[r, c]
+                sub = sub_metric[
+                    (sub_metric.class_key == class_key) & (sub_metric.wave == wave_name)
+                ]
+                for i, sim_name in enumerate(sim_names):
+                    s = sub[sub.simulation == sim_name].sort_values("signed_phase_sigma_bin")
+                    if len(s) == 0:
+                        continue
+                    ax.plot(
+                        s.signed_phase_sigma_bin, s["mean"], color=cols[i],
+                        label=sim_name if (r == 0 and c == 0) else None,
+                    )
+                    ax.fill_between(
+                        s.signed_phase_sigma_bin, s.p25, s.p75, color=cols[i], alpha=0.15, lw=0
+                    )
+                ax.axvline(0.0, color="0.7", lw=0.8)
+                for thresh in (-WAVE_PHASE_THRESHOLD_STD, WAVE_PHASE_THRESHOLD_STD):
+                    ax.axvline(thresh, color="0.85", lw=0.8, ls=":")
+                ax.grid(alpha=0.2)
+                if r == 0:
+                    ax.set_title(wave_label(wave_name))
+                if c == 0:
+                    ax.set_ylabel(f"{class_label}\n{ylabel}")
+                if r == len(WAVE_PHASE_CLASS_SPECS) - 1:
+                    ax.set_xlabel("Signed wave anomaly ($\\sigma$)")
+                if invert and c == 0:
+                    ax.invert_yaxis()
+        axes[0, 0].legend(frameon=False)
+        fig.suptitle(f"Wave-phase composites of high-cloud classes ({ylabel.lower()})")
+        save_figure(10, fig, stem)
+        plt.close(fig)
+
+
+def plot_wave_active_latitude_profiles(profile_table):
+    if len(profile_table) == 0:
+        return
+    control_name = sim_names[0]
+    for wave_name in WAVE_BANDS_FOR_FIG3:
+        wave_table = profile_table[profile_table.wave == wave_name]
+        if len(wave_table) == 0:
+            continue
+        fig, axes = plt.subplots(
+            len(WAVE_PHASE_CLASS_SPECS), 2,
+            figsize=(9.0, 2.7 * len(WAVE_PHASE_CLASS_SPECS)),
+            constrained_layout=True,
+            sharex=True,
+            squeeze=False,
+        )
+        for r, (class_key, class_label) in enumerate(WAVE_PHASE_CLASS_SPECS):
+            sub = wave_table[wave_table.class_key == class_key]
+            by_sim = {
+                sim_name: sub[sub.simulation == sim_name].sort_values("latitude")
+                for sim_name in sim_names
+            }
+            ax = axes[r, 0]
+            for i, sim_name in enumerate(sim_names):
+                s = by_sim[sim_name]
+                if len(s):
+                    ax.plot(s.latitude, s.fraction, color=cols[i],
+                            label=sim_name if r == 0 else None)
+            ax.set_ylabel(f"{class_label}\nactive-phase fraction")
+            ax.grid(alpha=0.2)
+
+            ax = axes[r, 1]
+            ctrl = by_sim[control_name]
+            deltas = {}
+            for i, sim_name in enumerate(sim_names[1:], start=1):
+                s = by_sim[sim_name]
+                if len(s) == 0 or len(ctrl) == 0:
+                    continue
+                merged = s.merge(ctrl, on="latitude", suffixes=("", "_control"))
+                delta = merged.fraction - merged.fraction_control
+                deltas[sim_name] = (merged.latitude, delta)
+                ax.plot(merged.latitude, delta, color=cols[i],
+                        label=f"{sim_name} $-$ {control_name}" if r == 0 else None)
+            if len(deltas) == 2:
+                (lat_u, du), (lat_t, dt_) = deltas[sim_names[1]], deltas[sim_names[2]]
+                if len(du) == len(dt_):
+                    ax.plot(lat_u, du.values - dt_.values, color="0.5", ls="--",
+                            label="residual ($\\Delta$u $-$ $\\Delta$T)" if r == 0 else None)
+            ax.axhline(0.0, color="0.7", lw=0.8)
+            ax.set_ylabel("Fraction difference")
+            ax.grid(alpha=0.2)
+        for c in range(2):
+            axes[-1, c].set_xlabel("Latitude (deg)")
+        axes[0, 0].legend(frameon=False, fontsize=8)
+        axes[0, 1].legend(frameon=False, fontsize=8)
+        fig.suptitle(
+            f"High-cloud classes vs latitude during active {wave_label(wave_name)} phases "
+            f"(phase $\\geq$ {WAVE_PHASE_THRESHOLD_STD:g}$\\sigma$)"
+        )
+        save_figure(10, fig, f"wave_active_latitude_profiles_{wave_name}")
+        plt.close(fig)
+
+
 # -----------------------------------------------------------------------------
 # Residual model helpers
 # -----------------------------------------------------------------------------
@@ -2026,6 +2232,40 @@ if should_run_figure(9):
         )
         plot_wave_conditioned_cloud_diagnostics(wave_cloud_table)
         progress("Done with figure: wave_conditioned_cloud_classes_and_cloud_top_pressure")
+
+
+# -----------------------------------------------------------------------------
+# Figure 10. Fine wave-phase-binned cloud composites and latitude profiles
+# -----------------------------------------------------------------------------
+# Interpretation:
+#   * Smooth signed-phase composites resolve where in the wave cycle each
+#     cloud class responds, beyond the coarse suppressed/neutral/active split
+#     of Figure 9.
+#   * Convective-precipitating fraction rising toward positive phase with an
+#     unchanged non-precipitating curve implies the wave modulates convection
+#     rather than broad cloud cover.
+#   * Latitude profiles under active phases show whether nudged-run changes
+#     are equatorially confined (wave-coupled) or spread across the tropics.
+
+if should_run_figure(10):
+    progress("Starting Figure 10: wave_phase_binned_cloud_composites")
+    if kf_filter is None:
+        print("Skipping Figure 10: waveFilter.kf_filter is unavailable.")
+    else:
+        phase_table, profile_table = wave_phase_binned_cloud_tables(
+            fields_by_run, classifications_by_run
+        )
+        if save and len(phase_table) > 0:
+            phase_table.to_csv(
+                os.path.join(save_loc, "wave_phase_binned_cloud_composites.csv"), index=False
+            )
+        if save and len(profile_table) > 0:
+            profile_table.to_csv(
+                os.path.join(save_loc, "wave_active_cloud_latitude_profiles.csv"), index=False
+            )
+        plot_wave_phase_binned_composites(phase_table)
+        plot_wave_active_latitude_profiles(profile_table)
+        progress("Done with figure: wave_phase_binned_cloud_composites")
 
 
 # -----------------------------------------------------------------------------

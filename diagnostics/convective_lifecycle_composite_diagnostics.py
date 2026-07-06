@@ -4,10 +4,9 @@
 """
 Convective lifecycle composites centred on tracked convective-precipitating onset.
 
-This diagnostic uses existing high-cloud classification caches and
-PyFLEXTRKR-style track outputs where they are available.  Its main event set is
-the first appearance of tracked convective-precipitating high cloud; a
-precipitation-only onset set is retained as a sensitivity option.
+This diagnostic requires the PyFLEXTRKR output generated from the shared
+convective-precipitating high-cloud mask. Its event set is the first appearance
+of those tracked deep-convection objects.
 
 # WHAT TO LOOK FOR:
 #   * In the lag-longitude Hovmollers, a moisture signal that peaks earlier or
@@ -16,8 +15,8 @@ precipitation-only onset set is retained as a sensitivity option.
 #     pathways for the T-nudged and U-nudged experiments.
 #   * Post-onset precipitation, cloud-top, and high-cloud persistence diagnose
 #     whether nudging changes storm longevity rather than just onset amplitude.
-#   * Kelvin phase histograms test whether event onsets remain locked to the
-#     same wave phase across simulations.
+#   * Track-following Kelvin, easterly-wave, and ER composites show whether
+#     convection samples different moisture, circulation, and cloud anomalies.
 """
 
 import glob
@@ -42,14 +41,26 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from matplotlib import colors, pyplot as plt
-from scipy import ndimage
-from scipy.signal import hilbert
 
 from diagnostic_helpers import *
 from high_cloud_classification import (
     CLASSIFICATION_CACHE_VERSION,
     HighCloudThresholds,
     cached_classification_is_current as shared_cached_classification_is_current,
+)
+from equatorial_wave_config import (
+    CORE_WAVE_NAMES,
+    WAVE_BOXES,
+    WAVE_VARIABILITY_FIELDS,
+)
+from pyflextrkr_contract import (
+    PRIMARY_ANALYSIS_ROLE,
+    PYFLEXTRKR_PRODUCT_VERSION,
+    epoch_seconds,
+    product_fingerprint,
+    read_product_metadata,
+    sha256_file,
+    time_signature,
 )
 
 try:
@@ -79,7 +90,7 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/convective_l
 #   2: mechanistic fingerprint summary panels
 #   3: difference-lifecycle fingerprints
 #   4: event-centred spatial composites
-#   5: wave-convection phase-locking diagnostics
+#   5: wave-filtered fields following tracked convective objects
 #   6: track-property lifecycle statistics
 #   7: mechanistic synthesis figure
 #   8: cloud-top-pressure lifecycle validation
@@ -123,7 +134,8 @@ SPATIAL_LAGS_DAYS = [-2.0, -1.0, 0.0, 1.0, 2.0]
 
 # Event and object filters.  The defaults are deliberately simple so threshold
 # sensitivity can be changed near the top of the file.
-EVENT_SET = "convective"  # "convective" or "all_precip"
+EVENT_SET = "convective"
+PRIMARY_TRACK_SOURCE = "convective_precipitating_high_cloud_mask"
 MIN_EVENT_LIFETIME_HOURS = 18.0
 MIN_EVENT_AREA_KM2 = 800.0
 MIN_EVENT_MAX_PRECIP_MM_DAY = 5.0
@@ -144,9 +156,8 @@ CONVECTIVE_FRACTION = 0.50
 EARTH_RADIUS_KM = 6371.0
 LONGITUDE_PERIOD_DEG = 360.0
 
-KELVIN_FILTER = dict(k=(1, 14), period=(2.5, 20.0), depth=(8, 90), filter_name="Kelvin")
-MJO_LIKE_FILTER = dict(k=(1, 5), period=(30.0, 96.0), depth=(-999.0, -999.0), filter_name="None")
-WAVE_FILTER_FIELD = "precip"
+LIFECYCLE_WAVE_NAMES = tuple(CORE_WAVE_NAMES)
+LIFECYCLE_WAVE_FIELDS = tuple(WAVE_VARIABILITY_FIELDS)
 
 latlon_chunks = {"Time": 8, "latitude": 90, "longitude": 180}
 zm_chunks = {"Time": -1}
@@ -193,6 +204,14 @@ needed_vars = sorted(
         + VAR_ALIASES["u_zm"]
         + VAR_ALIASES["u_isobaric"]
         + VAR_ALIASES["zgrid"]
+        + [
+            "cldfrac",
+            "uzonal_isobaric",
+            "umeridional_isobaric",
+            "t_isobaric",
+            "pressure",
+            "w",
+        ]
     )
 )
 
@@ -225,10 +244,11 @@ def should_run_any(numbers):
 # Store-backed derived-product caches
 # -----------------------------------------------------------------------------
 
-TRACK_EVENT_CACHE_VERSION = "lifecycle_track_events_v2_cloud_top_pressure"
-COMPOSITE_CACHE_VERSION = "lifecycle_composites_v2_cloud_top_pressure"
-PHASE_CACHE_VERSION = "lifecycle_kelvin_phase_v1"
-TRACK_PROPERTY_CACHE_VERSION = "lifecycle_track_properties_v2_cloud_top_pressure"
+TRACK_EVENT_CACHE_VERSION = "lifecycle_track_events_v4_exact_pyflextrkr_contract"
+COMPOSITE_CACHE_VERSION = "lifecycle_composites_v3_track_following_core_waves"
+TRACK_PROPERTY_CACHE_VERSION = "lifecycle_track_properties_v3_nonprecipitating"
+
+PYFLEXTRKR_PRODUCT_FINGERPRINTS = {}
 
 
 def ensure_cache_dir():
@@ -286,6 +306,7 @@ def object_filter_signature(source_name):
         cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
         min_object_cells=int(MIN_OBJECT_CELLS),
         min_object_area_km2=float(MIN_OBJECT_AREA_KM2),
+        pyflextrkr_product_fingerprints=dict(PYFLEXTRKR_PRODUCT_FINGERPRINTS),
     )
     return signature
 
@@ -310,19 +331,10 @@ def composite_cache_signature(source_name, spec_keys, include_spatial):
         spatial_lags_days=jsonable_value(SPATIAL_LAGS_DAYS),
         event_lat_half_width=float(EVENT_LAT_HALF_WIDTH),
         fingerprint_lon_window_deg=float(FINGERPRINT_LON_WINDOW_DEG),
-        wave_filter_field=WAVE_FILTER_FIELD,
-        kelvin_filter=jsonable_value(KELVIN_FILTER),
-        mjo_like_filter=jsonable_value(MJO_LIKE_FILTER),
-    )
-    return signature
-
-
-def phase_cache_signature(source_name):
-    signature = object_filter_signature(source_name)
-    signature.update(
-        cache_version=PHASE_CACHE_VERSION,
-        wave_filter_field=WAVE_FILTER_FIELD,
-        kelvin_filter=jsonable_value(KELVIN_FILTER),
+        lifecycle_wave_names=list(LIFECYCLE_WAVE_NAMES),
+        lifecycle_wave_fields=list(LIFECYCLE_WAVE_FIELDS),
+        wave_boxes={name: jsonable_value(WAVE_BOXES[name]) for name in LIFECYCLE_WAVE_NAMES},
+        track_centering="tracked_centroid_with_endpoint_clamping_v1",
     )
     return signature
 
@@ -512,6 +524,7 @@ def spatial_composite_expected(var, include_spatial):
         "precip",
         "pw_anom",
         "stratiform_precipitating",
+        "nonprecipitating",
         "cloud_top_pressure",
         "cloud_top_height",
         "N2_TTL_anom",
@@ -648,41 +661,6 @@ def write_composite_cache(source_name, spec_keys, include_spatial, composites, s
         event_counts,
         available_specs_by_sim,
     )
-
-
-def phase_cache_files():
-    return {
-        "metadata": "lifecycle_kelvin_phase_cache_metadata.json",
-        "stats": "lifecycle_kelvin_phase_stats.csv",
-        "series": "lifecycle_kelvin_phase_series.csv",
-    }
-
-
-def load_cached_phase_products(source_name):
-    files = phase_cache_files()
-    if not cache_metadata_matches(files["metadata"], phase_cache_signature(source_name), "Kelvin phase diagnostics"):
-        return None
-    phase_stats = read_cache_csv(files["stats"])
-    phase_table = read_cache_csv(files["series"])
-    if phase_stats is None or phase_table is None:
-        return None
-    phase_series = {
-        sim: sub["phase_rad"].to_numpy(dtype=float)
-        for sim, sub in phase_table.groupby("simulation")
-    } if len(phase_table) else {}
-    progress(f"Using cached Kelvin phase diagnostics from {ensure_cache_dir()}")
-    return phase_stats, phase_series
-
-
-def write_phase_cache(source_name, phase_stats, phase_series):
-    files = phase_cache_files()
-    write_cache_csv(phase_stats, files["stats"])
-    rows = []
-    for sim, phases in phase_series.items():
-        for phase in np.asarray(phases, dtype=float):
-            rows.append(dict(simulation=sim, phase_rad=float(phase)))
-    write_cache_csv(pd.DataFrame(rows), files["series"])
-    write_cache_metadata(files["metadata"], phase_cache_signature(source_name))
 
 
 def track_property_cache_files():
@@ -853,44 +831,6 @@ def circular_mean_lon(lon, weights=None):
     return float(np.rad2deg(np.arctan2(sin_mean, cos_mean)) % LONGITUDE_PERIOD_DEG)
 
 
-def merge_periodic_longitude_labels(labels):
-    labels = np.asarray(labels, dtype=np.int32)
-    max_label = int(labels.max())
-    if max_label == 0 or labels.shape[1] < 2:
-        return labels
-
-    parent = np.arange(max_label + 1, dtype=np.int32)
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        if a <= 0 or b <= 0:
-            return
-        ra = find(int(a))
-        rb = find(int(b))
-        if ra != rb:
-            parent[rb] = ra
-
-    for j in range(labels.shape[0]):
-        left = labels[j, 0]
-        if left <= 0:
-            continue
-        for jj in range(max(0, j - 1), min(labels.shape[0], j + 2)):
-            union(left, labels[jj, -1])
-
-    roots = np.array([find(i) for i in range(max_label + 1)], dtype=np.int32)
-    unique_roots = [root for root in np.unique(roots[1:]) if root > 0]
-    remap = {root: index + 1 for index, root in enumerate(unique_roots)}
-    out = np.zeros_like(labels)
-    positive = labels > 0
-    out[positive] = np.array([remap[roots[label]] for label in labels[positive]], dtype=np.int32)
-    return out
-
-
 # -----------------------------------------------------------------------------
 # Cloud classification and TTL fields
 # -----------------------------------------------------------------------------
@@ -1000,6 +940,50 @@ def prepare_vertical_field(ds, da):
             da = da.assign_coords(z=("z", zvals))
             da["z"].attrs.update(units="m", long_name="inferred geometric height of layer midpoints")
     return da
+
+
+def lifecycle_wave_field(ds, precip, field_name):
+    """Return the same field definition used by equatorial-wave variability."""
+    if field_name == "Precip":
+        out = precip
+    elif field_name == "OLR":
+        name = find_var(ds, "olr", required=True)
+        out = finite_or_nan(ds[name])
+    elif field_name == "PW":
+        name = find_var(ds, "pw", required=True)
+        out = finite_or_nan(ds[name])
+    elif field_name == "cldfrac":
+        if "cldfrac" not in ds.data_vars:
+            raise ValueError("cldfrac is required by the shared wave-field definition")
+        cloud = prepare_vertical_field(ds, finite_or_nan(ds["cldfrac"]))
+        zdim = vertical_dim(cloud)
+        out = cloud.mean(dim=zdim, skipna=True)
+    else:
+        prefixes = (
+            ("w", None),
+            ("u", "uzonal_isobaric"),
+            ("v", "umeridional_isobaric"),
+            ("T", "t_isobaric"),
+        )
+        out = None
+        for prefix, variable in prefixes:
+            if not field_name.startswith(prefix):
+                continue
+            level = float(field_name[len(prefix):])
+            if variable is None:
+                out = vertical_velocity_at_pressure(ds, level)
+            else:
+                if variable not in ds.data_vars:
+                    raise ValueError(
+                        f"{variable} is required for shared wave field {field_name}"
+                    )
+                out = finite_or_nan(ds[variable]).sel(pres=level, method="nearest")
+            break
+        if out is None:
+            raise ValueError(f"Unrecognised shared wave field: {field_name}")
+    out = select_common_time(out, precip)
+    out.name = field_name
+    return out
 
 
 def _z_or_pres_layer_mask(da, z_bounds_km=(14.0, 18.0), pres_bounds_hpa=(70.0, 150.0)):
@@ -1140,110 +1124,6 @@ def object_properties_from_labels(labels, lat, lon, area2d, field_slices=None):
     return pd.DataFrame(rows)
 
 
-def label_objects_with_properties(mask2d, area2d, field_slices=None):
-    mask2d = mask2d.transpose("latitude", "longitude")
-    area2d = area2d.sel(latitude=mask2d.latitude, longitude=mask2d.longitude)
-    mask_vals = np.asarray(mask2d.fillna(False).values, dtype=bool)
-    if not np.any(mask_vals):
-        return np.zeros(mask_vals.shape, dtype=np.int32), pd.DataFrame()
-    labels, _ = ndimage.label(mask_vals, structure=np.ones((3, 3), dtype=np.int8))
-    labels = merge_periodic_longitude_labels(labels)
-    objects = object_properties_from_labels(labels, mask2d.latitude.values, mask2d.longitude.values, area2d, field_slices)
-    if len(objects) == 0:
-        return np.zeros(mask_vals.shape, dtype=np.int32), objects
-    valid = set(objects.label.astype(int).values)
-    labels[~np.isin(labels, list(valid))] = 0
-    return labels.astype(np.int32), objects.reset_index(drop=True)
-
-
-def nearest_previous_track(current_labels, previous_labels, previous_label_to_track, overlap_fraction=0.2):
-    out = {}
-    current_positive = np.unique(current_labels[current_labels > 0])
-    for label_id in current_positive:
-        obj = current_labels == label_id
-        prev = previous_labels[obj]
-        prev = prev[prev > 0]
-        if prev.size == 0:
-            continue
-        labels, counts = np.unique(prev, return_counts=True)
-        best_index = int(np.argmax(counts))
-        best_label = int(labels[best_index])
-        frac = float(counts[best_index] / np.count_nonzero(obj))
-        if frac >= overlap_fraction and best_label in previous_label_to_track:
-            out[int(label_id)] = previous_label_to_track[best_label]
-    return out
-
-
-def track_objects_from_mask(mask, fields, source_name, sim_name, onset_flag_field=None):
-    mask = subset_lat(mask.fillna(False).astype(bool), lat_bounds=TROPICAL_LAT_BOUNDS)
-    if "Time" not in mask.dims:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    field_keys = [
-        "precip",
-        "pw",
-        "cloud_top_pressure",
-        "cloud_top_height",
-        "high_cloud_fraction",
-        "stratiform_precipitating_high_cloud_mask",
-        "convective_precipitating_high_cloud_mask",
-    ]
-    available = {key: fields[key] for key in field_keys if key in fields and {"latitude", "longitude"}.issubset(fields[key].dims)}
-    align_inputs = [mask] + [available[key] for key in available]
-    aligned = xr.align(*align_inputs, join="inner")
-    mask = aligned[0]
-    available = {key: aligned[i + 1] for i, key in enumerate(available)}
-
-    area2d = grid_cell_area_km2(mask.latitude.values, mask.longitude.values)
-    time_days = time_days_from_coord(mask.Time)
-    dt_hours = 24.0 * median_time_step_days(mask)
-
-    rows = []
-    labels_by_time = []
-    next_track_id = 1
-    previous_labels = None
-    previous_label_to_track = {}
-
-    for it in range(mask.sizes["Time"]):
-        field_slices = {key: da.isel(Time=it).load() for key, da in available.items()}
-        labels, objects = label_objects_with_properties(mask.isel(Time=it).load(), area2d, field_slices)
-        track_lookup = {}
-        if previous_labels is not None:
-            track_lookup.update(nearest_previous_track(labels, previous_labels, previous_label_to_track))
-        for label_id in np.unique(labels):
-            if label_id <= 0:
-                continue
-            if int(label_id) not in track_lookup:
-                track_lookup[int(label_id)] = next_track_id
-                next_track_id += 1
-        labels_by_time.append(labels)
-        previous_labels = labels
-        previous_label_to_track = track_lookup
-
-        if len(objects) == 0:
-            continue
-        for record in objects.to_dict("records"):
-            label_id = int(record["label"])
-            rows.append(
-                dict(
-                    source=source_name,
-                    simulation=sim_name,
-                    Time=mask.Time.values[it],
-                    time_index=it,
-                    time_days=float(time_days[it]),
-                    dt_hours=dt_hours,
-                    track_id=int(track_lookup[label_id]),
-                    tracking_method="local_overlap",
-                    onset_flag=True if onset_flag_field is None else bool(record.get(f"frac_{onset_flag_field}", 0.0) > 0.0),
-                    **record,
-                )
-            )
-
-    objects_df = pd.DataFrame(rows)
-    track_time, tracks_df = summarise_tracks(objects_df)
-    return objects_df, track_time, tracks_df
-
-
 def chararray_to_strings(array):
     arr = np.asarray(array)
     if arr.dtype.kind in ("S", "U") and arr.ndim == 2:
@@ -1274,19 +1154,95 @@ def find_pyflextrkr_work_path(source_name, sim_name):
     return None
 
 
-def load_pyflextrkr_objects(source_name, sim_name, fields):
+def require_pyflextrkr_work_path(source_name, sim_name):
     work_path = find_pyflextrkr_work_path(source_name, sim_name)
     if work_path is None:
-        return None, None, None
+        raise FileNotFoundError(
+            f"{sim_name}: required PyFLEXTRKR output for {source_name} is missing. "
+            "Run convective_organisation_diagnostics.py first."
+        )
+    return work_path
 
-    stats_files = sorted(glob.glob(os.path.join(work_path, "stats", "tracknumbers_*.nc")))
-    tracknumbers_path = stats_files[-1]
+
+def validate_pyflextrkr_product(source_name, sim_name, fields):
+    work_path = require_pyflextrkr_work_path(source_name, sim_name)
+    metadata = read_product_metadata(work_path)
+    if metadata is None:
+        raise RuntimeError(
+            f"{sim_name}: PyFLEXTRKR output lacks required product metadata in "
+            f"{work_path}. Rerun convective_organisation_diagnostics.py; this "
+            "directory is an obsolete-output candidate."
+        )
+    expected = dict(
+        product_version=PYFLEXTRKR_PRODUCT_VERSION,
+        source=source_name,
+        simulation=sim_name,
+        analysis_role=PRIMARY_ANALYSIS_ROLE,
+        classification_cache_version=CLASSIFICATION_CACHE_VERSION,
+        **time_signature(fields["precip"].Time.values),
+    )
+    changed = [key for key, value in expected.items() if metadata.get(key) != value]
+    if changed:
+        raise RuntimeError(
+            f"{sim_name}: stale or incorrect PyFLEXTRKR product ({', '.join(changed)}): "
+            f"{work_path}. Rerun convective_organisation_diagnostics.py."
+        )
+    if metadata.get("product_fingerprint") != product_fingerprint(metadata):
+        raise RuntimeError(f"{sim_name}: invalid PyFLEXTRKR product fingerprint: {work_path}")
+    tracknumbers_name = metadata.get("tracknumbers_file", "")
+    tracknumbers_path = os.path.join(work_path, "stats", tracknumbers_name)
+    if not tracknumbers_name or not os.path.exists(tracknumbers_path):
+        raise RuntimeError(
+            f"{sim_name}: the track-number file named by PyFLEXTRKR metadata is missing: "
+            f"{tracknumbers_path}"
+        )
+    if metadata.get("tracknumbers_sha256") != sha256_file(tracknumbers_path):
+        raise RuntimeError(
+            f"{sim_name}: PyFLEXTRKR track-number checksum mismatch: {tracknumbers_path}"
+        )
+    expected_basetimes = epoch_seconds(fields["precip"].Time.values)
+    with xr.open_dataset(
+        tracknumbers_path,
+        mask_and_scale=False,
+        decode_times=False,
+        concat_characters=True,
+    ) as track_ds:
+        file_basetimes = np.asarray(track_ds["basetimes"].values).astype(np.int64).ravel()
+        track_time_count = int(track_ds["track_numbers"].sizes.get("nfiles", -1))
+        listed_cloudids = (
+            chararray_to_strings(track_ds["cloudid_files"].values)
+            if "cloudid_files" in track_ds
+            else []
+        )
+    if not np.array_equal(file_basetimes, expected_basetimes):
+        raise RuntimeError(
+            f"{sim_name}: timestamps inside {tracknumbers_path} do not exactly "
+            "match the instantaneous 6-hourly model output"
+        )
+    if track_time_count not in (-1, expected_basetimes.size):
+        raise RuntimeError(
+            f"{sim_name}: PyFLEXTRKR track array has {track_time_count} times, "
+            f"expected {expected_basetimes.size}"
+        )
+    if len(listed_cloudids) != expected_basetimes.size:
+        raise RuntimeError(
+            f"{sim_name}: PyFLEXTRKR lists {len(listed_cloudids)} cloudid files, "
+            f"expected {expected_basetimes.size}"
+        )
+    PYFLEXTRKR_PRODUCT_FINGERPRINTS[sim_name] = metadata["product_fingerprint"]
+    return work_path, tracknumbers_path, metadata
+
+
+def load_pyflextrkr_objects(source_name, sim_name, fields):
+    work_path, tracknumbers_path, _ = validate_pyflextrkr_product(
+        source_name, sim_name, fields
+    )
     progress(f"{sim_name}: reading PyFLEXTRKR track links for {source_name}: {tracknumbers_path}")
     ds_track = xr.open_dataset(tracknumbers_path, mask_and_scale=False, decode_times=False, concat_characters=True)
     track_numbers = np.asarray(ds_track["track_numbers"].squeeze().values)
     if track_numbers.ndim == 1:
         track_numbers = track_numbers[None, :]
-    basetimes = np.asarray(ds_track["basetimes"].values).astype(float)
+    basetimes = np.asarray(ds_track["basetimes"].values).astype(np.int64).ravel()
     if "cloudid_files" in ds_track:
         cloud_files = chararray_to_strings(ds_track["cloudid_files"].values)
     else:
@@ -1294,13 +1250,30 @@ def load_pyflextrkr_objects(source_name, sim_name, fields):
     ds_track.close()
 
     tracking_path = os.path.join(work_path, "tracking")
-    if not cloud_files:
-        cloud_files = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(tracking_path, "cloudid_*.nc")))]
-
     precip = fields["precip"]
-    time_count = min(len(cloud_files), precip.sizes.get("Time", len(cloud_files)), track_numbers.shape[0])
+    expected_basetimes = epoch_seconds(precip.Time.values)
+    time_count = precip.sizes.get("Time", 0)
     if time_count < 1:
-        return None, None, None
+        raise RuntimeError(f"{sim_name}: no model timestamps are available for lifecycle tracking")
+    if track_numbers.shape[0] != time_count:
+        raise RuntimeError(
+            f"{sim_name}: PyFLEXTRKR track-number time count {track_numbers.shape[0]} "
+            f"does not match model time count {time_count}"
+        )
+    if basetimes.size != time_count or not np.array_equal(basetimes, expected_basetimes):
+        raise RuntimeError(
+            f"{sim_name}: PyFLEXTRKR basetimes do not exactly match the instantaneous "
+            "6-hourly model timestamps"
+        )
+    if len(np.unique(basetimes)) != time_count or np.any(np.diff(basetimes) <= 0):
+        raise RuntimeError(f"{sim_name}: PyFLEXTRKR basetimes are duplicated or unordered")
+    if not cloud_files:
+        raise RuntimeError(f"{sim_name}: track-number product does not list cloudid files")
+    if len(cloud_files) != time_count:
+        raise RuntimeError(
+            f"{sim_name}: PyFLEXTRKR cloudid file count {len(cloud_files)} does not "
+            f"match model time count {time_count}"
+        )
 
     rows = []
     dt_hours = 24.0 * median_time_step_days(precip)
@@ -1309,8 +1282,13 @@ def load_pyflextrkr_objects(source_name, sim_name, fields):
     for it in range(time_count):
         path = os.path.join(tracking_path, cloud_files[it])
         if not os.path.exists(path):
-            continue
+            raise FileNotFoundError(f"{sim_name}: required PyFLEXTRKR cloudid file is missing: {path}")
         with xr.open_dataset(path, decode_times=False, mask_and_scale=False) as cloud:
+            cloud_basetime = int(np.asarray(cloud["base_time"].values).ravel()[0])
+            if cloud_basetime != int(expected_basetimes[it]):
+                raise RuntimeError(
+                    f"{sim_name}: cloudid timestamp mismatch at model index {it}: {path}"
+                )
             labels = np.asarray(cloud["feature_number"].squeeze().values, dtype=np.int32)
             lat_name = "lat" if "lat" in cloud.coords else "latitude"
             lon_name = "lon" if "lon" in cloud.coords else "longitude"
@@ -1325,7 +1303,12 @@ def load_pyflextrkr_objects(source_name, sim_name, fields):
         lon_da = xr.DataArray(lon, dims=("longitude",), name="longitude")
         area2d = grid_cell_area_km2(lat, lon)
         field_slices = {}
-        for key in ("precip", "pw", "cloud_top_pressure", "cloud_top_height", "high_cloud_fraction", "stratiform_precipitating_high_cloud_mask", "convective_precipitating_high_cloud_mask"):
+        for key in (
+            "precip", "pw", "cloud_top_pressure", "cloud_top_height",
+            "high_cloud_fraction", "stratiform_precipitating_high_cloud_mask",
+            "convective_precipitating_high_cloud_mask",
+            "nonprecipitating_high_cloud_mask",
+        ):
             if key not in fields or not {"latitude", "longitude"}.issubset(fields[key].dims):
                 continue
             field_slices[key] = fields[key].isel(Time=it).sel(latitude=lat_da, longitude=lon_da, method="nearest").load()
@@ -1345,7 +1328,7 @@ def load_pyflextrkr_objects(source_name, sim_name, fields):
                     source=source_name,
                     simulation=sim_name,
                     Time=precip.Time.values[it],
-                    pyflextrkr_basetime=basetimes[it] if it < basetimes.size else np.nan,
+                    pyflextrkr_basetime=int(basetimes[it]),
                     time_index=it,
                     time_days=float(time_days[it]),
                     dt_hours=dt_hours,
@@ -1444,20 +1427,12 @@ def summarise_tracks(objects_df):
 
 
 def build_track_tables_for_source(source_name, fields, sim_name):
-    objects_df, track_time, tracks_df = load_pyflextrkr_objects(source_name, sim_name, fields)
-    if objects_df is not None and len(objects_df) > 0:
-        return objects_df, track_time, tracks_df
-
-    if source_name == "convective_precipitating_high_cloud_mask" and "convective_precipitating_high_cloud_mask" in fields:
-        progress(f"{sim_name}: building local overlap tracks for convective precipitating high cloud")
-        return track_objects_from_mask(fields["convective_precipitating_high_cloud_mask"], fields, source_name, sim_name)
-
-    if source_name == "precip_ge_1mmh":
-        progress(f"{sim_name}: building local overlap tracks for precipitation sensitivity")
-        mask = fields["precip"] >= PRECIP_ONSET_THRESHOLD_MM_DAY
-        return track_objects_from_mask(mask, fields, source_name, sim_name)
-
-    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    if source_name != PRIMARY_TRACK_SOURCE:
+        raise ValueError(
+            f"Lifecycle composites require the primary tracked source "
+            f"{PRIMARY_TRACK_SOURCE!r}, got {source_name!r}"
+        )
+    return load_pyflextrkr_objects(source_name, sim_name, fields)
 
 
 def filter_separated_events(candidates):
@@ -1545,6 +1520,85 @@ def select_onset_events(track_time, tracks_df, source_name, sim_name):
     return events
 
 
+def build_track_path_lookup(track_time):
+    paths = {}
+    if track_time is None or len(track_time) == 0:
+        return paths
+    for track_id, group in track_time.groupby("track_id"):
+        group = group.sort_values("time_index").drop_duplicates("time_index")
+        paths[int(track_id)] = dict(
+            time_index=group.time_index.to_numpy(dtype=int),
+            latitude=group.centroid_lat.to_numpy(dtype=float),
+            longitude_unwrapped=np.rad2deg(
+                np.unwrap(np.deg2rad(group.centroid_lon.to_numpy(dtype=float)))
+            ),
+        )
+    return paths
+
+
+def track_center_at_index(event, time_index, track_paths):
+    track_id = int(event.track_id)
+    if track_id not in track_paths:
+        raise RuntimeError(f"No tracked centroid path is available for track {track_id}")
+    path = track_paths[track_id]
+    indices = path["time_index"]
+    if time_index < indices[0]:
+        pos = 0
+        method = "pre_genesis_endpoint"
+        latitude = path["latitude"][pos]
+        longitude = path["longitude_unwrapped"][pos]
+    elif time_index > indices[-1]:
+        pos = -1
+        method = "post_lysis_endpoint"
+        latitude = path["latitude"][pos]
+        longitude = path["longitude_unwrapped"][pos]
+    else:
+        exact = np.where(indices == int(time_index))[0]
+        if exact.size:
+            pos = int(exact[0])
+            method = "tracked_centroid"
+            latitude = path["latitude"][pos]
+            longitude = path["longitude_unwrapped"][pos]
+        else:
+            method = "interpolated_tracked_centroid"
+            latitude = np.interp(time_index, indices, path["latitude"])
+            longitude = np.interp(time_index, indices, path["longitude_unwrapped"])
+    return float(latitude), float(longitude % 360.0), method
+
+
+def build_composite_centre_table(
+    events_by_run,
+    track_time_by_run,
+    fields_by_run,
+    lag_days,
+    lag_steps,
+):
+    rows = []
+    for sim, fields in zip(sim_names, fields_by_run):
+        events = events_by_run.get(sim, pd.DataFrame())
+        paths = build_track_path_lookup(track_time_by_run.get(sim, pd.DataFrame()))
+        for event in events.itertuples(index=False):
+            for lag_day, step in zip(lag_days, lag_steps):
+                it = int(event.onset_time_index) + int(step)
+                if it < 0 or it >= fields["precip"].sizes.get("Time", 0):
+                    continue
+                lat, lon, method = track_center_at_index(event, it, paths)
+                rows.append(
+                    dict(
+                        simulation=sim,
+                        event_id=int(event.event_id),
+                        track_id=int(event.track_id),
+                        lag_days=float(lag_day),
+                        time_index=it,
+                        Time=fields["precip"].Time.values[it],
+                        center_latitude=lat,
+                        center_longitude=lon,
+                        center_method=method,
+                    )
+                )
+    return pd.DataFrame(rows)
+
+
 # -----------------------------------------------------------------------------
 # Wave filters and composite-field preparation
 # -----------------------------------------------------------------------------
@@ -1567,10 +1621,33 @@ def anomaly(da, label=None):
 
 
 def wave_cache_path(sim_name, field_key, wave_name):
-    cache_dir = ensure_cache_dir()
+    cache_dir = diagnostic_cache_dir("wave_cache", root_dir=root_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+    projection = "direct" if wave_name == "Easterly" else "symmetric"
+    lat_tag = (
+        f"{WAVE_FILTER_LAT_BOUNDS[0]:g}_{WAVE_FILTER_LAT_BOUNDS[1]:g}"
+        .replace("-", "m")
+        .replace(".", "p")
+    )
     return os.path.join(
         cache_dir,
-        f"{safe_name(sim_name)}_{field_key}_{wave_name}_latmean_{WAVE_FILTER_LAT_BOUNDS[0]:g}_{WAVE_FILTER_LAT_BOUNDS[1]:g}.nc".replace("-", "m"),
+        f"{safe_name(sim_name)}_{safe_name(field_key)}_{safe_name(wave_name)}_"
+        f"{lat_tag}_avgLat_{projection}.nc",
+    )
+
+
+def wave_cache_is_current(wave, sim_name, field_key, wave_name, wave_box):
+    projection = "direct" if wave_name == "Easterly" else "symmetric"
+    return (
+        wave.attrs.get("field") == field_key
+        and wave.attrs.get("wave_name") == wave_name
+        and wave.attrs.get("source_simulation") == sim_name
+        and wave.attrs.get("filter_name") == wave_box["filter_name"]
+        and wave.attrs.get("filter_lat_bounds")
+        == f"{WAVE_FILTER_LAT_BOUNDS[0]:g},{WAVE_FILTER_LAT_BOUNDS[1]:g}"
+        and wave.attrs.get("latitude_projection") == projection
+        and wave.attrs.get("wave_box")
+        == json.dumps(jsonable_value(wave_box), sort_keys=True)
     )
 
 
@@ -1580,12 +1657,21 @@ def filter_wave_latmean(fields, sim_name, field_key, wave_name, wave_box):
     cache_path = wave_cache_path(sim_name, field_key, wave_name)
     if os.path.exists(cache_path):
         with xr.open_dataset(cache_path) as cached:
-            return cached["wave"].load()
+            wave = cached["wave"]
+            if wave_cache_is_current(
+                wave, sim_name, field_key, wave_name, wave_box
+            ):
+                progress(f"{sim_name}: using shared {wave_name} {field_key} filter cache")
+                return wave.load()
+        progress(f"{sim_name}: regenerating stale {wave_name} {field_key} filter cache")
     if kf_filter is None:
-        warnings.warn("waveFilter.kf_filter is unavailable; Kelvin/MJO lifecycle diagnostics will be skipped.")
-        return None
+        raise ModuleNotFoundError(
+            "waveFilter.kf_filter is required for lifecycle wave composites"
+        )
 
-    da = weighted_lat_mean(fields[field_key], lat_bounds=WAVE_FILTER_LAT_BOUNDS)
+    da = subset_lat(fields[field_key], lat_bounds=WAVE_FILTER_LAT_BOUNDS)
+    if "latitude" in da.dims:
+        da = da.mean(dim="latitude", skipna=True)
     if "longitude" not in da.dims:
         return None
     da = da.transpose("Time", "longitude")
@@ -1610,12 +1696,62 @@ def filter_wave_latmean(fields, sim_name, field_key, wave_name, wave_box):
         dims=("Time", "longitude"),
         coords={"Time": obs_time, "longitude": lon},
         name="wave",
-        attrs=dict(field=field_key, wave_name=wave_name, filter_name=filter_name, units=fields[field_key].attrs.get("units", "")),
+        attrs=dict(
+            field=field_key,
+            wave_name=wave_name,
+            filter_name=filter_name,
+            source_simulation=sim_name,
+            filter_lat_bounds=f"{WAVE_FILTER_LAT_BOUNDS[0]:g},{WAVE_FILTER_LAT_BOUNDS[1]:g}",
+            latitude_projection=("direct" if wave_name == "Easterly" else "symmetric"),
+            avgLat=1,
+            wave_box=json.dumps(jsonable_value(wave_box), sort_keys=True),
+            units=fields[field_key].attrs.get("units", ""),
+        ),
     )
-    tmp = cache_path + ".tmp"
-    wave.to_dataset().to_netcdf(tmp)
+    if field_key[0] in ("u", "v", "w", "T") and field_key[1:].replace(".", "", 1).isdigit():
+        wave.attrs["cache_version"] = "pressure-axis-fixed"
+    tmp = cache_path + f".tmp.{os.getpid()}"
+    netcdf_safe_dataset(wave.to_dataset()).to_netcdf(tmp)
     os.replace(tmp, cache_path)
     return wave
+
+
+WAVE_FIELD_LABELS = {
+    "Precip": "precipitation",
+    "OLR": "OLR",
+    "PW": "PW",
+    "cldfrac": "vertically averaged cloud fraction",
+    "u850": "850-hPa zonal wind",
+    "u250": "250-hPa zonal wind",
+    "u100": "100-hPa zonal wind",
+    "v850": "850-hPa meridional wind",
+    "v250": "250-hPa meridional wind",
+    "w500": "500-hPa vertical velocity",
+    "w250": "250-hPa vertical velocity",
+    "T250": "250-hPa temperature",
+    "T100": "100-hPa temperature",
+}
+
+
+WAVE_FIELD_UNITS = {
+    "Precip": "mm day$^{-1}$",
+    "OLR": "W m$^{-2}$",
+    "PW": "kg m$^{-2}$",
+    "cldfrac": "fraction",
+    "u850": "m s$^{-1}$",
+    "u250": "m s$^{-1}$",
+    "u100": "m s$^{-1}$",
+    "v850": "m s$^{-1}$",
+    "v250": "m s$^{-1}$",
+    "w500": "m s$^{-1}$",
+    "w250": "m s$^{-1}$",
+    "T250": "K",
+    "T100": "K",
+}
+
+
+def wave_composite_key(wave_name, field_name):
+    return f"wave_{wave_name.lower()}_{field_name.lower()}"
 
 
 def prepare_composite_fields(fields, sim_name):
@@ -1631,6 +1767,14 @@ def prepare_composite_fields(fields, sim_name):
         )
     if "stratiform_precipitating_high_cloud_mask" in fields:
         specs["stratiform_precipitating"] = dict(da=fields["stratiform_precipitating_high_cloud_mask"].astype(float), label="Stratiform precipitating high cloud", units="fraction", cmap="YlGnBu", anomaly=False)
+    if "nonprecipitating_high_cloud_mask" in fields:
+        specs["nonprecipitating"] = dict(
+            da=fields["nonprecipitating_high_cloud_mask"].astype(float),
+            label="Non-precipitating high cloud",
+            units="fraction",
+            cmap="Greys",
+            anomaly=False,
+        )
     if "cloud_top_height" in fields:
         specs["cloud_top_height"] = dict(da=fields["cloud_top_height"], label="Cloud-top height", units="km", cmap="magma", anomaly=False)
     if "cloud_top_pressure" in fields:
@@ -1660,13 +1804,26 @@ def prepare_composite_fields(fields, sim_name):
             anomaly=True,
         )
 
-    kelvin = filter_wave_latmean(fields, sim_name, WAVE_FILTER_FIELD, "Kelvin", KELVIN_FILTER)
-    if kelvin is not None:
-        specs["kelvin_anom"] = dict(da=kelvin, label="Filtered Kelvin anomaly", units=kelvin.attrs.get("units", ""), cmap="RdBu_r", anomaly=True)
-        fields["kelvin_anom"] = kelvin
-    mjo = filter_wave_latmean(fields, sim_name, WAVE_FILTER_FIELD, "MJO_like", MJO_LIKE_FILTER)
-    if mjo is not None:
-        fields["mjo_like_anom"] = mjo
+    for wave_name in LIFECYCLE_WAVE_NAMES:
+        for field_name in LIFECYCLE_WAVE_FIELDS:
+            wave = filter_wave_latmean(
+                fields,
+                sim_name,
+                field_name,
+                wave_name,
+                WAVE_BOXES[wave_name],
+            )
+            key = wave_composite_key(wave_name, field_name)
+            specs[key] = dict(
+                da=wave,
+                label=f"{wave_name}-filtered {WAVE_FIELD_LABELS[field_name]}",
+                units=WAVE_FIELD_UNITS[field_name],
+                cmap="RdBu_r",
+                anomaly=True,
+                wave_name=wave_name,
+                wave_field=field_name,
+            )
+            fields[key] = wave
     return specs
 
 
@@ -1782,7 +1939,14 @@ def composite_lag_scalar(da, events, lag_days, lag_steps):
     )
 
 
-def composite_lag_products(da, events, lag_days, lag_steps, rel_lon_grid=REL_LON_GRID):
+def composite_lag_products(
+    da,
+    events,
+    track_paths,
+    lag_days,
+    lag_steps,
+    rel_lon_grid=REL_LON_GRID,
+):
     hov_sums = np.zeros((len(lag_steps), len(rel_lon_grid)), dtype=float)
     hov_sums2 = np.zeros_like(hov_sums)
     hov_counts = np.zeros_like(hov_sums)
@@ -1792,14 +1956,17 @@ def composite_lag_products(da, events, lag_days, lag_steps, rel_lon_grid=REL_LON
     no_longitude = "longitude" not in da.dims
 
     for event in events.itertuples(index=False):
-        center_lon = float(event.center_lon)
         for ilag, step in enumerate(lag_steps):
             it = int(event.onset_time_index) + int(step)
             if it < 0 or it >= da.sizes.get("Time", 0):
                 continue
 
+            center_lat, center_lon, _ = track_center_at_index(
+                event, it, track_paths
+            )
+
             x = da.isel(Time=it)
-            x = lat_window_mean(x, float(event.centroid_lat)).load()
+            x = lat_window_mean(x, center_lat).load()
             if "longitude" in x.dims:
                 vals = lon_series_relative_to_event(x, center_lon, rel_lon_grid)
                 rel_lon = ((x.longitude.values.astype(float) - center_lon + 180.0) % 360.0) - 180.0
@@ -1830,11 +1997,15 @@ def composite_lag_products(da, events, lag_days, lag_steps, rel_lon_grid=REL_LON
     hov_var[hov_valid] = (hov_sums2[hov_valid] - hov_sums[hov_valid] ** 2 / hov_counts[hov_valid]) / (hov_counts[hov_valid] - 1)
     hov_stderr = np.full_like(hov_sums, np.nan)
     hov_stderr[hov_valid] = np.sqrt(hov_var[hov_valid] / hov_counts[hov_valid])
+    hov_rms = np.full_like(hov_sums, np.nan)
+    np.divide(hov_sums2, hov_counts, out=hov_rms, where=hov_counts > 0)
+    hov_rms = np.sqrt(hov_rms)
     hov = xr.Dataset(
         data_vars=dict(
             mean=(("lag_days", "relative_longitude"), hov_mean),
             count=(("lag_days", "relative_longitude"), hov_counts),
             stderr=(("lag_days", "relative_longitude"), hov_stderr),
+            rms=(("lag_days", "relative_longitude"), hov_rms),
         ),
         coords=dict(lag_days=lag_days, relative_longitude=rel_lon_grid),
         attrs=dict(no_longitude=bool(no_longitude)),
@@ -1849,18 +2020,34 @@ def composite_lag_products(da, events, lag_days, lag_steps, rel_lon_grid=REL_LON
     ) / (scalar_counts[scalar_valid] - 1)
     scalar_stderr = np.full_like(scalar_sums, np.nan)
     scalar_stderr[scalar_valid] = np.sqrt(scalar_var[scalar_valid] / scalar_counts[scalar_valid])
+    scalar_rms = np.full_like(scalar_sums, np.nan)
+    np.divide(
+        scalar_sums2,
+        scalar_counts,
+        out=scalar_rms,
+        where=scalar_counts > 0,
+    )
+    scalar_rms = np.sqrt(scalar_rms)
     scalar = xr.Dataset(
         data_vars=dict(
             mean=("lag_days", scalar_mean),
             count=("lag_days", scalar_counts),
             stderr=("lag_days", scalar_stderr),
+            rms=("lag_days", scalar_rms),
         ),
         coords=dict(lag_days=lag_days),
     )
     return hov, scalar
 
 
-def event_centred_patch(da, event, it, rel_lat_grid=SPATIAL_REL_LAT_GRID, rel_lon_grid=SPATIAL_REL_LON_GRID):
+def event_centred_patch(
+    da,
+    it,
+    center_lat,
+    center_lon,
+    rel_lat_grid=SPATIAL_REL_LAT_GRID,
+    rel_lon_grid=SPATIAL_REL_LON_GRID,
+):
     if not {"latitude", "longitude"}.issubset(da.dims):
         return None
     x = da.isel(Time=it)
@@ -1874,15 +2061,15 @@ def event_centred_patch(da, event, it, rel_lat_grid=SPATIAL_REL_LAT_GRID, rel_lo
         ],
         dim="longitude",
     )
-    target_lat = float(event.centroid_lat) + rel_lat_grid
-    target_lon = (float(event.center_lon) % 360.0) + rel_lon_grid
+    target_lat = float(center_lat) + rel_lat_grid
+    target_lon = (float(center_lon) % 360.0) + rel_lon_grid
     patch = x_ext.interp(latitude=target_lat, longitude=target_lon)
     patch = patch.assign_coords(latitude=rel_lat_grid, longitude=rel_lon_grid)
     patch = patch.rename(latitude="relative_latitude", longitude="relative_longitude")
     return patch.load()
 
 
-def composite_spatial(da, events, selected_lags_days, step_days):
+def composite_spatial(da, events, track_paths, selected_lags_days, step_days):
     lag_steps = [int(round(lag / step_days)) for lag in selected_lags_days]
     out = {}
     for lag_day, step in zip(selected_lags_days, lag_steps):
@@ -1893,7 +2080,10 @@ def composite_spatial(da, events, selected_lags_days, step_days):
             it = int(event.onset_time_index) + step
             if it < 0 or it >= da.sizes.get("Time", 0):
                 continue
-            patch = event_centred_patch(da, event, it)
+            center_lat, center_lon, _ = track_center_at_index(
+                event, it, track_paths
+            )
+            patch = event_centred_patch(da, it, center_lat, center_lon)
             if patch is None:
                 continue
             vals = np.asarray(patch.values, dtype=float)
@@ -2155,73 +2345,158 @@ def plot_spatial_composites(spatial_products, specs, var_names):
         plt.close(fig)
 
 
-def compute_kelvin_phase_stats(fields_by_run, events_by_run):
+def wave_filter_title(wave_name):
+    box = WAVE_BOXES[wave_name]
+    k0, k1 = box["k"]
+    p0, p1 = box["period"]
+    direction = "E" if k0 > 0 else "W"
+    return (
+        f"{wave_name}\n{direction} k={min(abs(k0), abs(k1))}--"
+        f"{max(abs(k0), abs(k1))}; {p0:g}--{p1:g} d"
+    )
+
+
+def wave_composite_curve_table(composites):
     rows = []
-    phase_series = {}
-    for sim, fields in zip(sim_names, fields_by_run):
-        if "kelvin_anom" not in fields or sim not in events_by_run:
-            continue
-        wav = fields["kelvin_anom"].transpose("Time", "longitude").load()
-        analytic = hilbert(np.asarray(wav.values, dtype=float), axis=0)
-        phase = np.angle(analytic)
-        amp = np.abs(analytic)
-        lon_vals = np.asarray(wav.longitude.values, dtype=float)
-        sim_phases = []
-        sim_amps = []
-        for event in events_by_run[sim].itertuples(index=False):
-            it = int(event.onset_time_index)
-            if it < 0 or it >= phase.shape[0]:
-                continue
-            rel = np.abs(((lon_vals - event.center_lon + 180.0) % 360.0) - 180.0)
-            j = int(np.nanargmin(rel))
-            sim_phases.append(float(phase[it, j]))
-            sim_amps.append(float(amp[it, j]))
-        if not sim_phases:
-            continue
-        sim_phases = np.asarray(sim_phases)
-        sim_amps = np.asarray(sim_amps)
-        vector = np.nanmean(np.exp(1j * sim_phases))
+    for sim in sim_names:
+        for wave_name in LIFECYCLE_WAVE_NAMES:
+            for field_name in LIFECYCLE_WAVE_FIELDS:
+                key = wave_composite_key(wave_name, field_name)
+                if key not in composites.get(sim, {}):
+                    continue
+                ds = composites[sim][key]["scalar"]
+                for lag, mean, rms, stderr, count in zip(
+                    ds.lag_days.values,
+                    ds["mean"].values,
+                    ds.rms.values,
+                    ds.stderr.values,
+                    ds["count"].values,
+                ):
+                    rows.append(
+                        dict(
+                            simulation=sim,
+                            wave=wave_name,
+                            field=field_name,
+                            lag_days=float(lag),
+                            mean=float(mean),
+                            rms=float(rms),
+                            stderr=float(stderr),
+                            object_count=int(count),
+                            longitude_half_width_deg=float(FINGERPRINT_LON_WINDOW_DEG),
+                            centering="tracked centroid; endpoints held before genesis/after lysis",
+                        )
+                    )
+    return pd.DataFrame(rows)
+
+
+def wave_composite_method_table():
+    rows = []
+    for wave_name in LIFECYCLE_WAVE_NAMES:
+        box = WAVE_BOXES[wave_name]
         rows.append(
             dict(
-                simulation=sim,
-                event_count=len(sim_phases),
-                preferred_phase_rad=float(np.angle(vector)),
-                vector_strength=float(np.abs(vector)),
-                mean_kelvin_amplitude=float(np.nanmean(sim_amps)),
+                wave=wave_name,
+                direction=("eastward" if box["k"][0] > 0 else "westward"),
+                zonal_wavenumber_min=min(abs(box["k"][0]), abs(box["k"][1])),
+                zonal_wavenumber_max=max(abs(box["k"][0]), abs(box["k"][1])),
+                period_min_days=min(box["period"]),
+                period_max_days=max(box["period"]),
+                equivalent_depth_min_m=(
+                    np.nan if box["depth"][0] < 0 else box["depth"][0]
+                ),
+                equivalent_depth_max_m=(
+                    np.nan if box["depth"][1] < 0 else box["depth"][1]
+                ),
+                latitude_band="10S-10N mean",
+                fields=", ".join(LIFECYCLE_WAVE_FIELDS),
+                composite_center="moving PyFLEXTRKR centroid",
+                reference=(
+                    "Rios-Berrios et al. 2023 J Climate"
+                    if wave_name == "Easterly"
+                    else "Wheeler-Kiladis convention"
+                ),
             )
         )
-        phase_series[sim] = sim_phases
-    return pd.DataFrame(rows), phase_series
+    return pd.DataFrame(rows)
 
 
-def plot_phase_locking(phase_stats, phase_series):
-    if not phase_series:
-        print("Skipping Figure 5: no Kelvin-filtered phase series available.")
-        return
-    bins = np.linspace(-np.pi, np.pi, 17)
-    fig = plt.figure(figsize=(10.5, 4.2), constrained_layout=True)
-    ax0 = fig.add_subplot(1, 2, 1)
-    ax1 = fig.add_subplot(1, 2, 2, projection="polar")
-    for i, sim in enumerate(sim_names):
-        if sim not in phase_series:
+def plot_wave_filtered_track_composites(composites, specs):
+    field_groups = (
+        ("convective_moisture_cloud", ("Precip", "OLR", "PW", "cldfrac")),
+        ("winds_vertical_motion", ("u850", "u250", "u100", "v850", "v250", "w500", "w250")),
+        ("temperature", ("T250", "T100")),
+    )
+    for stem, field_names in field_groups:
+        available = [
+            field_name
+            for field_name in field_names
+            if any(
+                wave_composite_key(wave_name, field_name) in composites.get(sim, {})
+                for sim in sim_names
+                for wave_name in LIFECYCLE_WAVE_NAMES
+            )
+        ]
+        if not available:
             continue
-        phases = phase_series[sim]
-        hist, edges = np.histogram(phases, bins=bins, density=True)
-        centres = 0.5 * (edges[:-1] + edges[1:])
-        ax0.step(centres, hist, where="mid", color=cols[i], label=sim)
-        row = phase_stats[phase_stats.simulation == sim]
-        if len(row):
-            theta = float(row.preferred_phase_rad.iloc[0])
-            r = float(row.vector_strength.iloc[0])
-            ax1.plot([theta, theta], [0, r], color=cols[i], lw=2.0, label=sim)
-            ax1.scatter([theta], [r], color=cols[i], s=35)
-    ax0.set_xlabel("Kelvin phase at onset (rad)")
-    ax0.set_ylabel("Probability density")
-    ax0.legend(frameon=False)
-    ax1.set_title("Preferred phase vector")
-    ax1.set_ylim(0, 1)
-    save_figure(5, fig, "wave_convection_phase_locking")
-    plt.close(fig)
+        fig, axes = plt.subplots(
+            len(available),
+            len(LIFECYCLE_WAVE_NAMES),
+            figsize=(4.0 * len(LIFECYCLE_WAVE_NAMES), 2.25 * len(available)),
+            constrained_layout=True,
+            sharex=True,
+            squeeze=False,
+        )
+        for row, field_name in enumerate(available):
+            row_arrays = []
+            for wave_name in LIFECYCLE_WAVE_NAMES:
+                key = wave_composite_key(wave_name, field_name)
+                for sim in sim_names:
+                    if key in composites.get(sim, {}):
+                        row_arrays.append(composites[sim][key]["scalar"]["mean"].values)
+            limit = finite_percentile(
+                [np.abs(values) for values in row_arrays], 99.0, default=1.0
+            )
+            for col, wave_name in enumerate(LIFECYCLE_WAVE_NAMES):
+                ax = axes[row, col]
+                key = wave_composite_key(wave_name, field_name)
+                for sim_index, sim in enumerate(sim_names):
+                    if key not in composites.get(sim, {}):
+                        continue
+                    ds = composites[sim][key]["scalar"]
+                    ax.plot(
+                        ds.lag_days,
+                        ds["mean"],
+                        color=cols[sim_index],
+                        lw=1.6,
+                        label=sim if row == 0 and col == 0 else None,
+                    )
+                    ax.fill_between(
+                        ds.lag_days.values,
+                        (ds["mean"] - ds.stderr).values,
+                        (ds["mean"] + ds.stderr).values,
+                        color=cols[sim_index],
+                        alpha=0.12,
+                        linewidth=0,
+                    )
+                ax.axvline(0.0, color="0.2", lw=0.8)
+                ax.axhline(0.0, color="0.5", lw=0.6)
+                ax.set_ylim(-limit, limit)
+                if row == 0:
+                    ax.set_title(wave_filter_title(wave_name), fontsize=9)
+                if col == 0:
+                    units = WAVE_FIELD_UNITS[field_name]
+                    ax.set_ylabel(f"{WAVE_FIELD_LABELS[field_name]}\n({units})")
+                if row == len(available) - 1:
+                    ax.set_xlabel("Lag from tracked onset (days)")
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc="upper center", ncol=len(sim_names), frameon=False)
+        fig.suptitle(
+            f"Wave-filtered fields within {FINGERPRINT_LON_WINDOW_DEG:g} deg of tracked convective-object centres",
+            fontsize=11,
+        )
+        save_figure(5, fig, f"wave_filtered_track_composites_{stem}")
+        plt.close(fig)
 
 
 def build_track_property_lifecycle(track_time_by_run, events_by_run, step_days):
@@ -2344,8 +2619,8 @@ def plot_cloud_top_pressure_lifecycle(track_summary, tracks_all):
     plt.close(fig)
 
 
-def plot_synthesis(composites, specs, milestone_table, phase_stats):
-    synth_vars = [v for v in ("pw_anom", "precip", "stratiform_precipitating", "N2_TTL_anom", "dudz_TTL_anom", "kelvin_anom") if v in specs]
+def plot_synthesis(composites, specs, milestone_table):
+    synth_vars = [v for v in ("pw_anom", "precip", "stratiform_precipitating", "nonprecipitating", "N2_TTL_anom", "dudz_TTL_anom") if v in specs]
     if not synth_vars:
         return
     fig, ax = plt.subplots(len(synth_vars), 1, figsize=(8.8, 1.75 * len(synth_vars)), constrained_layout=True, sharex=True)
@@ -2373,11 +2648,6 @@ def plot_synthesis(composites, specs, milestone_table, phase_stats):
                     text_rows.append(f"{sim} {label}: {s.lag_days.iloc[0] - c.lag_days.iloc[0]:+.1f} d")
         if text_rows:
             ax[0].text(0.01, 0.97, "\n".join(text_rows[:6]), transform=ax[0].transAxes, va="top", ha="left", fontsize=8, bbox=dict(facecolor="w", alpha=0.75, edgecolor="0.8"))
-    if len(phase_stats):
-        phase_text = []
-        for row in phase_stats.to_dict("records"):
-            phase_text.append(f"{row['simulation']}: R={row['vector_strength']:.2f}")
-        ax[-1].text(0.99, 0.05, "\n".join(phase_text), transform=ax[-1].transAxes, va="bottom", ha="right", fontsize=8, bbox=dict(facecolor="w", alpha=0.75, edgecolor="0.8"))
     save_figure(7, fig, "mechanistic_synthesis_lifecycle")
     plt.close(fig)
 
@@ -2429,9 +2699,17 @@ def build_fields(ds, zds, sim_name):
             fields[key] = da
 
     classif = load_required_classification(ds, fields, sim_name)
-    for key in ("cloud_top_pressure", "cloud_top_height", "high_cloud_fraction", "high_cloud_mask", "stratiform_precipitating_high_cloud_mask", "convective_precipitating_high_cloud_mask"):
+    for key in (
+        "cloud_top_pressure", "cloud_top_height", "high_cloud_fraction",
+        "high_cloud_mask", "stratiform_precipitating_high_cloud_mask",
+        "convective_precipitating_high_cloud_mask",
+        "nonprecipitating_high_cloud_mask", "unclassified_high_cloud_mask",
+    ):
         if key in classif:
             fields[key] = classif[key]
+
+    for field_name in LIFECYCLE_WAVE_FIELDS:
+        fields[field_name] = lifecycle_wave_field(ds, precip, field_name)
 
     ttl = compute_ttl_fields(ds, precip)
     ttl_fallback = compute_ttl_fields(zds, precip)
@@ -2457,7 +2735,9 @@ def main():
     for sim_name, ds, zds in zip(sim_names, dss, zss):
         fields_by_run.append(build_fields(ds, zds, sim_name))
 
-    source_name = "convective_precipitating_high_cloud_mask" if EVENT_SET == "convective" else "precip_ge_1mmh"
+    source_name = PRIMARY_TRACK_SOURCE
+    for sim_name, fields in zip(sim_names, fields_by_run):
+        validate_pyflextrkr_product(source_name, sim_name, fields)
     cached_tables = load_cached_track_event_tables(source_name)
     if cached_tables is None:
         all_objects = []
@@ -2499,11 +2779,29 @@ def main():
         return
 
     lag_days, lag_steps, step_days = lag_steps_for_reference(fields_by_run[0]["precip"])
+    centre_table = build_composite_centre_table(
+        events_by_run,
+        track_time_by_run,
+        fields_by_run,
+        lag_days,
+        lag_steps,
+    )
+    write_csv(centre_table, "convective_lifecycle_composite_centres.csv")
     specs_by_run = {}
     for sim_name, fields in zip(sim_names, fields_by_run):
         specs_by_run[sim_name] = prepare_composite_fields(fields, sim_name)
     spec_keys = []
-    for key in ("precip", "pw_anom", "stratiform_precipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom", "u_TTL_anom", "dudz_TTL_anom", "kelvin_anom"):
+    preferred_keys = [
+        "precip", "pw_anom", "stratiform_precipitating", "nonprecipitating",
+        "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom",
+        "u_TTL_anom", "dudz_TTL_anom",
+    ]
+    preferred_keys.extend(
+        wave_composite_key(wave_name, field_name)
+        for wave_name in LIFECYCLE_WAVE_NAMES
+        for field_name in LIFECYCLE_WAVE_FIELDS
+    )
+    for key in preferred_keys:
         if any(key in specs_by_run[sim] for sim in sim_names):
             spec_keys.append(key)
     specs = {}
@@ -2512,6 +2810,9 @@ def main():
             if key in specs_by_run[sim]:
                 specs[key] = specs_by_run[sim][key]
                 break
+    core_spec_keys = [
+        key for key in preferred_keys[:9] if key in specs
+    ]
 
     include_spatial = should_run_figure(4)
     expected_composite_token = composite_cache_token(
@@ -2554,6 +2855,9 @@ def main():
         spatial_products = {}
         for sim_name, fields in zip(sim_names, fields_by_run):
             events = events_by_run.get(sim_name, pd.DataFrame())
+            track_paths = build_track_path_lookup(
+                track_time_by_run.get(sim_name, pd.DataFrame())
+            )
             composites[sim_name] = {"event_count": len(events)}
             spatial_products[sim_name] = {}
             if len(events) == 0:
@@ -2580,7 +2884,9 @@ def main():
                 da = specs_by_run[sim_name][var]["da"]
                 progress(f"{sim_name}: compositing {var}")
                 progress(f"{sim_name}: {var} lag-longitude and scalar composites")
-                hov, scalar = composite_lag_products(da, events, lag_days, lag_steps)
+                hov, scalar = composite_lag_products(
+                    da, events, track_paths, lag_days, lag_steps
+                )
                 composites[sim_name][var] = {
                     "hov": hov,
                     "scalar": scalar,
@@ -2594,6 +2900,7 @@ def main():
                     spatial = composite_spatial(
                         da,
                         events,
+                        track_paths,
                         SPATIAL_LAGS_DAYS,
                         step_days,
                     )
@@ -2617,8 +2924,8 @@ def main():
         composites, spatial_products = cached_composites
 
     if should_run_figure(1):
-        first_group = [v for v in ("precip", "pw_anom", "stratiform_precipitating", "cloud_top_pressure", "cloud_top_height") if v in specs]
-        second_group = [v for v in ("N2_TTL_anom", "u_TTL_anom", "dudz_TTL_anom", "kelvin_anom") if v in specs]
+        first_group = [v for v in ("precip", "pw_anom", "stratiform_precipitating", "nonprecipitating", "cloud_top_pressure", "cloud_top_height") if v in specs]
+        second_group = [v for v in ("N2_TTL_anom", "u_TTL_anom", "dudz_TTL_anom") if v in specs]
         if first_group:
             plot_hovmoller_group(composites, specs, first_group, "core")
         if second_group:
@@ -2626,29 +2933,30 @@ def main():
 
     milestone_table = pd.DataFrame()
     if should_run_figure(2):
-        milestone_table = plot_fingerprint_summary(composites, specs, spec_keys)
+        milestone_table = plot_fingerprint_summary(
+            composites, specs, core_spec_keys
+        )
         write_csv(milestone_table, "convective_lifecycle_milestones.csv")
 
     if should_run_figure(3):
-        diff_vars = [v for v in ("pw_anom", "precip", "stratiform_precipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom", "dudz_TTL_anom", "kelvin_anom") if v in specs]
+        diff_vars = [v for v in ("pw_anom", "precip", "stratiform_precipitating", "nonprecipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom", "dudz_TTL_anom") if v in specs]
         plot_difference_fingerprints(composites, specs, diff_vars)
 
     if should_run_figure(4):
-        spatial_vars = [v for v in ("precip", "pw_anom", "stratiform_precipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom") if v in specs]
+        spatial_vars = [v for v in ("precip", "pw_anom", "stratiform_precipitating", "nonprecipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom") if v in specs]
         plot_spatial_composites(spatial_products, specs, spatial_vars)
 
-    phase_stats = pd.DataFrame()
-    phase_series = {}
-    if should_run_figure(5) or should_run_figure(7):
-        cached_phase = load_cached_phase_products(source_name)
-        if cached_phase is None:
-            phase_stats, phase_series = compute_kelvin_phase_stats(fields_by_run, events_by_run)
-            write_phase_cache(source_name, phase_stats, phase_series)
-        else:
-            phase_stats, phase_series = cached_phase
-        write_csv(phase_stats, "convective_lifecycle_kelvin_phase_stats.csv")
     if should_run_figure(5):
-        plot_phase_locking(phase_stats, phase_series)
+        write_csv(
+            wave_composite_method_table(),
+            "convective_lifecycle_wave_filter_methods.csv",
+        )
+        wave_curve_table = wave_composite_curve_table(composites)
+        write_csv(
+            wave_curve_table,
+            "convective_lifecycle_wave_filtered_track_composites.csv",
+        )
+        plot_wave_filtered_track_composites(composites, specs)
 
     if should_run_any([6, 8]):
         cached_lifecycle = load_cached_track_property_lifecycle(source_name, step_days)
@@ -2666,9 +2974,11 @@ def main():
 
     if should_run_figure(7):
         if len(milestone_table) == 0:
-            milestone_table = plot_fingerprint_summary(composites, specs, spec_keys)
+            milestone_table = plot_fingerprint_summary(
+                composites, specs, core_spec_keys
+            )
             write_csv(milestone_table, "convective_lifecycle_milestones.csv")
-        plot_synthesis(composites, specs, milestone_table, phase_stats)
+        plot_synthesis(composites, specs, milestone_table)
 
     print("\nFinished convective_lifecycle_composite_diagnostics.py")
 

@@ -20,6 +20,7 @@ Longitude is periodic both when labelling objects across the seam and when
 measuring distances between centroids.
 """
 
+import argparse
 import glob
 import json
 import os
@@ -41,6 +42,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from matplotlib import animation, colors as mpl_colors, pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from scipy import ndimage
 
@@ -49,6 +51,15 @@ from high_cloud_classification import (
     CLASSIFICATION_CACHE_VERSION,
     HighCloudThresholds,
     cached_classification_is_current as shared_cached_classification_is_current,
+)
+from pyflextrkr_contract import (
+    PYFLEXTRKR_PRODUCT_VERSION,
+    product_fingerprint,
+    read_product_metadata,
+    sha256_file,
+    sha256_label_sequence,
+    time_signature,
+    write_product_metadata,
 )
 
 from pyflextrkr.gettracks import gettracknumbers as pyflextrkr_gettracknumbers
@@ -68,6 +79,7 @@ def env_flag(name, default=False):
 
 save = True
 save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/organisation/")
+default_save_loc = save_loc
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -77,14 +89,15 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/organisation
 #   3: object count/area/area-fraction distributions
 #   4: Lorg conditioned on tropical-mean precipitation
 #   5: Lorg conditioned on convective area fraction
-#   6: PyFLEXTRKR-method track lifetime survival and boxplots
-#   7: long-lived tracked area/precipitation contribution
-#   8: PyFLEXTRKR-method track lifetime conditioned on tropical-mean precipitation
-#   9: PyFLEXTRKR-method track lifetime conditioned on convective area fraction
+#   6: primary convective-object track lifetime survival and boxplots
+#   7: primary convective long-lived area/precipitation contribution
+#   8: primary convective lifetime conditioned on tropical-mean precipitation
+#   9: primary convective lifetime conditioned on convective area fraction
 #   10: propagation-aware pattern autocorrelation
 #   11: PyFLEXTRKR cloud-object and track validation snapshots
 #   12: separate per-simulation classification and PyFLEXTRKR tracking movies
 #   13: PyFLEXTRKR track-step continuity validation
+#   14: PyFLEXTRKR validation inventory and time-series dashboard
 #
 # WHAT TO LOOK FOR:
 #   * Robust Lorg or object-count changes at fixed tropical precipitation imply
@@ -97,14 +110,32 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/organisation
 #   * PyFLEXTRKR is used here to define overlap-based tracks and merge/split
 #     bookkeeping; the separate block-resampling script tests whether the
 #     resulting metric differences are consistent across time chunks.
-#   * In Figure 11, feature boundaries should follow the plotted rain, cold-OLR,
-#     or cloud masks and numbered paths should move continuously between scenes.
-#   * Figure 12 separates the evolving classification, cloud-object tracks, and
-#     independent precipitation/OLR tracks so each movie answers one question.
+#   * The convective-precipitating high-cloud mask is the primary tracked object
+#     set used for persistence and downstream lifecycle/wave composites.
+#   * Rain-rate and cold-OLR tracks are object-definition sensitivity checks;
+#     stratiform and non-precipitating cloud are not tracked.
+#   * In Figure 11, retained features should follow the input mask and numbered
+#     paths should move continuously between scenes.
+#   * Figure 12 separates the evolving classification, primary convective
+#     tracks, and precipitation/OLR sensitivity tracks.
 #   * Figure 13 exposes implausible centroid jumps quantitatively rather than
 #     relying only on visual inspection of paths.
+#   * Figure 14 shows whether every requested scene was written and whether
+#     object counts, active tracks, lifetimes, speeds, and area changes are
+#     plausible before the resulting science metrics are interpreted.
 figures_to_run = []
 figsave = None
+
+TEST_MODE = False
+TEST_TIME_STEPS = 16
+TEST_START = None
+TEST_REUSE_CACHE = False
+TEST_DEFAULT_FIGURES = [11, 12, 13, 14]
+SIMULATION_ARGUMENTS = {
+    "control": 0,
+    "nudged-u": 1,
+    "nudged-T": 2,
+}
 
 # Expensive organisation and persistence tables are cached in save_loc. Metadata
 # must match active settings; older CSV-only caches can be adopted once if their
@@ -199,6 +230,9 @@ ENABLE_CLOUD_OBJECTS = True
 CLOUD_CLASSIFICATION_CACHE_DIRS = [
     diagnostic_cache_dir("classification_cache", root_dir=root_dir),
 ]
+CLASSIFICATION_TEST_OUTPUT_ROOT = diagnostic_output_dir(
+    "/home/cwp29/tmp/mpas/crf_on/final/high_cloud_refined/"
+)
 
 CLOUD_OBJECT_KEYS_PRIMARY = [
     "convective_precipitating_high_cloud_mask",
@@ -213,16 +247,18 @@ CLOUD_OBJECT_KEYS = CLOUD_OBJECT_KEYS_PRIMARY + (
     CLOUD_OBJECT_KEYS_SENSITIVITY if RUN_SENSITIVITY_OBJECT_SOURCES else []
 )
 
-# Figure 11 samples the principal independent object definitions as well as the
-# two precipitation-regime cloud masks. This makes it possible to distinguish a
-# PyFLEXTRKR linkage problem from a problem in the cloud classification itself.
-PYFLEXTRKR_VALIDATION_SOURCES = [
-    "precip_ge_1mmh",
-    "olr_tb241",
-    *CLOUD_OBJECT_KEYS_PRIMARY,
+# The classifier's convective-precipitating mask is the primary object set for
+# persistence and lifecycle/wave composites. Rain-rate and cold-OLR objects are
+# tracked only to test sensitivity to the object definition. Stratiform and
+# non-precipitating cloud are environmental context, not tracked populations.
+PYFLEXTRKR_PRIMARY_SOURCE = "convective_precipitating_high_cloud_mask"
+PYFLEXTRKR_SENSITIVITY_SOURCES = ["precip_ge_1mmh", "olr_tb241"]
+PYFLEXTRKR_TRACKED_SOURCES = [
+    PYFLEXTRKR_PRIMARY_SOURCE,
+    *PYFLEXTRKR_SENSITIVITY_SOURCES,
 ]
-PYFLEXTRKR_CLASS_SOURCES = list(CLOUD_OBJECT_KEYS_PRIMARY)
-PYFLEXTRKR_CONTEXT_SOURCES = ["precip_ge_1mmh", "olr_tb241"]
+PYFLEXTRKR_VALIDATION_SOURCES = list(PYFLEXTRKR_TRACKED_SOURCES)
+PYFLEXTRKR_CLASS_SOURCES = [PYFLEXTRKR_PRIMARY_SOURCE]
 PYFLEXTRKR_MOVIE_MAX_FRAMES = 48
 PYFLEXTRKR_MOVIE_FPS = 4
 PYFLEXTRKR_MOVIE_TRACK_HISTORY_STEPS = 6
@@ -275,12 +311,12 @@ VAR_ALIASES = {
 }
 
 SOURCE_LABELS = {
-    "precip_ge_1mmh": r"Precip $\geq$ 1 mm h$^{-1}$",
+    "precip_ge_1mmh": r"Sensitivity: precip $\geq$ 1 mm h$^{-1}$",
     "precip_ge_2mmh": r"Precip $\geq$ 2 mm h$^{-1}$",
     "precip_ge_8mmh": r"Precip $\geq$ 8 mm h$^{-1}$",
     "precip_p95": "Precip p95 sensitivity",
     "precip_p99": "Precip p99 sensitivity",
-    "olr_tb241": r"OLR $T_b^\ast \leq$ 241 K",
+    "olr_tb241": r"Sensitivity: OLR $T_b^\ast \leq$ 241 K",
     "olr_tb233": r"OLR $T_b^\ast \leq$ 233 K",
     "olr_cold_p05": "Cold OLR anomaly p5",
     "high_cloud_mask": "High cloud",
@@ -346,6 +382,109 @@ def should_run_any(numbers):
     return figure_should_run_any(figures_to_run, numbers)
 
 
+def parse_command_line(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute convective-organisation metrics and validate PyFLEXTRKR "
+            "object segmentation and tracking."
+        )
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run one simulation over a short isolated time window.",
+    )
+    parser.add_argument(
+        "--simulation",
+        choices=tuple(SIMULATION_ARGUMENTS),
+        default="control",
+        help="Simulation used by --test (default: control).",
+    )
+    parser.add_argument(
+        "--test-times",
+        type=int,
+        default=TEST_TIME_STEPS,
+        metavar="N",
+        help="Number of tracked six-hourly snapshots in --test mode (default: 16).",
+    )
+    parser.add_argument(
+        "--test-start",
+        default=None,
+        metavar="TIME",
+        help="Optional first source time, for example 2000-10-01.",
+    )
+    parser.add_argument(
+        "--reuse-test-cache",
+        action="store_true",
+        help="Reuse matching short-run metric and PyFLEXTRKR caches in test mode.",
+    )
+    parser.add_argument(
+        "--figures",
+        type=int,
+        nargs="+",
+        choices=range(1, 15),
+        default=None,
+        metavar="N",
+        help="Run only the listed figure numbers (1-14).",
+    )
+    args = parser.parse_args(argv)
+    if args.test and args.test_times < 5:
+        parser.error(
+            "--test-times must be at least 5 because PyFLEXTRKR's track-number "
+            "allocator needs four adjacent-scene files"
+        )
+    return args
+
+
+def configure_run(args):
+    global TEST_MODE, TEST_TIME_STEPS, TEST_START, TEST_REUSE_CACHE
+    global save_loc, figures_to_run, figsave, PYFLEXTRKR_WORK_DIR
+    global data_locs, latlon_file, sim_names, cols
+    global CLOUD_CLASSIFICATION_CACHE_DIRS
+    global FORCE_RECOMPUTE_ORGANISATION_CACHE
+    global FORCE_RECOMPUTE_PERSISTENCE_CACHE, FORCE_RECOMPUTE_PYFLEXTRKR_CACHE
+
+    TEST_MODE = bool(args.test)
+    TEST_TIME_STEPS = int(args.test_times)
+    TEST_START = args.test_start
+    TEST_REUSE_CACHE = bool(args.reuse_test_cache)
+
+    if args.figures is not None:
+        figures_to_run = list(args.figures)
+    elif TEST_MODE:
+        figures_to_run = list(TEST_DEFAULT_FIGURES)
+
+    if TEST_MODE:
+        index = SIMULATION_ARGUMENTS[args.simulation]
+        data_locs = [data_locs[index]]
+        latlon_file = [latlon_file[index]]
+        sim_names = [sim_names[index]]
+        cols = [cols[index]]
+
+        start_label = f"_{TEST_START}" if TEST_START else ""
+        test_label = f"{args.simulation}{start_label}_{TEST_TIME_STEPS:03d}times"
+        test_label = test_label.replace(":", "").replace(" ", "_")
+        save_loc = os.path.join(default_save_loc, "testing", test_label)
+        PYFLEXTRKR_WORK_DIR = os.path.join(save_loc, "pyflextrkr_tracking")
+        test_classification_dir = os.path.join(
+            CLASSIFICATION_TEST_OUTPUT_ROOT,
+            "testing",
+            test_label,
+            "classification_products",
+        )
+        CLOUD_CLASSIFICATION_CACHE_DIRS = [
+            test_classification_dir,
+            *CLOUD_CLASSIFICATION_CACHE_DIRS,
+        ]
+
+        if not TEST_REUSE_CACHE:
+            FORCE_RECOMPUTE_ORGANISATION_CACHE = True
+            FORCE_RECOMPUTE_PERSISTENCE_CACHE = True
+            FORCE_RECOMPUTE_PYFLEXTRKR_CACHE = True
+
+    figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
+
+
 def save_figure(number, fig, stem, dpi=300):
     global figsave
     if figsave is None:
@@ -374,7 +513,7 @@ def feature_label_cmap():
 # -----------------------------------------------------------------------------
 
 METRIC_CACHE_VERSION = "organisation_metrics_v3_cloud_regimes"
-TRACK_PERSISTENCE_CACHE_VERSION = "pyflextrkr_track_persistence_v3_cloud_regimes"
+TRACK_PERSISTENCE_CACHE_VERSION = "pyflextrkr_track_persistence_v5_product_contract"
 PATTERN_PERSISTENCE_CACHE_VERSION = "shifted_pattern_persistence_v1"
 
 ORGANISATION_CACHE_FILES = {
@@ -483,6 +622,9 @@ def base_data_cache_signature():
         analysis_end_date=analysis_end_date,
         time_format=time_format,
         tropical_lat_bounds=list(TROPICAL_LAT_BOUNDS),
+        test_mode=bool(TEST_MODE),
+        test_time_steps=int(TEST_TIME_STEPS) if TEST_MODE else None,
+        test_start=TEST_START if TEST_MODE else None,
     )
 
 
@@ -523,6 +665,8 @@ def track_persistence_cache_signature():
     signature = object_definition_cache_signature()
     signature.update(
         cache_version=TRACK_PERSISTENCE_CACHE_VERSION,
+        primary_track_source=PYFLEXTRKR_PRIMARY_SOURCE,
+        tracked_sources=list(PYFLEXTRKR_TRACKED_SOURCES),
         pyflextrkr_nmaxlinks=int(PYFLEXTRKR_NMAXLINKS),
         pyflextrkr_fillval=int(PYFLEXTRKR_FILLVAL),
         track_min_overlap_fraction=float(TRACK_MIN_OVERLAP_FRACTION),
@@ -868,6 +1012,14 @@ def source_label(source_name):
     return SOURCE_LABELS.get(source_name, source_name.replace("_", " "))
 
 
+def track_source_role(source_name):
+    if source_name == PYFLEXTRKR_PRIMARY_SOURCE:
+        return "primary_persistence_and_composites"
+    if source_name in PYFLEXTRKR_SENSITIVITY_SOURCES:
+        return "object_definition_sensitivity"
+    return "not_tracked"
+
+
 def ordered_sources(metrics_df):
     present = set(metrics_df.source.unique())
     ordered = [name for name in SOURCE_ORDER if name in present]
@@ -1049,7 +1201,8 @@ def label_objects_with_properties(mask2d, area2d, precip2d=None):
     labels = merge_periodic_longitude_labels(labels)
 
     lat_vals = np.asarray(mask2d.latitude.values, dtype=float)
-    lon_vals = np.asarray(mask2d.longitude.values, dtype=float) % LONGITUDE_PERIOD_DEG
+    lon_coord = np.asarray(mask2d.longitude.values, dtype=float)
+    lon_vals = lon_coord % LONGITUDE_PERIOD_DEG
     lat_grid, lon_grid = np.meshgrid(lat_vals, lon_vals, indexing="ij")
 
     rows = []
@@ -1074,7 +1227,9 @@ def label_objects_with_properties(mask2d, area2d, precip2d=None):
         theta = 2.0 * np.pi * lon_grid[obj] / LONGITUDE_PERIOD_DEG
         sin_mean = np.average(np.sin(theta), weights=weights)
         cos_mean = np.average(np.cos(theta), weights=weights)
-        centroid_lon = (np.rad2deg(np.arctan2(sin_mean, cos_mean)) % 360.0)
+        centroid_lon = np.rad2deg(np.arctan2(sin_mean, cos_mean)) % 360.0
+        if np.nanmin(lon_coord) < 0.0:
+            centroid_lon = (centroid_lon + 180.0) % 360.0 - 180.0
 
         rows.append(
             dict(
@@ -1392,6 +1547,84 @@ def attach_pyflextrkr_track_ids(tracknumbers_file, objects_df):
     return objects_df
 
 
+def record_pyflextrkr_product(
+    work_path,
+    tracknumbers_file,
+    labels_by_time,
+    mask,
+    source_name,
+    sim_name,
+):
+    metadata = dict(
+        product_version=PYFLEXTRKR_PRODUCT_VERSION,
+        source=source_name,
+        simulation=sim_name,
+        analysis_role=track_source_role(source_name),
+        classification_cache_version=(
+            CLASSIFICATION_CACHE_VERSION if source_name in CLOUD_OBJECT_KEYS else ""
+        ),
+        cloudid_labels_sha256=sha256_label_sequence(labels_by_time),
+        tracknumbers_file=os.path.basename(tracknumbers_file),
+        tracknumbers_sha256=sha256_file(tracknumbers_file),
+        track_min_overlap_fraction=float(TRACK_MIN_OVERLAP_FRACTION),
+        track_min_area_km2=float(TRACK_MIN_AREA_KM2),
+        pyflextrkr_nmaxlinks=int(PYFLEXTRKR_NMAXLINKS),
+        **time_signature(mask.Time.values),
+    )
+    return write_product_metadata(work_path, metadata)
+
+
+def cached_pyflextrkr_product_is_current(
+    work_path,
+    tracknumbers_file,
+    labels_by_time,
+    mask,
+    source_name,
+    sim_name,
+):
+    metadata = read_product_metadata(work_path)
+    if metadata is None or not os.path.exists(tracknumbers_file):
+        return False
+    expected = dict(
+        product_version=PYFLEXTRKR_PRODUCT_VERSION,
+        source=source_name,
+        simulation=sim_name,
+        analysis_role=track_source_role(source_name),
+        classification_cache_version=(
+            CLASSIFICATION_CACHE_VERSION if source_name in CLOUD_OBJECT_KEYS else ""
+        ),
+        cloudid_labels_sha256=sha256_label_sequence(labels_by_time),
+        tracknumbers_file=os.path.basename(tracknumbers_file),
+        track_min_overlap_fraction=float(TRACK_MIN_OVERLAP_FRACTION),
+        track_min_area_km2=float(TRACK_MIN_AREA_KM2),
+        pyflextrkr_nmaxlinks=int(PYFLEXTRKR_NMAXLINKS),
+        **time_signature(mask.Time.values),
+    )
+    if any(metadata.get(key) != value for key, value in expected.items()):
+        return False
+    return metadata.get("tracknumbers_sha256") == sha256_file(tracknumbers_file)
+
+
+def attach_and_record_pyflextrkr_product(
+    work_path,
+    tracknumbers_file,
+    labels_by_time,
+    objects_df,
+    mask,
+    source_name,
+    sim_name,
+):
+    record_pyflextrkr_product(
+        work_path,
+        tracknumbers_file,
+        labels_by_time,
+        mask,
+        source_name,
+        sim_name,
+    )
+    return attach_pyflextrkr_track_ids(tracknumbers_file, objects_df)
+
+
 def assign_pyflextrkr_track_ids(labels_by_time, objects_df, mask, source_name, sim_name):
     if len(labels_by_time) < 2:
         raise ValueError("at least two scenes are required for PyFLEXTRKR tracking")
@@ -1426,28 +1659,44 @@ def assign_pyflextrkr_track_ids(labels_by_time, objects_df, mask, source_name, s
     if FORCE_RECOMPUTE_PYFLEXTRKR_CACHE and os.path.exists(tracknumbers_file):
         os.remove(tracknumbers_file)
 
-    if not FORCE_RECOMPUTE_PYFLEXTRKR_CACHE and os.path.exists(tracknumbers_file):
+    cached_product_current = cached_pyflextrkr_product_is_current(
+        work_path,
+        tracknumbers_file,
+        labels_by_time,
+        mask,
+        source_name,
+        sim_name,
+    )
+    if not FORCE_RECOMPUTE_PYFLEXTRKR_CACHE and cached_product_current:
         print(f"Using cached PyFLEXTRKR track numbers for {sim_name} {source_name}: {tracknumbers_file}")
-        return attach_pyflextrkr_track_ids(tracknumbers_file, objects_df)
+        return attach_and_record_pyflextrkr_product(
+            work_path, tracknumbers_file, labels_by_time, objects_df, mask,
+            source_name, sim_name,
+        )
 
-    if (
-        not FORCE_RECOMPUTE_PYFLEXTRKR_CACHE
-        and expected_pyflextrkr_files_available(tracking_path, basetimes)
-    ):
-        print(f"Using cached PyFLEXTRKR cloudid/track files for {sim_name} {source_name}: {tracking_path}")
-        tracknumbers_file = pyflextrkr_gettracknumbers(config)
-        return attach_pyflextrkr_track_ids(tracknumbers_file, objects_df)
+    if os.path.exists(tracknumbers_file):
+        print(
+            f"Regenerating stale PyFLEXTRKR product for {sim_name} {source_name}: "
+            f"{tracknumbers_file}"
+        )
+        os.remove(tracknumbers_file)
 
     files, basetimes, tracking_path = write_pyflextrkr_cloudid_files(labels_by_time, mask, work_path)
     old_cwd = os.getcwd()
     try:
         os.chdir(tracking_path)
         for it in range(len(files) - 1):
-            pyflextrkr_trackclouds(
-                (os.path.basename(files[it]), os.path.basename(files[it + 1])),
-                (basetimes[it], basetimes[it + 1]),
-                config,
-            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Converting non-nanosecond precision datetime values.*",
+                    category=UserWarning,
+                )
+                pyflextrkr_trackclouds(
+                    (os.path.basename(files[it]), os.path.basename(files[it + 1])),
+                    (basetimes[it], basetimes[it + 1]),
+                    config,
+                )
             short_name = os.path.join(tracking_path, pyflextrkr_track_filename(basetimes[it + 1]))
             seconds_name = os.path.join(tracking_path, pyflextrkr_track_filename_with_seconds(basetimes[it + 1]))
             if os.path.exists(seconds_name):
@@ -1458,7 +1707,10 @@ def assign_pyflextrkr_track_ids(labels_by_time, objects_df, mask, source_name, s
         os.chdir(old_cwd)
 
     tracknumbers_file = pyflextrkr_gettracknumbers(config)
-    return attach_pyflextrkr_track_ids(tracknumbers_file, objects_df)
+    return attach_and_record_pyflextrkr_product(
+        work_path, tracknumbers_file, labels_by_time, objects_df, mask,
+        source_name, sim_name,
+    )
 
 
 def build_track_tables(mask, fields, source_name, sim_name):
@@ -1506,6 +1758,7 @@ def build_track_tables(mask, fields, source_name, sim_name):
                     node_id=node_id,
                     source=source_name,
                     source_label=source_label(source_name),
+                    analysis_role=track_source_role(source_name),
                     simulation=sim_name,
                     Time=mask.Time.values[it],
                     time_index=it,
@@ -1560,6 +1813,7 @@ def build_track_tables(mask, fields, source_name, sim_name):
             dict(
                 source=source,
                 source_label=label,
+                analysis_role=track_source_role(source),
                 simulation=simulation,
                 track_id=int(track_id),
                 start_time=group.Time.iloc[0],
@@ -1625,6 +1879,7 @@ def build_track_tables(mask, fields, source_name, sim_name):
                 dict(
                     source=record["source"],
                     source_label=record["source_label"],
+                    analysis_role=track_source_role(record["source"]),
                     simulation=record["simulation"],
                     Time=record["Time"],
                     time_days=record["time_days"],
@@ -1648,8 +1903,11 @@ def build_track_persistence_metrics(masks_by_run, fields_by_run):
     contribution_rows = []
     for i, masks in enumerate(masks_by_run):
         sim_name = sim_names[i]
-        for source_name in [name for name in SOURCE_ORDER if name in masks]:
-            print(f"Tracking object persistence for {sim_name}: {source_name}")
+        for source_name in [name for name in PYFLEXTRKR_TRACKED_SOURCES if name in masks]:
+            print(
+                f"Tracking object persistence for {sim_name}: {source_name}",
+                flush=True,
+            )
             objects, tracks, contribution = build_track_tables(
                 masks[source_name],
                 fields_by_run[i],
@@ -1667,6 +1925,69 @@ def build_track_persistence_metrics(masks_by_run, fields_by_run):
     tracks_df = pd.concat(track_rows, ignore_index=True) if track_rows else pd.DataFrame()
     contribution_df = pd.concat(contribution_rows, ignore_index=True) if contribution_rows else pd.DataFrame()
     return objects_df, tracks_df, contribution_df
+
+
+def write_pyflextrkr_obsolete_output_report():
+    rows = []
+    expected_paths = {
+        os.path.abspath(pyflextrkr_work_path(source, sim)): (source, sim)
+        for source in PYFLEXTRKR_TRACKED_SOURCES
+        for sim in sim_names
+    }
+    candidate_paths = {
+        os.path.abspath(path)
+        for path in glob.glob(os.path.join(PYFLEXTRKR_WORK_DIR, "*", "*"))
+        if os.path.isdir(path)
+    }
+    for path in sorted(candidate_paths):
+        metadata = read_product_metadata(path)
+        if path not in expected_paths:
+            rows.append(dict(path=path, reason="not a current tracked source/simulation"))
+            continue
+        if metadata is None:
+            rows.append(dict(path=path, reason="missing product metadata"))
+            continue
+        if metadata.get("product_version") != PYFLEXTRKR_PRODUCT_VERSION:
+            rows.append(dict(path=path, reason="obsolete product version"))
+            continue
+        source, sim = expected_paths[path]
+        expected_classification = (
+            CLASSIFICATION_CACHE_VERSION if source in CLOUD_OBJECT_KEYS else ""
+        )
+        if (
+            metadata.get("source") != source
+            or metadata.get("simulation") != sim
+            or metadata.get("classification_cache_version")
+            != expected_classification
+        ):
+            rows.append(dict(path=path, reason="metadata does not match current product definition"))
+            continue
+        if metadata.get("product_fingerprint") != product_fingerprint(metadata):
+            rows.append(dict(path=path, reason="invalid product fingerprint"))
+            continue
+        selected = metadata.get("tracknumbers_file", "")
+        selected_path = os.path.join(path, "stats", selected)
+        if not selected or not os.path.exists(selected_path):
+            rows.append(dict(path=path, reason="selected track-number file is missing"))
+            continue
+        if metadata.get("tracknumbers_sha256") != sha256_file(selected_path):
+            rows.append(dict(path=path, reason="selected track-number checksum mismatch"))
+        for track_file in glob.glob(os.path.join(path, "stats", "tracknumbers_*.nc")):
+            if os.path.basename(track_file) != selected:
+                rows.append(dict(path=track_file, reason="unselected track-number file"))
+
+    report = pd.DataFrame(rows, columns=["path", "reason"])
+    report_path = os.path.join(save_loc, "pyflextrkr_obsolete_output_candidates.csv")
+    report.to_csv(report_path, index=False)
+    if len(report):
+        print(
+            f"Found {len(report)} PyFLEXTRKR output candidate(s) for manual deletion; "
+            f"see {report_path}",
+            flush=True,
+        )
+    else:
+        print(f"No obsolete PyFLEXTRKR outputs found; wrote {report_path}", flush=True)
+    return report
 
 
 # -----------------------------------------------------------------------------
@@ -1725,6 +2046,21 @@ def cloud_masks_from_cache(sim_name, precip_ref):
         cached.close()
         raise RuntimeError(
             f"{sim_name}: high-cloud classification cache lacks required shared variables {missing}: {path}"
+        )
+    if "Time" not in cached.dims or "Time" not in precip_ref.dims:
+        cached.close()
+        raise RuntimeError(
+            f"{sim_name}: classification and precipitation must both have Time coordinates"
+        )
+    requested_time = precip_ref.Time.to_index()
+    missing_time = requested_time.difference(cached.Time.to_index())
+    if len(missing_time) > 0:
+        cached.close()
+        preview = ", ".join(str(value) for value in missing_time[:4])
+        suffix = "" if len(missing_time) <= 4 else ", ..."
+        raise RuntimeError(
+            f"{sim_name}: shared classification is missing {len(missing_time)} requested "
+            f"times ({preview}{suffix}): {path}"
         )
     masks = {}
     for key in CLASSIFICATION_DIAGNOSTIC_KEYS:
@@ -2095,6 +2431,10 @@ def plot_track_lifetime_distribution(tracks_df):
     if len(tracks_df) == 0:
         print("Skipping track lifetime plot: no tracks")
         return
+    tracks_df = tracks_df[tracks_df.source == PYFLEXTRKR_PRIMARY_SOURCE]
+    if len(tracks_df) == 0:
+        print("Skipping track lifetime plot: no primary convective tracks")
+        return
     sources = ordered_sources(tracks_df)
     fig, ax = plt.subplots(
         len(sources),
@@ -2128,7 +2468,10 @@ def plot_track_lifetime_distribution(tracks_df):
         ax[si, 0].grid(alpha=0.2)
         ax[si, 1].grid(alpha=0.2, axis="y")
     ax[0, 0].legend(loc="best")
-    fig.suptitle("Persistence: lifetime of tracked organised convective patterns")
+    fig.suptitle(
+        "Track lifetime: convective precipitating high-cloud objects",
+        fontsize=12,
+    )
     save_figure(6, fig, "track_lifetime_survival_boxplot")
 
 
@@ -2136,8 +2479,15 @@ def plot_long_lived_contribution(contribution_df):
     if len(contribution_df) == 0:
         print("Skipping long-lived contribution plot: no contribution table")
         return
+    contribution_df = contribution_df[
+        contribution_df.source == PYFLEXTRKR_PRIMARY_SOURCE
+    ]
+    if len(contribution_df) == 0:
+        print("Skipping long-lived contribution plot: no primary convective tracks")
+        return
     sources = ordered_sources(contribution_df)
     fig, ax = source_axis_grid(sources, height_per_row=3.2)
+    fig.set_size_inches(7.2, 4.2)
     for si, source in enumerate(sources):
         axis = ax.ravel()[si]
         ncols = ax.shape[1]
@@ -2163,7 +2513,10 @@ def plot_long_lived_contribution(contribution_df):
             axis.set_ylabel("Fraction in long-lived tracks")
         axis.grid(alpha=0.2)
     ax.ravel()[0].legend(loc="best")
-    fig.suptitle("Long-lived organised contribution: area solid, precipitation dashed")
+    fig.suptitle(
+        "Primary convective tracks: area solid, precipitation dashed",
+        fontsize=11,
+    )
     save_figure(7, fig, "long_lived_track_contribution")
 
 
@@ -2210,6 +2563,10 @@ def conditional_track_summary(tracks_df, source, condition_key):
 def plot_conditional_track_lifetime(tracks_df, condition_key, number, stem, xlabel):
     if len(tracks_df) == 0 or condition_key not in tracks_df.columns:
         print(f"Skipping {stem}: no track lifetime samples")
+        return
+    tracks_df = tracks_df[tracks_df.source == PYFLEXTRKR_PRIMARY_SOURCE]
+    if len(tracks_df) == 0:
+        print(f"Skipping {stem}: no primary convective tracks")
         return
     sources = ordered_sources(tracks_df)
     summaries = [conditional_track_summary(tracks_df, source, condition_key) for source in sources]
@@ -2346,7 +2703,7 @@ def pyflextrkr_cloudid_files(source_name, sim_name):
     return sorted(glob.glob(os.path.join(work_path, "tracking", "cloudid_*.nc")))
 
 
-def plot_pyflextrkr_track_validation(objects_df, fields_by_run):
+def plot_pyflextrkr_track_validation(objects_df, fields_by_run, masks_by_run):
     if not should_run_figure(11):
         return
     if objects_df is None or len(objects_df) == 0:
@@ -2361,16 +2718,16 @@ def plot_pyflextrkr_track_validation(objects_df, fields_by_run):
     precip_cmap, precip_norm = precip_rate_cmap_norm()
     for source_name in sources:
         fig, axes = plt.subplots(
-            1,
             len(sim_names),
-            figsize=(14.5, 4.2),
+            1,
+            figsize=(12.0, max(3.8, 3.5 * len(sim_names))),
             constrained_layout=True,
             squeeze=False,
-            sharey=True,
+            sharex=True,
         )
         last_precip_im = None
         for c, sim_name in enumerate(sim_names):
-            ax = axes[0, c]
+            ax = axes[c, 0]
             sub = objects_df[
                 (objects_df.source == source_name)
                 & (objects_df.simulation == sim_name)
@@ -2405,6 +2762,10 @@ def plot_pyflextrkr_track_validation(objects_df, fields_by_run):
                 rasterized=True,
             )
             masked_labels = np.ma.masked_where(labels <= 0, labels)
+            source_mask = tracking_grid_field(
+                masks_by_run[c][source_name], time_index, lat, lon
+            ).astype(bool)
+            source_values = np.asarray(source_mask.values, dtype=bool)
             ax.pcolormesh(
                 lon,
                 lat,
@@ -2416,6 +2777,27 @@ def plot_pyflextrkr_track_validation(objects_df, fields_by_run):
             )
             if np.any(labels > 0):
                 ax.contour(lon, lat, (labels > 0).astype(float), levels=[0.5], colors="0.15", linewidths=0.45)
+            if np.any(source_values):
+                ax.contour(
+                    lon,
+                    lat,
+                    source_values.astype(float),
+                    levels=[0.5],
+                    colors="#00a6ca",
+                    linewidths=1.0,
+                )
+
+            feature_values = labels > 0
+            source_cells = int(np.count_nonzero(source_values))
+            feature_cells = int(np.count_nonzero(feature_values))
+            intersection_cells = int(np.count_nonzero(source_values & feature_values))
+            union_cells = int(np.count_nonzero(source_values | feature_values))
+            retained_percent = (
+                100.0 * intersection_cells / source_cells if source_cells else np.nan
+            )
+            footprint_iou = (
+                intersection_cells / union_cells if union_cells else np.nan
+            )
 
             scene = sub[sub.time_index == time_index].nlargest(12, "area_km2")
             selected_track_ids = set(scene.track_id.astype(int))
@@ -2444,6 +2826,7 @@ def plot_pyflextrkr_track_validation(objects_df, fields_by_run):
                     ha="center",
                     va="center",
                     bbox=dict(facecolor="white", edgecolor="0.2", alpha=0.75, pad=0.5),
+                    clip_on=True,
                 )
                 validation_rows.append(
                     dict(
@@ -2457,13 +2840,30 @@ def plot_pyflextrkr_track_validation(objects_df, fields_by_run):
                         centroid_lat=float(record.centroid_lat),
                         centroid_lon=float(record.centroid_lon),
                         cloudid_file=files[time_index],
+                        source_mask_cell_count=source_cells,
+                        cloudid_feature_cell_count=feature_cells,
+                        source_mask_retained_percent=retained_percent,
+                        source_cloudid_footprint_iou=footprint_iou,
                     )
                 )
             ax.set_xlim(float(lon.min()), float(lon.max()))
             ax.set_ylim(*TROPICAL_LAT_BOUNDS)
             ax.set_xlabel("Longitude")
             ax.set_ylabel("Latitude")
-            ax.set_title(f"{sim_name}\nfeature masks, track IDs, and recent paths")
+            ax.set_title(
+                f"{sim_name}, snapshot {time_index}: "
+                f"source-mask retention {retained_percent:.1f}%, footprint IoU {footprint_iou:.2f}"
+            )
+            ax.legend(
+                handles=[
+                    Line2D([0], [0], color="#00a6ca", lw=1.2, label="Input source mask"),
+                    Line2D([0], [0], color="0.15", lw=0.8, label="Retained cloudid footprint"),
+                    Line2D([0], [0], color="k", lw=1.0, label="Track-centroid path"),
+                ],
+                loc="lower left",
+                fontsize=6,
+                frameon=True,
+            )
 
         if last_precip_im is not None:
             fig.colorbar(
@@ -2472,7 +2872,10 @@ def plot_pyflextrkr_track_validation(objects_df, fields_by_run):
                 label=r"Precipitation (mm day$^{-1}$)",
                 shrink=0.86,
             )
-        fig.suptitle(f"PyFLEXTRKR validation: {source_label(source_name)}")
+        fig.suptitle(
+            f"PyFLEXTRKR mask retention and tracks: {source_label(source_name)}",
+            fontsize=12,
+        )
         save_figure(
             11,
             fig,
@@ -2537,6 +2940,245 @@ def pyflextrkr_track_step_table(objects_df):
                 )
             )
     return pd.DataFrame(rows)
+
+
+def pyflextrkr_validation_inventory(
+    objects_df,
+    tracks_df,
+    masks_by_run,
+):
+    steps = pyflextrkr_track_step_table(objects_df)
+    rows = []
+    for sim_index, sim_name in enumerate(sim_names):
+        masks = masks_by_run[sim_index]
+        sources = [source for source in PYFLEXTRKR_TRACKED_SOURCES if source in masks]
+        for source in sources:
+            mask = masks[source]
+            expected_scenes = int(mask.sizes.get("Time", 0))
+            files = pyflextrkr_cloudid_files(source, sim_name)
+            objects = objects_df[
+                (objects_df.simulation == sim_name) & (objects_df.source == source)
+            ] if len(objects_df) else pd.DataFrame()
+            tracks = tracks_df[
+                (tracks_df.simulation == sim_name) & (tracks_df.source == source)
+            ] if len(tracks_df) else pd.DataFrame()
+            source_steps = steps[
+                (steps.simulation == sim_name) & (steps.source == source)
+            ] if len(steps) else pd.DataFrame()
+
+            issues = []
+            if len(files) != expected_scenes:
+                issues.append(
+                    f"cloudid files {len(files)} != expected scenes {expected_scenes}"
+                )
+            if len(objects) == 0:
+                issues.append("no tracked objects")
+            if len(tracks) == 0:
+                issues.append("no tracks")
+            invalid_time_indices = 0
+            if len(objects) and expected_scenes > 0:
+                invalid_time_indices = int(
+                    np.count_nonzero(
+                        (objects.time_index.to_numpy(dtype=int) < 0)
+                        | (objects.time_index.to_numpy(dtype=int) >= expected_scenes)
+                    )
+                )
+                if invalid_time_indices:
+                    issues.append(f"{invalid_time_indices} invalid object time indices")
+            multistep_tracks = int(
+                np.count_nonzero(tracks.lifetime_steps.to_numpy(dtype=float) > 1)
+            ) if len(tracks) and "lifetime_steps" in tracks else 0
+            status = "FAIL" if issues else ("WARN" if multistep_tracks == 0 else "PASS")
+            if not issues and multistep_tracks == 0:
+                issues.append("no multi-snapshot tracks")
+
+            object_counts = (
+                objects.groupby("time_index").size().to_numpy(dtype=float)
+                if len(objects)
+                else np.array([], dtype=float)
+            )
+            lifetimes = (
+                tracks.lifetime_hours.to_numpy(dtype=float)
+                if len(tracks) and "lifetime_hours" in tracks
+                else np.array([], dtype=float)
+            )
+            speeds = (
+                source_steps.translation_speed_km_h.to_numpy(dtype=float)
+                if len(source_steps)
+                else np.array([], dtype=float)
+            )
+            area_changes = (
+                source_steps.area_change_factor.to_numpy(dtype=float)
+                if len(source_steps)
+                else np.array([], dtype=float)
+            )
+            rows.append(
+                dict(
+                    simulation=sim_name,
+                    source=source,
+                    source_label=source_label(source),
+                    analysis_role=track_source_role(source),
+                    validation_status=status,
+                    issue="; ".join(issues) if issues else "none",
+                    expected_scene_count=expected_scenes,
+                    cloudid_file_count=len(files),
+                    cloudid_scene_coverage_percent=(
+                        100.0 * len(files) / expected_scenes
+                        if expected_scenes > 0
+                        else np.nan
+                    ),
+                    scenes_with_tracked_objects=(
+                        int(objects.time_index.nunique()) if len(objects) else 0
+                    ),
+                    tracked_object_count=int(len(objects)),
+                    track_count=int(len(tracks)),
+                    multistep_track_count=multistep_tracks,
+                    median_objects_per_nonempty_scene=(
+                        float(np.nanmedian(object_counts)) if object_counts.size else np.nan
+                    ),
+                    p95_objects_per_nonempty_scene=(
+                        float(np.nanpercentile(object_counts, 95)) if object_counts.size else np.nan
+                    ),
+                    median_track_lifetime_hours=(
+                        float(np.nanmedian(lifetimes)) if lifetimes.size else np.nan
+                    ),
+                    p95_track_lifetime_hours=(
+                        float(np.nanpercentile(lifetimes, 95)) if lifetimes.size else np.nan
+                    ),
+                    tracks_starting_as_split=(
+                        int(np.count_nonzero(tracks.starts_as_split))
+                        if len(tracks) and "starts_as_split" in tracks
+                        else 0
+                    ),
+                    tracks_ending_as_merge=(
+                        int(np.count_nonzero(tracks.ends_as_merge))
+                        if len(tracks) and "ends_as_merge" in tracks
+                        else 0
+                    ),
+                    median_translation_speed_km_h=(
+                        float(np.nanmedian(speeds)) if speeds.size else np.nan
+                    ),
+                    p95_translation_speed_km_h=(
+                        float(np.nanpercentile(speeds, 95)) if speeds.size else np.nan
+                    ),
+                    p95_area_change_factor=(
+                        float(np.nanpercentile(area_changes, 95))
+                        if area_changes.size
+                        else np.nan
+                    ),
+                    invalid_object_time_index_count=invalid_time_indices,
+                )
+            )
+    return pd.DataFrame(rows)
+
+
+def plot_pyflextrkr_validation_dashboard(
+    objects_df,
+    tracks_df,
+    fields_by_run,
+    masks_by_run,
+):
+    if not should_run_figure(14):
+        return
+    inventory = pyflextrkr_validation_inventory(
+        objects_df, tracks_df, masks_by_run
+    )
+    inventory.to_csv(
+        os.path.join(save_loc, "pyflextrkr_validation_inventory.csv"), index=False
+    )
+    steps = pyflextrkr_track_step_table(objects_df)
+
+    for sim_index, sim_name in enumerate(sim_names):
+        sources = [
+            source
+            for source in PYFLEXTRKR_TRACKED_SOURCES
+            if source in masks_by_run[sim_index]
+        ]
+        colors = plt.get_cmap("tab10")(np.linspace(0.0, 0.9, max(1, len(sources))))
+        fig, axes = plt.subplots(2, 2, figsize=(15.0, 8.6), constrained_layout=True)
+        for source, color in zip(sources, colors):
+            objects = objects_df[
+                (objects_df.simulation == sim_name) & (objects_df.source == source)
+            ] if len(objects_df) else pd.DataFrame()
+            if len(objects):
+                index = np.arange(int(masks_by_run[sim_index][source].sizes["Time"]))
+                object_count = objects.groupby("time_index").size().reindex(index, fill_value=0)
+                active_tracks = (
+                    objects.groupby("time_index").track_id.nunique().reindex(index, fill_value=0)
+                )
+                axes[0, 0].plot(index, object_count, color=color, lw=1.5, label=source_label(source))
+                axes[0, 1].plot(index, active_tracks, color=color, lw=1.5, label=source_label(source))
+
+        lifetime_data = []
+        speed_data = []
+        labels = []
+        box_colors = []
+        for source, color in zip(sources, colors):
+            tracks = tracks_df[
+                (tracks_df.simulation == sim_name) & (tracks_df.source == source)
+            ] if len(tracks_df) else pd.DataFrame()
+            source_steps = steps[
+                (steps.simulation == sim_name) & (steps.source == source)
+            ] if len(steps) else pd.DataFrame()
+            lifetime = (
+                tracks.lifetime_hours.to_numpy(dtype=float)
+                if len(tracks) and "lifetime_hours" in tracks
+                else np.array([], dtype=float)
+            )
+            speed = (
+                source_steps.translation_speed_km_h.to_numpy(dtype=float)
+                if len(source_steps)
+                else np.array([], dtype=float)
+            )
+            if lifetime.size or speed.size:
+                labels.append(source_label(source))
+                lifetime_data.append(lifetime[np.isfinite(lifetime)] if lifetime.size else np.array([np.nan]))
+                speed_data.append(speed[np.isfinite(speed)] if speed.size else np.array([np.nan]))
+                box_colors.append(color)
+
+        for axis, values, title, xlabel in (
+            (axes[1, 0], lifetime_data, "Track lifetime", "Lifetime (hours)"),
+            (
+                axes[1, 1],
+                speed_data,
+                "Consecutive-snapshot centroid translation speed",
+                "Translation speed (km h$^{-1}$)",
+            ),
+        ):
+            if values:
+                boxes = axis.boxplot(
+                    values,
+                    vert=False,
+                    labels=labels,
+                    patch_artist=True,
+                    showfliers=False,
+                )
+                for patch, color in zip(boxes["boxes"], box_colors):
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.65)
+            else:
+                axis.text(0.5, 0.5, "No values", transform=axis.transAxes, ha="center", va="center")
+            axis.set_title(title)
+            axis.set_xlabel(xlabel)
+            axis.grid(axis="x", alpha=0.2)
+
+        axes[0, 0].set_title("Tracked objects per snapshot")
+        axes[0, 1].set_title("Active track IDs per snapshot")
+        for axis in axes[0]:
+            axis.set_xlabel("Snapshot index (6-hour spacing)")
+            axis.set_ylabel("Count")
+            axis.grid(alpha=0.2)
+        axes[0, 0].legend(frameon=False, fontsize=7, ncol=2)
+        sim_inventory = inventory[inventory.simulation == sim_name]
+        status_counts = sim_inventory.validation_status.value_counts().to_dict()
+        fig.suptitle(
+            f"PyFLEXTRKR validation overview: {sim_name} | "
+            f"PASS {status_counts.get('PASS', 0)}, WARN {status_counts.get('WARN', 0)}, "
+            f"FAIL {status_counts.get('FAIL', 0)}"
+        )
+        safe_sim = sim_name.replace(" ", "_")
+        save_figure(14, fig, f"pyflextrkr_validation_dashboard_{safe_sim}")
+        plt.close(fig)
 
 
 def plot_pyflextrkr_track_step_validation(objects_df):
@@ -2651,15 +3293,6 @@ def draw_pyflextrkr_movie_object_panel(
         alpha=0.45,
         rasterized=True,
     )
-    if np.any(labels > 0):
-        ax.contour(
-            lon,
-            lat,
-            (labels > 0).astype(float),
-            levels=[0.5],
-            colors="0.1",
-            linewidths=0.55,
-        )
 
     source_objects = sim_objects[sim_objects.source == source_name]
     scene = source_objects[source_objects.time_index == time_index].nlargest(10, "area_km2")
@@ -2688,6 +3321,7 @@ def draw_pyflextrkr_movie_object_panel(
             ha="center",
             va="center",
             bbox=dict(facecolor="white", edgecolor="0.2", alpha=0.78, pad=0.4),
+            clip_on=True,
         )
     ax.set_title(source_label(source_name), fontsize=9)
     ax.set_xlim(float(lon.min()), float(lon.max()))
@@ -2872,7 +3506,7 @@ def _plot_legacy_pyflextrkr_overview_movies(objects_df, fields_by_run, masks_by_
         )
 
     pd.DataFrame(manifest_rows).to_csv(
-        os.path.join(save_loc, "pyflextrkr_cloud_classification_movie_manifest.csv"),
+        os.path.join(save_loc, "pyflextrkr_validation_movie_manifest.csv"),
         index=False,
     )
 
@@ -2968,7 +3602,9 @@ def plot_pyflextrkr_validation_movies(objects_df, fields_by_run, masks_by_run):
 
         safe_sim = sim_name.replace(" ", "_")
 
-        class_fig, class_axes = plt.subplots(1, 3, figsize=(15.0, 4.8), constrained_layout=True)
+        class_fig, class_axes = plt.subplots(
+            3, 1, figsize=(12.0, 9.2), constrained_layout=True, sharex=True
+        )
         class_fig.colorbar(
             plt.cm.ScalarMappable(norm=precip_norm, cmap=precip_cmap),
             ax=class_axes[0], label=r"Precipitation (mm day$^{-1}$)", shrink=0.80,
@@ -3027,14 +3663,14 @@ def plot_pyflextrkr_validation_movies(objects_df, fields_by_run, masks_by_run):
         manifest_rows.append(dict(simulation=sim_name, movie_type="classification", output_file=class_path))
 
         for movie_type, sources in (
-            ("cloud_object_tracking", PYFLEXTRKR_CLASS_SOURCES),
-            ("independent_object_tracking", PYFLEXTRKR_CONTEXT_SOURCES),
+            ("primary_convective_tracking", PYFLEXTRKR_CLASS_SOURCES),
+            ("object_definition_sensitivity", PYFLEXTRKR_SENSITIVITY_SOURCES),
         ):
             track_fig, track_axes = plt.subplots(
-                1, len(sources), figsize=(5.0 * len(sources), 4.8),
-                constrained_layout=True, squeeze=False, sharey=True,
+                len(sources), 1, figsize=(12.0, 3.4 * len(sources)),
+                constrained_layout=True, squeeze=False, sharex=True,
             )
-            track_axes = track_axes[0]
+            track_axes = track_axes[:, 0]
             track_fig.colorbar(
                 plt.cm.ScalarMappable(norm=precip_norm, cmap=precip_cmap),
                 ax=track_axes.tolist(), label=r"Precipitation (mm day$^{-1}$)", shrink=0.80,
@@ -3074,7 +3710,7 @@ def plot_pyflextrkr_validation_movies(objects_df, fields_by_run, masks_by_run):
                 )
 
     pd.DataFrame(manifest_rows).to_csv(
-        os.path.join(save_loc, "pyflextrkr_cloud_classification_movie_manifest.csv"),
+        os.path.join(save_loc, "pyflextrkr_validation_movie_manifest.csv"),
         index=False,
     )
 
@@ -3082,6 +3718,100 @@ def plot_pyflextrkr_validation_movies(objects_df, fields_by_run, masks_by_run):
 # -----------------------------------------------------------------------------
 # Driver
 # -----------------------------------------------------------------------------
+
+
+def select_test_source_window(ds, sim_name):
+    """Select N+1 source snapshots so accumulated rain can yield N rates."""
+    if "Time" not in ds.dims:
+        raise RuntimeError(f"{sim_name}: test mode requires a Time dimension")
+    index = ds.Time.to_index()
+    source_count = TEST_TIME_STEPS + 1
+    if len(index) < source_count:
+        raise RuntimeError(
+            f"{sim_name}: test mode requested {source_count} source snapshots, "
+            f"but only {len(index)} are available"
+        )
+    first = 0
+    if TEST_START is not None:
+        if not isinstance(index, pd.DatetimeIndex):
+            raise ValueError("--test-start requires a datetime Time coordinate")
+        candidates = np.flatnonzero(index >= pd.Timestamp(TEST_START))
+        if candidates.size == 0:
+            raise ValueError(
+                f"{sim_name}: --test-start {TEST_START!r} is after the available data"
+            )
+        first = int(candidates[0])
+
+    selected = None
+    for start in range(first, len(index) - source_count + 1):
+        candidate = index[start:start + source_count]
+        if isinstance(candidate, pd.DatetimeIndex):
+            if not np.all(np.diff(candidate.values) == np.timedelta64(int(dt), "h")):
+                continue
+        selected = candidate
+        break
+    if selected is None:
+        raise RuntimeError(
+            f"{sim_name}: could not find {source_count} contiguous {dt:g}-hourly snapshots"
+        )
+    print(
+        f"{sim_name}: test source window {selected[0]} to {selected[-1]} "
+        f"({source_count} source snapshots)",
+        flush=True,
+    )
+    return ds.sel(Time=selected)
+
+
+def trim_test_fields(fields, sim_name):
+    precip = fields["precip"]
+    if "Time" not in precip.dims or precip.sizes["Time"] < TEST_TIME_STEPS:
+        raise RuntimeError(
+            f"{sim_name}: test mode produced fewer than {TEST_TIME_STEPS} precipitation times"
+        )
+    tracked_times = precip.Time.isel(Time=slice(0, TEST_TIME_STEPS))
+    out = {}
+    for key, da in fields.items():
+        if "Time" in da.dims:
+            missing = tracked_times.to_index().difference(da.Time.to_index())
+            if len(missing) > 0:
+                raise RuntimeError(
+                    f"{sim_name}: {key} is missing {len(missing)} requested test times"
+                )
+            da = da.sel(Time=tracked_times)
+        out[key] = da
+    print(
+        f"{sim_name}: tracking {TEST_TIME_STEPS} snapshots from "
+        f"{tracked_times.values[0]} to {tracked_times.values[-1]}",
+        flush=True,
+    )
+    return out
+
+
+def materialize_test_tracking_inputs(fields_by_run, masks_by_run):
+    """Load each short tropical test window once for all tracked sources."""
+    if not TEST_MODE:
+        return
+    for sim_name, fields, masks in zip(sim_names, fields_by_run, masks_by_run):
+        print(
+            f"{sim_name}: loading the short tropical fields and masks once",
+            flush=True,
+        )
+        precip = subset_lat(
+            fields["precip"], lat_bounds=TROPICAL_LAT_BOUNDS
+        ).load()
+        fields["precip"] = precip
+        fields["mean_precip"] = weighted_tropical_mean(
+            precip, lat_bounds=TROPICAL_LAT_BOUNDS
+        ).load()
+        test_mask_names = list(dict.fromkeys([
+            *[name for name in PYFLEXTRKR_TRACKED_SOURCES if name in masks],
+            *[name for name in CLASSIFICATION_DIAGNOSTIC_KEYS if name in masks],
+        ]))
+        for source_name in test_mask_names:
+            print(f"{sim_name}: loading test mask {source_name}", flush=True)
+            masks[source_name] = subset_lat(
+                masks[source_name], lat_bounds=TROPICAL_LAT_BOUNDS
+            ).load()
 
 
 def load_datasets():
@@ -3096,6 +3826,8 @@ def load_datasets():
             chunks=latlon_chunks,
         )
         ds = standardize_latlon_dataset(ds, needed_vars)
+        if TEST_MODE:
+            ds = select_test_source_window(ds, sim_names[i])
         print(ds)
         dss.append(ds)
     return dss
@@ -3141,8 +3873,16 @@ def build_all_metrics(dss, fields_by_run, threshold_table, masks_by_run=None):
     return pd.concat(all_rows, ignore_index=True)
 
 
-def main():
+def main(argv=None):
+    args = parse_command_line(argv)
+    configure_run(args)
     os.makedirs(save_loc, exist_ok=True)
+    if TEST_MODE:
+        print(
+            f"TEST MODE: simulation={sim_names[0]}, tracked_times={TEST_TIME_STEPS}, "
+            f"figures={figures_to_run}, reuse_cache={TEST_REUSE_CACHE}, output={save_loc}",
+            flush=True,
+        )
 
     dss = None
     fields_by_run = None
@@ -3153,6 +3893,29 @@ def main():
         if fields_by_run is None:
             dss = load_datasets()
             fields_by_run = [build_fields(ds) for ds in dss]
+            if TEST_MODE:
+                fields_by_run = [
+                    trim_test_fields(fields, sim_name)
+                    for fields, sim_name in zip(fields_by_run, sim_names)
+                ]
+                rows = []
+                for sim_name, fields in zip(sim_names, fields_by_run):
+                    rows.append(
+                        dict(
+                            simulation=sim_name,
+                            tracked_snapshot_count=int(fields["precip"].sizes["Time"]),
+                            first_tracked_time=str(fields["precip"].Time.values[0]),
+                            last_tracked_time=str(fields["precip"].Time.values[-1]),
+                            snapshot_spacing_hours=dt,
+                            output_directory=save_loc,
+                            pyflextrkr_work_directory=PYFLEXTRKR_WORK_DIR,
+                            reused_test_cache=TEST_REUSE_CACHE,
+                        )
+                    )
+                pd.DataFrame(rows).to_csv(
+                    os.path.join(save_loc, "pyflextrkr_test_run_manifest.csv"),
+                    index=False,
+                )
         return dss, fields_by_run
 
     def ensure_masks(threshold_table):
@@ -3162,47 +3925,62 @@ def main():
             masks_by_run = build_masks_by_run(dss_local, fields_local, threshold_table)
         return masks_by_run
 
-    metric_products = load_cached_metric_products()
-    if metric_products is None:
-        dss, fields_by_run = ensure_fields()
-        threshold_table = build_threshold_table(fields_by_run)
-        if len(threshold_table) > 0:
-            print("\nOrganisation object thresholds")
-            print(threshold_table.to_string(index=False))
+    threshold_table = pd.DataFrame()
+    metrics_df = pd.DataFrame()
+    summary = pd.DataFrame()
+    metric_products_needed = should_run_any([1, 2, 3, 4, 5])
+    if metric_products_needed:
+        metric_products = load_cached_metric_products()
+        if metric_products is None:
+            dss, fields_by_run = ensure_fields()
+            threshold_table = build_threshold_table(fields_by_run)
+            if len(threshold_table) > 0:
+                print("\nOrganisation object thresholds")
+                print(threshold_table.to_string(index=False))
 
-        masks_by_run = ensure_masks(threshold_table)
-        metrics_df = build_all_metrics(dss, fields_by_run, threshold_table, masks_by_run=masks_by_run)
-        if len(metrics_df) == 0:
-            print("No organisation metrics were computed.")
-            return
+            masks_by_run = ensure_masks(threshold_table)
+            metrics_df = build_all_metrics(
+                dss, fields_by_run, threshold_table, masks_by_run=masks_by_run
+            )
+            if len(metrics_df) == 0:
+                print("No organisation metrics were computed.")
+                return
 
-        summary = organisation_metric_summary(metrics_df)
-        write_metric_cache(threshold_table, metrics_df, summary)
-    else:
-        threshold_table, metrics_df, summary = metric_products
-        if len(threshold_table) > 0:
-            print("\nCached organisation object thresholds")
-            print(threshold_table.to_string(index=False))
+            summary = organisation_metric_summary(metrics_df)
+            write_metric_cache(threshold_table, metrics_df, summary)
+        else:
+            threshold_table, metrics_df, summary = metric_products
+            if len(threshold_table) > 0:
+                print("\nCached organisation object thresholds")
+                print(threshold_table.to_string(index=False))
 
     objects_df = pd.DataFrame()
     tracks_df = pd.DataFrame()
     contribution_df = pd.DataFrame()
-    track_persistence_needed = should_run_any([6, 7, 8, 9, 11, 12, 13])
+    track_persistence_needed = should_run_any([6, 7, 8, 9, 11, 12, 13, 14])
     if track_persistence_needed:
+        if len(threshold_table) == 0:
+            _, fields_by_run = ensure_fields()
+            threshold_table = build_threshold_table(fields_by_run)
         track_products = load_cached_track_persistence_products()
         if track_products is None:
-            if len(threshold_table) == 0:
-                _, fields_by_run = ensure_fields()
-                threshold_table = build_threshold_table(fields_by_run)
             masks_by_run = ensure_masks(threshold_table)
             _, fields_by_run = ensure_fields()
+            materialize_test_tracking_inputs(fields_by_run, masks_by_run)
             objects_df, tracks_df, contribution_df = build_track_persistence_metrics(masks_by_run, fields_by_run)
             write_track_persistence_cache(objects_df, tracks_df, contribution_df)
         else:
             objects_df, tracks_df, contribution_df = track_products
+            if TEST_MODE and should_run_any([11, 12, 14]):
+                masks_by_run = ensure_masks(threshold_table)
+                _, fields_by_run = ensure_fields()
+                materialize_test_tracking_inputs(fields_by_run, masks_by_run)
 
-    print("\nOrganisation metric summary")
-    print(summary.to_string(index=False))
+        write_pyflextrkr_obsolete_output_report()
+
+    if len(summary) > 0:
+        print("\nOrganisation metric summary")
+        print(summary.to_string(index=False))
 
     if should_run_figure(1):
         plot_lorg_timeseries(metrics_df)
@@ -3257,13 +4035,22 @@ def main():
             plot_shifted_pattern_autocorrelation(persistence_df)
     if should_run_figure(11):
         _, fields_by_run = ensure_fields()
-        plot_pyflextrkr_track_validation(objects_df, fields_by_run)
+        masks_by_run = ensure_masks(threshold_table)
+        plot_pyflextrkr_track_validation(
+            objects_df, fields_by_run, masks_by_run
+        )
     if should_run_figure(12):
         _, fields_by_run = ensure_fields()
         masks_by_run = ensure_masks(threshold_table)
         plot_pyflextrkr_validation_movies(objects_df, fields_by_run, masks_by_run)
     if should_run_figure(13):
         plot_pyflextrkr_track_step_validation(objects_df)
+    if should_run_figure(14):
+        _, fields_by_run = ensure_fields()
+        masks_by_run = ensure_masks(threshold_table)
+        plot_pyflextrkr_validation_dashboard(
+            objects_df, tracks_df, fields_by_run, masks_by_run
+        )
 
     print("\nFinished convective_organisation_diagnostics.py")
 
