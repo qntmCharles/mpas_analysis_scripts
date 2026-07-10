@@ -1013,7 +1013,7 @@ if should_run_figure(2) and fixed_level_autocorr:
             ac.latitude,
             ac.transpose("latitude", "lag_days").values,
             levels=levels,
-            cmap="RdBu_r",
+            cmap=difference_cmap(levels),
             extend="both",
         )
         ax[row].contour(ac.lag_days, ac.latitude, ac.transpose("latitude", "lag_days").values,
@@ -1201,7 +1201,7 @@ if should_run_figure(6) and jet_structure_fields:
                 field.z.values / 1000.0,
                 field.values,
                 levels=raw_levels,
-                cmap="RdBu_r",
+                cmap=difference_cmap(raw_levels),
                 extend="both",
             )
             if np.nanmin(field.values) < 0.0 < np.nanmax(field.values):

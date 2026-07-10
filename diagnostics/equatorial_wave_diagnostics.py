@@ -34,7 +34,7 @@ The script caches filtered fields as NetCDF files beside the source simulations
 so that figures can be regenerated without re-running the k-f filters.
 """
 
-import os, sys, numbers, glob, json
+import os, sys, numbers, json
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("../..", "../../.."):
@@ -47,7 +47,6 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from matplotlib import colors
 from matplotlib.lines import Line2D
-from scipy.ndimage import uniform_filter1d
 import xarray as xr
 import dask
 
@@ -80,7 +79,7 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/waves/")
 #
 # Figure numbers:
 #   1:  wave_filtered_hovmollers_precip
-#   2:  wave_power_absolute_and_change
+#   2:  wave_power_absolute_and_change (+ wave_power_fraction_of_total)
 #   3:  wave_amplitude_lag_correlations
 #   4:  wave_conditioned_precip_olr_pw
 #   5:  intense_precip_wave_attribution
@@ -89,12 +88,13 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/waves/")
 #   8:  wave_filtered_eddy_fluxes_HEAVY
 #   9:  symmetric_antisymmetric_wave_spectra
 #       plus period-axis and wavenumber-phase-speed variants
+#  10:  wave_phase_speed_power_distributions
 #   11: compact_wave_attribution_metrics
 #
-# Figures 10 and 12 (Kelvin-conditioned cloud decomposition / cloud-top
+# Earlier figures 10 and 12 (Kelvin-conditioned cloud decomposition / cloud-top
 # pressure) moved to convective_pathway_diagnostics.py figure 10, which covers
 # Kelvin, Easterly, and ER phase conditioning.
-figures_to_run = []
+figures_to_run = [2, 7]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 # Restart/resume controls.  With the default full run, existing figure files are
@@ -165,7 +165,7 @@ lag_target_fields = ["Precip", "OLR", "PW", "cldfrac"]
 conditioned_fields = ["Precip", "OLR", "PW", "cldfrac"]
 vertical_profile_waves = wave_names
 vertical_profile_fields = ["u", "w", "T", "cldfrac"]
-vertical_profile_levels = [50, 70, 100, 150, 200, 250, 300, 500, 700, 850]
+vertical_profile_levels = [50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 850, 900, 950, 1000]
 cldfrac_profile_heights_km = [2, 5, 8, 11, 14, 17, 20]
 
 # Figure 8 keeps latitude resolved and applies each wave box directly.
@@ -182,6 +182,12 @@ spectrum_period_reference_days = [3.0, 6.0, 30.0]
 spectrum_phase_speed_lines_ms = [5.0, 10.0, 20.0, 40.0]
 spectrum_phase_speed_limits = (-160.0, 160.0)
 spectrum_phase_speed_step = 2.0
+spectrum_components = ("symmetric", "antisymmetric")
+phase_speed_distribution_limits = (-400.0, 300.0)
+phase_speed_distribution_bin_width = 5.0
+phase_speed_distribution_power_mode = "excess_normalised_power"
+# Shared x-axis for figure 7's wind profiles and phase-speed distributions.
+critical_level_phase_speed_xlim = (-40.0, 25.0)
 spectrum_outline_colors = {
     "Kelvin": "tab:orange",
     "EIG": "tab:red",
@@ -532,10 +538,6 @@ def precip_rate(ds):
     pr.name = "Precip"
     pr.attrs["units"] = "mm day-1"
     return finite_or_nan(pr)
-
-
-def sel_time_like(da, ref):
-    return da.sel(Time=ref.Time)
 
 
 def cldfrac_level_field_name(height_km):
@@ -1205,8 +1207,9 @@ def build_compact_wave_attribution_table(wave_metrics_df, intense_attribution_df
     rows = []
 
     if wave_metrics_df is not None and len(wave_metrics_df) > 0:
+        wave_metrics_df = add_common_power_fractions(wave_metrics_df)
         for (field, wave), sub in wave_metrics_df.groupby(["field", "wave"]):
-            values = sub.set_index("simulation")["wave_fraction"].to_dict()
+            values = sub.set_index("simulation")["wave_fraction_of_total"].to_dict()
             rows.append(
                 attribution_row(
                     "wave_variance_fraction",
@@ -1215,7 +1218,8 @@ def build_compact_wave_attribution_table(wave_metrics_df, intense_attribution_df
                     "all",
                     values,
                     "fraction",
-                    f"Filtered wave variance divided by total anomaly variance; projection={lat_projection_for_wave(wave)}",
+                    "Filtered wave power (variance of the filtered anomaly) divided by the field's "
+                    "total latitude-mean power (symmetric + antisymmetric)",
                 )
             )
 
@@ -1324,7 +1328,7 @@ def plot_attribution_change_heatmaps(table):
         ax.grid(False)
     add_symmetric_colorbar(
         fig, im, np.atleast_1d(axes).ravel(), levels,
-        label="Wave-band variance fraction change (percentage points)",
+        label="Wave-band power fraction change (percentage points)",
     )
     fig.suptitle("Wave power change from control (u-nudged response absent from the T-nudged panel is wind-mediated)")
     save_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER, fig, "wave_attribution_change_heatmaps")
@@ -1344,15 +1348,15 @@ def find_attribution_selection(table, metric_name, variable, wave_band, conditio
 
 def plot_attribution_summary_bars(table):
     selections = [
-        ("Kelvin precip variance", "wave_variance_fraction", "Precip", "Kelvin", "all"),
-        ("Kelvin OLR variance", "wave_variance_fraction", "OLR", "Kelvin", "all"),
-        ("Kelvin PW variance", "wave_variance_fraction", "PW", "Kelvin", "all"),
-        ("Kelvin cldfrac variance", "wave_variance_fraction", "cldfrac", "Kelvin", "all"),
-        ("Easterly cldfrac variance", "wave_variance_fraction", "cldfrac", "Easterly", "all"),
-        ("ER cldfrac variance", "wave_variance_fraction", "cldfrac", "ER", "all"),
-        ("Kelvin T100 variance", "wave_variance_fraction", "T100", "Kelvin", "all"),
-        ("Kelvin w500 variance", "wave_variance_fraction", "w500", "Kelvin", "all"),
-        ("Kelvin u850 variance", "wave_variance_fraction", "u850", "Kelvin", "all"),
+        ("Kelvin precip power", "wave_variance_fraction", "Precip", "Kelvin", "all"),
+        ("Kelvin OLR power", "wave_variance_fraction", "OLR", "Kelvin", "all"),
+        ("Kelvin PW power", "wave_variance_fraction", "PW", "Kelvin", "all"),
+        ("Kelvin cldfrac power", "wave_variance_fraction", "cldfrac", "Kelvin", "all"),
+        ("Easterly cldfrac power", "wave_variance_fraction", "cldfrac", "Easterly", "all"),
+        ("ER cldfrac power", "wave_variance_fraction", "cldfrac", "ER", "all"),
+        ("Kelvin T100 power", "wave_variance_fraction", "T100", "Kelvin", "all"),
+        ("Kelvin w500 power", "wave_variance_fraction", "w500", "Kelvin", "all"),
+        ("Kelvin u850 power", "wave_variance_fraction", "u850", "Kelvin", "all"),
     ]
     rows = []
     labels = []
@@ -1707,7 +1711,7 @@ def spectrum_cache_signature(sim_index):
             spectrum_segment_days=spectrum_segment_days,
             spectrum_overlap_days=spectrum_overlap_days,
             obs_per_day=obs_per_day,
-            components=["symmetric", "antisymmetric"],
+            components=list(spectrum_components),
         ),
     )
 
@@ -1737,6 +1741,198 @@ def write_cached_spectra(sim_index, spectra):
     )
     cache_name = f"normalised_wave_spectrum_{safe_name(sim_names[sim_index])}"
     write_cached_dataset(cache_name, ds_out, spectrum_cache_signature(sim_index))
+
+
+def compute_normalised_spectra_for_sim(ds, sim_index):
+    spectra = load_cached_spectra(sim_index)
+    if spectra is not None:
+        return spectra
+
+    sp_input = spectrum_input_field(ds, spectrum_field, spectrum_lat_bounds)
+    raw_spectrum = spacetime_power(
+        sp_input,
+        lataggreg="mean",
+        latitude_bounds=normalise_lat_bounds(spectrum_lat_bounds),
+        dosymmetries=True,
+        segsize=spectrum_segment_days,
+        noverlap=spectrum_overlap_days,
+        spd=obs_per_day,
+    )
+
+    spectra = {}
+    for component in spectrum_components:
+        raw_component = raw_spectrum.sel(component=component)
+        background = smooth_wavefreq(raw_component, freq_name="frequency")
+        spectra[component] = xr.where(background > 0, raw_component / background, np.nan).load()
+    write_cached_spectra(sim_index, spectra)
+    return spectra
+
+
+def load_or_compute_normalised_spectra_by_sim():
+    spectra_by_sim = []
+    for i, ds in enumerate(dss):
+        try:
+            spectra_by_sim.append(compute_normalised_spectra_for_sim(ds, i))
+        except Exception as exc:
+            spectra_by_sim.append(None)
+            print(f"Skipping symmetric/antisymmetric spectrum for {sim_names[i]}: {exc}")
+    return spectra_by_sim
+
+
+def phase_speed_distribution_centres():
+    lo, hi = phase_speed_distribution_limits
+    step = phase_speed_distribution_bin_width
+    return np.arange(lo, hi + 0.5 * step, step)
+
+
+def phase_speed_distribution_edges():
+    centres = phase_speed_distribution_centres()
+    step = phase_speed_distribution_bin_width
+    return np.concatenate(([centres[0] - 0.5 * step], centres + 0.5 * step))
+
+
+def phase_speed_distribution_weights(values):
+    values = np.asarray(values, dtype=float)
+    if phase_speed_distribution_power_mode == "excess_normalised_power":
+        return np.where(np.isfinite(values) & (values > 1.0), values - 1.0, 0.0)
+    if phase_speed_distribution_power_mode == "normalised_power":
+        return np.where(np.isfinite(values) & (values > 0.0), values, 0.0)
+    raise ValueError(f"Unknown phase-speed distribution mode: {phase_speed_distribution_power_mode}")
+
+
+def phase_speed_distribution_signature():
+    return cache_signature(
+        "wave_phase_speed_power_distributions",
+        extra=dict(
+            spectrum_field=spectrum_field,
+            spectrum_lat_bounds=jsonable_value(spectrum_lat_bounds),
+            spectrum_segment_days=spectrum_segment_days,
+            spectrum_overlap_days=spectrum_overlap_days,
+            spectrum_components=list(spectrum_components),
+            phase_speed_distribution_limits=jsonable_value(phase_speed_distribution_limits),
+            phase_speed_distribution_bin_width=phase_speed_distribution_bin_width,
+            phase_speed_distribution_power_mode=phase_speed_distribution_power_mode,
+        ),
+    )
+
+
+def compute_wave_phase_speed_distributions():
+    """
+    Return phase-speed distributions made by binning the plotted spectrum.
+
+    This is not a sampled phase-speed PDF. It is a phase-speed projection of the
+    normalised wavenumber-frequency spectrum: spectral power inside each wave
+    filter is binned by c = omega/k and normalised to unit area for each
+    simulation-wave pair.
+    """
+    signature = phase_speed_distribution_signature()
+    dist = load_cached_table(
+        "wave_phase_speed_power_distributions",
+        signature,
+        output_filename="wave_phase_speed_power_distributions.csv",
+        required_columns=(
+            "simulation", "simulation_index", "wave", "phase_speed_ms",
+            "density_per_ms", "fractional_power", "weighted_power",
+        ),
+    )
+    if dist is not None:
+        return dist
+
+    spectra_by_sim = load_or_compute_normalised_spectra_by_sim()
+    centres = phase_speed_distribution_centres()
+    edges = phase_speed_distribution_edges()
+    bin_width = phase_speed_distribution_bin_width
+    rows = []
+
+    for i, spectra in enumerate(spectra_by_sim):
+        if spectra is None:
+            continue
+        for wname in wave_names:
+            hist = np.zeros(centres.size, dtype=float)
+            component_names = [
+                component for component in WAVE_BOXES[wname].get("components", spectrum_components)
+                if component in spectra
+            ]
+            for component in component_names:
+                spectrum = spectra[component].transpose("wavenumber", "frequency")
+                wn = np.asarray(spectrum.wavenumber.values, dtype=float)
+                freq = np.asarray(spectrum.frequency.values, dtype=float)
+                values = np.asarray(spectrum.values, dtype=float)
+                kgrid, fgrid = np.meshgrid(wn, freq, indexing="ij")
+                mask = wave_filter_mask_on_spectrum(wn, freq, wname)
+                mask &= (kgrid != 0.0) & (fgrid > 0.0)
+                weights = phase_speed_distribution_weights(values)
+                phase_speed = zonal_phase_speed_from_frequency(kgrid, fgrid)
+                valid = mask & np.isfinite(phase_speed) & np.isfinite(weights) & (weights > 0.0)
+                if not np.any(valid):
+                    continue
+                hist += np.histogram(
+                    phase_speed[valid],
+                    bins=edges,
+                    weights=weights[valid],
+                )[0]
+
+            total_weight = float(np.nansum(hist))
+            if total_weight > 0.0:
+                fractional_power = hist / total_weight
+                density = fractional_power / bin_width
+            else:
+                fractional_power = np.full_like(hist, np.nan, dtype=float)
+                density = np.full_like(hist, np.nan, dtype=float)
+
+            cmin, ccen, cmax = wave_phase_speed_range(wname)
+            for c, power, frac, dens in zip(centres, hist, fractional_power, density):
+                rows.append(
+                    dict(
+                        simulation=sim_names[i],
+                        simulation_index=i,
+                        wave=wname,
+                        wave_label=wave_label(wname),
+                        phase_speed_ms=c,
+                        weighted_power=power,
+                        fractional_power=frac,
+                        density_per_ms=dens,
+                        total_weighted_power=total_weight,
+                        power_mode=phase_speed_distribution_power_mode,
+                        c_min_box_ms=cmin,
+                        c_central_box_ms=ccen,
+                        c_max_box_ms=cmax,
+                    )
+                )
+
+    dist = pd.DataFrame(rows)
+    write_cached_table("wave_phase_speed_power_distributions", dist, signature)
+    if save:
+        dist.to_csv(os.path.join(save_loc, "wave_phase_speed_power_distributions.csv"), index=False)
+    return dist
+
+
+def add_common_power_fractions(df):
+    """Add each band's share of a single per-field total power.
+
+    The full-band latitude mean and the antisymmetric hemisphere difference
+    are the even/odd decomposition of the latitude-mean signal, so their
+    variances sum to one projection-independent total per field and
+    simulation (the Wheeler-Kiladis symmetric + antisymmetric convention).
+    Unlike wave_fraction, these shares are comparable across wave bands and
+    approximately summable where the k-f boxes do not overlap.
+    """
+    out = df.copy()
+    out["wave_fraction_of_total"] = np.nan
+    if "total_variance" not in out.columns or "latitude_projection" not in out.columns:
+        return out
+    for (sim, field), sub in out.groupby(["simulation", "field"]):
+        t_sym = sub.loc[
+            sub.latitude_projection.isin(("symmetric", "direct")), "total_variance"
+        ].median()
+        t_anti = sub.loc[
+            sub.latitude_projection == "antisymmetric", "total_variance"
+        ].median()
+        if np.isfinite(t_sym) and np.isfinite(t_anti) and (t_sym + t_anti) > 0:
+            out.loc[sub.index, "wave_fraction_of_total"] = (
+                sub.wave_variance / (t_sym + t_anti)
+            )
+    return out
 
 
 def add_wave_metric_ratios(wave_metrics):
@@ -1814,13 +2010,15 @@ if should_build_figure(1, "wave_filtered_hovmollers_precip"):
 # -----------------------------------------------------------------------------
 # 2. Absolute wave-band power and change relative to control
 # -----------------------------------------------------------------------------
+# Here "power" is the variance of the k-f filtered anomaly, which by Parseval
+# equals the spectral power integrated over the wave's filter box.
 # WHAT TO LOOK FOR:
-#   * The top row shows which wave bands actually carry strong absolute power
-#     in each field; the total-variance ticks above each bar give the
-#     variance-fraction context.
-#   * The bottom row shows the nudged-run power change in percent. Read the
-#     two rows together: a large percentage change matters most in a band
-#     whose absolute power is non-negligible.
+#   * The top row of the main figure shows which wave bands actually carry
+#     strong absolute power in each field; the bottom row shows the nudged-run
+#     change in percent. Read the rows together: a large percentage change
+#     matters most in a band whose absolute power is non-negligible.
+#   * The companion fraction-of-total figure gives context on how much of each
+#     field's variability the band explains at all.
 #   * Compare precipitation with dynamical fields. If u/w/T wave power
 #     increases but precipitation power does not, waves are modified aloft but
 #     weakly coupled to rainfall. If precipitation power increases without a
@@ -1893,10 +2091,13 @@ if should_run_any([2, WAVE_ATTRIBUTION_FIGURE_NUMBER]):
         if save:
             wave_metrics.to_csv(os.path.join(save_loc, "wave_band_variance_metrics.csv"), index=False)
 
-if should_build_figure(2, "wave_power_absolute_and_change") and wave_metrics is not None and len(wave_metrics) > 0:
+if should_build_figure(2, ["wave_power_absolute_and_change", "wave_power_fraction_of_total"]) \
+        and wave_metrics is not None and len(wave_metrics) > 0:
     plot_fields = ["Precip", "OLR", "PW", "cldfrac", "u850", "w500", "T100"]
     plot_fields = [f for f in plot_fields if f in set(wave_metrics.field)]
 
+    # Main figure: absolute wave-band power (log) and percentage change from
+    # control. The change row makes quantitative what the log bars cannot show.
     fig, ax = plt.subplots(2, len(plot_fields), figsize=(3.2 * len(plot_fields), 6.0), constrained_layout=True)
     if len(plot_fields) == 1:
         ax = ax[:, None]
@@ -1908,15 +2109,8 @@ if should_build_figure(2, "wave_power_absolute_and_change") and wave_metrics is 
         for i, sim in enumerate(sim_names):
             s = sub[sub.simulation == sim].set_index("wave").reindex(wave_names)
             offset = (i - (len(dss) - 1) / 2) * width
-            # Absolute wave-band power, with the total anomaly variance of the
-            # same latitude projection marked above each bar. Bar height vs
-            # tick shows the variance fraction; coloured vs black bar shows the
-            # nudged/control power change.
             ax[0, j].bar(x + offset, s.wave_variance.values, width,
                          color=cols[i], label=sim if j == 0 else None)
-            ax[0, j].plot(x + offset, s.total_variance.values, ls="none",
-                          marker="_", ms=3.6 * width * 10, color=cols[i], alpha=0.55,
-                          label="total variance" if (j == 0 and i == 0) else None)
             if i > 0:
                 pct = 100.0 * (s.power_ratio_to_control.values - 1.0)
                 ax[1, j].bar(x + offset, pct, width, color=cols[i])
@@ -1929,11 +2123,54 @@ if should_build_figure(2, "wave_power_absolute_and_change") and wave_metrics is 
         ax[0, j].set_yscale("log")
         ax[0, j].grid(alpha=0.2)
         ax[1, j].grid(alpha=0.2)
-    ax[0, 0].set_ylabel("Wave-band variance (field units$^2$)")
-    ax[1, 0].set_ylabel("Wave power change vs control (%)")
+    ax[0, 0].set_ylabel("Wave-band power (field units$^2$)")
+    ax[1, 0].set_ylabel("Wave-band power change vs control (%)")
     ax[0, 0].legend(loc="best", fontsize=8)
     figsave.save(fig, "wave_power_absolute_and_change", number=2)
     print("Done with figure: wave_power_absolute_and_change")
+
+    # Context figure: how much of each field's total anomaly power each wave
+    # band explains, as one annotated percentage heatmap per simulation.
+    # One denominator per field and simulation (symmetric + antisymmetric
+    # latitude-mean power), so cells are comparable across wave bands and
+    # roughly summable; the remainder is unfiltered background variability.
+    metrics_common = add_common_power_fractions(wave_metrics)
+    frac_pivots = []
+    for sim in sim_names:
+        sub = metrics_common[metrics_common.simulation == sim]
+        pivot = sub.pivot_table(index="wave", columns="field", values="wave_fraction_of_total", aggfunc="mean")
+        frac_pivots.append(
+            100.0 * pivot.reindex(index=wave_names, columns=plot_fields).values.astype(float)
+        )
+    positive = np.concatenate(
+        [v[np.isfinite(v) & (v > 0)].ravel() for v in frac_pivots]
+    )
+    if positive.size > 0:
+        norm = colors.LogNorm(vmin=positive.min(), vmax=positive.max())
+        fig, axes = plt.subplots(
+            1, len(sim_names),
+            figsize=(0.62 * len(plot_fields) * len(sim_names) + 3.0, 0.5 * len(wave_names) + 2.2),
+            constrained_layout=True, sharey=True,
+        )
+        for k, (axk, sim) in enumerate(zip(np.atleast_1d(axes), sim_names)):
+            values = frac_pivots[k]
+            im = axk.imshow(values, cmap="viridis", norm=norm, aspect="auto")
+            for r in range(values.shape[0]):
+                for c in range(values.shape[1]):
+                    v = values[r, c]
+                    if np.isfinite(v) and v > 0:
+                        axk.text(c, r, f"{v:.2g}", ha="center", va="center", fontsize=7,
+                                 color="k" if norm(v) > 0.6 else "w")
+            axk.set_title(sim)
+            axk.set_xticks(np.arange(len(plot_fields)))
+            axk.set_xticklabels(plot_fields, rotation=35, ha="right")
+            axk.set_yticks(np.arange(len(wave_names)))
+            axk.set_yticklabels([wave_label(w) for w in wave_names])
+            axk.grid(False)
+        fig.colorbar(im, ax=np.atleast_1d(axes).ravel(), shrink=0.9,
+                     label="Share of the field's total power (%)")
+        figsave.save(fig, "wave_power_fraction_of_total", number=2)
+        print("Done with figure: wave_power_fraction_of_total")
 
 
 # -----------------------------------------------------------------------------
@@ -2298,9 +2535,8 @@ if should_build_figure(6, "vertical_wave_power_profiles"):
                         max(cldfrac_profile_heights_km),
                     )
                 else:
-                    ax[fj, wj].invert_yaxis()
                     ax[fj, wj].set_yscale("log")
-                    ax[fj, wj].set_ylim(1000, 70)
+                    ax[fj, wj].set_ylim(1000, 50)
                 ax[fj, wj].grid(alpha=0.2)
                 if fj == 0:
                     ax[fj, wj].set_title(wave_label(wname))
@@ -2308,7 +2544,7 @@ if should_build_figure(6, "vertical_wave_power_profiles"):
                     ylabel = f"{var}\nHeight (km)" if var == "cldfrac" else f"{var}\nPressure (hPa)"
                     ax[fj, wj].set_ylabel(ylabel)
                 if fj == len(vertical_profile_fields) - 1:
-                    ax[fj, wj].set_xlabel("wave variance")
+                    ax[fj, wj].set_xlabel("wave power")
         ax[0, 0].legend(loc="best")
         fig.suptitle("Vertical wave-power profiles")
         figsave.save(fig, "vertical_wave_power_profiles", number=6)
@@ -2322,6 +2558,9 @@ if should_build_figure(6, "vertical_wave_power_profiles"):
 #   * A line where Ubar approaches the wave phase speed is a potential critical
 #     or absorption layer.  If u_nudge moves such a layer into/out of the UTLS,
 #     the wave--convection coupling can change without a large mean precip shift.
+#   * The vertical lines are each band's power-weighted mean phase speed from
+#     that simulation's own spectrum (matching the distributions below), not a
+#     fixed property of the filter box.
 
 if should_build_figure(7, "critical_level_phase_speed_profiles"):
     speed_rows = []
@@ -2337,27 +2576,79 @@ if should_build_figure(7, "critical_level_phase_speed_profiles"):
     if save:
         speed_df.to_csv(os.path.join(save_loc, "wave_box_phase_speed_estimates.csv"), index=False)
 
-    fig, ax = plt.subplots(1, len(dss_zm), figsize=(3.6 * len(dss_zm), 4.2), constrained_layout=True, sharey=True)
+    phase_speed_dist = compute_wave_phase_speed_distributions()
+
+    def power_weighted_mean_phase_speed(sim_index, wname):
+        if len(phase_speed_dist) == 0:
+            return np.nan
+        sub = phase_speed_dist[
+            (phase_speed_dist.simulation_index == sim_index) & (phase_speed_dist.wave == wname)
+        ]
+        w = np.clip(np.nan_to_num(sub.density_per_ms.values, nan=0.0), 0.0, None)
+        if w.sum() <= 0:
+            return np.nan
+        return float(np.sum(sub.phase_speed_ms.values * w) / w.sum())
+
+    fig, ax = plt.subplots(
+        2, len(dss_zm),
+        figsize=(3.8 * len(dss_zm), 6.2),
+        constrained_layout=True,
+        sharey="row",
+        sharex="col",
+        gridspec_kw={"height_ratios": [2.4, 1.2]},
+    )
     if len(dss_zm) == 1:
-        ax = [ax]
+        ax = np.asarray(ax).reshape(2, 1)
+    profile_ax = ax[0, :]
+    dist_ax = ax[1, :]
+
     for i, zds in enumerate(dss_zm):
+        a = profile_ax[i]
         u = zds.uzonal_isobaric.sel(latitude=slice(filter_lat_bounds[0], filter_lat_bounds[1])).mean(dim=("Time", "latitude"))
-        ax[i].plot(u.values, u.pres.values, color=cols[i], lw=1.8, label=sim_names[i])
-        for _, row in speed_df.iterrows():
-            # Only draw the central phase speed as a labelled line, with the full range faintly shaded.
-            ax[i].axvline(row.c_central_ms, color="0.5", lw=0.8, ls="--")
-            ax[i].text(row.c_central_ms, 80, row.wave_label, rotation=90, ha="right", va="top", fontsize=7)
-            #ax[i].axvspan(min(row.c_min_ms, row.c_max_ms), max(row.c_min_ms, row.c_max_ms), color="0.8", alpha=0.08)
-        ax[i].axvline(0, color="0.7", lw=0.6)
-        ax[i].set_title(sim_names[i])
-        ax[i].set_xlabel(r"$\overline{u}$ and $c$ (m s$^{-1}$)")
-        ax[i].set_yscale("log")
-        ax[i].invert_yaxis()
-        ax[i].set_ylim(1000, 50)
-        ax[i].grid(alpha=0.2)
-        annotate_panel_label(ax[i], sim_names[i])
-    ax[0].set_ylabel("Pressure (hPa)")
-    fig.suptitle(f"Tropical mean wind profile over {filter_lat_bounds[0]}--{filter_lat_bounds[1]}° with wave phase-speed ranges")
+        a.plot(u.values, u.pres.values, color=cols[i], lw=1.8, label=sim_names[i])
+        for wname in wave_names:
+            # This simulation's power-weighted mean phase speed for the band,
+            # colour-matched to the distribution below. Fall back to the
+            # filter-box centre estimate if no distribution is available.
+            c_mean = power_weighted_mean_phase_speed(i, wname)
+            if not np.isfinite(c_mean):
+                c_mean = float(speed_df.loc[speed_df.wave == wname, "c_central_ms"].iloc[0])
+            a.axvline(c_mean, color=spectrum_outline_colors.get(wname, "0.5"), lw=1.0, ls="--", alpha=0.8)
+        a.axvline(0, color="0.7", lw=0.6)
+        a.set_title(sim_names[i])
+        a.set_yscale("log")
+        a.set_ylim(1000, 50)
+        a.grid(alpha=0.2)
+        annotate_panel_label(a, sim_names[i])
+
+        b = dist_ax[i]
+        sim_dist = phase_speed_dist[phase_speed_dist.simulation_index == i] if len(phase_speed_dist) else pd.DataFrame()
+        for wname in wave_names:
+            sub = sim_dist[sim_dist.wave == wname].sort_values("phase_speed_ms") if len(sim_dist) else pd.DataFrame()
+            if len(sub) == 0 or not np.any(np.isfinite(sub.density_per_ms.values)):
+                continue
+            b.plot(
+                sub.phase_speed_ms,
+                sub.density_per_ms,
+                color=spectrum_outline_colors.get(wname, "0.1"),
+                lw=1.5,
+                label=wave_label(wname) if i == 0 else None,
+            )
+        b.axvline(0, color="0.7", lw=0.6)
+        b.set_xlim(*critical_level_phase_speed_xlim)
+        b.set_xlabel(r"$\overline{u}$ and zonal phase speed (m s$^{-1}$)")
+        b.grid(alpha=0.2)
+        if i == 0:
+            b.set_ylabel("Power-weighted\ndensity")
+        else:
+            b.tick_params(labelleft=False)
+    profile_ax[0].set_ylabel("Pressure (hPa)")
+    if len(phase_speed_dist) > 0:
+        dist_ax[0].legend(loc="best", fontsize=7, ncol=2)
+    fig.suptitle(
+        f"Tropical mean wind profile with power-weighted mean phase speeds (dashed) and "
+        f"phase-speed distributions over {filter_lat_bounds[0]}--{filter_lat_bounds[1]}°"
+    )
     figsave.save(fig, "critical_level_phase_speed_profiles", number=7)
     print("Done with figure: critical_level_phase_speed_profiles")
 
@@ -2469,33 +2760,8 @@ if should_build_figure(
     spec_levels = np.linspace(0, 3.0, 26)
     spec_cmap, spec_norm = make_spectrum_cmap(spec_levels)
 
-    components = ("symmetric", "antisymmetric")
-    spectra_by_sim = []
-    for i, ds in enumerate(dss):
-        try:
-            spectra = load_cached_spectra(i)
-            if spectra is None:
-                sp_input = spectrum_input_field(ds, spectrum_field, spectrum_lat_bounds)
-                raw_spectrum = spacetime_power(
-                    sp_input,
-                    lataggreg="mean",
-                    latitude_bounds=normalise_lat_bounds(spectrum_lat_bounds),
-                    dosymmetries=True,
-                    segsize=spectrum_segment_days,
-                    noverlap=spectrum_overlap_days,
-                    spd=obs_per_day,
-                )
-
-                spectra = {}
-                for component in components:
-                    raw_component = raw_spectrum.sel(component=component)
-                    background = smooth_wavefreq(raw_component, freq_name="frequency")
-                    spectra[component] = xr.where(background > 0, raw_component / background, np.nan).load()
-                write_cached_spectra(i, spectra)
-            spectra_by_sim.append(spectra)
-        except Exception as exc:
-            spectra_by_sim.append(None)
-            print(f"Skipping symmetric/antisymmetric spectrum for {sim_names[i]}: {exc}")
+    components = spectrum_components
+    spectra_by_sim = load_or_compute_normalised_spectra_by_sim()
 
     fig, ax = plt.subplots(len(dss), 2, figsize=(9.0, 2.8 * len(dss)),
                            constrained_layout=True, sharex=True, sharey=True)
@@ -2664,6 +2930,72 @@ if should_build_figure(
 
 
 # -----------------------------------------------------------------------------
+# 10. Phase-speed distributions by simulation
+# -----------------------------------------------------------------------------
+# WHAT TO LOOK FOR:
+#   * Whether a simulation changes the preferred phase speed of a wave band, not
+#     only its integrated wave-box power.
+#   * Broad or multi-peaked distributions mean the single phase-speed line in
+#     the critical-level diagnostic should be interpreted cautiously.
+
+if should_build_figure(10, "wave_phase_speed_power_distributions"):
+    dist = compute_wave_phase_speed_distributions()
+    if len(dist) > 0:
+        if save:
+            dist.to_csv(os.path.join(save_loc, "wave_phase_speed_power_distributions.csv"), index=False)
+
+        ncols = min(3, len(wave_names))
+        nrows = int(np.ceil(len(wave_names) / ncols))
+        fig, ax = plt.subplots(
+            nrows, ncols,
+            figsize=(4.0 * ncols, 2.8 * nrows),
+            constrained_layout=True,
+            sharey=True,
+        )
+        axes = np.asarray(ax).reshape(-1)
+        for wj, wname in enumerate(wave_names):
+            a = axes[wj]
+            wave_dist = dist[dist.wave == wname]
+            for i, sim in enumerate(sim_names):
+                sub = wave_dist[wave_dist.simulation == sim].sort_values("phase_speed_ms")
+                if len(sub) == 0 or not np.any(np.isfinite(sub.density_per_ms.values)):
+                    continue
+                a.plot(sub.phase_speed_ms, sub.density_per_ms, color=cols[i], lw=1.7, label=sim)
+            cmin, ccen, cmax = wave_phase_speed_range(wname)
+            a.axvline(0, color="0.75", lw=0.6)
+            a.axvline(ccen, color="0.45", lw=0.8, ls="--")
+            occupied = wave_dist[np.isfinite(wave_dist.weighted_power) & (wave_dist.weighted_power > 0.0)]
+            if len(occupied) > 0:
+                x0 = float(occupied.phase_speed_ms.min())
+                x1 = float(occupied.phase_speed_ms.max())
+            else:
+                x0, x1 = sorted((cmin, cmax))
+            margin = max(10.0, 0.08 * max(1.0, x1 - x0))
+            x0 = max(phase_speed_distribution_limits[0], x0 - margin)
+            x1 = min(phase_speed_distribution_limits[1], x1 + margin)
+            if x0 >= x1:
+                x0, x1 = phase_speed_distribution_limits
+            a.set_xlim(x0, x1)
+            a.set_title(wave_label(wname))
+            a.grid(alpha=0.2)
+            if wj % ncols == 0:
+                a.set_ylabel("Power-weighted\ndensity")
+            if wj >= (nrows - 1) * ncols:
+                a.set_xlabel(r"Zonal phase speed (m s$^{-1}$)")
+        for a in axes[len(wave_names):]:
+            a.set_visible(False)
+        axes[0].legend(loc="best", fontsize=8)
+        fig.suptitle(
+            f"Spectrum-derived phase-speed distributions "
+            f"({phase_speed_distribution_power_mode.replace('_', ' ')})"
+        )
+        figsave.save(fig, "wave_phase_speed_power_distributions", number=10)
+        print("Done with figure: wave_phase_speed_power_distributions")
+    else:
+        print("Skipping figure: wave_phase_speed_power_distributions (no distribution data)")
+
+
+# -----------------------------------------------------------------------------
 # 11. Compact attribution metrics
 # -----------------------------------------------------------------------------
 # WHAT TO LOOK FOR:
@@ -2685,6 +3017,7 @@ compact_signature = cache_signature(
         waves=list(wave_names),
         intense_precip_percentile=95.0,
         attribution_eps=ATTRIBUTION_EPS,
+        fraction_denominator="symmetric_plus_antisymmetric",
     ),
 )
 if should_build_versioned_figure(WAVE_ATTRIBUTION_FIGURE_NUMBER, compact_attribution_figure_stems, compact_signature):

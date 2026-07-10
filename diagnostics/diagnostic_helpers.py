@@ -6,6 +6,7 @@ import warnings
 import numpy as np
 import pandas as pd
 from matplotlib import colors, pyplot as plt, ticker
+from matplotlib.patches import Patch
 import scipy.interpolate as intp
 import xarray as xr
 
@@ -689,6 +690,62 @@ def add_symmetric_colorbar(fig, mappable, ax, levels, label, location="right", n
     return cbar
 
 
+PRECIP_RATE_COLORS = [
+    [1.0, 1.0, 1.0],
+    [205 / 255.0, 236 / 255.0, 251 / 255.0],
+    [157 / 255.0, 218 / 255.0, 247 / 255.0],
+    [72 / 255.0, 142 / 255.0, 202 / 255.0],
+    [72 / 255.0, 158 / 255.0, 148 / 255.0],
+    [73 / 255.0, 181 / 255.0, 70 / 255.0],
+    [150 / 255.0, 203 / 255.0, 80 / 255.0],
+    [250 / 255.0, 232 / 255.0, 92 / 255.0],
+    [248 / 255.0, 184 / 255.0, 73 / 255.0],
+    [245 / 255.0, 106 / 255.0, 41 / 255.0],
+    [230 / 255.0, 74 / 255.0, 41 / 255.0],
+    [211 / 255.0, 31 / 255.0, 40 / 255.0],
+    [183 / 255.0, 27 / 255.0, 34 / 255.0],
+    [146 / 255.0, 21 / 255.0, 25 / 255.0],
+    [110 / 255.0, 15 / 255.0, 15 / 255.0],
+]
+PRECIP_RATE_LEVELS = np.linspace(0.01, 25.0, len(PRECIP_RATE_COLORS))
+
+HIGH_CLOUD_CLASS_SPECS = (
+    (1, "Convective precipitating", "tab:red"),
+    (2, "Stratiform precipitating", "tab:blue"),
+    (3, "Non-precipitating", "tab:green"),
+    (4, "Invalid/unclassified", "0.70"),
+)
+
+
+def precip_rate_cmap_norm():
+    cmap = colors.LinearSegmentedColormap.from_list(
+        "project_precip_rate", PRECIP_RATE_COLORS, N=len(PRECIP_RATE_COLORS)
+    )
+    norm = colors.BoundaryNorm(
+        PRECIP_RATE_LEVELS, ncolors=len(PRECIP_RATE_COLORS) - 1
+    )
+    return cmap, norm
+
+
+def high_cloud_class_cmap_norm(alpha=0.82):
+    rgba = [(0.0, 0.0, 0.0, 0.0)]
+    for _code, _label, color in HIGH_CLOUD_CLASS_SPECS:
+        rgba.append(colors.to_rgba(color, alpha=alpha))
+    cmap = colors.ListedColormap(rgba, name="high_cloud_class_codes")
+    norm = colors.BoundaryNorm(
+        np.arange(-0.5, len(HIGH_CLOUD_CLASS_SPECS) + 1.5, 1.0),
+        cmap.N,
+    )
+    return cmap, norm
+
+
+def high_cloud_class_legend_handles():
+    return [
+        Patch(facecolor=color, label=label)
+        for _code, label, color in HIGH_CLOUD_CLASS_SPECS
+    ]
+
+
 def make_diff_norm(levels):
     return colors.BoundaryNorm(levels, plt.get_cmap("bwr").N)
 
@@ -707,6 +764,110 @@ def difference_cmap(levels, cmap="bwr"):
     out.set_over(base(1.0))
     out.set_bad(base.get_bad())
     return out
+
+
+# Minimum ratio between the troposphere and stratosphere colour scales before
+# a difference panel is worth splitting into two colorbars.
+SPLIT_SCALE_RATIO = 3.0
+
+
+def tropopause_on_latitudes(tropopause_values, tropopause_latitudes, target_latitudes):
+    """Interpolate a per-latitude tropopause curve onto a field's latitude grid."""
+    return np.interp(
+        np.asarray(target_latitudes, dtype=float),
+        np.asarray(tropopause_latitudes, dtype=float),
+        np.asarray(tropopause_values, dtype=float),
+    )
+
+
+def tropopause_region_masks(vertical2d, tropopause, coord="height"):
+    """Boolean (troposphere, stratosphere) masks for a (nlev, nlat) vertical mesh.
+
+    ``tropopause`` gives the tropopause of each latitude column in the same
+    units as ``vertical2d``: height in m, or pressure in hPa with
+    ``coord="pressure"``.
+    """
+    vert = np.asarray(vertical2d, dtype=float)
+    tp = np.asarray(tropopause, dtype=float)
+    if tp.ndim == 0:
+        tp = np.full(vert.shape[1], float(tp))
+    tp2d = np.broadcast_to(tp[None, :], vert.shape)
+    tropo = vert >= tp2d if coord == "pressure" else vert <= tp2d
+    return tropo, ~tropo
+
+
+def region_symmetric_levels(value_mask_pairs, ndiv=10, fallback=1.0, percentile=None):
+    """Symmetric contour levels from the masked region of one or more fields."""
+    pooled = []
+    for values, mask in value_mask_pairs:
+        vals = np.asarray(values, dtype=float)[np.asarray(mask, dtype=bool)]
+        pooled.append(vals[np.isfinite(vals)])
+    pooled = np.concatenate(pooled) if pooled else np.array([], dtype=float)
+    if pooled.size == 0:
+        vmax = fallback
+    elif percentile is None:
+        vmax = np.max(np.abs(pooled))
+    else:
+        vmax = np.percentile(np.abs(pooled), percentile)
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = fallback
+    return symmetric_levels(vmax, ndiv=ndiv)
+
+
+def split_scales_warranted(tropo_levels, strat_levels, ratio=SPLIT_SCALE_RATIO):
+    """True when troposphere and stratosphere need visibly different scales."""
+    tropo_max = float(np.max(np.abs(tropo_levels)))
+    strat_max = float(np.max(np.abs(strat_levels)))
+    if not (np.isfinite(tropo_max) and np.isfinite(strat_max)):
+        return False
+    if min(tropo_max, strat_max) <= 0:
+        return False
+    return max(tropo_max / strat_max, strat_max / tropo_max) >= ratio
+
+
+def contourf_split_difference(ax, x2d, y2d, values, tropo_mask,
+                              tropo_levels, strat_levels, cmap="bwr"):
+    """Difference panel with separate troposphere/stratosphere colour scales.
+
+    The region with the wider scale is drawn over the full domain so the cells
+    straddling the tropopause stay coloured (they sit near white on the wide
+    scale); the tighter-scale region is then overlaid with its own scale.
+    Returns (tropo_im, strat_im).
+    """
+    vals = np.asarray(values, dtype=float)
+    tropo_mask = np.asarray(tropo_mask, dtype=bool)
+    strat_is_wide = float(np.max(np.abs(strat_levels))) >= float(np.max(np.abs(tropo_levels)))
+    base_levels = strat_levels if strat_is_wide else tropo_levels
+    over_levels = tropo_levels if strat_is_wide else strat_levels
+    over_mask = tropo_mask if strat_is_wide else ~tropo_mask
+    base_im = ax.contourf(x2d, y2d, vals, levels=base_levels,
+                          cmap=difference_cmap(base_levels, cmap), extend="both")
+    over_im = ax.contourf(x2d, y2d, np.where(over_mask, vals, np.nan),
+                          levels=over_levels,
+                          cmap=difference_cmap(over_levels, cmap), extend="both")
+    return (over_im, base_im) if strat_is_wide else (base_im, over_im)
+
+
+def add_split_difference_colorbars(fig, tropo_im, strat_im, ax, tropo_levels,
+                                   strat_levels, label, nticks=4, shrink_each=0.47):
+    """Two stacked colorbars right of ``ax``: stratosphere above troposphere."""
+    strat_ticks = symmetric_colorbar_ticks(strat_levels, nticks=nticks)
+    strat_cbar = fig.colorbar(
+        strat_im, ax=ax, location="right", shrink=shrink_each,
+        anchor=(0.0, 1.0), ticks=strat_ticks, label=label,
+    )
+    strat_cbar.set_ticklabels([format_colorbar_tick(t) for t in strat_ticks])
+    strat_cbar.ax.set_title("strat.", fontsize=8)
+
+    # The lower bar lives in an inset of the upper (layout-managed) bar so the
+    # pair stays one constrained-layout column, stacked vertically.
+    gap = 1.0 - 2.0 * shrink_each
+    tropo_cax = strat_cbar.ax.inset_axes([0.0, -(shrink_each + gap) / shrink_each, 1.0, 1.0])
+    tropo_ticks = symmetric_colorbar_ticks(tropo_levels, nticks=nticks)
+    tropo_cbar = fig.colorbar(tropo_im, cax=tropo_cax, ticks=tropo_ticks)
+    tropo_cbar.set_ticklabels([format_colorbar_tick(t) for t in tropo_ticks])
+    tropo_cbar.ax.set_title("trop.", fontsize=8)
+    return tropo_cbar, strat_cbar
 
 
 def make_spectrum_cmap(levels):
@@ -745,7 +906,7 @@ class FigureSaver:
         self.index = start
         self.dpi = dpi
         self.figures_to_run = figures_to_run
-        os.makedirs(save_loc, exist_ok=True)
+        os.makedirs(self.save_loc, exist_ok=True)
 
     def save(self, fig, stem, number=None, dpi=None):
         if number is None:

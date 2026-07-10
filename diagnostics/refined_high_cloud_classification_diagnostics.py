@@ -39,14 +39,12 @@ import pandas as pd
 import xarray as xr
 from matplotlib import animation, colors, pyplot as plt
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 from scipy import ndimage
 
 from diagnostic_helpers import *
 from high_cloud_classification import (
     HighCloudThresholds,
     cached_classification_is_current as shared_cached_classification_is_current,
-    classification_cache_metadata as shared_classification_cache_metadata,
     classification_dataset as shared_classification_dataset,
     classify_high_cloud_from_dataset,
     precip_component_rate_from_dataset,
@@ -234,33 +232,6 @@ CLASSIFICATION_CACHE_VARS = (
     "high_cloud_regime_code",
     "convective_evidence_count",
 )
-
-PRECIP_RATE_COLS = [
-    [255 / 255.0, 255 / 255.0, 255 / 255.0],
-    [205 / 255.0, 236 / 255.0, 251 / 255.0],
-    [157 / 255.0, 218 / 255.0, 247 / 255.0],
-    [72 / 255.0, 142 / 255.0, 202 / 255.0],
-    [72 / 255.0, 158 / 255.0, 148 / 255.0],
-    [73 / 255.0, 181 / 255.0, 70 / 255.0],
-    [150 / 255.0, 203 / 255.0, 80 / 255.0],
-    [250 / 255.0, 232 / 255.0, 92 / 255.0],
-    [248 / 255.0, 184 / 255.0, 73 / 255.0],
-    [245 / 255.0, 106 / 255.0, 41 / 255.0],
-    [230 / 255.0, 74 / 255.0, 41 / 255.0],
-    [211 / 255.0, 31 / 255.0, 40 / 255.0],
-    [183 / 255.0, 27 / 255.0, 34 / 255.0],
-    [146 / 255.0, 21 / 255.0, 25 / 255.0],
-    [110 / 255.0, 15 / 255.0, 15 / 255.0],
-]
-PRECIP_RATE_LEVELS = np.linspace(0.01, 25.0, len(PRECIP_RATE_COLS))
-
-CLASS_CODE_SPECS = [
-    (1, "Convective precipitating", "tab:red"),
-    (2, "Stratiform precipitating", "tab:blue"),
-    (3, "Non-precipitating", "tab:green"),
-    (4, "Invalid/unclassified", "0.70"),
-]
-
 
 def should_run_figure(number):
     return figure_should_run(figures_to_run, number)
@@ -792,16 +763,6 @@ def weighted_area_time_mean(da, lat_bounds=TROPICAL_LAT_BOUNDS):
     return float(x.weighted(weights).mean(dim=dims, skipna=True).values)
 
 
-def weighted_mean_dims(da, dims):
-    dims = [dim for dim in dims if dim in da.dims]
-    if not dims:
-        return da
-    if "latitude" in da.dims and "latitude" in dims:
-        weights = np.cos(np.deg2rad(da.latitude))
-        return da.weighted(weights).mean(dim=dims, skipna=True)
-    return da.mean(dim=dims, skipna=True)
-
-
 def time_step_days(da):
     if "Time" not in da.dims or da.sizes["Time"] < 2:
         return dt / 24.0
@@ -963,10 +924,6 @@ def classify_high_cloud(
         dt_hours=dt,
         include_process_diagnostics=include_process_diagnostics,
     )
-
-
-def classification_cache_metadata():
-    return shared_classification_cache_metadata(classification_thresholds())
 
 
 def classification_dataset(classif):
@@ -1205,37 +1162,6 @@ def weighted_quantile(values, quantiles, weights=None):
     cdf = np.cumsum(weights) - 0.5 * weights
     cdf /= np.sum(weights)
     return np.interp(quantiles, cdf, values)
-
-
-def unique_monotonic_bins(edges, fallback=None):
-    edges = np.asarray(edges, dtype=float)
-    edges = edges[np.isfinite(edges)]
-    edges = np.unique(edges)
-    if edges.size < 3:
-        if fallback is None:
-            raise ValueError("Could not construct enough unique bin edges")
-        return np.asarray(fallback, dtype=float)
-    return edges
-
-
-def weighted_binned_mean(x, y, bins, weights=None, min_count=MIN_BIN_COUNT):
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    weights = np.ones_like(x) if weights is None else np.asarray(weights, dtype=float)
-    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(weights) & (weights > 0)
-    x = x[ok]
-    y = y[ok]
-    weights = weights[ok]
-    idx = np.digitize(x, bins) - 1
-    centres = 0.5 * (bins[:-1] + bins[1:])
-    mean = np.full(centres.size, np.nan)
-    count = np.zeros(centres.size, dtype=int)
-    for j in range(centres.size):
-        m = idx == j
-        count[j] = int(np.count_nonzero(m))
-        if count[j] >= min_count and np.sum(weights[m]) > 0:
-            mean[j] = np.sum(weights[m] * y[m]) / np.sum(weights[m])
-    return centres, mean, count
 
 
 def class_overlap_sanity(classifications):
@@ -1941,25 +1867,6 @@ def representative_validation_time(classif):
     return high.Time.isel(Time=idx).values
 
 
-def precip_rate_cmap_norm():
-    cmap = colors.LinearSegmentedColormap.from_list(
-        name="project_precip_rate",
-        colors=PRECIP_RATE_COLS,
-        N=len(PRECIP_RATE_COLS),
-    )
-    norm = colors.BoundaryNorm(boundaries=PRECIP_RATE_LEVELS, ncolors=len(PRECIP_RATE_COLS) - 1)
-    return cmap, norm
-
-
-def class_code_cmap_norm(alpha=0.82):
-    rgba = [(0.0, 0.0, 0.0, 0.0)]
-    for _code, _label, color in CLASS_CODE_SPECS:
-        rgba.append(colors.to_rgba(color, alpha=alpha))
-    cmap = colors.ListedColormap(rgba, name="high_cloud_class_codes")
-    norm = colors.BoundaryNorm(np.arange(-0.5, len(CLASS_CODE_SPECS) + 1.5, 1.0), cmap.N)
-    return cmap, norm
-
-
 def class_code_from_masks(high, convective, stratiform, nonprecipitating, unclassified):
     code = np.zeros(high.shape, dtype=np.int16)
     code[np.asarray(convective.values) >= 0.5] = 1
@@ -2046,7 +1953,7 @@ def add_class_band(ax, x, code_values, y0=17.5, y1=SNAPSHOT_Z_MAX_KM):
     codes = np.asarray(code_values, dtype=float)
     if x.size == 0 or not np.any(codes > 0):
         return
-    cmap, norm = class_code_cmap_norm(alpha=0.45)
+    cmap, norm = high_cloud_class_cmap_norm(alpha=0.45)
     masked = np.ma.masked_where(codes <= 0, codes)
     ax.pcolormesh(
         centres_to_edges(x),
@@ -2076,13 +1983,6 @@ def add_rain_ticks(ax, x, precip_values):
     )
 
 
-def class_legend_handles():
-    return [
-        Patch(facecolor=color, label=label)
-        for _code, label, color in CLASS_CODE_SPECS
-    ]
-
-
 def classification_threshold_summary():
     return (
         f"High: cldfrac >= {CF_THRESH:g}, cloud-top p <= {P_HIGH_HPA:g} hPa | "
@@ -2093,7 +1993,7 @@ def classification_threshold_summary():
 
 
 def overlay_class_tint(ax, class_code, alpha=0.20):
-    cmap, norm = class_code_cmap_norm(alpha=alpha)
+    cmap, norm = high_cloud_class_cmap_norm(alpha=alpha)
     values = np.asarray(class_code.values)
     masked = np.ma.masked_where(values <= 0, values)
     return ax.pcolormesh(
@@ -2210,7 +2110,7 @@ def plot_cloud_top_height_map(
 
 
 def plot_class_map(ax, class_code, focus_lon, focus_lat):
-    cmap, norm = class_code_cmap_norm(alpha=0.88)
+    cmap, norm = high_cloud_class_cmap_norm(alpha=0.88)
     cls = crop_longitude_window(class_code, focus_lon)
     values = np.ma.masked_where(np.asarray(cls.values) <= 0, np.asarray(cls.values))
     ax.set_facecolor("0.96")
@@ -2296,10 +2196,10 @@ def save_validation_map_figure(
         pad=0.025,
     )
     fig.legend(
-        handles=class_legend_handles(),
+        handles=high_cloud_class_legend_handles(),
         loc="lower center",
         bbox_to_anchor=(0.5, 0.025),
-        ncol=len(CLASS_CODE_SPECS),
+        ncol=len(HIGH_CLOUD_CLASS_SPECS),
         frameon=False,
         title="High-cloud column class (tint in top row)",
     )
@@ -3406,8 +3306,8 @@ def plot_classification_validation_movies(fields_by_run, classifications):
         vmin=CLOUD_TOP_HEIGHT_MAP_MIN_KM,
         vmax=CLOUD_TOP_HEIGHT_MAP_MAX_KM,
     )
-    class_cmap, class_norm = class_code_cmap_norm(alpha=0.92)
-    class_legend = class_legend_handles()
+    class_cmap, class_norm = high_cloud_class_cmap_norm(alpha=0.92)
+    class_legend = high_cloud_class_legend_handles()
     manifest_rows = []
 
     for i, sim_name in enumerate(sim_names):
@@ -3463,7 +3363,7 @@ def plot_classification_validation_movies(fields_by_run, classifications):
             handles=class_legend,
             loc="lower center",
             bbox_to_anchor=(0.5, 0.025),
-            ncol=len(CLASS_CODE_SPECS),
+            ncol=len(HIGH_CLOUD_CLASS_SPECS),
             frameon=False,
             title="High-cloud column class (tint in top row)",
         )

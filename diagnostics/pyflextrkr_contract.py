@@ -10,12 +10,18 @@ import numpy as np
 import pandas as pd
 
 
-PYFLEXTRKR_PRODUCT_VERSION = "mpas-convective-pyflextrkr-v1"
+PYFLEXTRKR_PRODUCT_VERSION = "mpas-organised-convective-envelope-pyflextrkr-v9"
 PYFLEXTRKR_METADATA_FILENAME = "pyflextrkr_product_metadata.json"
-PRIMARY_TRACK_SOURCE = "convective_precipitating_high_cloud_mask"
+PYFLEXTRKR_TRACK_MANIFEST_FILENAME = "organised_track_manifest.csv"
+PRIMARY_TRACK_SOURCE = "organised_convective_system_mask"
 PRIMARY_ANALYSIS_ROLE = "primary_persistence_and_composites"
-SENSITIVITY_TRACK_SOURCES = ("precip_ge_1mmh", "olr_tb241")
-TRACKED_SOURCES = (PRIMARY_TRACK_SOURCE, *SENSITIVITY_TRACK_SOURCES)
+TRACKED_SOURCES = (PRIMARY_TRACK_SOURCE,)
+MIN_ORGANISED_TRACK_OBSERVATIONS = 4
+MIN_ORGANISED_TRACK_DURATION_HOURS = 24.0
+ORGANISED_TRACK_ACCEPTANCE_CRITERIA = "duration_and_embedded_classifier_core"
+ORGANISED_TRACK_EMBEDDED_CORE_REQUIREMENT = "any_positive_area_during_track"
+ORGANISED_TRACK_OBJECT_GEOMETRY = "pyflextrkr_olr_to_tb_detect_and_spread"
+ORGANISED_ENVELOPE_MIN_RAW_AREA_KM2 = 5000.0
 
 
 def epoch_seconds(time_values):
@@ -72,6 +78,20 @@ def product_fingerprint(metadata):
         "tracknumbers_sha256",
         "track_min_overlap_fraction",
         "track_min_area_km2",
+        "min_track_observations",
+        "min_track_duration_hours",
+        "track_acceptance_criteria",
+        "embedded_convective_core_requirement",
+        "object_geometry",
+        "envelope_min_raw_area_km2",
+        "pyflextrkr_tb_core_k",
+        "pyflextrkr_tb_cold_k",
+        "pyflextrkr_tb_warm_k",
+        "pyflextrkr_tb_cloud_k",
+        "pyflextrkr_tb_smoothing_cells",
+        "pyflextrkr_min_cold_core_pixels",
+        "pyflextrkr_warm_anvil_expansion",
+        "track_manifest_sha256",
         "pyflextrkr_nmaxlinks",
     )
     payload = {key: metadata.get(key) for key in keys}
@@ -81,6 +101,28 @@ def product_fingerprint(metadata):
 
 def metadata_path(work_path):
     return os.path.join(work_path, PYFLEXTRKR_METADATA_FILENAME)
+
+
+def track_manifest_path(work_path):
+    return os.path.join(work_path, PYFLEXTRKR_TRACK_MANIFEST_FILENAME)
+
+
+def read_track_manifest(work_path):
+    path = track_manifest_path(work_path)
+    if not os.path.exists(path):
+        return None
+    return pd.read_csv(path)
+
+
+def manifest_accepted_mask(manifest):
+    values = manifest["accepted"]
+    if values.dtype.kind == "b":
+        return values.astype(bool)
+    normalized = values.astype(str).str.strip().str.lower()
+    invalid = ~normalized.isin({"true", "false", "1", "0"})
+    if invalid.any():
+        raise ValueError("organised-track manifest contains invalid accepted values")
+    return normalized.isin({"true", "1"})
 
 
 def read_product_metadata(work_path):

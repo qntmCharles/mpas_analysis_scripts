@@ -49,6 +49,10 @@ from equatorial_wave_config import (
     WAVE_BOXES as SHARED_WAVE_BOXES,
     WAVE_LATITUDE_PROJECTION as SHARED_WAVE_LATITUDE_PROJECTION,
 )
+from pyflextrkr_contract import (
+    PRIMARY_TRACK_SOURCE as PYFLEXTRKR_PRIMARY_TRACK_SOURCE,
+    PYFLEXTRKR_PRODUCT_VERSION,
+)
 
 try:
     from waveFilter import kf_filter
@@ -190,14 +194,17 @@ ORGANISATION_TRACK_METRIC_SPECS = [
     ("mean_area_km2", "km2"),
     ("area_time_km2_h", "km2 h"),
     ("precip_area_rate_time", "mm day-1 km2 h"),
+    ("max_area_convective_precipitating_high_cloud_mask_km2", "km2"),
+    ("mean_frac_convective_precipitating_high_cloud_mask", "fraction"),
+    ("max_translation_speed_kmh", "km h-1"),
     ("starts_as_split", "fraction"),
     ("ends_as_merge", "fraction"),
     ("complete_lifecycle", "fraction"),
 ]
 # Track-persistence rows come from convective_organisation_diagnostics.py, which
-# uses PyFLEXTRKR overlap tracking to define object lifetimes. This script does
-# the across-time chunk-consistency check; it is not invoking a separate
-# PyFLEXTRKR statistical test.
+# uses PyFLEXTRKR overlap tracking on broad organised convective-system envelopes.
+# This script only performs the across-time chunk-consistency check; it never
+# creates or substitutes an alternative tracking product.
 
 # Shared coarse-grid precipitation-regime cloud thresholds.
 CF_THRESH = 0.05
@@ -882,6 +889,16 @@ def water_vapour_field(ds, zds):
     if "qv" in zds.data_vars:
         return field_from_candidates(zds, ("qv",), "water_vapour", scale=1000.0)
     return latlon_field_from_candidates(ds, ("qv",), "water_vapour", scale=1000.0)
+
+
+def cloud_fraction_time_field(ds, zds):
+    cf = get_cloud_fraction(zds)
+    if cf is None:
+        cf = get_cloud_fraction(ds)
+    if cf is None:
+        raise ValueError("cldfrac unavailable or lacks a usable z coordinate")
+    cf.name = "cloud_fraction"
+    return cf
 
 
 LATHEIGHT_FIELD_SPECS = [
@@ -1616,7 +1633,7 @@ def run_cloud_response(precip_by_run):
             cloud_thresholds=dict(
                 **vars(classification_thresholds()),
                 cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
-                classifier="shared coarse-grid precipitation-regime high-cloud classification",
+                classification="shared coarse-grid precipitation-regime high-cloud classification",
             ),
         ),
     )
@@ -1787,30 +1804,10 @@ def run_conditional_precipitation_states(precip_by_run):
 # -----------------------------------------------------------------------------
 
 ORGANISATION_SOURCE_ORDER = [
-    "precip_ge_1mmh",
-    "olr_tb241",
-    "convective_precipitating_high_cloud_mask",
-    "stratiform_precipitating_high_cloud_mask",
-    # Sensitivity-only sources from convective_organisation_diagnostics.py.
-    "precip_ge_2mmh",
-    "precip_ge_8mmh",
-    "precip_p95",
-    "precip_p99",
-    "olr_tb233",
-    "olr_cold_p05",
-    "high_cloud_mask",
+    PYFLEXTRKR_PRIMARY_TRACK_SOURCE,
 ]
-ORGANISATION_EXCLUDED_SOURCES = {
-    "nonprecipitating_high_cloud_mask",
-    "unclassified_high_cloud_mask",
-}
-ORGANISATION_CONTEXT_SOURCES = {
-    "high_cloud_mask",
-    "stratiform_precipitating_high_cloud_mask",
-}
-ORGANISATION_PRIMARY_TRACK_SOURCE = "convective_precipitating_high_cloud_mask"
-ORGANISATION_TRACK_SENSITIVITY_SOURCES = {"precip_ge_1mmh", "olr_tb241"}
-ORGANISATION_TRACK_CACHE_VERSION = "pyflextrkr_track_persistence_v5_product_contract"
+ORGANISATION_PRIMARY_TRACK_SOURCE = PYFLEXTRKR_PRIMARY_TRACK_SOURCE
+ORGANISATION_TRACK_CACHE_VERSION = "pyflextrkr_ctp_basin_shield_tracks_v13"
 
 
 def require_current_organisation_metadata(path, label):
@@ -1880,8 +1877,13 @@ def load_organisation_tracks():
         )
     if metadata.get("primary_track_source") != ORGANISATION_PRIMARY_TRACK_SOURCE:
         raise RuntimeError(
-            "Organisation track metadata does not use the classifier's "
-            f"primary convective source {ORGANISATION_PRIMARY_TRACK_SOURCE!r}."
+            "Organisation track metadata does not use the shared organised "
+            f"convective-system source {ORGANISATION_PRIMARY_TRACK_SOURCE!r}."
+        )
+    if metadata.get("product_version") != PYFLEXTRKR_PRODUCT_VERSION:
+        raise RuntimeError(
+            "Organisation track metadata does not describe the current "
+            f"PyFLEXTRKR product version {PYFLEXTRKR_PRODUCT_VERSION!r}."
         )
     df = pd.read_csv(ORGANISATION_TRACKS_FILE)
     required = {"source", "source_label", "simulation", "track_id"}
@@ -1983,30 +1985,23 @@ def organisation_condition_edges(df, source, condition_key):
 
 def ordered_organisation_sources(df):
     present = set(df["source"].dropna().unique())
-    usable = present - ORGANISATION_EXCLUDED_SOURCES
-    ordered = [source for source in ORGANISATION_SOURCE_ORDER if source in usable]
-    ordered.extend(sorted(usable - set(ordered)))
-    return ordered
-
-
-def note_skipped_organisation_sources(df):
-    present = set(df["source"].dropna().unique())
-    skipped = sorted(present & ORGANISATION_EXCLUDED_SOURCES)
-    if skipped:
-        record_skip(
-            "organisation/Lorg metrics for passive high-cloud classes "
-            f"({', '.join(skipped)} are cloud-regime diagnostics, not convective-organisation diagnostics)"
+    unexpected = present - {ORGANISATION_PRIMARY_TRACK_SOURCE}
+    if unexpected:
+        raise RuntimeError(
+            "Organisation tables contain sources outside the current shared "
+            f"PyFLEXTRKR product: {sorted(unexpected)}"
         )
+    ordered = [source for source in ORGANISATION_SOURCE_ORDER if source in present]
+    return ordered
 
 
 def organisation_source_role(source):
     if source == ORGANISATION_PRIMARY_TRACK_SOURCE:
-        return "primary_convective_objects"
-    if source in ORGANISATION_TRACK_SENSITIVITY_SOURCES:
-        return "object_definition_sensitivity"
-    if source in ORGANISATION_CONTEXT_SOURCES:
-        return "cloud_context"
-    return "convective_proxy"
+        return "organised_convective_systems"
+    raise RuntimeError(
+        "Organisation tables contain a source outside the current shared "
+        f"PyFLEXTRKR product: {source!r}"
+    )
 
 
 def plot_organisation_bootstrap_summary(org_df, org_source_labels):
@@ -2107,9 +2102,7 @@ def run_convective_organisation_bootstrap():
                 metric_specs=jsonable_value(ORGANISATION_METRIC_SPECS),
                 track_metric_specs=jsonable_value(ORGANISATION_TRACK_METRIC_SPECS),
                 primary_track_source=ORGANISATION_PRIMARY_TRACK_SOURCE,
-                track_sensitivity_sources=sorted(ORGANISATION_TRACK_SENSITIVITY_SOURCES),
                 organisation_track_cache_version=ORGANISATION_TRACK_CACHE_VERSION,
-                excluded_sources=sorted(ORGANISATION_EXCLUDED_SOURCES),
                 cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
             ),
         )
@@ -2133,7 +2126,6 @@ def run_convective_organisation_bootstrap():
         if org is None or len(org) == 0:
             return
 
-        note_skipped_organisation_sources(org)
         sources = ordered_organisation_sources(org)
         source_labels = {source: organisation_source_label(org, source) for source in sources}
         org_row_start = len(scalar_metric_rows)
@@ -2214,7 +2206,6 @@ def run_convective_organisation_bootstrap():
                     )
 
         if tracks is not None and len(tracks) > 0:
-            note_skipped_organisation_sources(tracks)
             for source in ordered_organisation_sources(tracks):
                 source_labels.setdefault(source, organisation_source_label(tracks, source))
                 sub_source = tracks[tracks["source"] == source]

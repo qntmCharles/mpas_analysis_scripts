@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import os, glob, sys, numbers
+import os, sys, numbers
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("..", "../..", "../../.."):
@@ -12,15 +12,11 @@ for _rel_path in ("..", "../..", "../../.."):
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
-from scipy.interpolate import griddata, RegularGridInterpolator
-import pygeode as pyg
 from jfunctions import *
-import scipy.interpolate as intp
 from scipy.ndimage import uniform_filter1d
 import xarray as xr
 import dask
 from wavenumber_frequency_functions import *
-from matplotlib import colors
 from tropopause import *
 from diagnostic_helpers import *
 from high_cloud_classification import (
@@ -61,7 +57,10 @@ figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 
 def save_figure(number, fig, stem, dpi=300):
-    return figsave.save(fig, stem, number=number, dpi=dpi)
+    try:
+        return figsave.save(fig, stem, number=number, dpi=dpi)
+    finally:
+        plt.close(fig)
 
 
 def should_run_figure(number):
@@ -126,6 +125,12 @@ needed_vars = [
     "cape", "cin", "lcl", "lfc", "lh", "hfx",
     "lwdnt", "lwdnb", "lwupb", "lwupt", "swdnt", "swdnb", "swupb", "swupt",
 ]
+
+# Figures 14 and 20 need the full model-level hydrometeor fields.  They are not
+# present in the zonal-mean files, so retain them from the lat-lon datasets and
+# let condensate_latheight fall back to a lazy zonal mean of those fields.
+if should_run_any([14, 20]):
+    needed_vars.extend(["qc", "qr", "qi", "qs", "qg"])
 
 check_vars = ['t_isobaric']
 
@@ -325,22 +330,6 @@ def fraction_hemispheric_antisymmetry(da):
     va = weighted_var(xa, dims=dims, weights=w)
     return float((va / (vs + va)).values)
 
-def cldfrac_full_with_z(ds):
-    """Return full lat/lon cloud fraction with a geometric-height z coordinate."""
-    if "cldfrac" not in ds.data_vars:
-        return None
-    cf = ds.cldfrac
-    if "nVertLevels" in cf.dims:
-        cf = cf.rename({"nVertLevels": "z"})
-    elif "nVertLevelsP1" in cf.dims:
-        raise ValueError("cldfrac appears to be on interface levels")
-    if "z" not in cf.dims:
-        return None
-    if "z" not in cf.coords or cf.z.size != cf.sizes["z"] or not np.issubdtype(cf.z.dtype, np.number):
-        zmid = midlevel_height_from_latlon(ds, mean_latitude=True)
-        cf = cf.assign_coords(z=("z", zmid.values))
-    return cf
-
 _classification_cache = {}
 
 
@@ -522,35 +511,11 @@ def strided_matching_samples(*arrays, latmax=30, max_time=24, max_lat=80, max_lo
 
 g = 9.80665
 
-def conv_precip_accum(ds):
-    """Accumulated convective precipitation in mm, including bucket counters."""
-    return ds["rainc"] + ds["i_rainc"] * 100.0
-
-def gridscale_precip_accum(ds):
-    """Accumulated grid-scale precipitation in mm, including bucket counters."""
-    return ds["rainnc"] + ds["i_rainnc"] * 100.0
-
 def tropical_mean_latlon(da, lat_bounds=(-10, 10)):
     """Area-weighted latitude mean and arithmetic longitude mean."""
     da = finite_or_nan(da).sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
     w = np.cos(np.deg2rad(da.latitude))
     return da.weighted(w).mean(dim="latitude").mean(dim="longitude")
-
-def tropical_mean_zm(da, lat_bounds=(-10, 10)):
-    """Area-weighted tropical mean for zonal-mean fields."""
-    da = finite_or_nan(da).sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
-    w = np.cos(np.deg2rad(da.latitude))
-    return da.weighted(w).mean(dim="latitude")
-
-def interp_control_like(field, control):
-    """Interpolate a control field onto another field's coordinates."""
-    kwargs = {}
-    for coord in ("z", "pres", "latitude", "longitude"):
-        if coord in field.coords and coord in control.coords:
-            kwargs[coord] = field[coord]
-    if kwargs:
-        return control.interp(**kwargs, kwargs={"fill_value": np.nan})
-    return control
 
 def safe_nanpercentile(arr, q, default=1.0):
     vals = np.asarray(arr)
@@ -608,32 +573,8 @@ def plot_binned_conditional_curve(
         ax.fill_between(xc, y25, y75, color=color, alpha=0.15, linewidth=0)
     return True
 
-def hemi_components_latlon(da, lat_dim="latitude"):
-    """Return hemispherically symmetric and antisymmetric components."""
-    flipped = da.isel({lat_dim: slice(None, None, -1)})
-    flipped = flipped.assign_coords({lat_dim: da[lat_dim].values})
-    sym = 0.5 * (da + flipped)
-    asym = 0.5 * (da - flipped)
-    return sym, asym
-
-
-def hemispheric_symmetrise_lat(da, lat_dim="latitude"):
-    """Return the hemispherically symmetric part on the original latitude grid."""
-    return hemispheric_fold(da, lat_dim=lat_dim, parity="even")
-
-def pressure_level_nearest(da, p_hpa):
-    """Select nearest pressure level in hPa."""
-    return da.sel(pres=p_hpa, method="nearest")
-
 def add_cpt_height(ax, i):
     ax.plot(dss_zm[i].latitude.values, CPTs[i][0] / 1000.0, color="k", lw=1, ls=":")
-
-def get_latheight_field_from_zm(zds, var, hemispheric_parity="even"):
-    """Time-mean zonal-mean model-level variable as (z, latitude)."""
-    x = finite_or_nan(zds[var]).mean(dim="Time")
-    x = hemispheric_fold(x, parity=hemispheric_parity)
-    zmid = height_from_zm_latlon(zds)
-    return lat_height_mesh(x, zmid, zds.latitude.values)
 
 def condensate_latheight(ds, zds, varlist):
     """Return time-mean zonal-mean condensate in g/kg as (z, latitude)."""
@@ -974,7 +915,14 @@ if should_run_figure(5):
             zmid = height_from_zm_latlon(zds)
             field, lat2d, z2d = lat_height_mesh(shear * 1000.0, zmid, zds.latitude.values)
 
-            im = ax[i].contourf(lat2d, z2d/1000., field.values, levels=shear_levels, cmap="bwr", extend="both")
+            im = ax[i].contourf(
+                lat2d,
+                z2d / 1000.0,
+                field.values,
+                levels=shear_levels,
+                cmap=difference_cmap(shear_levels),
+                extend="both",
+            )
             ax[i].plot(zds.latitude.values, CPTs[i][0]/1000., color="k", lw=1, ls=":")
             annotate_panel_label(ax[i], sim_names[i])
             set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
@@ -983,7 +931,14 @@ if should_run_figure(5):
 
             if i == 0:
                 control_shear = shear
-                im2 = ax2[i].contourf(lat2d, z2d/1000., field.values, levels=shear_levels, cmap="bwr", extend="both")
+                im2 = ax2[i].contourf(
+                    lat2d,
+                    z2d / 1000.0,
+                    field.values,
+                    levels=shear_levels,
+                    cmap=difference_cmap(shear_levels),
+                    extend="both",
+                )
             else:
                 cshear = control_shear.interp(z=shear.z, latitude=shear.latitude)
                 diff = (shear - cshear) * 1000.0
@@ -1375,7 +1330,7 @@ if should_run_figure(13):
         ax2[j].set_ylabel(r"$\Delta$ " + ylabel)
         for a in (ax[j], ax2[j]):
             a.axvline(0, color="grey", lw=0.5)
-            a.set_xlim(-90, 90)
+            a.set_xlim(-40, 40)
 
     ax[-1].set_xlabel("Latitude")
     ax2[-1].set_xlabel("Latitude")
@@ -1402,6 +1357,7 @@ if should_run_figure(14):
     ]
 
     for outname, varlist, cbar_label in hydro_groups:
+        fig = fig2 = None
         try:
             fig, ax = plt.subplots(len(dss), 1, figsize=(8, 3.4 * len(dss)), constrained_layout=True, sharex=True)
             fig2, ax2 = plt.subplots(len(dss), 1, figsize=(8, 3.4 * len(dss)), constrained_layout=True, sharex=True)
@@ -1454,6 +1410,11 @@ if should_run_figure(14):
             print(f"Done with figure: comp_{outname}_latheight")
         except ValueError as e:
             print(f"Skipping {outname}: {e}")
+        finally:
+            if fig is not None:
+                plt.close(fig)
+            if fig2 is not None:
+                plt.close(fig2)
 
 # ============================================================
 # 6. Cloud-top height and high-cloud fraction from the shared classification
@@ -1487,8 +1448,8 @@ if should_run_figure(15):
                 ax2[0].axhline(0, color="k", lw=0.7)
                 ax2[1].axhline(0, color="k", lw=0.7)
             else:
-                ax2[0].plot(cld.latitude, ctop - control_ctop.interp(latitude=ctop.latitude), color=cols[i], label=sim_names[i])
-                ax2[1].plot(cld.latitude, hcld - control_hcld.interp(latitude=hcld.latitude), color=cols[i], label=sim_names[i])
+                ax2[0].plot(ctop.latitude, ctop - control_ctop.interp(latitude=ctop.latitude), color=cols[i], label=sim_names[i])
+                ax2[1].plot(hcld.latitude, hcld - control_hcld.interp(latitude=hcld.latitude), color=cols[i], label=sim_names[i])
 
         ax[0].set_ylabel("Cloud-top height (km)")
         ax[1].set_ylabel("High cloud fraction\ncloud top <= 440 hPa")

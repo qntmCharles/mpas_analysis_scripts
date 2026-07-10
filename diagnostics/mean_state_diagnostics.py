@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
 
-import os, glob, sys, numbers
+
+import os, glob, sys
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("..", "../..", "../../.."):
@@ -12,18 +12,21 @@ for _rel_path in ("..", "../..", "../../.."):
         sys.path.append(_path)
 
 import numpy as np
-import pandas as pd
 from matplotlib import pyplot as plt
-from scipy.interpolate import griddata, RegularGridInterpolator
-import pygeode as pyg
 from jfunctions import *
-import scipy.interpolate as intp
-from scipy.ndimage import uniform_filter1d
 import xarray as xr
+from dask import compute as dask_compute
 from wavenumber_frequency_functions import *
 from matplotlib import colors
 from tropopause import *
 from diagnostic_helpers import *
+from mean_state_memory_helpers import (
+    accumulated_precipitation_components,
+    domain_histograms,
+    duration_domain_histograms,
+    precipitation_rate,
+    relative_frequency_from_histogram,
+)
 
 silence_hdf5_error_stack()
 
@@ -63,6 +66,14 @@ save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/mean_state/'
 #     ambiguous.
 figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
+
+
+def save_figure(fig, stem, number=None, dpi=None):
+    """Save and release a figure so long runs do not retain its artists."""
+    try:
+        return figsave.save(fig, stem, number=number, dpi=dpi)
+    finally:
+        plt.close(fig)
 
 
 def should_run_figure(number):
@@ -294,6 +305,43 @@ def fields_for_level_limits(fields, spec):
     return [field_for_level_limits(field, spec) for field in fields]
 
 
+def tropopause_split_diff_context(diff_entries, spec, percentile=None, ndiv=10):
+    """Masks and per-region levels for tropopause-split difference panels.
+
+    ``diff_entries`` maps sim index -> (values2d, z2d_m, latitudes), with the
+    vertical mesh in metres. Returns (masks, tropo_levels, strat_levels,
+    split) where ``masks`` maps sim index -> (tropo_mask, strat_mask) using
+    that simulation's cold-point tropopause, and ``split`` says whether the
+    two regions differ enough in scale to warrant separate colorbars.
+    """
+    masks = {}
+    for i, entry in diff_entries.items():
+        values, z2d, lats = entry[0], entry[1], entry[2]
+        cpt = tropopause_on_latitudes(CPTs[i][0], dss_zm[i].latitude.values, lats)
+        masks[i] = tropopause_region_masks(z2d, cpt)
+
+    min_height = spec.get("level_min_height_m")
+
+    def level_mask(mask, z2d):
+        return mask & (z2d >= min_height) if min_height is not None else mask
+
+    fallback = spec.get("diff_fallback", 1.0)
+    tropo_levels = region_symmetric_levels(
+        [(entry[0], level_mask(masks[i][0], entry[1])) for i, entry in diff_entries.items()],
+        ndiv=ndiv, fallback=fallback, percentile=percentile,
+    )
+    strat_levels = region_symmetric_levels(
+        [(entry[0], level_mask(masks[i][1], entry[1])) for i, entry in diff_entries.items()],
+        ndiv=ndiv, fallback=fallback, percentile=percentile,
+    )
+    split = (
+        spec.get("diff_split_tropopause", False)
+        and bool(diff_entries)
+        and split_scales_warranted(tropo_levels, strat_levels)
+    )
+    return masks, tropo_levels, strat_levels, split
+
+
 def latlon_contour_levels(fields, symmetric=False, n=21, fallback=1.0):
     if symmetric:
         return symmetric_contour_levels(fields, ndiv=n-1, fallback=fallback)
@@ -321,6 +369,7 @@ LATHEIGHT_MEAN_STATE_SPECS = [
         "raw_symmetric": False,
         "raw_fallback": 300.0,
         "diff_fallback": 2.0,
+        "diff_split_tropopause": True,
         "hemispheric_parity": "even",
     },
     {
@@ -331,6 +380,7 @@ LATHEIGHT_MEAN_STATE_SPECS = [
         "raw_symmetric": True,
         "raw_fallback": 10.0,
         "diff_fallback": 2.0,
+        "diff_split_tropopause": True,
         "hemispheric_parity": "even",
     },
     {
@@ -341,6 +391,7 @@ LATHEIGHT_MEAN_STATE_SPECS = [
         "raw_symmetric": True,
         "raw_fallback": 10.0,
         "diff_fallback": 2.0,
+        "diff_split_tropopause": True,
         "hemispheric_parity": "odd",
     },
 ]
@@ -354,6 +405,7 @@ LATHEIGHT_W_RH_SPECS = [
         "raw_symmetric": True,
         "raw_fallback": 0.05,
         "diff_fallback": 0.01,
+        "diff_split_tropopause": True,
         "hemispheric_parity": "even",
     },
     {
@@ -364,6 +416,7 @@ LATHEIGHT_W_RH_SPECS = [
         "raw_symmetric": False,
         "raw_fallback": 100.0,
         "diff_fallback": 10.0,
+        "diff_split_tropopause": True,
         "hemispheric_parity": "even",
     },
 ]
@@ -380,6 +433,7 @@ LATHEIGHT_TEM_SPECS = [
         "raw_percentile": 99.0,
         "diff_fallback": 0.5,
         "diff_percentile": 99.0,
+        "diff_split_tropopause": True,
         "level_min_height_m": 1000.0,
         "hemispheric_parity": "even",
     },
@@ -393,6 +447,7 @@ LATHEIGHT_TEM_SPECS = [
         "raw_percentile": 99.0,
         "diff_fallback": 0.002,
         "diff_percentile": 99.0,
+        "diff_split_tropopause": True,
         "level_min_height_m": 1000.0,
         "hemispheric_parity": "even",
     },
@@ -406,6 +461,7 @@ LATHEIGHT_TEM_SPECS = [
         "raw_percentile": 99.0,
         "diff_fallback": 0.5,
         "diff_percentile": 99.0,
+        "diff_split_tropopause": True,
         "level_min_height_m": 1000.0,
         "hemispheric_parity": "odd",
     },
@@ -439,6 +495,7 @@ SCALAR_CONSTITUENT_GROUPS = [
                 "raw_log_min": 1.0e-4,
                 "raw_fallback": 20.0,
                 "diff_fallback": 1.0,
+                "diff_split_tropopause": True,
                 "hemispheric_parity": "even",
             },
         ],
@@ -479,7 +536,7 @@ SCALAR_CONSTITUENT_GROUPS = [
     },
 ]
 
-# In[2]:
+
 
 ##### config_microp_re on/off test #####
 #root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/'
@@ -523,7 +580,10 @@ needed_vars = [
 
 check_vars = ['t_isobaric']
 
-latlon_chunks = {"Time": 8, "latitude": 60, "longitude": 120}
+# Match the native 4-D isobaric chunks spatially. The previous 60x120 chunks
+# split every 180x360 HDF5 chunk into nine Dask tasks and made figure 4 spend
+# hours repeatedly traversing an unnecessarily large graph.
+latlon_chunks = {"Time": 4, "latitude": 180, "longitude": 360}
 zm_chunks = {"Time": -1}
 
 
@@ -594,10 +654,7 @@ if should_run_figure(1):
     fig, ax = plt.subplots(2, 1, figsize=(8, 4.5), constrained_layout=True)
 
     for i, ds in enumerate(dss):
-        precip = (
-            ds["rainnc"] + ds["i_rainnc"] * 100.0
-            + ds["rainc"] + ds["i_rainc"] * 100.0
-        )
+        precip, _, _ = accumulated_precipitation_components(ds)
 
         precip_mean = lat_mean(precip.mean(dim="longitude"))
         precip_water = lat_mean(ds.precipw.mean(dim="longitude"))
@@ -606,11 +663,7 @@ if should_run_figure(1):
         t_pw = get_time_values(precip_water, dt=dt)
 
         # Rainfall rate has one fewer Time point, so use diff() and its own Time coord
-        if issubclass(precip_mean.Time.values.dtype.type, numbers.Integral):
-            precip_rate = precip_mean.diff("Time") / (dt / 24.0)
-        else:
-            dt_days = precip_mean.Time.diff("Time") / np.timedelta64(1, "D")
-            precip_rate = precip_mean.diff("Time") / dt_days
+        precip_rate = precipitation_rate(precip_mean, dt_hours=dt)
 
         t_rate = get_time_values(precip_rate, dt=dt)
 
@@ -627,10 +680,9 @@ if should_run_figure(1):
 
     fig.legend(loc='outside lower center', ncol=4)
 
-    figsave.save(fig, "rain_stats", number=1)
+    save_figure(fig, "rain_stats", number=1)
     print("Done with figure: comp_rain_stats")
 
-# In[7]:
 
 if should_run_figure(2):
     # Vertical profiles of tropical-mean potential temperature (theta) and zonal-mean wind (uReconstructZonal)
@@ -673,10 +725,9 @@ if should_run_figure(2):
 
     fig.legend(loc='outside lower center', ncol=len(dss))
 
-    figsave.save(fig, "profiles", number=2)
+    save_figure(fig, "profiles", number=2)
     print("Done with figure: comp_profiles")
 
-# In[8]:
 
 # pre-compute CPTs for plotting
 
@@ -705,7 +756,7 @@ if should_run_any([3, 10, 11, 13, 14, 16, 18]):
 
     CPTs = np.array(CPTs)
 
-# In[ ]:
+
 
 if should_run_figure(3):
     fig, ax = plt.subplots(len(dss), 2, figsize=(8, 3.0*len(dss)), sharey=True, constrained_layout=True)
@@ -751,10 +802,9 @@ if should_run_figure(3):
     fig.colorbar(T_im, ax=ax[-1, 0], location='bottom', label="temperature (K)")
     fig.colorbar(rh_im, ax=ax[-1, 1], location='bottom', label="relative humidity (%)")
 
-    figsave.save(fig, "temp_relhum", number=3)
+    save_figure(fig, "temp_relhum", number=3)
     print("Done with figure: comp_temp_relhum")
 
-    # In[ ]:
 
 if should_run_figure(4):
     # Meridional eddy fluxes
@@ -762,19 +812,35 @@ if should_run_figure(4):
     fig, ax = plt.subplots(4, 4, figsize=(8, 8), constrained_layout='True')
 
     for i, ds in enumerate(dss):
-        ua = ds.uzonal_isobaric.sel(pres=[100, 250, 700, 850]) - ds.uzonal_isobaric.sel(pres=[100, 250, 700, 850]).mean(dim=('longitude', 'Time'))
-        va = ds.umeridional_isobaric.sel(pres=[100, 250, 700, 850]) - ds.umeridional_isobaric.sel(pres=[100, 250, 700, 850]).mean(dim=('longitude', 'Time'))
-        Ta = ds.t_isobaric.sel(pres=[100, 250, 700, 850]) - ds.t_isobaric.sel(pres=[100, 250, 700, 850]).mean(dim=('longitude', 'Time'))
-        qva = ds.qv_isobaric.sel(pres=[100, 250, 700, 850]) - ds.qv_isobaric.sel(pres=[100, 250, 700, 850]).mean(dim=('longitude', 'Time'))
+        pressure_levels = [100, 250, 700, 850]
+        u = ds.uzonal_isobaric.sel(pres=pressure_levels).astype(np.float64)
+        v = ds.umeridional_isobaric.sel(pres=pressure_levels).astype(np.float64)
+        temperature = ds.t_isobaric.sel(pres=pressure_levels).astype(np.float64)
+        water_vapour = ds.qv_isobaric.sel(pres=pressure_levels).astype(np.float64)
+        mean_dims = ('longitude', 'Time')
+        u_mean = u.mean(dim=mean_dims)
+        v_mean = v.mean(dim=mean_dims)
+        temperature_mean = temperature.mean(dim=mean_dims)
+        water_vapour_mean = water_vapour.mean(dim=mean_dims)
 
-        eke = 0.5 * (ua*ua + va*va).mean(dim=('longitude', 'Time'))
-        memf = (ua*va).mean(dim=('longitude', 'Time'))
-        mehf = (va*Ta).mean(dim=('longitude', 'Time'))
-        mewvf = (va*qva).mean(dim=('longitude', 'Time'))
+        # Covariance identities let Dask stream all required moments in one
+        # pass rather than first forming four full anomaly fields. Float64
+        # reductions avoid cancellation in mean(x*y) - mean(x)*mean(y).
+        eke = 0.5 * (
+            (u*u).mean(dim=mean_dims) - u_mean*u_mean
+            + (v*v).mean(dim=mean_dims) - v_mean*v_mean
+        )
+        memf = (u*v).mean(dim=mean_dims) - u_mean*v_mean
+        mehf = (v*temperature).mean(dim=mean_dims) - v_mean*temperature_mean
+        mewvf = (v*water_vapour).mean(dim=mean_dims) - v_mean*water_vapour_mean
         eke = hemispheric_fold(eke, parity="even")
         memf = hemispheric_fold(memf, parity="odd")
         mehf = hemispheric_fold(mehf, parity="odd")
         mewvf = hemispheric_fold(mewvf, parity="odd")
+
+        # Compute all four reductions in one shared Dask graph so source chunks
+        # fan out to every required moment before being released.
+        eke, memf, mehf, mewvf = dask_compute(eke, memf, mehf, mewvf)
 
         for j, var in enumerate([eke, memf, mehf, mewvf]):
             if j == 0:
@@ -800,68 +866,47 @@ if should_run_figure(4):
 
     fig.legend(loc='outside lower center', ncol=4)
 
-    figsave.save(fig, "eddy_fluxes", number=4)
+    save_figure(fig, "eddy_fluxes", number=4)
     print("Done with figure: comp_eddy_fluxes")
 
-    # In[ ]:
 
+imerg_ds = None
 imerg_pr = None
 if should_run_any([5, 6]):
     imerg_ds = xr.open_mfdataset(list(sorted(glob.glob('/data/phh1-hosted/cwp29/imerg/*3IMERG.*.nc4')))[:300], concat_dim='time', combine='nested', engine="netcdf4")
 
     imerg_pr = imerg_ds.precipitation.coarsen(lat=5, boundary="trim").mean().coarsen(lon=5, boundary="trim").mean()
 
-    # In[ ]:
 
 
 DISTRIBUTION_TROPICAL_LAT_BOUNDS = (-10.0, 10.0)
 DISTRIBUTION_DOMAIN_STYLES = (("Global", "-"), ("10S-10N", "--"))
 
 
-def global_and_tropical_values(da):
-    """Load a field once and return full-domain and 10S-10N values."""
-    lat_name = "latitude" if "latitude" in da.dims else "lat"
-    values = np.asarray(da.values)
-    lat = np.asarray(da[lat_name].values)
-    lo, hi = DISTRIBUTION_TROPICAL_LAT_BOUNDS
-    tropical = np.compress((lat >= lo) & (lat <= hi), values, axis=da.get_axis_num(lat_name))
-    return values, tropical
-
-
-def relative_frequency(values, bins, value_range, smooth):
-    h, edges = np.histogram(values, bins=bins, range=value_range)
-    h = uniform_filter1d(h.astype(float), size=smooth)
-    scale = h[0] if h[0] > 0 else np.nanmax(h)
-    if not np.isfinite(scale) or scale <= 0:
-        scale = 1.0
-    return 0.5 * (edges[1:] + edges[:-1]), h / scale
-
 if should_run_figure(5):
     # Normalised rainfall intensity distribution
     fig, ax = plt.subplots(1, 3, figsize=(8, 3), constrained_layout=True, sharey=True)
 
-    imerg_values = global_and_tropical_values(imerg_pr)
-    for (domain, linestyle), values in zip(DISTRIBUTION_DOMAIN_STYLES, imerg_values):
-        x, h = relative_frequency(values, bins=300, value_range=(0, 300), smooth=10)
+    imerg_histograms = domain_histograms(
+        imerg_pr, bins=300, value_range=(0, 300),
+        tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
+    )
+    for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, imerg_histograms):
+        x, h = relative_frequency_from_histogram(counts, edges, smooth=10)
         ax[0].plot(x, h, color='k', ls=linestyle, label=f'IMERG (Obs), {domain}')
     ax[0].set_yscale('log')
 
     for s, ds in enumerate(dss):
-        precip_con = ds.rainc + ds.i_rainc*100.
-        precip_res = ds.rainnc + ds.i_rainnc*100.
-        precip = precip_con + precip_res
+        precip, precip_con, precip_res = accumulated_precipitation_components(ds)
 
         for i, precip_var in enumerate([precip, precip_con, precip_res]):
-            if time_format == 'int':
-                precip_rate = precip_var.diff("Time") / (dt / 24.0)
-            else:
-                dt_days = (
-                    precip_var.Time.diff("Time") / np.timedelta64(1, "D")
-                )
-                precip_rate = precip_var.diff("Time") / dt_days
-            domain_values = global_and_tropical_values(precip_rate)
-            for (domain, linestyle), values in zip(DISTRIBUTION_DOMAIN_STYLES, domain_values):
-                x, h = relative_frequency(values, bins=300, value_range=(0, 300), smooth=10)
+            rate = precipitation_rate(precip_var, dt_hours=dt)
+            histograms = domain_histograms(
+                rate, bins=300, value_range=(0, 300),
+                tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
+            )
+            for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, histograms):
+                x, h = relative_frequency_from_histogram(counts, edges, smooth=10)
                 label = f"{sim_names[s]}, {domain}" if i == 0 else None
                 ax[i].plot(x, h, color=cols[s], ls=linestyle, label=label)
             ax[i].set_yscale('log')
@@ -878,58 +923,33 @@ if should_run_figure(5):
     ax[1].set_title("Parameterised")
     ax[2].set_title("Resolved")
 
-    figsave.save(fig, "pr_dist", number=5)
+    save_figure(fig, "pr_dist", number=5)
     print("Done with figure: comp_pr_dist")
 
-    # In[ ]:
-
-def calculate_rain_durations(pr_var, thresh):
-    pr_thresh = np.where(pr_var > thresh, 1, 0)
-
-    durations = []
-
-    for i in range(pr_thresh.shape[1]):
-        for j in range(pr_thresh.shape[2]):
-            timeseries = pr_thresh[:, i, j]
-
-            count = 0
-            for k in range(pr_thresh.shape[0]):
-                if timeseries[k] > 0:
-                    count += 1
-                else:
-                    if count > 0:
-                        durations.append(count)
-                        count = 0
-
-    return durations
 
 if should_run_figure(6):
     fig, ax = plt.subplots(1, 3, figsize=(8, 3), constrained_layout=True, sharey=True)
 
-    imerg_values = global_and_tropical_values(imerg_pr)
-    for (domain, linestyle), values in zip(DISTRIBUTION_DOMAIN_STYLES, imerg_values):
-        durations = calculate_rain_durations(values, 5)
-        x, h = relative_frequency(durations, bins=59, value_range=(1, 60), smooth=5)
+    imerg_histograms = duration_domain_histograms(
+        imerg_pr, threshold=5, bins=59, value_range=(1, 60),
+        tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
+    )
+    for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, imerg_histograms):
+        x, h = relative_frequency_from_histogram(counts, edges, smooth=5)
         ax[0].plot(x, h, color='k', ls=linestyle, label=f'IMERG (Obs), {domain}')
     ax[0].set_yscale('log')
 
     for s, ds in enumerate(dss):
-        precip_con = ds.rainc + ds.i_rainc*100.
-        precip_res = ds.rainnc + ds.i_rainnc*100.
-        precip = precip_con + precip_res
+        precip, precip_con, precip_res = accumulated_precipitation_components(ds)
 
         for i, precip_var in enumerate([precip, precip_con, precip_res]):
-            if time_format == 'int':
-                precip_rate = precip_var.diff("Time") / (dt / 24.0)
-            else:
-                dt_days = (
-                    precip_var.Time.diff("Time") / np.timedelta64(1, "D")
-                )
-                precip_rate = precip_var.diff("Time") / dt_days
-            domain_values = global_and_tropical_values(precip_rate)
-            for (domain, linestyle), values in zip(DISTRIBUTION_DOMAIN_STYLES, domain_values):
-                durations = calculate_rain_durations(values, 5)
-                x, h = relative_frequency(durations, bins=59, value_range=(1, 60), smooth=5)
+            rate = precipitation_rate(precip_var, dt_hours=dt)
+            histograms = duration_domain_histograms(
+                rate, threshold=5, bins=59, value_range=(1, 60),
+                tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
+            )
+            for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, histograms):
+                x, h = relative_frequency_from_histogram(counts, edges, smooth=5)
                 label = f"{sim_names[s]}, {domain}" if i == 0 else None
                 ax[i].plot(x, h, color=cols[s], ls=linestyle, label=label)
             ax[i].set_yscale('log')
@@ -945,10 +965,14 @@ if should_run_figure(6):
     ax[1].set_title("Parameterised")
     ax[2].set_title("Resolved")
 
-    figsave.save(fig, "duration_dist", number=6)
+    save_figure(fig, "duration_dist", number=6)
     print("Done with figure: comp_duration_dist")
 
-    # In[ ]:
+
+if imerg_ds is not None:
+    imerg_ds.close()
+    imerg_ds = None
+    imerg_pr = None
 
 if should_run_figure(7):
     spec_levels = np.linspace(0, 5, 26)
@@ -970,19 +994,19 @@ if should_run_figure(7):
     sym_diff_im = asym_diff_im = None
 
     for d, ds in enumerate(dss):
-        precip = ds.rainc + ds.i_rainc*100. + ds.rainnc + ds.i_rainnc*100.
+        precip, _, _ = accumulated_precipitation_components(ds)
+        rate = precipitation_rate(precip, dt_hours=dt)
 
-        if time_format == 'int':
-            precip_rate = precip.diff("Time") / (dt / 24.0)
-        else:
-            dt_days = (
-                precip.Time.diff("Time") / np.timedelta64(1, "D")
-            )
-            precip_rate = precip.diff("Time") / dt_days
-
-        pr = precip_rate.rename({'latitude':'lat', 'longitude':'lon'})
+        # The spectrum only uses 10S-10N. Subset while the field is lazy so
+        # load() materialises about one ninth of the former global array.
+        pr = rate.sel(
+            latitude=slice(*DISTRIBUTION_TROPICAL_LAT_BOUNDS)
+        ).rename({'latitude':'lat', 'longitude':'lon'})
         pr = pr.load()
-        print(pr)
+        print(
+            f"Loaded tropical precipitation rate for {sim_names[d]}: "
+            f"shape={pr.shape}, dtype={pr.dtype}, size={pr.nbytes / 2**20:.1f} MiB"
+        )
 
         spd = 4
 
@@ -1063,6 +1087,8 @@ if should_run_figure(7):
                 axes[d, 1].annotate('IG', (-5, 0.43), bbox=dict(facecolor='w', edgecolor='k', alpha=0.7))
                 axes[d, 1].annotate('EIG', (11, 0.32), bbox=dict(facecolor='w', edgecolor='k', alpha=0.7))
 
+    del pr, rate, precip
+
     ax[0, 0].set_title('Symmetric')
     ax[0, 1].set_title('Anti-symmetric')
     ax2[0, 0].set_title('Symmetric')
@@ -1071,8 +1097,8 @@ if should_run_figure(7):
     fig.colorbar(sym_spec_im, ax=ax[-1], location='bottom', shrink=0.5, label="Normalised power")
     add_symmetric_colorbar(fig2, sym_diff_im if sym_diff_im is not None else sym_spec_im, ax2[-1], spec_diff_levels, location='bottom', shrink=0.5, label=r"Difference in excess normalised power above 1" )
 
-    figsave.save(fig, "spectra", number=7)
-    figsave.save(fig2, "spectra_diff", number=7)
+    save_figure(fig, "spectra", number=7)
+    save_figure(fig2, "spectra_diff", number=7)
     print("Done with figure: comp_spectra")
 
 # Precip colourmap definition
@@ -1099,7 +1125,7 @@ levels = np.linspace(0.01, 25, len(precip_cols))
 precip_cmap = colors.LinearSegmentedColormap.from_list(name = "precip_rate", colors=precip_cols, N=len(precip_cols))
 precip_norm = colors.BoundaryNorm(boundaries=levels, ncolors=len(precip_cols)-1)
 
-# In[ ]:
+
 
 if should_run_figure(8):
     # Hovmoller diagrams of daily precipitation rate
@@ -1107,16 +1133,10 @@ if should_run_figure(8):
     fig, ax = plt.subplots(1, len(dss), figsize=(8, 3), constrained_layout=True)
 
     for d, ds in enumerate(dss):
-        precip = ds.rainc + ds.i_rainc*100. + ds.rainnc + ds.i_rainnc*100.
+        precip, _, _ = accumulated_precipitation_components(ds)
         precip = precip.sel(latitude=slice(-10, 10)).mean(dim='latitude')
 
-        if time_format == 'int':
-            pr = precip.diff("Time") / (dt / 24.0)
-        else:
-            dt_days = (
-                precip.Time.diff("Time") / np.timedelta64(1, "D")
-            )
-            pr = precip.diff("Time") / dt_days
+        pr = precipitation_rate(precip, dt_hours=dt)
 
         hovmoller_im = ax[d].contourf(precip.longitude, pr.Time, pr.values, levels=levels, norm=precip_norm, cmap=precip_cmap, extend='max')
 
@@ -1131,7 +1151,7 @@ if should_run_figure(8):
     for a in ax:
         a.set_xlabel("Longitude")
 
-    figsave.save(fig, "hovmoller", number=8)
+    save_figure(fig, "hovmoller", number=8)
     print("Done with figure: comp_hovmoller")
 
 if should_run_figure(9):
@@ -1197,7 +1217,7 @@ if should_run_figure(9):
     # one colourbar for the anomaly panels
     add_symmetric_colorbar(fig, im, ax[:, 1], height_anomaly_levels, label='Height anomaly from global mean (km)')
 
-    figsave.save(fig, "zgrid_horizontal_variation", number=9)
+    save_figure(fig, "zgrid_horizontal_variation", number=9)
 
     print("Done with figure: check_zgrid_horizontal_variation")
 
@@ -1265,11 +1285,10 @@ if should_run_figure(10):
     if im3 is not None:
         add_symmetric_colorbar(fig2, im3, ax2[1:], symmetric_levels(0.1, ndiv=11), label='Cloud-fraction difference')
 
-    figsave.save(fig, "cldfrac_latheight", number=10)
-    figsave.save(fig2, "cldfrac_latheight_diff", number=10)
+    save_figure(fig, "cldfrac_latheight", number=10)
+    save_figure(fig2, "cldfrac_latheight_diff", number=10)
     print("Done with figure: comp_cldfrac_latheight")
 
-    # In[ ]:
 
 if should_run_figure(11):
     # Latitude-height section of zonal-mean vorticity
@@ -1281,52 +1300,99 @@ if should_run_figure(11):
         ax = [ax]
         ax2 = [ax2]
 
-    im = im2 = im3 = None
-    control_vort = None
+    vort_plots = {}
+    for i, zds in enumerate(dss_zm):
+        if 'vorticity' not in zds.data_vars:
+            continue
+        vort = zds.vorticity.mean(dim="Time")
+        vort = hemispheric_fold(vort, parity="odd")
+        zmid = height_from_zm_latlon(zds)
+        vort, lat2d, z2d = lat_height_mesh(vort, zmid, zds.latitude.values)
+        vort_plots[i] = (vort, lat2d, z2d)
 
-    for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        if 'vorticity' in zds.data_vars:
-            vort = zds.vorticity.mean(dim="Time")
-            vort = hemispheric_fold(vort, parity="odd")
-            zmid = height_from_zm_latlon(zds)
-            vort, lat2d, z2d = lat_height_mesh(vort, zmid, zds.latitude.values)
-
-            vmax = np.nanmax(np.abs(vort.values))
-            levels = symmetric_levels(vmax, ndiv=19)
-
-            im = ax[i].contourf(lat2d, z2d/1000., vort.values, levels=levels, cmap='coolwarm', extend='both')
-            ax[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
-            annotate_panel_label(ax[i], sim_names[i])
-            set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
-            if i < len(dss)-1:
-                ax[i].tick_params(labelbottom=False)
-
+    control_vort = vort_plots[0][0] if 0 in vort_plots else None
+    vort_diffs = {}
+    if control_vort is not None:
+        for i, (vort, lat2d, z2d) in vort_plots.items():
             if i == 0:
-                control_vort = vort
-                im2 = ax2[i].contourf(lat2d, z2d/1000., vort.values, levels=levels, cmap='coolwarm', extend='both')
-            else:
-                c_vort = control_vort.interp(z=vort.z, latitude=vort.latitude)
-                diff = vort - c_vort
-                dmax = np.nanmax(np.abs(diff.values))
-                dlevels = symmetric_levels(dmax, ndiv=11)
-                im3 = ax2[i].contourf(lat2d, z2d/1000., diff.values, levels=dlevels, cmap=difference_cmap(dlevels), extend='both')
+                continue
+            c_vort = control_vort.interp(z=vort.z, latitude=vort.latitude)
+            vort_diffs[i] = vort - c_vort
 
-            ax2[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
-            annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
-            set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
-            if i < len(dss)-1:
-                ax2[i].tick_params(labelbottom=False)
+    dlevels = (
+        symmetric_contour_levels(list(vort_diffs.values()), ndiv=11)
+        if vort_diffs
+        else symmetric_levels(1.0, ndiv=11)
+    )
+    split_masks = split_tropo_levels = split_strat_levels = None
+    split_diff = False
+    if vort_diffs:
+        split_masks, split_tropo_levels, split_strat_levels, split_diff = (
+            tropopause_split_diff_context(
+                {i: (vort_diffs[i].values, vort_plots[i][2], vort_diffs[i].latitude.values) for i in vort_diffs},
+                {"diff_split_tropopause": True},
+                ndiv=11,
+            )
+        )
+
+    im = im2 = im3 = tropo_im = strat_im = None
+
+    for i, zds in enumerate(dss_zm):
+        if i not in vort_plots:
+            continue
+        vort, lat2d, z2d = vort_plots[i]
+
+        vmax = np.nanmax(np.abs(vort.values))
+        levels = symmetric_levels(vmax, ndiv=19)
+
+        im = ax[i].contourf(
+            lat2d,
+            z2d / 1000.0,
+            vort.values,
+            levels=levels,
+            cmap=difference_cmap(levels),
+            extend='both',
+        )
+        ax[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
+        annotate_panel_label(ax[i], sim_names[i])
+        set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
+        if i < len(dss)-1:
+            ax[i].tick_params(labelbottom=False)
+
+        if i == 0:
+            im2 = ax2[i].contourf(
+                lat2d,
+                z2d / 1000.0,
+                vort.values,
+                levels=levels,
+                cmap=difference_cmap(levels),
+                extend='both',
+            )
+        elif i in vort_diffs:
+            if split_diff:
+                tropo_im, strat_im = contourf_split_difference(
+                    ax2[i], lat2d, z2d/1000., vort_diffs[i].values,
+                    split_masks[i][0], split_tropo_levels, split_strat_levels)
+            else:
+                im3 = ax2[i].contourf(lat2d, z2d/1000., vort_diffs[i].values, levels=dlevels, cmap=difference_cmap(dlevels), extend='both')
+
+        ax2[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
+        annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
+        set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
+        if i < len(dss)-1:
+            ax2[i].tick_params(labelbottom=False)
 
     add_symmetric_colorbar(fig, im, ax, levels, label='Vorticity (s$^{-1}$)')
     fig2.colorbar(im2, ax=ax2[0], location='right', label='Vorticity (s$^{-1}$)')
-    if im3 is not None:
+    if split_diff and tropo_im is not None:
+        add_split_difference_colorbars(fig2, tropo_im, strat_im, ax2[1:], split_tropo_levels, split_strat_levels, label='Vorticity diff. (s$^{-1}$)')
+    elif im3 is not None:
         add_symmetric_colorbar(fig2, im3, ax2[1:], dlevels, label='Vorticity difference (s$^{-1}$)')
 
-    figsave.save(fig, "vorticity_latheight", number=11)
-    figsave.save(fig2, "vorticity_latheight_diff", number=11)
+    save_figure(fig, "vorticity_latheight", number=11)
+    save_figure(fig2, "vorticity_latheight_diff", number=11)
     print("Done with figure: comp_vorticity_latheight")
 
-    # In[ ]:
 
 if should_run_figure(12):
     # Histogram of OLR and time-mean lat/lon maps
@@ -1367,9 +1433,11 @@ if should_run_figure(12):
         ax_profile.plot(olr_zonal_mean.values, olr_zonal_mean.latitude.values,
                         color=olr_cols[i], label=sim_names[i])
 
-        domain_values = global_and_tropical_values(olr)
-        for (domain, linestyle), values in zip(DISTRIBUTION_DOMAIN_STYLES, domain_values):
-            h, b = np.histogram(values, bins=bins)
+        histograms = domain_histograms(
+            olr, bins=bins,
+            tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
+        )
+        for (domain, linestyle), (h, b) in zip(DISTRIBUTION_DOMAIN_STYLES, histograms):
             ax3.plot(
                 0.5 * (b[1:] + b[:-1]),
                 h / h.sum(),
@@ -1454,12 +1522,12 @@ if should_run_figure(12):
             label=r'OLR difference (W m$^{-2}$)',
         )
 
-    figsave.save(fig, "olrtoa_maps", number=12)
-    figsave.save(fig2, "olrtoa_maps_diff", number=12)
-    figsave.save(fig3, "olrtoa_hist", number=12)
+    save_figure(fig, "olrtoa_maps", number=12)
+    save_figure(fig2, "olrtoa_maps_diff", number=12)
+    save_figure(fig3, "olrtoa_hist", number=12)
     print("Done with figure: comp_olrtoa_hist_maps")
 
-    # In[ ]:
+    
 
 if should_run_figure(16):
     # Time-mean latitude-height sections using a shared raw/control-difference layout.
@@ -1566,7 +1634,23 @@ if should_run_figure(16):
                     else symmetric_levels(spec.get("diff_fallback", 1.0), ndiv=10)
                 )
 
-            raw_im = control_im = diff_im = None
+            diff_plots = {}
+            for i, diff in diff_fields.items():
+                diff_plot, diff_lat2d, diff_z2d = lat_height_mesh(
+                    diff, height_from_zm_latlon(dss_zm[i]), diff.latitude.values
+                )
+                diff_plots[i] = (diff_plot.values, diff_z2d, diff.latitude.values, diff_lat2d)
+
+            split_masks = split_tropo_levels = split_strat_levels = None
+            split_diff = False
+            if diff_plots and spec.get("diff_split_tropopause", False):
+                split_masks, split_tropo_levels, split_strat_levels, split_diff = (
+                    tropopause_split_diff_context(
+                        diff_plots, spec, percentile=spec.get("diff_percentile")
+                    )
+                )
+
+            raw_im = control_im = diff_im = tropo_im = strat_im = None
             for i in range(ncols):
                 field = fields_by_sim.get(i)
                 for axes in (ax[row, i], ax2[row, i]):
@@ -1606,16 +1690,26 @@ if should_run_figure(16):
                         extend="both",
                     )
                 else:
-                    diff = diff_fields[i]
-                    diff_plot, diff_lat2d, diff_z2d = lat_height_mesh(diff, zmid, diff.latitude.values)
-                    diff_im = ax2[row, i].contourf(
-                        diff_lat2d,
-                        diff_z2d / 1000.0,
-                        diff_plot.values,
-                        levels=diff_levels,
-                        cmap=difference_cmap(diff_levels),
-                        extend="both",
-                    )
+                    diff_values, diff_z2d, _, diff_lat2d = diff_plots[i]
+                    if split_diff:
+                        tropo_im, strat_im = contourf_split_difference(
+                            ax2[row, i],
+                            diff_lat2d,
+                            diff_z2d / 1000.0,
+                            diff_values,
+                            split_masks[i][0],
+                            split_tropo_levels,
+                            split_strat_levels,
+                        )
+                    else:
+                        diff_im = ax2[row, i].contourf(
+                            diff_lat2d,
+                            diff_z2d / 1000.0,
+                            diff_values,
+                            levels=diff_levels,
+                            cmap=difference_cmap(diff_levels),
+                            extend="both",
+                        )
                 ax2[row, i].plot(dss_zm[i].latitude.values, CPTs[i][0]/1000.0, color="k", lw=1, ls=":")
                 annotate_panel_label(ax2[row, i], control_diff_label(sim_names, i))
 
@@ -1624,7 +1718,17 @@ if should_run_figure(16):
                 fig.colorbar(raw_im, ax=ax[row, :], location="right", label=label)
             if control_im is not None:
                 fig2.colorbar(control_im, ax=ax2[row, 0], location="right", label=label)
-            if diff_im is not None:
+            if split_diff and tropo_im is not None:
+                add_split_difference_colorbars(
+                    fig2,
+                    tropo_im,
+                    strat_im,
+                    ax2[row, 1:],
+                    split_tropo_levels,
+                    split_strat_levels,
+                    label=f"diff. ({spec['units']})",
+                )
+            elif diff_im is not None:
                 add_symmetric_colorbar(
                     fig2,
                     diff_im,
@@ -1633,11 +1737,11 @@ if should_run_figure(16):
                     label=f"{spec['label']} difference ({spec['units']})",
                 )
 
-        figsave.save(fig, group["raw_name"], number=16)
-        figsave.save(fig2, group["diff_name"], number=16)
+        save_figure(fig, group["raw_name"], number=16)
+        save_figure(fig2, group["diff_name"], number=16)
         print(f"Done with figure: comp_{group['raw_name']}")
 
-    # In[ ]:
+    
 
 if should_run_figure(17):
     # Time-mean MSLP lat/lon maps, using the same raw/control-difference layout
@@ -1787,13 +1891,13 @@ if should_run_figure(17):
                 label=f"{spec['label']} difference ({spec['units']})",
             )
 
-        figsave.save(fig, "mslp_maps", number=17)
-        figsave.save(fig2, "mslp_maps_diff", number=17)
+        save_figure(fig, "mslp_maps", number=17)
+        save_figure(fig2, "mslp_maps_diff", number=17)
         print("Done with figure: comp_mslp_maps")
     else:
         print("Skipping MSLP lat/lon maps: control field is missing")
 
-    # In[ ]:
+    
 
 if should_run_figure(18):
     # Time-mean latitude-height sections of MPAS moist scalar constituents.
@@ -1876,7 +1980,19 @@ if should_run_figure(18):
                 else symmetric_levels(spec.get("diff_fallback", 1.0), ndiv=10)
             )
 
-            raw_im = control_im = diff_im = None
+            diff_plots = {}
+            for i, diff in diff_fields.items():
+                diff_lat2d, diff_z2d = meshes_by_sim[i]
+                diff_plots[i] = (diff.values, diff_z2d, diff.latitude.values, diff_lat2d)
+
+            split_masks = split_tropo_levels = split_strat_levels = None
+            split_diff = False
+            if diff_plots and spec.get("diff_split_tropopause", False):
+                split_masks, split_tropo_levels, split_strat_levels, split_diff = (
+                    tropopause_split_diff_context(diff_plots, spec, percentile=99.0)
+                )
+
+            raw_im = control_im = diff_im = tropo_im = strat_im = None
             for i in range(ncols):
                 field = fields_by_sim.get(i)
                 for axes in (ax[row, i], ax2[row, i]):
@@ -1919,14 +2035,25 @@ if should_run_figure(18):
                     )
                 else:
                     diff = diff_fields[i]
-                    diff_im = ax2[row, i].contourf(
-                        lat2d,
-                        z2d / 1000.0,
-                        diff.values,
-                        levels=diff_levels,
-                        cmap=difference_cmap(diff_levels),
-                        extend="both",
-                    )
+                    if split_diff:
+                        tropo_im, strat_im = contourf_split_difference(
+                            ax2[row, i],
+                            lat2d,
+                            z2d / 1000.0,
+                            diff.values,
+                            split_masks[i][0],
+                            split_tropo_levels,
+                            split_strat_levels,
+                        )
+                    else:
+                        diff_im = ax2[row, i].contourf(
+                            lat2d,
+                            z2d / 1000.0,
+                            diff.values,
+                            levels=diff_levels,
+                            cmap=difference_cmap(diff_levels),
+                            extend="both",
+                        )
 
                 ax2[row, i].plot(dss_zm[i].latitude.values, CPTs[i][0]/1000.0, color="k", lw=1, ls=":")
                 annotate_panel_label(ax2[row, i], control_diff_label(sim_names, i))
@@ -1936,7 +2063,17 @@ if should_run_figure(18):
                 fig.colorbar(raw_im, ax=ax[row, :], location="right", label=label)
             if control_im is not None:
                 fig2.colorbar(control_im, ax=ax2[row, 0], location="right", label=label)
-            if diff_im is not None:
+            if split_diff and tropo_im is not None:
+                add_split_difference_colorbars(
+                    fig2,
+                    tropo_im,
+                    strat_im,
+                    ax2[row, 1:],
+                    split_tropo_levels,
+                    split_strat_levels,
+                    label=f"diff. ({spec['units']})",
+                )
+            elif diff_im is not None:
                 add_symmetric_colorbar(
                     fig2,
                     diff_im,
@@ -1947,11 +2084,11 @@ if should_run_figure(18):
 
         fig.suptitle(group["title"])
         fig2.suptitle(f"{group['title']} differences")
-        figsave.save(fig, f"scalar_constituents_{group['name']}_latheight", number=18)
-        figsave.save(fig2, f"scalar_constituents_{group['name']}_latheight_diff", number=18)
+        save_figure(fig, f"scalar_constituents_{group['name']}_latheight", number=18)
+        save_figure(fig2, f"scalar_constituents_{group['name']}_latheight_diff", number=18)
         print(f"Done with figure: comp_scalar_constituents_{group['name']}_latheight")
 
-    # In[ ]:
+    
 
 if should_run_figure(13):
     # Latitude-height section of zonal-mean kinetic energy
@@ -1963,48 +2100,80 @@ if should_run_figure(13):
         ax = [ax]
         ax2 = [ax2]
 
-    im = im2 = im3 = None
-    control_ke = None
+    ke_plots = {}
+    for i, zds in enumerate(dss_zm):
+        if 'ke' not in zds.data_vars:
+            continue
+        ke = zds.ke.mean(dim="Time")
+        ke = hemispheric_fold(ke, parity="even")
+        zmid = height_from_zm_latlon(zds)
+        ke, lat2d, z2d = lat_height_mesh(ke, zmid, zds.latitude.values)
+        ke_plots[i] = (ke, lat2d, z2d)
 
-    for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        if 'ke' in zds.data_vars:
-            ke = zds.ke.mean(dim="Time")
-            ke = hemispheric_fold(ke, parity="even")
-            zmid = height_from_zm_latlon(zds)
-            ke, lat2d, z2d = lat_height_mesh(ke, zmid, zds.latitude.values)
-
-            ke_levels = positive_levels(np.nanmax(ke.values), n=21)
-            im = ax[i].contourf(lat2d, z2d/1000., ke.values, levels=ke_levels, cmap='YlGnBu', extend='max')
-            ax[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
-            annotate_panel_label(ax[i], sim_names[i])
-            set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
-            if i < len(dss)-1:
-                ax[i].tick_params(labelbottom=False)
-
+    control_ke = ke_plots[0][0] if 0 in ke_plots else None
+    ke_diffs = {}
+    if control_ke is not None:
+        for i, (ke, lat2d, z2d) in ke_plots.items():
             if i == 0:
-                control_ke = ke
-                im2 = ax2[i].contourf(lat2d, z2d/1000., ke.values, levels=ke_levels, cmap='YlGnBu', extend='max')
-            else:
-                c_ke = control_ke.interp(z=ke.z, latitude=ke.latitude)
-                ke_diff_levels = symmetric_levels(100.0, ndiv=11)
-                im3 = ax2[i].contourf(lat2d, z2d/1000., (ke - c_ke).values, levels=ke_diff_levels, cmap=difference_cmap(ke_diff_levels), extend='both')
+                continue
+            c_ke = control_ke.interp(z=ke.z, latitude=ke.latitude)
+            ke_diffs[i] = ke - c_ke
 
-            ax2[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
-            annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
-            set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
-            if i < len(dss)-1:
-                ax2[i].tick_params(labelbottom=False)
+    ke_diff_levels = symmetric_levels(100.0, ndiv=11)
+    split_masks = split_tropo_levels = split_strat_levels = None
+    split_diff = False
+    if ke_diffs:
+        split_masks, split_tropo_levels, split_strat_levels, split_diff = (
+            tropopause_split_diff_context(
+                {i: (ke_diffs[i].values, ke_plots[i][2], ke_diffs[i].latitude.values) for i in ke_diffs},
+                {"diff_split_tropopause": True, "diff_fallback": 100.0},
+                ndiv=11,
+            )
+        )
+
+    im = im2 = im3 = tropo_im = strat_im = None
+
+    for i, zds in enumerate(dss_zm):
+        if i not in ke_plots:
+            continue
+        ke, lat2d, z2d = ke_plots[i]
+
+        ke_levels = positive_levels(np.nanmax(ke.values), n=21)
+        im = ax[i].contourf(lat2d, z2d/1000., ke.values, levels=ke_levels, cmap='YlGnBu', extend='max')
+        ax[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
+        annotate_panel_label(ax[i], sim_names[i])
+        set_latheight_labels(ax[i], xlabel=(i == len(dss)-1))
+        if i < len(dss)-1:
+            ax[i].tick_params(labelbottom=False)
+
+        if i == 0:
+            im2 = ax2[i].contourf(lat2d, z2d/1000., ke.values, levels=ke_levels, cmap='YlGnBu', extend='max')
+        elif i in ke_diffs:
+            if split_diff:
+                tropo_im, strat_im = contourf_split_difference(
+                    ax2[i], lat2d, z2d/1000., ke_diffs[i].values,
+                    split_masks[i][0], split_tropo_levels, split_strat_levels)
+            else:
+                im3 = ax2[i].contourf(lat2d, z2d/1000., ke_diffs[i].values, levels=ke_diff_levels, cmap=difference_cmap(ke_diff_levels), extend='both')
+
+        ax2[i].plot(zds.latitude.values, CPTs[i][0]/1000., color='k', lw=1, ls=':')
+        annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
+        set_latheight_labels(ax2[i], xlabel=(i == len(dss)-1))
+        if i < len(dss)-1:
+            ax2[i].tick_params(labelbottom=False)
 
     fig.colorbar(im, ax=ax, location='right', label=r'Kinetic energy (m$^2$ s$^{-2}$)')
     fig2.colorbar(im2, ax=ax2[0], location='right', label=r'Kinetic energy (m$^2$ s$^{-2}$)')
-    if im3 is not None:
-        add_symmetric_colorbar(fig2, im3, ax2[1:], symmetric_levels(100.0, ndiv=11), label=r'KE difference (m$^2$ s$^{-2}$)')
+    if split_diff and tropo_im is not None:
+        add_split_difference_colorbars(fig2, tropo_im, strat_im, ax2[1:], split_tropo_levels, split_strat_levels, label=r'KE difference (m$^2$ s$^{-2}$)')
+    elif im3 is not None:
+        add_symmetric_colorbar(fig2, im3, ax2[1:], ke_diff_levels, label=r'KE difference (m$^2$ s$^{-2}$)')
 
-    figsave.save(fig, "ke_latheight", number=13)
-    figsave.save(fig2, "ke_latheight_diff", number=13)
+    save_figure(fig, "ke_latheight", number=13)
+    save_figure(fig2, "ke_latheight_diff", number=13)
     print("Done with figure: comp_ke_latheight")
 
-    # In[ ]:
+    
 
 # Latitude-pressure section of isobaric eddy kinetic energy
 
@@ -2030,16 +2199,39 @@ if should_run_figure(14):
 
         eke_fields = [eke for _, eke in eke_entries]
         eke_levels = positive_contour_levels(eke_fields)
-        diff_fields = []
+        diff_by_sim = {}
         control_index, control_eke = eke_entries[0]
 
-        for _, eke in eke_entries[1:]:
+        for i, eke in eke_entries[1:]:
             c_eke = control_eke.interp(pres=eke.pres, latitude=eke.latitude)
-            diff_fields.append(eke - c_eke)
+            diff_by_sim[i] = eke - c_eke
 
-        diff_levels = symmetric_contour_levels(diff_fields, ndiv=11) if diff_fields else symmetric_levels(1.0, ndiv=11)
+        diff_levels = (
+            symmetric_contour_levels(list(diff_by_sim.values()), ndiv=11)
+            if diff_by_sim
+            else symmetric_levels(1.0, ndiv=11)
+        )
 
-        im = im2 = im3 = None
+        diff_masks = {}
+        for i, diff in diff_by_sim.items():
+            pres2d = np.broadcast_to(diff.pres.values[:, None], diff.shape)
+            cpt_hpa = tropopause_on_latitudes(
+                CPTs[i][1] / 100.0, dss_zm[i].latitude.values, diff.latitude.values
+            )
+            diff_masks[i] = tropopause_region_masks(pres2d, cpt_hpa, coord="pressure")
+
+        split_tropo_levels = split_strat_levels = None
+        split_diff = False
+        if diff_by_sim:
+            split_tropo_levels = region_symmetric_levels(
+                [(diff_by_sim[i].values, diff_masks[i][0]) for i in diff_by_sim], ndiv=11
+            )
+            split_strat_levels = region_symmetric_levels(
+                [(diff_by_sim[i].values, diff_masks[i][1]) for i in diff_by_sim], ndiv=11
+            )
+            split_diff = split_scales_warranted(split_tropo_levels, split_strat_levels)
+
+        im = im2 = im3 = tropo_im = strat_im = None
 
         for row, (i, eke) in enumerate(eke_entries):
             im = ax[row].contourf(
@@ -2066,16 +2258,20 @@ if should_run_figure(14):
                     extend="max"
                 )
             else:
-                c_eke = control_eke.interp(pres=eke.pres, latitude=eke.latitude)
-                diff = eke - c_eke
-                im3 = ax2[row].contourf(
-                    eke.latitude.values,
-                    eke.pres.values,
-                    diff.values,
-                    levels=diff_levels,
-                    cmap=difference_cmap(diff_levels),
-                    extend="both"
-                )
+                diff = diff_by_sim[i]
+                if split_diff:
+                    tropo_im, strat_im = contourf_split_difference(
+                        ax2[row], eke.latitude.values, eke.pres.values, diff.values,
+                        diff_masks[i][0], split_tropo_levels, split_strat_levels)
+                else:
+                    im3 = ax2[row].contourf(
+                        eke.latitude.values,
+                        eke.pres.values,
+                        diff.values,
+                        levels=diff_levels,
+                        cmap=difference_cmap(diff_levels),
+                        extend="both"
+                    )
 
             ax2[row].plot(dss[i].latitude.values, CPTs[i][1]/100., color="k", lw=1, ls=":")
             annotate_panel_label(ax2[row], control_diff_label(sim_names, i, control=control_index))
@@ -2085,11 +2281,13 @@ if should_run_figure(14):
 
         fig.colorbar(im, ax=ax, location="right", label=r"Eddy kinetic energy (m$^2$ s$^{-2}$)")
         fig2.colorbar(im2, ax=ax2[0], location="right", label=r"Eddy kinetic energy (m$^2$ s$^{-2}$)")
-        if im3 is not None:
+        if split_diff and tropo_im is not None:
+            add_split_difference_colorbars(fig2, tropo_im, strat_im, ax2[1:], split_tropo_levels, split_strat_levels, label=r"EKE difference (m$^2$ s$^{-2}$)")
+        elif im3 is not None:
             add_symmetric_colorbar(fig2, im3, ax2[1:], diff_levels, label=r"EKE difference (m$^2$ s$^{-2}$)")
 
-        figsave.save(fig, "eke_latpres", number=14)
-        figsave.save(fig2, "eke_latpres_diff", number=14)
+        save_figure(fig, "eke_latpres", number=14)
+        save_figure(fig2, "eke_latpres_diff", number=14)
         print("Done with figure: comp_eke_latpres")
     else:
         print("Skipping EKE latitude-pressure plot: no simulations had the required winds")

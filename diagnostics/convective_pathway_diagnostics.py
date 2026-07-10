@@ -212,27 +212,6 @@ def progress(message):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
 
 
-def write_dataset_with_progress(ds, path, label, encoding=None):
-    """Write a NetCDF file through a temporary path with optional dask progress."""
-    progress(f"{label}: writing {path}")
-    tmp_path = path + ".tmp"
-    progress_bar = None
-    if dask is not None:
-        try:
-            from dask.diagnostics import ProgressBar
-            progress_bar = ProgressBar()
-        except Exception:
-            progress_bar = None
-
-    if progress_bar is None:
-        ds.to_netcdf(tmp_path, encoding=encoding)
-    else:
-        with progress_bar:
-            ds.to_netcdf(tmp_path, encoding=encoding)
-    os.replace(tmp_path, path)
-    progress(f"{label}: finished writing {path}")
-
-
 # -----------------------------------------------------------------------------
 # General helpers
 # -----------------------------------------------------------------------------
@@ -649,25 +628,6 @@ def pooled_weighted_bins(field_dicts, key, nbins, lat_bounds=TROPICAL_LAT_BOUNDS
     q = np.linspace(0.01, 0.99, nbins + 1)
     edges = weighted_quantile(vals, q, weights)
     return unique_monotonic_bins(edges, fallback=fallback_bins_for_key(key, vals, nbins))
-
-
-def pooled_tercile_edges(field_dicts, key, lat_bounds=TROPICAL_LAT_BOUNDS, limits=PLOT_SAMPLE_LIMITS):
-    vals_all = []
-    weights_all = []
-    for fields in field_dicts:
-        if key not in fields:
-            continue
-        vals, weights = sample_matching_arrays(fields[key], lat_bounds=lat_bounds, **limits)
-        vals_all.append(vals[0])
-        weights_all.append(weights)
-    if not vals_all:
-        return None
-    vals = np.concatenate(vals_all)
-    weights = np.concatenate(weights_all)
-    q = weighted_quantile(vals, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0], weights)
-    q[0] = np.nanmin(vals)
-    q[-1] = np.nanmax(vals)
-    return unique_monotonic_bins(q)
 
 
 def pooled_classified_values(field_dicts, classifications, key, lat_bounds=TROPICAL_LAT_BOUNDS, limits=PLOT_SAMPLE_LIMITS):
@@ -1412,16 +1372,6 @@ def feature_arrays(fields, feature_keys):
         else:
             arrays.append(fields[key])
     return arrays
-
-
-def feature_matrix_from_values(feature_keys, values):
-    cols_out = []
-    for key, val in zip(feature_keys, values):
-        if key == "precip_log":
-            cols_out.append(np.log1p(np.maximum(val, 0.0)))
-        else:
-            cols_out.append(val)
-    return np.column_stack(cols_out)
 
 
 def residual_target_da(classif, target_key):

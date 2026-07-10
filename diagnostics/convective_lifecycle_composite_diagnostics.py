@@ -2,11 +2,13 @@
 # coding: utf-8
 
 """
-Convective lifecycle composites centred on tracked convective-precipitating onset.
+Convective lifecycle composites centred on tracked organised convective systems.
 
 This diagnostic requires the PyFLEXTRKR output generated from the shared
-convective-precipitating high-cloud mask. Its event set is the first appearance
-of those tracked deep-convection objects.
+organised convective-system envelope product. Its event set is the first
+accepted appearance of those envelope tracks, while embedded
+convective/stratiform/non-precipitating high-cloud fractions remain composite
+diagnostics sampled inside and around the tracked systems.
 
 # WHAT TO LOOK FOR:
 #   * In the lag-longitude Hovmollers, a moisture signal that peaks earlier or
@@ -20,6 +22,7 @@ of those tracked deep-convection objects.
 """
 
 import glob
+import gc
 import hashlib
 import json
 import os
@@ -40,7 +43,7 @@ import dask
 import numpy as np
 import pandas as pd
 import xarray as xr
-from matplotlib import colors, pyplot as plt
+from matplotlib import pyplot as plt
 
 from diagnostic_helpers import *
 from high_cloud_classification import (
@@ -54,13 +57,23 @@ from equatorial_wave_config import (
     WAVE_VARIABILITY_FIELDS,
 )
 from pyflextrkr_contract import (
+    MIN_ORGANISED_TRACK_DURATION_HOURS,
+    MIN_ORGANISED_TRACK_OBSERVATIONS,
+    ORGANISED_ENVELOPE_MIN_RAW_AREA_KM2,
+    ORGANISED_TRACK_ACCEPTANCE_CRITERIA,
+    ORGANISED_TRACK_EMBEDDED_CORE_REQUIREMENT,
+    ORGANISED_TRACK_OBJECT_GEOMETRY,
     PRIMARY_ANALYSIS_ROLE,
+    PRIMARY_TRACK_SOURCE,
     PYFLEXTRKR_PRODUCT_VERSION,
     epoch_seconds,
+    manifest_accepted_mask,
     product_fingerprint,
     read_product_metadata,
+    read_track_manifest,
     sha256_file,
     time_signature,
+    track_manifest_path,
 )
 
 try:
@@ -87,13 +100,10 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/convective_l
 #
 # Figure numbers:
 #   1: lifecycle Hovmoller composites
-#   2: mechanistic fingerprint summary panels
-#   3: difference-lifecycle fingerprints
-#   4: event-centred spatial composites
-#   5: wave-filtered fields following tracked convective objects
-#   6: track-property lifecycle statistics
-#   7: mechanistic synthesis figure
-#   8: cloud-top-pressure lifecycle validation
+#   2: difference-lifecycle fingerprints
+#   3: event-centred spatial composites
+#   4: wave-filtered fields following tracked organised-system centres
+#   5: track-property lifecycle statistics
 figures_to_run = []
 figsave = None
 
@@ -132,19 +142,13 @@ SPATIAL_REL_LON_GRID = np.arange(-50.0, 50.0 + 1.0e-6, 2.0)
 SPATIAL_REL_LAT_GRID = np.arange(-20.0, 20.0 + 1.0e-6, 2.0)
 SPATIAL_LAGS_DAYS = [-2.0, -1.0, 0.0, 1.0, 2.0]
 
-# Event and object filters.  The defaults are deliberately simple so threshold
-# sensitivity can be changed near the top of the file.
-EVENT_SET = "convective"
-PRIMARY_TRACK_SOURCE = "convective_precipitating_high_cloud_mask"
+# Lifecycle event selection. The organiser diagnostic owns track acceptance;
+# this script only keeps the tropical events relevant to wave-coupling
+# composites. Object-size diversity is shown in track-property diagnostics,
+# not by branching the main composite definition.
 MIN_EVENT_LIFETIME_HOURS = 18.0
-MIN_EVENT_AREA_KM2 = 800.0
-MIN_EVENT_MAX_PRECIP_MM_DAY = 5.0
-MIN_EVENT_SEPARATION_HOURS = 24.0
-MIN_EVENT_SEPARATION_KM = 1200.0
 MAX_EVENTS_PER_RUN = None
 
-PRECIP_ONSET_THRESHOLD_MM_DAY = 24.0  # 1 mm h-1
-DEEP_PRECIP_THRESHOLD_MM_DAY = 5.0
 MIN_OBJECT_CELLS = 1
 MIN_OBJECT_AREA_KM2 = 0.0
 
@@ -236,17 +240,14 @@ def should_run_figure(number):
     return figure_should_run(figures_to_run, number)
 
 
-def should_run_any(numbers):
-    return figure_should_run_any(figures_to_run, numbers)
-
-
 # -----------------------------------------------------------------------------
 # Store-backed derived-product caches
 # -----------------------------------------------------------------------------
 
-TRACK_EVENT_CACHE_VERSION = "lifecycle_track_events_v4_exact_pyflextrkr_contract"
-COMPOSITE_CACHE_VERSION = "lifecycle_composites_v3_track_following_core_waves"
+TRACK_EVENT_CACHE_VERSION = "lifecycle_track_events_v5_organised_manifest"
+COMPOSITE_CACHE_VERSION = "lifecycle_composites_v5_lazy_fields_lat_subset"
 TRACK_PROPERTY_CACHE_VERSION = "lifecycle_track_properties_v3_nonprecipitating"
+ANOMALY_BASELINE_CACHE_VERSION = "lifecycle_anomaly_baseline_v1"
 
 PYFLEXTRKR_PRODUCT_FINGERPRINTS = {}
 
@@ -293,16 +294,13 @@ def object_filter_signature(source_name):
     signature = base_cache_signature()
     signature.update(
         source_name=source_name,
-        event_set=EVENT_SET,
         event_lat_bounds=list(EVENT_LAT_BOUNDS),
         min_event_lifetime_hours=float(MIN_EVENT_LIFETIME_HOURS),
-        min_event_area_km2=float(MIN_EVENT_AREA_KM2),
-        min_event_max_precip_mm_day=float(MIN_EVENT_MAX_PRECIP_MM_DAY),
-        min_event_separation_hours=float(MIN_EVENT_SEPARATION_HOURS),
-        min_event_separation_km=float(MIN_EVENT_SEPARATION_KM),
+        lifecycle_event_selection=(
+            "first accepted tropical organised-system track observation; "
+            "no area, precip, or separation filter"
+        ),
         max_events_per_run=jsonable_value(MAX_EVENTS_PER_RUN),
-        precip_onset_threshold_mm_day=float(PRECIP_ONSET_THRESHOLD_MM_DAY),
-        deep_precip_threshold_mm_day=float(DEEP_PRECIP_THRESHOLD_MM_DAY),
         cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
         min_object_cells=int(MIN_OBJECT_CELLS),
         min_object_area_km2=float(MIN_OBJECT_AREA_KM2),
@@ -334,7 +332,10 @@ def composite_cache_signature(source_name, spec_keys, include_spatial):
         lifecycle_wave_names=list(LIFECYCLE_WAVE_NAMES),
         lifecycle_wave_fields=list(LIFECYCLE_WAVE_FIELDS),
         wave_boxes={name: jsonable_value(WAVE_BOXES[name]) for name in LIFECYCLE_WAVE_NAMES},
+        composite_weighting="event_equal",
         track_centering="tracked_centroid_with_endpoint_clamping_v1",
+        composite_field_lat_bounds=jsonable_value(COMPOSITE_FIELD_LAT_BOUNDS),
+        anomaly_baseline_cache_version=ANOMALY_BASELINE_CACHE_VERSION,
     )
     return signature
 
@@ -523,6 +524,7 @@ def spatial_composite_expected(var, include_spatial):
     return include_spatial and var in (
         "precip",
         "pw_anom",
+        "convective_precipitating",
         "stratiform_precipitating",
         "nonprecipitating",
         "cloud_top_pressure",
@@ -632,37 +634,6 @@ def load_cached_composites(source_name, spec_keys, include_spatial):
     return composites, spatial_products
 
 
-def write_composite_cache(source_name, spec_keys, include_spatial, composites, spatial_products):
-    event_counts = {}
-    available_specs_by_sim = {}
-    cache_token = composite_cache_token(source_name, spec_keys, include_spatial)
-    for sim in sim_names:
-        event_counts[sim] = int(composites.get(sim, {}).get("event_count", 0))
-        available_specs_by_sim[sim] = [
-            var
-            for var in spec_keys
-            if var in composites.get(sim, {}) and isinstance(composites[sim].get(var), dict)
-        ]
-        for var in spec_keys:
-            product = composites.get(sim, {}).get(var)
-            if product is None:
-                continue
-            write_composite_product_cache(
-                sim,
-                var,
-                product,
-                spatial_products.get(sim, {}).get(var, {}),
-                cache_token,
-            )
-    write_composite_cache_manifest(
-        source_name,
-        spec_keys,
-        include_spatial,
-        event_counts,
-        available_specs_by_sim,
-    )
-
-
 def track_property_cache_files():
     return {
         "metadata": "lifecycle_track_property_cache_metadata.json",
@@ -741,13 +712,6 @@ def get_precip_rate(ds):
     pr.name = "precip"
     pr.attrs["units"] = "mm day-1"
     return pr
-
-
-def weighted_lat_mean(da, lat_bounds=TROPICAL_LAT_BOUNDS):
-    x = subset_lat(da, lat_bounds=lat_bounds)
-    if "latitude" not in x.dims:
-        return x
-    return x.weighted(np.cos(np.deg2rad(x.latitude))).mean(dim="latitude", skipna=True)
 
 
 def weighted_tropical_mean(da, lat_bounds=TROPICAL_LAT_BOUNDS):
@@ -1115,8 +1079,11 @@ def object_properties_from_labels(labels, lat, lon, area2d, field_slices=None):
                 row[f"mean_{key}"] = float(np.average(v[ok], weights=w))
                 row[f"max_{key}"] = float(np.nanmax(v))
                 row[f"min_{key}"] = float(np.nanmin(v))
+                row[f"area_integral_{key}"] = float(np.nansum(v[ok] * w))
                 if key.endswith("_mask") or key == "stratiform_precipitating":
-                    row[f"frac_{key}"] = float(np.average(v[ok] > 0.5, weights=w))
+                    present = v[ok] > 0.5
+                    row[f"frac_{key}"] = float(np.average(present, weights=w))
+                    row[f"area_{key}_km2"] = float(np.nansum(w[present]))
             else:
                 row[f"mean_{key}"] = np.nan
                 row[f"max_{key}"] = np.nan
@@ -1132,13 +1099,12 @@ def chararray_to_strings(array):
 
 
 def find_pyflextrkr_work_path(source_name, sim_name):
+    if source_name != PRIMARY_TRACK_SOURCE:
+        raise ValueError(
+            f"Lifecycle composites require {PRIMARY_TRACK_SOURCE!r}, got {source_name!r}"
+        )
     safe_sim = sim_name.replace(" ", "_").replace("/", "_")
-    if source_name.endswith("_high_cloud_mask") or source_name == "high_cloud_mask":
-        # Cloud-track directories are classification-versioned by the
-        # organisation diagnostic. Never fall back to unversioned tracks.
-        source_candidates = [f"{source_name}_{CLASSIFICATION_CACHE_VERSION}"]
-    else:
-        source_candidates = [source_name]
+    source_candidates = [f"{source_name}_{CLASSIFICATION_CACHE_VERSION}"]
     candidates = []
     for root in PYFLEXTRKR_SEARCH_ROOTS:
         for source_candidate in source_candidates:
@@ -1179,6 +1145,12 @@ def validate_pyflextrkr_product(source_name, sim_name, fields):
         simulation=sim_name,
         analysis_role=PRIMARY_ANALYSIS_ROLE,
         classification_cache_version=CLASSIFICATION_CACHE_VERSION,
+        min_track_observations=MIN_ORGANISED_TRACK_OBSERVATIONS,
+        min_track_duration_hours=MIN_ORGANISED_TRACK_DURATION_HOURS,
+        track_acceptance_criteria=ORGANISED_TRACK_ACCEPTANCE_CRITERIA,
+        embedded_convective_core_requirement=ORGANISED_TRACK_EMBEDDED_CORE_REQUIREMENT,
+        object_geometry=ORGANISED_TRACK_OBJECT_GEOMETRY,
+        envelope_min_raw_area_km2=ORGANISED_ENVELOPE_MIN_RAW_AREA_KM2,
         **time_signature(fields["precip"].Time.values),
     )
     changed = [key for key, value in expected.items() if metadata.get(key) != value]
@@ -1199,6 +1171,56 @@ def validate_pyflextrkr_product(source_name, sim_name, fields):
     if metadata.get("tracknumbers_sha256") != sha256_file(tracknumbers_path):
         raise RuntimeError(
             f"{sim_name}: PyFLEXTRKR track-number checksum mismatch: {tracknumbers_path}"
+        )
+    manifest_path = track_manifest_path(work_path)
+    manifest = read_track_manifest(work_path)
+    if manifest is None:
+        raise RuntimeError(
+            f"{sim_name}: required organised-track manifest is missing: {manifest_path}"
+        )
+    if metadata.get("track_manifest_sha256") != sha256_file(manifest_path):
+        raise RuntimeError(
+            f"{sim_name}: organised-track manifest checksum mismatch: {manifest_path}"
+        )
+    required_manifest_columns = {
+        "source", "simulation", "track_id", "accepted", "rejection_reason",
+        "observation_count", "sampling_support_hours", "max_area_km2",
+        "has_embedded_convective_core", "max_embedded_convective_core_area_km2",
+        "max_embedded_convective_core_fraction", "max_abs_centroid_lat",
+        "max_translation_speed_kmh",
+    }
+    missing_manifest_columns = required_manifest_columns - set(manifest.columns)
+    if missing_manifest_columns:
+        raise RuntimeError(
+            f"{sim_name}: organised-track manifest lacks columns "
+            f"{sorted(missing_manifest_columns)}: {manifest_path}"
+        )
+    if set(manifest.source.astype(str)) != {source_name} or set(
+        manifest.simulation.astype(str)
+    ) != {sim_name}:
+        raise RuntimeError(
+            f"{sim_name}: organised-track manifest source/simulation mismatch: "
+            f"{manifest_path}"
+        )
+    if manifest.track_id.duplicated().any():
+        raise RuntimeError(f"{sim_name}: duplicate track IDs in {manifest_path}")
+    accepted_mask = manifest_accepted_mask(manifest)
+    accepted_manifest = manifest[accepted_mask]
+    if (
+        (accepted_manifest.observation_count < MIN_ORGANISED_TRACK_OBSERVATIONS).any()
+        or (
+            accepted_manifest.sampling_support_hours
+            < MIN_ORGANISED_TRACK_DURATION_HOURS
+        ).any()
+        or (~accepted_manifest.has_embedded_convective_core.astype(bool)).any()
+    ):
+        raise RuntimeError(
+            f"{sim_name}: organised-track manifest contains accepted tracks that "
+            "violate duration/core constraints"
+        )
+    if metadata.get("accepted_track_count") != int(accepted_mask.sum()):
+        raise RuntimeError(
+            f"{sim_name}: accepted-track count disagrees with product metadata"
         )
     expected_basetimes = epoch_seconds(fields["precip"].Time.values)
     with xr.open_dataset(
@@ -1230,12 +1252,15 @@ def validate_pyflextrkr_product(source_name, sim_name, fields):
             f"expected {expected_basetimes.size}"
         )
     PYFLEXTRKR_PRODUCT_FINGERPRINTS[sim_name] = metadata["product_fingerprint"]
-    return work_path, tracknumbers_path, metadata
+    return work_path, tracknumbers_path, metadata, manifest
 
 
 def load_pyflextrkr_objects(source_name, sim_name, fields):
-    work_path, tracknumbers_path, _ = validate_pyflextrkr_product(
+    work_path, tracknumbers_path, _, manifest = validate_pyflextrkr_product(
         source_name, sim_name, fields
+    )
+    accepted_ids = set(
+        manifest.loc[manifest_accepted_mask(manifest), "track_id"].to_numpy(dtype=int)
     )
     progress(f"{sim_name}: reading PyFLEXTRKR track links for {source_name}: {tracknumbers_path}")
     ds_track = xr.open_dataset(tracknumbers_path, mask_and_scale=False, decode_times=False, concat_characters=True)
@@ -1321,7 +1346,7 @@ def load_pyflextrkr_objects(source_name, sim_name, fields):
             if label_index < 0 or label_index >= track_numbers.shape[1]:
                 continue
             track_id = int(track_numbers[it, label_index])
-            if track_id <= 0:
+            if track_id <= 0 or track_id not in accepted_ids:
                 continue
             rows.append(
                 dict(
@@ -1340,6 +1365,15 @@ def load_pyflextrkr_objects(source_name, sim_name, fields):
             )
 
     objects_df = pd.DataFrame(rows)
+    if len(objects_df):
+        objects_df = (
+            objects_df.sort_values(
+                ["track_id", "time_index", "area_km2"],
+                ascending=[True, True, False],
+            )
+            .drop_duplicates(["track_id", "time_index"])
+            .reset_index(drop=True)
+        )
     track_time, tracks_df = summarise_tracks(objects_df)
     return objects_df, track_time, tracks_df
 
@@ -1368,6 +1402,10 @@ def summarise_tracks(objects_df):
             agg[col] = (col, "min")
         elif col.startswith("frac_"):
             agg[col] = (col, "mean")
+        elif col.startswith("area_"):
+            agg[col] = (col, "sum")
+        elif col.startswith("area_integral_"):
+            agg[col] = (col, "sum")
 
     track_time = (
         objects_df
@@ -1375,6 +1413,13 @@ def summarise_tracks(objects_df):
         .agg(**agg)
         .sort_values(["source", "simulation", "track_id", "time_index"])
     )
+    if {"area_integral_precip", "area_km2"}.issubset(track_time.columns):
+        track_time["mean_precip"] = np.where(
+            track_time.area_km2.to_numpy(dtype=float) > 0.0,
+            track_time.area_integral_precip.to_numpy(dtype=float)
+            / track_time.area_km2.to_numpy(dtype=float),
+            np.nan,
+        )
 
     speed_values = np.full(len(track_time), np.nan)
     for _, idx in track_time.groupby(["source", "simulation", "track_id"]).groups.items():
@@ -1415,6 +1460,13 @@ def summarise_tracks(objects_df):
             max_propagation_speed_kmh=float(group.propagation_speed_kmh.max(skipna=True)),
             tracking_method=group.tracking_method.iloc[0],
         )
+        if "area_integral_precip" in group:
+            row["precip_volume_proxy_km2_mm"] = float(
+                (group.area_integral_precip * group.dt_hours / 24.0).sum(skipna=True)
+            )
+            row["max_precip_volume_rate_proxy_km2_mm_day"] = float(
+                group.area_integral_precip.max(skipna=True)
+            )
         for key in ("precip", "cloud_top_pressure", "cloud_top_height", "high_cloud_fraction", "pw"):
             if f"max_{key}" in group:
                 row[f"max_{key}"] = float(group[f"max_{key}"].max(skipna=True))
@@ -1435,26 +1487,6 @@ def build_track_tables_for_source(source_name, fields, sim_name):
     return load_pyflextrkr_objects(source_name, sim_name, fields)
 
 
-def filter_separated_events(candidates):
-    if len(candidates) == 0:
-        return candidates
-    candidates = candidates.sort_values(["time_days", "max_precip", "max_area_km2"], ascending=[True, False, False])
-    kept = []
-    for row in candidates.to_dict("records"):
-        too_close = False
-        for prev in kept:
-            dt_hours_i = abs(row["time_days"] - prev["time_days"]) * 24.0
-            if dt_hours_i > MIN_EVENT_SEPARATION_HOURS:
-                continue
-            dist = float(haversine_distances_km(row["centroid_lat"], row["centroid_lon"], prev["centroid_lat"], prev["centroid_lon"]))
-            if dist <= MIN_EVENT_SEPARATION_KM:
-                too_close = True
-                break
-        if not too_close:
-            kept.append(row)
-    return pd.DataFrame(kept)
-
-
 def select_onset_events(track_time, tracks_df, source_name, sim_name):
     if len(track_time) == 0 or len(tracks_df) == 0:
         return pd.DataFrame()
@@ -1462,7 +1494,18 @@ def select_onset_events(track_time, tracks_df, source_name, sim_name):
         tracks_df[[
             "source", "simulation", "track_id", "lifetime_hours", "max_area_km2",
             "mean_propagation_speed_kmh", "tracking_method"
-        ] + [c for c in ("max_precip", "min_cloud_top_pressure", "max_cloud_top_height", "max_high_cloud_fraction") if c in tracks_df.columns]],
+        ] + [
+            c for c in (
+                "max_precip",
+                "mean_precip",
+                "precip_volume_proxy_km2_mm",
+                "max_precip_volume_rate_proxy_km2_mm_day",
+                "min_cloud_top_pressure",
+                "max_cloud_top_height",
+                "max_high_cloud_fraction",
+            )
+            if c in tracks_df.columns
+        ]],
         on=["source", "simulation", "track_id"],
         how="left",
         suffixes=("", "_track"),
@@ -1482,12 +1525,13 @@ def select_onset_events(track_time, tracks_df, source_name, sim_name):
             max_precip = float(group.max_precip.max(skipna=True))
         if lifetime_hours < MIN_EVENT_LIFETIME_HOURS:
             continue
-        if np.isfinite(max_area) and max_area < MIN_EVENT_AREA_KM2:
-            continue
-        if np.isfinite(max_precip) and max_precip < MIN_EVENT_MAX_PRECIP_MM_DAY:
-            continue
         if not (EVENT_LAT_BOUNDS[0] <= float(onset.centroid_lat) <= EVENT_LAT_BOUNDS[1]):
             continue
+        precip_volume = float(
+            onset.get("precip_volume_proxy_km2_mm_track", onset.get("precip_volume_proxy_km2_mm", np.nan))
+        )
+        if not np.isfinite(precip_volume):
+            precip_volume = float(max_area * max_precip) if np.isfinite(max_area) and np.isfinite(max_precip) else np.nan
         rows.append(
             dict(
                 simulation=sim_name,
@@ -1502,6 +1546,14 @@ def select_onset_events(track_time, tracks_df, source_name, sim_name):
                 lifetime_hours=lifetime_hours,
                 max_area_km2=max_area,
                 max_precip=max_precip,
+                mean_precip=float(onset.get("mean_precip_track", onset.get("mean_precip", np.nan))),
+                precip_volume_proxy_km2_mm=precip_volume,
+                max_precip_volume_rate_proxy_km2_mm_day=float(
+                    onset.get(
+                        "max_precip_volume_rate_proxy_km2_mm_day_track",
+                        onset.get("max_precip_volume_rate_proxy_km2_mm_day", np.nan),
+                    )
+                ),
                 min_cloud_top_pressure=float(group.min_cloud_top_pressure.min(skipna=True)) if "min_cloud_top_pressure" in group else np.nan,
                 max_cloud_top_height=float(group.max_cloud_top_height.max(skipna=True)) if "max_cloud_top_height" in group else np.nan,
                 max_high_cloud_fraction=float(group.max_high_cloud_fraction.max(skipna=True)) if "max_high_cloud_fraction" in group else np.nan,
@@ -1510,7 +1562,7 @@ def select_onset_events(track_time, tracks_df, source_name, sim_name):
             )
         )
 
-    events = filter_separated_events(pd.DataFrame(rows))
+    events = pd.DataFrame(rows)
     if len(events) == 0:
         return events
     events = events.sort_values("time_days").reset_index(drop=True)
@@ -1616,6 +1668,86 @@ def anomaly(da, label=None):
         if getattr(baseline, "chunks", None) is not None:
             baseline = baseline.compute()
         out = da - baseline
+    out.attrs.update(getattr(da, "attrs", {}))
+    return out
+
+
+def anomaly_baseline_cache_filename(sim_name, field_key):
+    return f"anomaly_baseline_{safe_name(sim_name)}_{safe_name(field_key)}.nc"
+
+
+def anomaly_baseline_signature(da, sim_name, field_key):
+    signature = dict(
+        cache_version=ANOMALY_BASELINE_CACHE_VERSION,
+        source_simulation=sim_name,
+        field_key=field_key,
+        root_dir=root_dir,
+        ndays=int(ndays),
+        analysis_end_date=analysis_end_date,
+        time_format=time_format,
+        dims_after_mean={
+            dim: int(size)
+            for dim, size in da.sizes.items()
+            if dim != "Time"
+        },
+    )
+    if "Time" in da.dims:
+        signature.update(time_signature(da.Time.values))
+    for coord_name in ("latitude", "longitude", "pres", "z"):
+        if coord_name not in da.coords:
+            continue
+        values = np.asarray(da[coord_name].values, dtype=float)
+        finite = values[np.isfinite(values)]
+        signature[f"{coord_name}_size"] = int(values.size)
+        signature[f"{coord_name}_first"] = float(values[0]) if values.size else None
+        signature[f"{coord_name}_last"] = float(values[-1]) if values.size else None
+        signature[f"{coord_name}_min"] = float(finite.min()) if finite.size else None
+        signature[f"{coord_name}_max"] = float(finite.max()) if finite.size else None
+    return signature
+
+
+def signature_token(signature):
+    payload = json.dumps(
+        jsonable_value(signature),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def cached_anomaly(da, sim_name, field_key, label=None):
+    if "Time" not in da.dims:
+        return anomaly(da, label=label)
+
+    signature = anomaly_baseline_signature(da, sim_name, field_key)
+    token = signature_token(signature)
+    filename = anomaly_baseline_cache_filename(sim_name, field_key)
+    cached = read_cache_dataset(filename)
+    if (
+        cached is not None
+        and "baseline" in cached
+        and cached.attrs.get("anomaly_baseline_cache_token") == token
+    ):
+        progress(f"{sim_name}: using cached {field_key} anomaly baseline")
+        baseline = cached["baseline"]
+    else:
+        baseline = da.mean(dim="Time", skipna=True)
+        if getattr(baseline, "chunks", None) is not None:
+            progress(f"Computing reusable anomaly baseline for {label or da.name or field_key}")
+            baseline = baseline.compute()
+        baseline = baseline.rename("baseline")
+        ds = baseline.to_dataset()
+        ds.attrs.update(
+            anomaly_baseline_cache_token=token,
+            anomaly_baseline_signature=json.dumps(
+                jsonable_value(signature),
+                sort_keys=True,
+            ),
+        )
+        write_cache_dataset(ds, filename)
+        progress(f"{sim_name}: cached {field_key} anomaly baseline")
+
+    out = da - baseline
     out.attrs.update(getattr(da, "attrs", {}))
     return out
 
@@ -1754,77 +1886,144 @@ def wave_composite_key(wave_name, field_name):
     return f"wave_{wave_name.lower()}_{field_name.lower()}"
 
 
-def prepare_composite_fields(fields, sim_name):
-    specs = {}
-    specs["precip"] = dict(da=fields["precip"], label="Precipitation", units="mm day$^{-1}$", cmap="YlGnBu", anomaly=False)
-    if "pw" in fields:
-        specs["pw_anom"] = dict(
-            da=anomaly(fields["pw"], f"{sim_name} PW"),
-            label="PW anomaly",
-            units=fields["pw"].attrs.get("units", ""),
-            cmap="BrBG",
-            anomaly=True,
-        )
-    if "stratiform_precipitating_high_cloud_mask" in fields:
-        specs["stratiform_precipitating"] = dict(da=fields["stratiform_precipitating_high_cloud_mask"].astype(float), label="Stratiform precipitating high cloud", units="fraction", cmap="YlGnBu", anomaly=False)
-    if "nonprecipitating_high_cloud_mask" in fields:
-        specs["nonprecipitating"] = dict(
-            da=fields["nonprecipitating_high_cloud_mask"].astype(float),
-            label="Non-precipitating high cloud",
-            units="fraction",
-            cmap="Greys",
-            anomaly=False,
-        )
-    if "cloud_top_height" in fields:
-        specs["cloud_top_height"] = dict(da=fields["cloud_top_height"], label="Cloud-top height", units="km", cmap="magma", anomaly=False)
-    if "cloud_top_pressure" in fields:
-        specs["cloud_top_pressure"] = dict(da=fields["cloud_top_pressure"], label="Cloud-top pressure", units="hPa", cmap="magma_r", anomaly=False)
-    if "N2_TTL" in fields:
-        specs["N2_TTL_anom"] = dict(
-            da=anomaly(fields["N2_TTL"], f"{sim_name} N2_TTL"),
-            label=r"$N^2_{TTL}$ anomaly",
-            units="s$^{-2}$",
-            cmap="PuOr_r",
-            anomaly=True,
-        )
-    if "u_TTL" in fields:
-        specs["u_TTL_anom"] = dict(
-            da=anomaly(fields["u_TTL"], f"{sim_name} u_TTL"),
-            label=r"$u_{TTL}$ anomaly",
-            units="m s$^{-1}$",
-            cmap="RdBu_r",
-            anomaly=True,
-        )
-    if "dudz_TTL" in fields:
-        specs["dudz_TTL_anom"] = dict(
-            da=anomaly(fields["dudz_TTL"], f"{sim_name} dudz_TTL"),
-            label=r"$du/dz_{TTL}$ anomaly",
-            units="s$^{-1}$",
-            cmap="RdBu_r",
-            anomaly=True,
-        )
+WAVE_COMPOSITE_FIELDS = {
+    wave_composite_key(wave_name, field_name): (wave_name, field_name)
+    for wave_name in LIFECYCLE_WAVE_NAMES
+    for field_name in LIFECYCLE_WAVE_FIELDS
+}
 
-    for wave_name in LIFECYCLE_WAVE_NAMES:
-        for field_name in LIFECYCLE_WAVE_FIELDS:
-            wave = filter_wave_latmean(
-                fields,
-                sim_name,
-                field_name,
-                wave_name,
-                WAVE_BOXES[wave_name],
-            )
-            key = wave_composite_key(wave_name, field_name)
-            specs[key] = dict(
-                da=wave,
-                label=f"{wave_name}-filtered {WAVE_FIELD_LABELS[field_name]}",
-                units=WAVE_FIELD_UNITS[field_name],
-                cmap="RdBu_r",
-                anomaly=True,
-                wave_name=wave_name,
-                wave_field=field_name,
-            )
-            fields[key] = wave
-    return specs
+# Lifecycle composites only sample tracks in the deep tropics plus the local
+# latitude window around those tracks. Keeping composite-only fields to this
+# latitude range avoids expensive global anomaly baselines for TTL diagnostics.
+COMPOSITE_FIELD_LAT_BOUNDS = (
+    EVENT_LAT_BOUNDS[0] - max(EVENT_LAT_HALF_WIDTH, float(np.nanmax(np.abs(SPATIAL_REL_LAT_GRID)))) - 5.0,
+    EVENT_LAT_BOUNDS[1] + max(EVENT_LAT_HALF_WIDTH, float(np.nanmax(np.abs(SPATIAL_REL_LAT_GRID)))) + 5.0,
+)
+
+
+def trim_to_composite_latitudes(da):
+    if da is None or "latitude" not in da.dims:
+        return da
+    return subset_lat(da, lat_bounds=COMPOSITE_FIELD_LAT_BOUNDS)
+
+
+def available_composite_keys(fields):
+    available = ["precip"] if "precip" in fields else []
+    core_requirements = {
+        "pw_anom": "pw",
+        "convective_precipitating": "convective_precipitating_high_cloud_mask",
+        "stratiform_precipitating": "stratiform_precipitating_high_cloud_mask",
+        "nonprecipitating": "nonprecipitating_high_cloud_mask",
+        "cloud_top_height": "cloud_top_height",
+        "cloud_top_pressure": "cloud_top_pressure",
+        "N2_TTL_anom": "N2_TTL",
+        "u_TTL_anom": "u_TTL",
+        "dudz_TTL_anom": "dudz_TTL",
+    }
+    for key, field_key in core_requirements.items():
+        if field_key in fields:
+            available.append(key)
+    for key, (_, field_name) in WAVE_COMPOSITE_FIELDS.items():
+        if field_name in fields:
+            available.append(key)
+    return available
+
+
+def composite_spec_metadata(key, fields=None):
+    if key == "precip":
+        return dict(label="Precipitation", units="mm day$^{-1}$", cmap="YlGnBu", anomaly=False)
+    if key == "pw_anom":
+        units = fields["pw"].attrs.get("units", "") if fields and "pw" in fields else ""
+        return dict(label="PW anomaly", units=units, cmap="BrBG", anomaly=True)
+    if key == "convective_precipitating":
+        return dict(label="Convective precipitating high cloud", units="fraction", cmap="Reds", anomaly=False)
+    if key == "stratiform_precipitating":
+        return dict(label="Stratiform precipitating high cloud", units="fraction", cmap="YlGnBu", anomaly=False)
+    if key == "nonprecipitating":
+        return dict(label="Non-precipitating high cloud", units="fraction", cmap="Greys", anomaly=False)
+    if key == "cloud_top_height":
+        return dict(label="Cloud-top height", units="km", cmap="magma", anomaly=False)
+    if key == "cloud_top_pressure":
+        return dict(label="Cloud-top pressure", units="hPa", cmap="magma_r", anomaly=False)
+    if key == "N2_TTL_anom":
+        return dict(label=r"$N^2_{TTL}$ anomaly", units="s$^{-2}$", cmap="PuOr_r", anomaly=True)
+    if key == "u_TTL_anom":
+        return dict(label=r"$u_{TTL}$ anomaly", units="m s$^{-1}$", cmap="RdBu_r", anomaly=True)
+    if key == "dudz_TTL_anom":
+        return dict(label=r"$du/dz_{TTL}$ anomaly", units="s$^{-1}$", cmap="RdBu_r", anomaly=True)
+    if key in WAVE_COMPOSITE_FIELDS:
+        wave_name, field_name = WAVE_COMPOSITE_FIELDS[key]
+        return dict(
+            label=f"{wave_name}-filtered {WAVE_FIELD_LABELS[field_name]}",
+            units=WAVE_FIELD_UNITS[field_name],
+            cmap="RdBu_r",
+            anomaly=True,
+            wave_name=wave_name,
+            wave_field=field_name,
+        )
+    raise KeyError(f"Unrecognised composite variable: {key}")
+
+
+def build_composite_spec(fields, sim_name, key):
+    meta = composite_spec_metadata(key, fields)
+    if key == "precip":
+        da = fields["precip"]
+    elif key == "pw_anom":
+        da = cached_anomaly(
+            trim_to_composite_latitudes(fields["pw"]),
+            sim_name,
+            "PW",
+            label=f"{sim_name} PW",
+        )
+    elif key == "convective_precipitating":
+        da = fields["convective_precipitating_high_cloud_mask"].astype(float)
+    elif key == "stratiform_precipitating":
+        da = fields["stratiform_precipitating_high_cloud_mask"].astype(float)
+    elif key == "nonprecipitating":
+        da = fields["nonprecipitating_high_cloud_mask"].astype(float)
+    elif key == "cloud_top_height":
+        da = fields["cloud_top_height"]
+    elif key == "cloud_top_pressure":
+        da = fields["cloud_top_pressure"]
+    elif key == "N2_TTL_anom":
+        da = cached_anomaly(
+            trim_to_composite_latitudes(fields["N2_TTL"]),
+            sim_name,
+            "N2_TTL",
+            label=f"{sim_name} N2_TTL",
+        )
+    elif key == "u_TTL_anom":
+        da = cached_anomaly(
+            trim_to_composite_latitudes(fields["u_TTL"]),
+            sim_name,
+            "u_TTL",
+            label=f"{sim_name} u_TTL",
+        )
+    elif key == "dudz_TTL_anom":
+        da = cached_anomaly(
+            trim_to_composite_latitudes(fields["dudz_TTL"]),
+            sim_name,
+            "dudz_TTL",
+            label=f"{sim_name} dudz_TTL",
+        )
+    elif key in WAVE_COMPOSITE_FIELDS:
+        wave_name, field_name = WAVE_COMPOSITE_FIELDS[key]
+        da = filter_wave_latmean(
+            fields,
+            sim_name,
+            field_name,
+            wave_name,
+            WAVE_BOXES[wave_name],
+        )
+        if da is None:
+            return None
+        fields[key] = da
+    else:
+        return None
+
+    spec = dict(meta)
+    spec["da"] = trim_to_composite_latitudes(da)
+    return spec
 
 
 # -----------------------------------------------------------------------------
@@ -1855,88 +2054,6 @@ def lat_window_mean(slice_da, center_lat, half_width=EVENT_LAT_HALF_WIDTH):
     if "latitude" in sub.dims:
         sub = sub.weighted(np.cos(np.deg2rad(sub.latitude))).mean(dim="latitude", skipna=True)
     return sub
-
-
-def composite_lag_lon(da, events, lag_days, lag_steps, rel_lon_grid=REL_LON_GRID):
-    sums = np.zeros((len(lag_steps), len(rel_lon_grid)), dtype=float)
-    sums2 = np.zeros_like(sums)
-    counts = np.zeros_like(sums)
-    no_longitude = "longitude" not in da.dims
-
-    for event in events.itertuples(index=False):
-        for ilag, step in enumerate(lag_steps):
-            it = int(event.onset_time_index) + int(step)
-            if it < 0 or it >= da.sizes.get("Time", 0):
-                continue
-            x = da.isel(Time=it)
-            x = lat_window_mean(x, float(event.centroid_lat))
-            if "longitude" in x.dims:
-                vals = lon_series_relative_to_event(x.load(), float(event.center_lon), rel_lon_grid)
-            else:
-                value = float(x.load().values)
-                vals = np.full(len(rel_lon_grid), value, dtype=float)
-            ok = np.isfinite(vals)
-            sums[ilag, ok] += vals[ok]
-            sums2[ilag, ok] += vals[ok] ** 2
-            counts[ilag, ok] += 1.0
-
-    mean = np.full_like(sums, np.nan)
-    np.divide(sums, counts, out=mean, where=counts > 0)
-    var = np.full_like(sums, np.nan)
-    valid = counts > 1
-    var[valid] = (sums2[valid] - sums[valid] ** 2 / counts[valid]) / (counts[valid] - 1)
-    stderr = np.full_like(sums, np.nan)
-    stderr[valid] = np.sqrt(var[valid] / counts[valid])
-    out = xr.Dataset(
-        data_vars=dict(
-            mean=(("lag_days", "relative_longitude"), mean),
-            count=(("lag_days", "relative_longitude"), counts),
-            stderr=(("lag_days", "relative_longitude"), stderr),
-        ),
-        coords=dict(lag_days=lag_days, relative_longitude=rel_lon_grid),
-        attrs=dict(no_longitude=bool(no_longitude)),
-    )
-    return out
-
-
-def scalar_at_event_lag(da, event, it, lon_window=FINGERPRINT_LON_WINDOW_DEG):
-    x = da.isel(Time=it)
-    x = lat_window_mean(x, float(event.centroid_lat))
-    if "longitude" not in x.dims:
-        return float(x.load().values)
-    rel_lon = ((x.longitude.values.astype(float) - float(event.center_lon) + 180.0) % 360.0) - 180.0
-    mask = np.abs(rel_lon) <= lon_window
-    if not np.any(mask):
-        return np.nan
-    return float(x.isel(longitude=mask).mean(dim="longitude", skipna=True).load().values)
-
-
-def composite_lag_scalar(da, events, lag_days, lag_steps):
-    sums = np.zeros(len(lag_steps), dtype=float)
-    sums2 = np.zeros_like(sums)
-    counts = np.zeros_like(sums)
-    for event in events.itertuples(index=False):
-        for ilag, step in enumerate(lag_steps):
-            it = int(event.onset_time_index) + int(step)
-            if it < 0 or it >= da.sizes.get("Time", 0):
-                continue
-            value = scalar_at_event_lag(da, event, it)
-            if not np.isfinite(value):
-                continue
-            sums[ilag] += value
-            sums2[ilag] += value ** 2
-            counts[ilag] += 1.0
-    mean = np.full_like(sums, np.nan)
-    np.divide(sums, counts, out=mean, where=counts > 0)
-    var = np.full_like(sums, np.nan)
-    valid = counts > 1
-    var[valid] = (sums2[valid] - sums[valid] ** 2 / counts[valid]) / (counts[valid] - 1)
-    stderr = np.full_like(sums, np.nan)
-    stderr[valid] = np.sqrt(var[valid] / counts[valid])
-    return xr.Dataset(
-        data_vars=dict(mean=("lag_days", mean), count=("lag_days", counts), stderr=("lag_days", stderr)),
-        coords=dict(lag_days=lag_days),
-    )
 
 
 def composite_lag_products(
@@ -1994,7 +2111,9 @@ def composite_lag_products(
     np.divide(hov_sums, hov_counts, out=hov_mean, where=hov_counts > 0)
     hov_var = np.full_like(hov_sums, np.nan)
     hov_valid = hov_counts > 1
-    hov_var[hov_valid] = (hov_sums2[hov_valid] - hov_sums[hov_valid] ** 2 / hov_counts[hov_valid]) / (hov_counts[hov_valid] - 1)
+    hov_var[hov_valid] = (
+        hov_sums2[hov_valid] - hov_sums[hov_valid] ** 2 / hov_counts[hov_valid]
+    ) / (hov_counts[hov_valid] - 1)
     hov_stderr = np.full_like(hov_sums, np.nan)
     hov_stderr[hov_valid] = np.sqrt(hov_var[hov_valid] / hov_counts[hov_valid])
     hov_rms = np.full_like(hov_sums, np.nan)
@@ -2008,7 +2127,10 @@ def composite_lag_products(
             rms=(("lag_days", "relative_longitude"), hov_rms),
         ),
         coords=dict(lag_days=lag_days, relative_longitude=rel_lon_grid),
-        attrs=dict(no_longitude=bool(no_longitude)),
+        attrs=dict(
+            no_longitude=bool(no_longitude),
+            composite_weighting="event_equal",
+        ),
     )
 
     scalar_mean = np.full_like(scalar_sums, np.nan)
@@ -2016,17 +2138,15 @@ def composite_lag_products(
     scalar_var = np.full_like(scalar_sums, np.nan)
     scalar_valid = scalar_counts > 1
     scalar_var[scalar_valid] = (
-        scalar_sums2[scalar_valid] - scalar_sums[scalar_valid] ** 2 / scalar_counts[scalar_valid]
+        scalar_sums2[scalar_valid]
+        - scalar_sums[scalar_valid] ** 2 / scalar_counts[scalar_valid]
     ) / (scalar_counts[scalar_valid] - 1)
     scalar_stderr = np.full_like(scalar_sums, np.nan)
-    scalar_stderr[scalar_valid] = np.sqrt(scalar_var[scalar_valid] / scalar_counts[scalar_valid])
-    scalar_rms = np.full_like(scalar_sums, np.nan)
-    np.divide(
-        scalar_sums2,
-        scalar_counts,
-        out=scalar_rms,
-        where=scalar_counts > 0,
+    scalar_stderr[scalar_valid] = np.sqrt(
+        scalar_var[scalar_valid] / scalar_counts[scalar_valid]
     )
+    scalar_rms = np.full_like(scalar_sums, np.nan)
+    np.divide(scalar_sums2, scalar_counts, out=scalar_rms, where=scalar_counts > 0)
     scalar_rms = np.sqrt(scalar_rms)
     scalar = xr.Dataset(
         data_vars=dict(
@@ -2036,8 +2156,9 @@ def composite_lag_products(
             rms=("lag_days", scalar_rms),
         ),
         coords=dict(lag_days=lag_days),
+        attrs=dict(composite_weighting="event_equal"),
     )
-    return hov, scalar
+    return {"hov": hov, "scalar": scalar}
 
 
 def event_centred_patch(
@@ -2179,92 +2300,9 @@ def plot_hovmoller_group(composites, specs, var_names, stem_suffix):
             if c == len(cols_to_plot) - 1:
                 cbar = fig.colorbar(im, ax=ax[r, :], location="right", shrink=0.85)
                 cbar.set_label(spec.get("units", ""))
+    fig.suptitle("Event-equal track-following lifecycle composites", fontsize=11)
     save_figure(1, fig, f"lifecycle_hovmoller_composites_{stem_suffix}")
     plt.close(fig)
-
-
-def normalized_curve(y):
-    y = np.asarray(y, dtype=float)
-    scale = np.nanmax(np.abs(y))
-    if not np.isfinite(scale) or scale == 0:
-        return y
-    return y / scale
-
-
-def milestone_lag(ds, kind="max", before_onset=False):
-    y = np.asarray(ds.mean.values, dtype=float)
-    x = np.asarray(ds.lag_days.values, dtype=float)
-    mask = np.isfinite(y)
-    if before_onset:
-        mask &= x <= 0.0
-    if not np.any(mask):
-        return np.nan, np.nan
-    idxs = np.where(mask)[0]
-    if kind == "min":
-        idx = idxs[int(np.nanargmin(y[mask]))]
-    else:
-        idx = idxs[int(np.nanargmax(y[mask]))]
-    return float(x[idx]), float(y[idx])
-
-
-def plot_fingerprint_summary(composites, specs, var_names):
-    ncols = 3
-    nrows = int(np.ceil(len(var_names) / ncols))
-    fig, ax = plt.subplots(nrows, ncols, figsize=(11.5, 2.7 * nrows), constrained_layout=True, sharex=True)
-    ax = np.asarray(ax).reshape(nrows, ncols)
-    milestone_rows = []
-    for k, var in enumerate(var_names):
-        a = ax.flat[k]
-        spec = specs[var]
-        for i, sim in enumerate(sim_names):
-            if var not in composites[sim]:
-                continue
-            ds = composites[sim][var]["scalar"]
-            y = normalized_curve(ds.mean.values)
-            a.plot(ds.lag_days, y, color=cols[i], label=sim, lw=1.6)
-            if var == "pw_anom":
-                lag, val = milestone_lag(ds, before_onset=True)
-                marker = "^"
-                name = "moisture preconditioning peak"
-            elif var == "precip":
-                lag, val = milestone_lag(ds)
-                marker = "o"
-                name = "maximum precipitation"
-            elif var == "cloud_top_height":
-                lag, val = milestone_lag(ds)
-                marker = "s"
-                name = "maximum cloud depth"
-            elif var == "cloud_top_pressure":
-                lag, val = milestone_lag(ds, kind="min")
-                marker = "v"
-                name = "minimum cloud-top pressure"
-            elif var == "stratiform_precipitating":
-                lag, val = milestone_lag(ds)
-                marker = "D"
-                name = "maximum high-cloud coverage"
-            else:
-                lag, val = milestone_lag(ds)
-                marker = "."
-                name = f"{spec['label']} extremum"
-            if np.isfinite(lag):
-                a.scatter([lag], [normalized_curve([val])[0] if False else np.interp(lag, ds.lag_days, y)], color=cols[i], marker=marker, s=25, zorder=5)
-                milestone_rows.append(dict(simulation=sim, variable=var, milestone=name, lag_days=lag, value=val))
-        a.axvline(0.0, color="0.25", lw=0.8)
-        a.axhline(0.0, color="0.75", lw=0.5)
-        a.set_title(spec["label"], fontsize=10)
-        if k % ncols == 0:
-            a.set_ylabel("normalised")
-        else:
-            a.tick_params(labelleft=False)
-        if a.get_subplotspec().is_last_row():
-            a.set_xlabel("Lag (days)")
-    for a in ax.flat[len(var_names):]:
-        a.set_axis_off()
-    handles, labels = ax.flat[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=len(sim_names), frameon=False)
-    save_figure(2, fig, "mechanistic_fingerprint_summary")
-    plt.close(fig)
-    return pd.DataFrame(milestone_rows)
 
 
 def plot_difference_fingerprints(composites, specs, var_names):
@@ -2292,7 +2330,8 @@ def plot_difference_fingerprints(composites, specs, var_names):
         if r == 0:
             a.legend(frameon=False, loc="best")
     ax[-1].set_xlabel("Lag (days)")
-    save_figure(3, fig, "difference_lifecycle_fingerprints")
+    fig.suptitle("Event-equal lifecycle differences from control", fontsize=11)
+    save_figure(2, fig, "difference_lifecycle_fingerprints")
     plt.close(fig)
 
 
@@ -2340,8 +2379,8 @@ def plot_spatial_composites(spatial_products, specs, var_names):
         if im is not None:
             cbar = fig.colorbar(im, ax=ax, location="right", shrink=0.9)
             cbar.set_label(specs[var].get("units", ""))
-        fig.suptitle(specs[var]["label"], fontsize=12)
-        save_figure(4, fig, f"event_centred_spatial_composites_{var}")
+        fig.suptitle(f"Event-equal spatial composite: {specs[var]['label']}", fontsize=12)
+        save_figure(3, fig, f"event_centred_spatial_composites_{var}")
         plt.close(fig)
 
 
@@ -2492,10 +2531,11 @@ def plot_wave_filtered_track_composites(composites, specs):
         if handles:
             fig.legend(handles, labels, loc="upper center", ncol=len(sim_names), frameon=False)
         fig.suptitle(
-            f"Wave-filtered fields within {FINGERPRINT_LON_WINDOW_DEG:g} deg of tracked convective-object centres",
+            "Event-equal wave-filtered fields within "
+            f"{FINGERPRINT_LON_WINDOW_DEG:g} deg of tracked organised-system centres",
             fontsize=11,
         )
-        save_figure(5, fig, f"wave_filtered_track_composites_{stem}")
+        save_figure(4, fig, f"wave_filtered_track_composites_{stem}")
         plt.close(fig)
 
 
@@ -2551,7 +2591,7 @@ def build_track_property_lifecycle(track_time_by_run, events_by_run, step_days):
 
 def plot_track_property_lifecycle(track_summary, tracks_all):
     if len(track_summary) == 0:
-        print("Skipping Figure 6: no track lifecycle properties available.")
+        print("Skipping Figure 5: no track lifecycle properties available.")
         return
     props = [
         ("area_km2", "Object area (km$^2$)"),
@@ -2583,72 +2623,7 @@ def plot_track_property_lifecycle(track_summary, tracks_all):
     a.set_xlabel("Lifetime (h)")
     a.set_ylabel("Density")
     a.legend(frameon=False)
-    save_figure(6, fig, "track_property_lifecycle_statistics")
-    plt.close(fig)
-
-
-def plot_cloud_top_pressure_lifecycle(track_summary, tracks_all):
-    sub = track_summary[track_summary.property == "min_cloud_top_pressure"]
-    if len(sub) == 0:
-        print("Skipping Figure 8: tracked cloud-top pressure is unavailable.")
-        return
-    fig, axes = plt.subplots(1, 2, figsize=(9.5, 3.8), constrained_layout=True)
-    for i, sim in enumerate(sim_names):
-        values = sub[sub.simulation == sim].sort_values("lag_days")
-        if len(values):
-            axes[0].plot(values.lag_days, values["mean"], color=cols[i], lw=1.7, label=sim)
-            axes[0].fill_between(values.lag_days, values.p25, values.p75, color=cols[i], alpha=0.16)
-        tracks = tracks_all[tracks_all.simulation == sim]
-        if "min_cloud_top_pressure" in tracks:
-            ctp = tracks.min_cloud_top_pressure.to_numpy(dtype=float)
-            ctp = ctp[np.isfinite(ctp)]
-            if ctp.size:
-                axes[1].hist(ctp, bins=np.linspace(50.0, P_HIGH_HPA, 28), histtype="step", density=True, color=cols[i], label=sim)
-    axes[0].axvline(0.0, color="0.25", lw=0.8)
-    axes[0].set_xlabel("Lag from tracked onset (days)")
-    axes[0].set_ylabel("Minimum object cloud-top pressure (hPa)")
-    axes[0].invert_yaxis()
-    axes[1].set_xlabel("Track-minimum cloud-top pressure (hPa)")
-    axes[1].set_ylabel("Density")
-    axes[1].invert_xaxis()
-    for ax in axes:
-        ax.grid(alpha=0.2)
-    axes[0].legend(frameon=False)
-    fig.suptitle("Tracked deep-convection cloud-top pressure evolution")
-    save_figure(8, fig, "tracked_cloud_top_pressure_lifecycle")
-    plt.close(fig)
-
-
-def plot_synthesis(composites, specs, milestone_table):
-    synth_vars = [v for v in ("pw_anom", "precip", "stratiform_precipitating", "nonprecipitating", "N2_TTL_anom", "dudz_TTL_anom") if v in specs]
-    if not synth_vars:
-        return
-    fig, ax = plt.subplots(len(synth_vars), 1, figsize=(8.8, 1.75 * len(synth_vars)), constrained_layout=True, sharex=True)
-    ax = np.atleast_1d(ax)
-    for r, var in enumerate(synth_vars):
-        a = ax[r]
-        for i, sim in enumerate(sim_names):
-            if var not in composites[sim]:
-                continue
-            ds = composites[sim][var]["scalar"]
-            y = normalized_curve(ds.mean.values)
-            a.plot(ds.lag_days, y, color=cols[i], label=sim if r == 0 else None, lw=1.7)
-        a.axvline(0.0, color="0.2", lw=0.8)
-        a.axhline(0.0, color="0.75", lw=0.5)
-        a.set_ylabel(specs[var]["label"])
-    ax[-1].set_xlabel("Lag from tracked onset (days)")
-    ax[0].legend(frameon=False, ncol=len(sim_names), loc="upper right")
-    if len(milestone_table):
-        text_rows = []
-        for sim in sim_names[1:]:
-            for variable, label in (("precip", "Pmax"), ("cloud_top_height", "CTHmax"), ("pw_anom", "PWpre")):
-                c = milestone_table[(milestone_table.simulation == "control") & (milestone_table.variable == variable)]
-                s = milestone_table[(milestone_table.simulation == sim) & (milestone_table.variable == variable)]
-                if len(c) and len(s):
-                    text_rows.append(f"{sim} {label}: {s.lag_days.iloc[0] - c.lag_days.iloc[0]:+.1f} d")
-        if text_rows:
-            ax[0].text(0.01, 0.97, "\n".join(text_rows[:6]), transform=ax[0].transAxes, va="top", ha="left", fontsize=8, bbox=dict(facecolor="w", alpha=0.75, edgecolor="0.8"))
-    save_figure(7, fig, "mechanistic_synthesis_lifecycle")
+    save_figure(5, fig, "track_property_lifecycle_statistics")
     plt.close(fig)
 
 
@@ -2734,6 +2709,7 @@ def main():
     fields_by_run = []
     for sim_name, ds, zds in zip(sim_names, dss, zss):
         fields_by_run.append(build_fields(ds, zds, sim_name))
+    fields_by_sim = dict(zip(sim_names, fields_by_run))
 
     source_name = PRIMARY_TRACK_SOURCE
     for sim_name, fields in zip(sim_names, fields_by_run):
@@ -2787,12 +2763,13 @@ def main():
         lag_steps,
     )
     write_csv(centre_table, "convective_lifecycle_composite_centres.csv")
-    specs_by_run = {}
-    for sim_name, fields in zip(sim_names, fields_by_run):
-        specs_by_run[sim_name] = prepare_composite_fields(fields, sim_name)
+    available_specs_by_run = {
+        sim_name: set(available_composite_keys(fields))
+        for sim_name, fields in zip(sim_names, fields_by_run)
+    }
     spec_keys = []
     preferred_keys = [
-        "precip", "pw_anom", "stratiform_precipitating", "nonprecipitating",
+        "precip", "pw_anom", "convective_precipitating", "stratiform_precipitating", "nonprecipitating",
         "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom",
         "u_TTL_anom", "dudz_TTL_anom",
     ]
@@ -2802,19 +2779,16 @@ def main():
         for field_name in LIFECYCLE_WAVE_FIELDS
     )
     for key in preferred_keys:
-        if any(key in specs_by_run[sim] for sim in sim_names):
+        if any(key in available_specs_by_run[sim] for sim in sim_names):
             spec_keys.append(key)
     specs = {}
     for key in spec_keys:
         for sim in sim_names:
-            if key in specs_by_run[sim]:
-                specs[key] = specs_by_run[sim][key]
+            if key in available_specs_by_run[sim]:
+                fields = fields_by_sim[sim]
+                specs[key] = composite_spec_metadata(key, fields)
                 break
-    core_spec_keys = [
-        key for key in preferred_keys[:9] if key in specs
-    ]
-
-    include_spatial = should_run_figure(4)
+    include_spatial = should_run_figure(3)
     expected_composite_token = composite_cache_token(
         source_name,
         spec_keys,
@@ -2838,7 +2812,7 @@ def main():
             sim: [
                 var
                 for var in spec_keys
-                if event_counts[sim] > 0 and var in specs_by_run[sim]
+                if event_counts[sim] > 0 and var in available_specs_by_run[sim]
             ]
             for sim in sim_names
         }
@@ -2863,34 +2837,39 @@ def main():
             if len(events) == 0:
                 continue
             for var in spec_keys:
-                if var not in specs_by_run[sim_name]:
+                if var not in available_specs_by_run[sim_name]:
                     continue
-                if composite_signature_valid:
-                    cached_product = load_cached_composite_product(
-                        sim_name,
-                        var,
-                        include_spatial,
-                        expected_composite_token,
-                    )
-                    if cached_product is not None:
-                        product, spatial = cached_product
-                        composites[sim_name][var] = product
-                        if spatial:
-                            spatial_products[sim_name][var] = spatial
-                        progress(
-                            f"{sim_name}: using cached {var} lifecycle composites"
-                        )
-                        continue
-                da = specs_by_run[sim_name][var]["da"]
-                progress(f"{sim_name}: compositing {var}")
-                progress(f"{sim_name}: {var} lag-longitude and scalar composites")
-                hov, scalar = composite_lag_products(
-                    da, events, track_paths, lag_days, lag_steps
+                cached_product = load_cached_composite_product(
+                    sim_name,
+                    var,
+                    include_spatial,
+                    expected_composite_token,
                 )
-                composites[sim_name][var] = {
-                    "hov": hov,
-                    "scalar": scalar,
-                }
+                if cached_product is not None:
+                    product, spatial = cached_product
+                    composites[sim_name][var] = product
+                    if spatial:
+                        spatial_products[sim_name][var] = spatial
+                    progress(
+                        f"{sim_name}: using cached {var} lifecycle composites"
+                    )
+                    continue
+                spec = build_composite_spec(fields, sim_name, var)
+                if spec is None:
+                    continue
+                da = spec["da"]
+                progress(f"{sim_name}: compositing {var}")
+                progress(
+                    f"{sim_name}: {var} event-equal lag-longitude/scalar composites"
+                )
+                product = composite_lag_products(
+                    da,
+                    events,
+                    track_paths,
+                    lag_days,
+                    lag_steps,
+                )
+                composites[sim_name][var] = product
                 spatial = {}
                 if (
                     spatial_composite_expected(var, include_spatial)
@@ -2908,11 +2887,13 @@ def main():
                 write_composite_product_cache(
                     sim_name,
                     var,
-                    composites[sim_name][var],
+                    product,
                     spatial,
                     expected_composite_token,
                 )
                 progress(f"{sim_name}: cached {var} lifecycle composites")
+                del da, spec, product, spatial
+                gc.collect()
         write_composite_cache_manifest(
             source_name,
             spec_keys,
@@ -2924,29 +2905,22 @@ def main():
         composites, spatial_products = cached_composites
 
     if should_run_figure(1):
-        first_group = [v for v in ("precip", "pw_anom", "stratiform_precipitating", "nonprecipitating", "cloud_top_pressure", "cloud_top_height") if v in specs]
+        first_group = [v for v in ("precip", "pw_anom", "convective_precipitating", "stratiform_precipitating", "nonprecipitating", "cloud_top_pressure", "cloud_top_height") if v in specs]
         second_group = [v for v in ("N2_TTL_anom", "u_TTL_anom", "dudz_TTL_anom") if v in specs]
         if first_group:
             plot_hovmoller_group(composites, specs, first_group, "core")
         if second_group:
             plot_hovmoller_group(composites, specs, second_group, "ttl_wave")
 
-    milestone_table = pd.DataFrame()
     if should_run_figure(2):
-        milestone_table = plot_fingerprint_summary(
-            composites, specs, core_spec_keys
-        )
-        write_csv(milestone_table, "convective_lifecycle_milestones.csv")
-
-    if should_run_figure(3):
-        diff_vars = [v for v in ("pw_anom", "precip", "stratiform_precipitating", "nonprecipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom", "dudz_TTL_anom") if v in specs]
+        diff_vars = [v for v in ("pw_anom", "precip", "convective_precipitating", "stratiform_precipitating", "nonprecipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom", "dudz_TTL_anom") if v in specs]
         plot_difference_fingerprints(composites, specs, diff_vars)
 
-    if should_run_figure(4):
-        spatial_vars = [v for v in ("precip", "pw_anom", "stratiform_precipitating", "nonprecipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom") if v in specs]
+    if should_run_figure(3):
+        spatial_vars = [v for v in ("precip", "pw_anom", "convective_precipitating", "stratiform_precipitating", "nonprecipitating", "cloud_top_pressure", "cloud_top_height", "N2_TTL_anom") if v in specs]
         plot_spatial_composites(spatial_products, specs, spatial_vars)
 
-    if should_run_figure(5):
+    if should_run_figure(4):
         write_csv(
             wave_composite_method_table(),
             "convective_lifecycle_wave_filter_methods.csv",
@@ -2958,7 +2932,7 @@ def main():
         )
         plot_wave_filtered_track_composites(composites, specs)
 
-    if should_run_any([6, 8]):
+    if should_run_figure(5):
         cached_lifecycle = load_cached_track_property_lifecycle(source_name, step_days)
         if cached_lifecycle is None:
             lifecycle, track_summary = build_track_property_lifecycle(track_time_by_run, events_by_run, step_days)
@@ -2967,18 +2941,7 @@ def main():
             lifecycle, track_summary = cached_lifecycle
         write_csv(lifecycle, "convective_lifecycle_track_property_samples.csv")
         write_csv(track_summary, "convective_lifecycle_track_property_summary.csv")
-        if should_run_figure(6):
-            plot_track_property_lifecycle(track_summary, tracks_all)
-        if should_run_figure(8):
-            plot_cloud_top_pressure_lifecycle(track_summary, tracks_all)
-
-    if should_run_figure(7):
-        if len(milestone_table) == 0:
-            milestone_table = plot_fingerprint_summary(
-                composites, specs, core_spec_keys
-            )
-            write_csv(milestone_table, "convective_lifecycle_milestones.csv")
-        plot_synthesis(composites, specs, milestone_table)
+        plot_track_property_lifecycle(track_summary, tracks_all)
 
     print("\nFinished convective_lifecycle_composite_diagnostics.py")
 
