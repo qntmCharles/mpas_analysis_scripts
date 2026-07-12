@@ -1,8 +1,13 @@
 import glob
+import hashlib
+import json
 import os
 import numbers
 import warnings
+from datetime import datetime
 
+import dask
+import dask.array as dsa
 import numpy as np
 import pandas as pd
 from matplotlib import colors, pyplot as plt, ticker
@@ -917,3 +922,1011 @@ class FigureSaver:
             fig.savefig(os.path.join(self.save_loc, fname), dpi=self.dpi if dpi is None else dpi)
             print(f"Done with figure file: {fname}", flush=True)
         return fname
+
+
+def numbered_figure_saver(figure_saver):
+    """Bind a FigureSaver to the common ``(number, fig, stem)`` call shape."""
+    return lambda number, fig, stem: figure_saver.save(fig, stem, number=number)
+
+
+# -----------------------------------------------------------------------------
+# Shared runtime, data-selection, and cache helpers
+# -----------------------------------------------------------------------------
+
+
+def env_flag(name, default=False):
+    """Read a conventional truthy/falsey environment flag."""
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def progress(message):
+    """Print timestamped progress for long diagnostics and captured logs."""
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
+
+
+def jsonable_value(value):
+    """Recursively convert numpy/pandas values into JSON-safe Python values."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [jsonable_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): jsonable_value(item) for key, item in value.items()}
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return str(pd.Timestamp(value))
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def safe_name(text):
+    """Return the filename-safe convention used by diagnostic cache products."""
+    return str(text).replace(" ", "_").replace("/", "-").replace(".", "p").replace("-", "m")
+
+
+def read_json_file(path):
+    """Read a JSON cache file, returning ``None`` when it does not exist."""
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json_file(path, payload):
+    """Atomically write a JSON cache payload."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(jsonable_value(payload), handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp_path, path)
+
+
+def metadata_reader(path_resolver):
+    """Bind a cache-name-to-path resolver to the shared JSON reader."""
+    return lambda name: read_json_file(path_resolver(name))
+
+
+def metadata_writer(path_resolver, enabled=True):
+    """Bind a cache-name-to-path resolver to the shared JSON writer."""
+    if not enabled:
+        return lambda name, payload: None
+    return lambda name, payload: write_json_file(path_resolver(name), payload)
+
+
+def netcdf_safe_attribute(value):
+    """Convert metadata to scalar/array types accepted by NetCDF backends."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bool):
+        return np.int8(value)
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return json.dumps(jsonable_value(value), sort_keys=True)
+    if isinstance(value, (list, tuple, np.ndarray)):
+        array = np.asarray(value)
+        if array.dtype.kind == "b":
+            return array.astype(np.int8)
+        if array.dtype.kind in "SUif":
+            return array
+        return json.dumps(jsonable_value(value), sort_keys=True)
+    if isinstance(value, (str, int, float)):
+        return value
+    return str(value)
+
+
+def netcdf_safe_attrs(attrs):
+    """Return a mapping containing only NetCDF-serializable attribute values."""
+    return {key: netcdf_safe_attribute(value) for key, value in attrs.items()}
+
+
+def netcdf_safe_dataset(ds):
+    """Return a shallow dataset copy with NetCDF-serializable attributes."""
+    out = ds.copy(deep=False)
+    out.attrs = netcdf_safe_attrs(ds.attrs)
+    for name in out.variables:
+        out[name].attrs = netcdf_safe_attrs(ds[name].attrs)
+    return out
+
+
+def subset_between(da, dim, bounds):
+    """Subset a coordinate range without assuming coordinate ordering."""
+    if bounds is None or dim not in da.dims:
+        return da
+    lo, hi = sorted(bounds)
+    return da.where((da[dim] >= lo) & (da[dim] <= hi), drop=True)
+
+
+def pressure_layer_weights(pressure):
+    """Return positive pressure-layer weights proportional to d ln(p)."""
+    values = np.asarray(
+        pressure.values if isinstance(pressure, xr.DataArray) else pressure,
+        dtype=float,
+    )
+    if np.any(values <= 0):
+        raise ValueError("Pressure values must be positive before taking log(p)")
+    if values.size == 1:
+        weights = np.ones_like(values)
+    else:
+        log_pressure = np.log(values)
+        bounds = np.empty(values.size + 1)
+        bounds[1:-1] = 0.5 * (log_pressure[:-1] + log_pressure[1:])
+        bounds[0] = log_pressure[0] - 0.5 * (log_pressure[1] - log_pressure[0])
+        bounds[-1] = log_pressure[-1] + 0.5 * (log_pressure[-1] - log_pressure[-2])
+        weights = np.abs(np.diff(bounds))
+    return xr.DataArray(
+        weights,
+        dims=("pres",),
+        coords={"pres": values},
+        name="dlnp_weight",
+    )
+
+
+def latitude_weights(latitude_or_field):
+    """Return non-negative cosine-latitude weights on the latitude dimension."""
+    latitude = (
+        latitude_or_field.latitude
+        if isinstance(latitude_or_field, xr.DataArray)
+        and "latitude" in latitude_or_field.dims
+        and latitude_or_field.ndim != 1
+        else latitude_or_field
+    )
+    values = np.asarray(
+        latitude.values if isinstance(latitude, xr.DataArray) else latitude,
+        dtype=float,
+    )
+    weights = np.maximum(np.cos(np.deg2rad(values)), 0.0)
+    return xr.DataArray(
+        weights,
+        dims=("latitude",),
+        coords={"latitude": values},
+        name="coslat_weight",
+    )
+
+
+def time_step_days(da, dt_hours=6, numeric_step_values=True):
+    """Return a robust positive median Time increment in days."""
+    if "Time" not in da.dims or da.sizes["Time"] < 2:
+        return dt_hours / 24.0
+    values = da.Time.values
+    if np.issubdtype(values.dtype, np.number):
+        if not numeric_step_values:
+            return dt_hours / 24.0
+        deltas = np.diff(np.asarray(values, dtype=float)) * dt_hours / 24.0
+    elif np.issubdtype(values.dtype, np.datetime64):
+        deltas = np.diff(values) / np.timedelta64(1, "D")
+    else:
+        timestamps = pd.to_datetime(values)
+        deltas = np.asarray(np.diff(timestamps) / pd.Timedelta(days=1), dtype=float)
+    deltas = np.asarray(deltas, dtype=float)
+    deltas = deltas[np.isfinite(deltas) & (deltas > 0)]
+    return float(np.median(deltas)) if deltas.size else dt_hours / 24.0
+
+
+def time_block_slices(
+    da,
+    block_days,
+    dt_hours=6,
+    complete=False,
+    min_blocks=0,
+    require_time=False,
+    numeric_step_values=True,
+):
+    """Construct time-block slices for resampling or bounded calculations."""
+    if "Time" not in da.dims:
+        if require_time:
+            raise ValueError(f"Cannot block-resample without Time dimension in {da.dims!r}")
+        return [slice(None)]
+    length = max(
+        1,
+        int(
+            round(
+                block_days
+                / time_step_days(
+                    da,
+                    dt_hours=dt_hours,
+                    numeric_step_values=numeric_step_values,
+                )
+            )
+        ),
+    )
+    ntime = int(da.sizes["Time"])
+    if complete:
+        nblocks = ntime // length
+        if nblocks < min_blocks:
+            raise ValueError(
+                f"Only {nblocks} complete blocks for {getattr(da, 'name', None)!r}; "
+                f"need at least {min_blocks}. Try a shorter block length."
+            )
+        return [slice(index * length, (index + 1) * length) for index in range(nblocks)]
+    return [slice(start, min(start + length, ntime)) for start in range(0, ntime, length)]
+
+
+def add_period_reference_lines_frequency(ax, periods):
+    """Annotate frequency axes with horizontal reference-period guides."""
+    _, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    ymin, ymax = sorted((y0, y1))
+    for period in periods:
+        frequency = 1.0 / period
+        if ymin <= frequency <= ymax:
+            ax.axhline(frequency, color="0.25", lw=0.8, ls=":", alpha=0.8)
+            ax.text(
+                x1,
+                frequency,
+                f"{period:g} d",
+                ha="right",
+                va="bottom",
+                fontsize=7,
+                color="0.25",
+            )
+
+
+def count_rows_to_frame(rows, stem, save=False, save_loc=None):
+    """Report diagnostic sample counts and optionally save them as CSV."""
+    frame = pd.DataFrame(rows)
+    if len(frame) == 0:
+        return frame
+    print(f"\nSample counts for {stem}")
+    print(frame.to_string(index=False, max_rows=240))
+    if save:
+        frame.to_csv(os.path.join(save_loc, f"{stem}_bin_counts.csv"), index=False)
+    return frame
+
+
+def configured_label(mapping, name):
+    """Return a configured display label with the key itself as fallback."""
+    return mapping.get(name, {}).get("label", name)
+
+
+def find_variable(ds, key, required=False, aliases=None):
+    """Find a data variable by its canonical key and optional alias mapping."""
+    names = (aliases or {}).get(key, [key])
+    for name in names:
+        if name in ds.data_vars:
+            return name
+    if required:
+        raise KeyError(f"Could not find variable for {key!r}; tried {names}")
+    return None
+
+
+def subset_latitude(da, lat_bounds=None):
+    """Subset a latitude dimension while tolerating fields without latitude."""
+    if lat_bounds is None or "latitude" not in da.dims:
+        return da
+    lo, hi = sorted(lat_bounds)
+    return da.where((da.latitude >= lo) & (da.latitude <= hi), drop=True)
+
+
+def latitude_weight_array(da):
+    """Broadcast cosine-latitude weights to the shape of a field."""
+    if "latitude" not in da.dims:
+        return xr.ones_like(da)
+    weights = xr.DataArray(
+        np.cos(np.deg2rad(da.latitude.values)),
+        dims=("latitude",),
+        coords={"latitude": da.latitude},
+        name="latitude_weight",
+    )
+    return xr.broadcast(weights, da)[0]
+
+
+def weighted_area_time_mean(da, lat_bounds=None):
+    """Return a cosine-latitude-weighted mean over available map/time axes."""
+    field = subset_latitude(da.astype(float), lat_bounds=lat_bounds)
+    dims = [dim for dim in ("Time", "latitude", "longitude") if dim in field.dims]
+    if "latitude" not in field.dims:
+        return float(field.mean(dim=dims, skipna=True).values)
+    weights = np.cos(np.deg2rad(field.latitude))
+    return float(field.weighted(weights).mean(dim=dims, skipna=True).values)
+
+
+def select_common_time(da, reference):
+    """Select the intersection of two Time coordinates when both are present."""
+    if "Time" not in da.dims or "Time" not in reference.dims:
+        return da
+    common_time = da.Time.to_index().intersection(reference.Time.to_index())
+    return da.sel(Time=common_time)
+
+
+def time_aligned_variable(
+    ds,
+    key,
+    reference,
+    required=False,
+    aliases=None,
+    intersect=True,
+):
+    """Load a finite variable by alias and align it to a reference time axis."""
+    name = find_variable(ds, key, required=required, aliases=aliases)
+    if name is None:
+        return None
+    out = finite_or_nan(ds[name])
+    if "Time" in out.dims and "Time" in reference.dims:
+        out = (
+            select_common_time(out, reference)
+            if intersect
+            else out.sel(Time=reference.Time)
+        )
+    out.name = key
+    return out
+
+
+def precipitation_rate_from_dataset(ds, aliases=None, dt_hours=6):
+    """Return a direct or accumulated total precipitation rate in mm/day."""
+    direct = find_variable(ds, "precip", aliases=aliases)
+    if direct is not None:
+        precip = finite_or_nan(ds[direct])
+        precip.name = "precip"
+        precip.attrs.setdefault("units", "mm day-1")
+        return precip
+
+    names = {
+        key: find_variable(ds, key, required=True, aliases=aliases)
+        for key in ("rainc", "rainnc", "i_rainc", "i_rainnc")
+    }
+    accumulated = (
+        ds[names["rainnc"]]
+        + ds[names["i_rainnc"]] * 100.0
+        + ds[names["rainc"]]
+        + ds[names["i_rainc"]] * 100.0
+    )
+    precip = finite_or_nan(precip_rate_from_accum(accumulated, dt=dt_hours))
+    precip.name = "precip"
+    precip.attrs["units"] = "mm day-1"
+    return precip
+
+
+def time_days_from_coord(time_coord, dt_hours=6):
+    """Convert a datetime or integer time coordinate to elapsed days."""
+    values = np.asarray(time_coord.values)
+    if np.issubdtype(values.dtype, np.datetime64):
+        return (values - values[0]) / np.timedelta64(1, "D")
+    return values.astype(float) * dt_hours / 24.0
+
+
+def median_time_step_days(da, dt_hours=6):
+    """Return the median Time increment in days."""
+    values = np.asarray(da.Time.values)
+    if values.size < 2:
+        return dt_hours / 24.0
+    if np.issubdtype(values.dtype, np.datetime64):
+        return float(np.median(np.diff(values) / np.timedelta64(1, "D")))
+    return float(np.median(np.diff(values))) * dt_hours / 24.0
+
+
+def weighted_tropical_mean(da, lat_bounds):
+    """Return a cosine-latitude-weighted horizontal mean."""
+    field = subset_latitude(finite_or_nan(da), lat_bounds=lat_bounds)
+    dims = [dim for dim in ("latitude", "longitude") if dim in field.dims]
+    if "latitude" in field.dims:
+        weights = np.cos(np.deg2rad(field.latitude))
+        return field.weighted(weights).mean(dim=dims, skipna=True)
+    return field.mean(dim=dims, skipna=True)
+
+
+def latitude_field_like(reference):
+    """Broadcast a field's latitude coordinate across all of its dimensions."""
+    latitude = xr.DataArray(
+        reference.latitude.values,
+        dims=("latitude",),
+        coords={"latitude": reference.latitude},
+        name="latitude",
+    )
+    return xr.broadcast(latitude, reference)[0]
+
+
+def coordinate_edges(values):
+    """Construct cell edges from one-dimensional cell centres."""
+    values = np.asarray(values, dtype=float)
+    if values.size == 1:
+        return np.array([values[0] - 0.5, values[0] + 0.5], dtype=float)
+    edges = np.empty(values.size + 1, dtype=float)
+    edges[1:-1] = 0.5 * (values[:-1] + values[1:])
+    edges[0] = values[0] - 0.5 * (values[1] - values[0])
+    edges[-1] = values[-1] + 0.5 * (values[-1] - values[-2])
+    return edges
+
+
+def grid_cell_area_km2(lat, lon, earth_radius_km=6371.0):
+    """Return spherical latitude/longitude grid-cell areas in square km."""
+    lat_edges = np.clip(coordinate_edges(lat), -90.0, 90.0)
+    lon_edges = coordinate_edges(lon)
+    dlon = np.abs(np.diff(lon_edges))
+    lat_factor = np.diff(np.sin(np.deg2rad(lat_edges)))
+    area = earth_radius_km ** 2 * np.deg2rad(dlon)[None, :] * np.abs(lat_factor)[:, None]
+    return xr.DataArray(
+        area,
+        dims=("latitude", "longitude"),
+        coords={"latitude": lat, "longitude": lon},
+        name="cell_area",
+        attrs={"units": "km2"},
+    )
+
+
+def haversine_distances_km(
+    lat1,
+    lon1,
+    lat2,
+    lon2,
+    lon_period=360.0,
+    earth_radius_km=6371.0,
+):
+    """Return periodic great-circle distances in km for broadcastable inputs."""
+    lat1 = np.deg2rad(np.asarray(lat1, dtype=float))
+    lat2 = np.deg2rad(np.asarray(lat2, dtype=float))
+    lon1 = np.asarray(lon1, dtype=float)
+    lon2 = np.asarray(lon2, dtype=float)
+    dlat = lat2 - lat1
+    dlon_deg = (lon2 - lon1 + 0.5 * lon_period) % lon_period - 0.5 * lon_period
+    dlon = np.deg2rad(dlon_deg)
+    haversine = (
+        np.sin(0.5 * dlat) ** 2
+        + np.cos(lat1) * np.cos(lat2) * np.sin(0.5 * dlon) ** 2
+    )
+    return 2.0 * earth_radius_km * np.arcsin(np.minimum(1.0, np.sqrt(haversine)))
+
+
+def weighted_quantile(values, quantiles, weights=None):
+    """Return weighted quantiles using midpoint positions in the weight CDF."""
+    values = np.asarray(values, dtype=float)
+    quantiles = np.asarray(quantiles, dtype=float)
+    valid = np.isfinite(values)
+    values = values[valid]
+    if weights is None:
+        if values.size == 0:
+            return np.full_like(quantiles, np.nan, dtype=float)
+        return np.nanpercentile(values, quantiles * 100.0)
+
+    weights = np.asarray(weights, dtype=float)[valid]
+    positive = weights > 0
+    values = values[positive]
+    weights = weights[positive]
+    if values.size == 0:
+        return np.full_like(quantiles, np.nan, dtype=float)
+    order = np.argsort(values)
+    values = values[order]
+    weights = weights[order]
+    cdf = np.cumsum(weights) - 0.5 * weights
+    cdf /= np.sum(weights)
+    return np.interp(quantiles, cdf, values)
+
+
+def sample_matching_arrays(
+    *arrays,
+    lat_bounds,
+    max_time=96,
+    max_lat=96,
+    max_lon=192,
+    return_weights=True,
+    time_mode="stride",
+):
+    """Align, stride, broadcast, and flatten matching xarray arrays."""
+    prepared = [
+        subset_latitude(
+            finite_or_nan(array.astype(float)) if hasattr(array, "astype") else array,
+            lat_bounds=lat_bounds,
+        )
+        for array in arrays
+    ]
+    prepared = list(xr.align(*prepared, join="inner"))
+    indexers = stride_indexers(
+        prepared,
+        max_time=max_time,
+        max_lat=max_lat,
+        max_lon=max_lon,
+        time_mode=time_mode,
+    )
+    if indexers:
+        prepared = [
+            array.isel({dim: slc for dim, slc in indexers.items() if dim in array.dims})
+            for array in prepared
+        ]
+
+    broadcasted = xr.broadcast(*prepared)
+    values = [np.asarray(array.values).ravel() for array in broadcasted]
+    valid = np.ones(values[0].shape, dtype=bool)
+    for value in values:
+        valid &= np.isfinite(value)
+    if return_weights:
+        weights = np.asarray(latitude_weight_array(broadcasted[0]).values).ravel()
+        valid &= np.isfinite(weights) & (weights > 0)
+        return [value[valid] for value in values], weights[valid]
+    return [value[valid] for value in values]
+
+
+def stride_indexers(
+    arrays,
+    max_time=None,
+    max_lat=None,
+    max_lon=None,
+    time_mode="stride",
+):
+    """Build bounded-size indexers shared by flattened sampling routines."""
+    limits = {"Time": max_time, "latitude": max_lat, "longitude": max_lon}
+    indexers = {}
+    for dim, maximum in limits.items():
+        if maximum is None:
+            continue
+        size = max((array.sizes[dim] for array in arrays if dim in array.dims), default=0)
+        if size <= maximum:
+            continue
+        if dim == "Time" and time_mode == "tail":
+            indexers[dim] = slice(size - maximum, None)
+        else:
+            indexers[dim] = slice(0, None, int(np.ceil(size / maximum)))
+    return indexers
+
+
+def compute_ttl_diagnostics(zonal_dataset, precip_reference, aliases):
+    """Return optional 14--18 km static-stability and shear diagnostics."""
+    output = {}
+    if "z" not in zonal_dataset.coords:
+        return output
+    z_coord = zonal_dataset["z"]
+    z_values = np.asarray(z_coord.values, dtype=float)
+    z_km = z_values / 1000.0 if np.nanmax(np.abs(z_values)) > 100.0 else z_values
+    ttl_mask = xr.DataArray(
+        (z_km >= 14.0) & (z_km <= 18.0),
+        dims=("z",),
+        coords={"z": z_coord},
+    )
+
+    n2_name = find_variable(zonal_dataset, "N2", aliases=aliases)
+    if n2_name is not None:
+        n2 = finite_or_nan(zonal_dataset[n2_name])
+        if vertical_dim(n2) != "z":
+            n2 = n2.rename({vertical_dim(n2): "z"})
+        output["N2_TTL"] = n2.where(ttl_mask, drop=True).mean(dim="z", skipna=True)
+    else:
+        theta_name = find_variable(zonal_dataset, "theta", aliases=aliases)
+        if theta_name is not None:
+            theta = finite_or_nan(zonal_dataset[theta_name])
+            if vertical_dim(theta) != "z":
+                theta = theta.rename({vertical_dim(theta): "z"})
+            try:
+                output["N2_TTL"] = (
+                    9.80665 / theta * theta.differentiate("z")
+                ).where(ttl_mask, drop=True).mean(dim="z", skipna=True)
+            except Exception as exc:
+                warnings.warn(f"Could not compute N2_TTL from theta: {exc}")
+
+    shear_name = find_variable(zonal_dataset, "dudz", aliases=aliases)
+    if shear_name is not None:
+        shear = finite_or_nan(zonal_dataset[shear_name])
+        if vertical_dim(shear) != "z":
+            shear = shear.rename({vertical_dim(shear): "z"})
+        output["dudz_TTL"] = shear.where(ttl_mask, drop=True).mean(dim="z", skipna=True)
+    else:
+        wind_name = find_variable(zonal_dataset, "u_zm", aliases=aliases)
+        if wind_name is not None:
+            wind = finite_or_nan(zonal_dataset[wind_name])
+            if vertical_dim(wind) != "z":
+                wind = wind.rename({vertical_dim(wind): "z"})
+            try:
+                output["dudz_TTL"] = wind.differentiate("z").where(
+                    ttl_mask, drop=True
+                ).mean(dim="z", skipna=True)
+            except Exception as exc:
+                warnings.warn(f"Could not compute dudz_TTL from uReconstructZonal: {exc}")
+
+    aligned = {}
+    for key, array in output.items():
+        if "Time" in array.dims:
+            array = array.sel(Time=precip_reference.Time)
+        array.name = key
+        aligned[key] = array
+    return aligned
+
+
+def residual_feature_arrays(fields, feature_keys):
+    """Build the common environmental predictors for cloud residual models."""
+    arrays = []
+    for key in feature_keys:
+        if key == "latitude":
+            arrays.append(latitude_field_like(fields["precip"]))
+        elif key == "precip_log":
+            arrays.append(np.log1p(fields["precip"].clip(min=0.0)))
+        else:
+            arrays.append(fields[key])
+    return arrays
+
+
+def residual_target_array(classification, target_key):
+    """Return one of the shared high-cloud residual-model targets."""
+    if target_key == "total":
+        return classification["high_cloud_fraction"].clip(min=0.0, max=1.0)
+    variable = {
+        "convective": "convective_precipitating_high_cloud_mask",
+        "stratiform": "stratiform_precipitating_high_cloud_mask",
+        "nonprecipitating": "nonprecipitating_high_cloud_mask",
+    }.get(target_key)
+    if variable is None:
+        raise ValueError(target_key)
+    return classification[variable].astype(float)
+
+
+def residual_model_training_data(
+    fields,
+    classification,
+    target_key,
+    feature_keys,
+    lat_bounds,
+    sample_limits,
+):
+    """Build the common weighted design matrix for cloud residual models."""
+    arrays = residual_feature_arrays(fields, feature_keys)
+    arrays.append(residual_target_array(classification, target_key))
+    values, weights = sample_matching_arrays(
+        *arrays,
+        lat_bounds=lat_bounds,
+        **sample_limits,
+    )
+    return np.column_stack(values[:-1]), values[-1], weights
+
+
+def available_residual_features(fields_by_run):
+    """Return predictors available for every simulation in a residual model."""
+    feature_keys = ["precip_log"]
+    for key in ("pw", "cape", "cin"):
+        if all(key in fields for fields in fields_by_run):
+            feature_keys.append(key)
+        else:
+            warnings.warn(
+                f"Residual model omits {key.upper()} because it is unavailable "
+                "in at least one run."
+            )
+    feature_keys.append("latitude")
+    return feature_keys
+
+
+class SimpleRidgeRegressor:
+    """Small weighted ridge fallback with linear, squared, and pair terms."""
+
+    def __init__(self, alpha=1.0):
+        self.alpha = alpha
+        self.mean_ = None
+        self.scale_ = None
+        self.beta_ = None
+
+    def _design(self, X, fit=False):
+        X = np.asarray(X, dtype=float)
+        if fit:
+            self.mean_ = np.nanmean(X, axis=0)
+            self.scale_ = np.nanstd(X, axis=0)
+            self.scale_[self.scale_ == 0] = 1.0
+        normalized = (X - self.mean_) / self.scale_
+        columns = [np.ones(normalized.shape[0]), normalized, normalized ** 2]
+        pairs = [
+            normalized[:, i] * normalized[:, j]
+            for i in range(normalized.shape[1])
+            for j in range(i + 1, normalized.shape[1])
+        ]
+        if pairs:
+            columns.append(np.column_stack(pairs))
+        return np.column_stack(columns)
+
+    def fit(self, X, y, sample_weight=None):
+        design = self._design(X, fit=True)
+        y = np.asarray(y, dtype=float)
+        weights = np.ones_like(y) if sample_weight is None else np.asarray(sample_weight, dtype=float)
+        sqrt_weights = np.sqrt(np.maximum(weights, 0.0))
+        weighted_design = design * sqrt_weights[:, None]
+        weighted_y = y * sqrt_weights
+        penalty = self.alpha * np.eye(design.shape[1])
+        penalty[0, 0] = 0.0
+        self.beta_ = np.linalg.solve(
+            weighted_design.T @ weighted_design + penalty,
+            weighted_design.T @ weighted_y,
+        )
+        return self
+
+    def predict(self, X):
+        return self._design(X, fit=False) @ self.beta_
+
+
+def fit_control_relationship(
+    X,
+    y,
+    weights,
+    target_label,
+    logger=print,
+    report_backend=False,
+):
+    """Fit the shared control high-cloud model with a ridge fallback."""
+    valid = (
+        np.all(np.isfinite(X), axis=1)
+        & np.isfinite(y)
+        & np.isfinite(weights)
+        & (weights > 0)
+    )
+    X = X[valid]
+    y = y[valid]
+    weights = weights[valid]
+    logger(f"Fitting control high-cloud model for {target_label}: {X.shape[0]} samples")
+    try:
+        from sklearn.ensemble import HistGradientBoostingRegressor
+
+        model = HistGradientBoostingRegressor(
+            max_iter=160,
+            learning_rate=0.04,
+            max_leaf_nodes=31,
+            l2_regularization=0.01,
+            min_samples_leaf=40,
+            random_state=0,
+        )
+        model.fit(X, y, sample_weight=weights)
+        if report_backend:
+            logger(f"  used HistGradientBoostingRegressor for {target_label}")
+        return model
+    except Exception as exc:
+        logger(f"  falling back to weighted ridge for {target_label}: {exc}")
+        return SimpleRidgeRegressor(alpha=1.0).fit(X, y, sample_weight=weights)
+
+
+def symmetric_percentile_levels_for_fields(
+    fields,
+    percentile=99.0,
+    ndiv=12,
+    fallback=1.0,
+):
+    """Build shared symmetric levels from the finite values in several fields."""
+    values = []
+    for field in fields:
+        if field is None:
+            continue
+        finite = np.asarray(field.values, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if finite.size:
+            values.append(np.abs(finite))
+    vmax = np.nanpercentile(np.concatenate(values), percentile) if values else fallback
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = fallback
+    return symmetric_levels(vmax, ndiv=ndiv)
+
+
+# -----------------------------------------------------------------------------
+# Memory-bounded mean-state precipitation helpers
+# -----------------------------------------------------------------------------
+
+
+DEFAULT_TROPICAL_LAT_BOUNDS = (-10.0, 10.0)
+
+
+def accumulated_precipitation_components(ds):
+    """Return total, convective, and resolved accumulated rain as float32."""
+    hundred = np.float32(100.0)
+    convective = ds["rainc"].astype(np.float32) + ds["i_rainc"].astype(np.float32) * hundred
+    resolved = ds["rainnc"].astype(np.float32) + ds["i_rainnc"].astype(np.float32) * hundred
+    return (convective + resolved).astype(np.float32), convective, resolved
+
+
+def precipitation_rate(accumulated, dt_hours=6):
+    """Convert accumulated precipitation to a float32 rate in mm/day."""
+    if issubclass(accumulated.Time.dtype.type, numbers.Integral):
+        rate = accumulated.diff("Time") / np.float32(dt_hours / 24.0)
+    else:
+        dt_days = accumulated.Time.diff("Time") / np.timedelta64(1, "D")
+        rate = accumulated.diff("Time") / dt_days
+    return rate.astype(np.float32)
+
+
+def domain_fields(field, tropical_lat_bounds=DEFAULT_TROPICAL_LAT_BOUNDS):
+    """Return lazy global and tropical views without loading either view."""
+    lat_name = "latitude" if "latitude" in field.dims else "lat"
+    lo, hi = tropical_lat_bounds
+    latitude = field[lat_name]
+    tropical = field.where((latitude >= lo) & (latitude <= hi), drop=True)
+    return field, tropical
+
+
+def _histogram_task(field, bins, value_range):
+    values = field.data
+    if not isinstance(values, dsa.Array):
+        return np.histogram(np.asarray(values), bins=bins, range=value_range)
+    return dsa.histogram(values.ravel(), bins=bins, range=value_range)
+
+
+def domain_histograms(
+    field,
+    bins,
+    value_range=None,
+    tropical_lat_bounds=DEFAULT_TROPICAL_LAT_BOUNDS,
+):
+    """Compute global and tropical histograms without materialising the field."""
+    tasks = [
+        _histogram_task(domain, bins=bins, value_range=value_range)
+        for domain in domain_fields(field, tropical_lat_bounds)
+    ]
+    count_tasks = [task[0] for task in tasks]
+    counts = (
+        dask.compute(*count_tasks)
+        if any(isinstance(task, dsa.Array) for task in count_tasks)
+        else tuple(np.asarray(task) for task in count_tasks)
+    )
+    edges = np.asarray(tasks[0][1])
+    return tuple((np.asarray(count), edges) for count in counts)
+
+
+def relative_frequency_from_histogram(counts, edges, smooth):
+    """Apply the diagnostic's smoothing and zero-bin normalisation."""
+    from scipy.ndimage import uniform_filter1d
+
+    smoothed = uniform_filter1d(np.asarray(counts, dtype=float), size=smooth)
+    scale = smoothed[0] if smoothed[0] > 0 else np.nanmax(smoothed)
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+    centres = 0.5 * (edges[1:] + edges[:-1])
+    return centres, smoothed / scale
+
+
+def duration_domain_histograms(
+    field,
+    threshold,
+    bins,
+    value_range,
+    tropical_lat_bounds=DEFAULT_TROPICAL_LAT_BOUNDS,
+    time_block=8,
+):
+    """Return global/tropical wet-spell histograms with bounded peak memory."""
+    lat_name = "latitude" if "latitude" in field.dims else "lat"
+    lon_name = "longitude" if "longitude" in field.dims else "lon"
+    time_name = "Time" if "Time" in field.dims else "time"
+    ordered = field.transpose(time_name, lat_name, lon_name)
+    edges = np.histogram_bin_edges([], bins=bins, range=value_range)
+    global_counts = np.zeros(edges.size - 1, dtype=np.int64)
+    tropical_counts = np.zeros_like(global_counts)
+    latitudes = np.asarray(ordered[lat_name].values)
+    lo, hi = tropical_lat_bounds
+    tropical_mask = (latitudes >= lo) & (latitudes <= hi)
+    run_dtype = np.int16 if ordered.sizes[time_name] <= np.iinfo(np.int16).max else np.int32
+    run_lengths = np.zeros(
+        (ordered.sizes[lat_name], ordered.sizes[lon_name]),
+        dtype=run_dtype,
+    )
+    for time_start in range(0, ordered.sizes[time_name], time_block):
+        time_stop = min(time_start + time_block, ordered.sizes[time_name])
+        values = ordered.isel({time_name: slice(time_start, time_stop)}).values
+        wet_block = np.isfinite(values) & (values > threshold)
+        for wet in wet_block:
+            run_lengths[wet] += 1
+            ended = (~wet) & (run_lengths > 0)
+            if not ended.any():
+                continue
+            global_counts += np.histogram(run_lengths[ended], bins=edges)[0]
+            tropical_ended = ended & tropical_mask[:, None]
+            if tropical_ended.any():
+                tropical_counts += np.histogram(run_lengths[tropical_ended], bins=edges)[0]
+            run_lengths[ended] = 0
+    return (global_counts, edges), (tropical_counts, edges)
+
+
+# -----------------------------------------------------------------------------
+# Shared producer/consumer contract for MPAS PyFLEXTRKR products
+# -----------------------------------------------------------------------------
+
+
+PYFLEXTRKR_PRODUCT_VERSION = "mpas-organised-convective-envelope-pyflextrkr-v9"
+PYFLEXTRKR_METADATA_FILENAME = "pyflextrkr_product_metadata.json"
+PYFLEXTRKR_TRACK_MANIFEST_FILENAME = "organised_track_manifest.csv"
+PRIMARY_TRACK_SOURCE = "organised_convective_system_mask"
+PRIMARY_ANALYSIS_ROLE = "primary_persistence_and_composites"
+TRACKED_SOURCES = (PRIMARY_TRACK_SOURCE,)
+MIN_ORGANISED_TRACK_OBSERVATIONS = 4
+MIN_ORGANISED_TRACK_DURATION_HOURS = 24.0
+ORGANISED_TRACK_ACCEPTANCE_CRITERIA = "duration_and_embedded_classifier_core"
+ORGANISED_TRACK_EMBEDDED_CORE_REQUIREMENT = "any_positive_area_during_track"
+ORGANISED_TRACK_OBJECT_GEOMETRY = "pyflextrkr_olr_to_tb_detect_and_spread"
+ORGANISED_ENVELOPE_MIN_RAW_AREA_KM2 = 5000.0
+
+
+def epoch_seconds(time_values):
+    stamps = pd.to_datetime(np.asarray(time_values))
+    return np.asarray(
+        (stamps - pd.Timestamp("1970-01-01")) / pd.Timedelta(seconds=1),
+        dtype=np.int64,
+    )
+
+
+def sha256_file(path, block_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(block_size)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def sha256_label_sequence(labels_by_time):
+    digest = hashlib.sha256()
+    for labels in labels_by_time:
+        values = np.ascontiguousarray(labels, dtype=np.int32)
+        digest.update(np.asarray(values.shape, dtype=np.int64).tobytes())
+        digest.update(values.tobytes())
+    return digest.hexdigest()
+
+
+def time_signature(time_values):
+    seconds = epoch_seconds(time_values)
+    digest = hashlib.sha256(np.ascontiguousarray(seconds).tobytes()).hexdigest()
+    return {
+        "time_count": int(seconds.size),
+        "first_basetime": int(seconds[0]) if seconds.size else None,
+        "last_basetime": int(seconds[-1]) if seconds.size else None,
+        "basetimes_sha256": digest,
+    }
+
+
+def product_fingerprint(metadata):
+    keys = (
+        "product_version", "source", "simulation", "analysis_role",
+        "classification_cache_version", "time_count", "first_basetime",
+        "last_basetime", "basetimes_sha256", "cloudid_labels_sha256",
+        "tracknumbers_sha256", "track_min_overlap_fraction",
+        "track_min_area_km2", "min_track_observations",
+        "min_track_duration_hours", "track_acceptance_criteria",
+        "embedded_convective_core_requirement", "object_geometry",
+        "envelope_min_raw_area_km2", "pyflextrkr_tb_core_k",
+        "pyflextrkr_tb_cold_k", "pyflextrkr_tb_warm_k",
+        "pyflextrkr_tb_cloud_k", "pyflextrkr_tb_smoothing_cells",
+        "pyflextrkr_min_cold_core_pixels", "pyflextrkr_warm_anvil_expansion",
+        "track_manifest_sha256", "pyflextrkr_nmaxlinks",
+    )
+    payload = {key: metadata.get(key) for key in keys}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def metadata_path(work_path):
+    return os.path.join(work_path, PYFLEXTRKR_METADATA_FILENAME)
+
+
+def track_manifest_path(work_path):
+    return os.path.join(work_path, PYFLEXTRKR_TRACK_MANIFEST_FILENAME)
+
+
+def read_track_manifest(work_path):
+    path = track_manifest_path(work_path)
+    return pd.read_csv(path) if os.path.exists(path) else None
+
+
+def manifest_accepted_mask(manifest):
+    values = manifest["accepted"]
+    if values.dtype.kind == "b":
+        return values.astype(bool)
+    normalized = values.astype(str).str.strip().str.lower()
+    invalid = ~normalized.isin({"true", "false", "1", "0"})
+    if invalid.any():
+        raise ValueError("organised-track manifest contains invalid accepted values")
+    return normalized.isin({"true", "1"})
+
+
+def read_product_metadata(work_path):
+    path = metadata_path(work_path)
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_product_metadata(work_path, metadata):
+    os.makedirs(work_path, exist_ok=True)
+    payload = dict(metadata)
+    payload["product_fingerprint"] = product_fingerprint(payload)
+    path = metadata_path(work_path)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp_path, path)
+    return payload

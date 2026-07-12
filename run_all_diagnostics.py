@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Run the MPAS-A diagnostic scripts one at a time.
 
-The diagnostics in ``diagnostics/`` execute their work at module top level, so
-this helper intentionally launches each file in a fresh Python process.  That
-keeps memory use, warnings, and failures isolated between diagnostics.
+The diagnostics in the family subdirectories below ``diagnostics/`` execute
+their work at module top level, so this helper intentionally launches each file
+in a fresh Python process.  That keeps memory use, warnings, and failures
+isolated between diagnostics.
 """
 
 from __future__ import annotations
@@ -33,23 +34,28 @@ DEFAULT_DIAGNOSTIC_CACHE_ROOT = Path(
 DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
 MODULE_SEARCH_DIRS = [
     DIAGNOSTICS_DIR,
+    *(
+        path
+        for path in DIAGNOSTICS_DIR.iterdir()
+        if path.is_dir() and not path.name.startswith("__")
+    ),
     ANALYSIS_DIR,
     ANALYSIS_DIR.parent,
 ]
 
 DEFAULT_SCRIPT_ORDER = [
-    "mean_state_diagnostics.py",
-    "global_atmospheric_energy_budget_diagnostics.py",
-    "refined_high_cloud_classification_diagnostics.py",
-    "symmetry_convection_diagnostics.py",
-    "thermal_wind_scaled_response.py",
-    "matched_pattern_response.py",
-    "convective_pathway_diagnostics.py",
-    "convective_organisation_diagnostics.py",
-    "convective_lifecycle_composite_diagnostics.py",
-    "equatorial_wave_diagnostics.py",
-    "significance_bootstrap_diagnostics.py",
-    "jet_variability_diagnostics.py",
+    "mean_state/mean_state_diagnostics.py",
+    "mean_state/energy_budget.py",
+    "mean_state/thermal_wind_scaled_response.py",
+    "mean_state/matched_pattern_response.py",
+    "mean_state/jet_variability_diagnostics.py",
+    "convection/refined_high_cloud_classification_diagnostics.py",
+    "convection/symmetry_convection_diagnostics.py",
+    "convection/convective_pathway_diagnostics.py",
+    "convection/convective_organisation_diagnostics.py",
+    "convection/convective_lifecycle_composite_diagnostics.py",
+    "waves/equatorial_wave_diagnostics.py",
+    "significance/significance_bootstrap_diagnostics.py",
 ]
 
 GUIDANCE_HEADER_RE = re.compile(
@@ -78,8 +84,8 @@ def parse_args() -> argparse.Namespace:
         metavar="NAME",
         help=(
             "Run only these diagnostics. Names may be stems such as "
-            "'mean_state_diagnostics' or filenames such as "
-            "'mean_state_diagnostics.py'."
+            "'mean_state_diagnostics', filenames, or family-relative paths "
+            "such as 'mean_state/mean_state_diagnostics.py'."
         ),
     )
     parser.add_argument(
@@ -125,31 +131,53 @@ def parse_args() -> argparse.Namespace:
 
 
 def normalise_name(name: str) -> str:
-    """Return a diagnostic script filename from a stem, filename, or path."""
-    filename = Path(name).name
-    return filename if filename.endswith(".py") else f"{filename}.py"
+    """Normalise a diagnostic stem, filename, or family-relative path."""
+    normalised = Path(name).as_posix().removeprefix("diagnostics/")
+    return normalised if normalised.endswith(".py") else f"{normalised}.py"
 
 
 def discover_diagnostic_scripts() -> list[str]:
     """Find diagnostic scripts, preserving the usual analysis order first."""
     discovered = set()
     for pattern in ("*_diagnostics.py", "*_response.py"):
-        discovered.update(path.name for path in DIAGNOSTICS_DIR.glob(pattern))
+        discovered.update(
+            path.relative_to(DIAGNOSTICS_DIR).as_posix()
+            for path in DIAGNOSTICS_DIR.rglob(pattern)
+        )
+    energy_budget = DIAGNOSTICS_DIR / "mean_state" / "energy_budget.py"
+    if energy_budget.exists():
+        discovered.add(energy_budget.relative_to(DIAGNOSTICS_DIR).as_posix())
 
     ordered = [script for script in DEFAULT_SCRIPT_ORDER if script in discovered]
     extras = sorted(discovered - set(ordered))
     return ordered + extras
 
 
+def resolve_script_name(name: str, available: list[str]) -> str:
+    """Resolve a family-relative path or an unambiguous basename/stem."""
+    normalised = normalise_name(name)
+    if normalised in available:
+        return normalised
+
+    basename = Path(normalised).name
+    matches = [script for script in available if Path(script).name == basename]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        choices = ", ".join(matches)
+        raise SystemExit(f"Ambiguous diagnostic {name!r}; choose one of: {choices}")
+    return normalised
+
+
 def selected_scripts(args: argparse.Namespace) -> list[str]:
     diagnostic_scripts = discover_diagnostic_scripts()
     available = set(diagnostic_scripts)
     selected = (
-        [normalise_name(name) for name in args.only]
+        [resolve_script_name(name, diagnostic_scripts) for name in args.only]
         if args.only
         else list(diagnostic_scripts)
     )
-    skipped = {normalise_name(name) for name in args.skip}
+    skipped = {resolve_script_name(name, diagnostic_scripts) for name in args.skip}
 
     unknown = sorted((set(selected) | skipped) - available)
     if unknown:
@@ -262,7 +290,8 @@ def run_script(script: str, args: argparse.Namespace) -> int:
     log_file = None
     if args.log_dir and not args.no_log:
         args.log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = args.log_dir / f"{Path(script).stem}.log"
+        log_name = script.removesuffix(".py").replace("/", "__")
+        log_path = args.log_dir / f"{log_name}.log"
         log_file = log_path.open("w", encoding="utf-8")
         log_file.write(f"[{start:%Y-%m-%d %H:%M:%S}] Starting {script}\n")
         log_file.write(f"Command: {command_text}\n\n")
@@ -332,7 +361,8 @@ def main() -> int:
             if args.no_log or not args.log_dir:
                 print(command)
             else:
-                log_path = args.log_dir / f"{Path(script).stem}.log"
+                log_name = script.removesuffix(".py").replace("/", "__")
+                log_path = args.log_dir / f"{log_name}.log"
                 print(f"{command}  # log: {log_path}")
         return 0
 

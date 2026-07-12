@@ -17,6 +17,7 @@ atmospheric forcing.
 
 import os
 import sys
+from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("..", "../..", "../../.."):
@@ -29,7 +30,7 @@ import pandas as pd
 from matplotlib import pyplot as plt
 import xarray as xr
 
-from diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import *
 
 
 silence_hdf5_error_stack()
@@ -54,8 +55,7 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/global_atmos
 figures_to_run = []
 
 
-def should_run_figure(number):
-    return figure_should_run(figures_to_run, number)
+should_run_figure = partial(figure_should_run, figures_to_run)
 
 
 RD = 287.0

@@ -35,6 +35,7 @@ so that figures can be regenerated without re-running the k-f filters.
 """
 
 import os, sys, numbers, json
+from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("../..", "../../.."):
@@ -50,8 +51,8 @@ from matplotlib.lines import Line2D
 import xarray as xr
 import dask
 
-from diagnostic_helpers import *
-from equatorial_wave_config import (
+from diagnostics.diagnostic_helpers import *
+from diagnostics.waves.equatorial_wave_config import (
     MISSING_EQUIVALENT_DEPTH,
     WAVE_BOXES,
     WAVE_LATITUDE_PROJECTION,
@@ -232,16 +233,9 @@ latlon_chunks = {"Time": 8, "latitude": 60, "longitude": 120}
 zm_chunks = {"Time": -1}
 
 
-def should_run_figure(number):
-    return figure_should_run(figures_to_run, number)
-
-
-def should_run_any(numbers):
-    return figure_should_run_any(figures_to_run, numbers)
-
-
-def run_all_figures():
-    return all_figures_requested(figures_to_run)
+should_run_figure = partial(figure_should_run, figures_to_run)
+should_run_any = partial(figure_should_run_any, figures_to_run)
+run_all_figures = partial(all_figures_requested, figures_to_run)
 
 
 def numbered_figure_path(number, stem):
@@ -268,42 +262,15 @@ def should_build_figure(number, stems):
     return True
 
 
-def save_figure(number, fig, stem):
-    return figsave.save(fig, stem, number=number)
-
-
-def jsonable_value(value):
-    if isinstance(value, dict):
-        return {str(k): jsonable_value(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [jsonable_value(v) for v in value]
-    if isinstance(value, np.ndarray):
-        return jsonable_value(value.tolist())
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        return float(value)
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    return value
+save_figure = numbered_figure_saver(figsave)
 
 
 def derived_cache_path(cache_name, suffix):
     return os.path.join(derived_cache_dir, f"{safe_name(cache_name)}.{suffix}")
 
 
-def read_cache_metadata(path):
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def write_cache_metadata(path, signature):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(jsonable_value(signature), handle, indent=2, sort_keys=True)
-    os.replace(tmp, path)
+read_cache_metadata = read_json_file
+write_cache_metadata = write_json_file
 
 
 def cache_signature(kind, extra=None):
@@ -525,12 +492,7 @@ for i, d in enumerate(data_locs):
 mis = MISSING_EQUIVALENT_DEPTH
 
 
-def wave_label(wave_name):
-    return WAVE_BOXES.get(wave_name, {}).get("label", wave_name)
-
-
-def safe_name(x):
-    return str(x).replace(" ", "_").replace("/", "-").replace(".", "p").replace("-", "m")
+wave_label = partial(configured_label, WAVE_BOXES)
 
 
 def precip_rate(ds):
@@ -659,26 +621,6 @@ def field_units(field_name):
     if field_name.startswith("RH"):
         return "%"
     return "m s$^{-1}$"
-
-
-def netcdf_safe_attrs(attrs):
-    """Convert Python/numpy bool attributes to NetCDF4-compatible metadata."""
-    safe = {}
-    for key, value in attrs.items():
-        if isinstance(value, (bool, np.bool_)):
-            safe[key] = int(value)
-        else:
-            safe[key] = value
-    return safe
-
-
-def netcdf_safe_dataset(ds):
-    """Return a shallow copy with bool attrs converted before NetCDF writing."""
-    out = ds.copy(deep=False)
-    out.attrs = netcdf_safe_attrs(out.attrs)
-    for name in out.variables:
-        out[name].attrs = netcdf_safe_attrs(out[name].attrs)
-    return out
 
 
 def to_filter_input_dataset(da, obs_var="x"):
@@ -1548,16 +1490,10 @@ def phase_speed_axis_values():
     return np.arange(lo, hi + 0.5 * step, step)
 
 
-def add_period_reference_lines_frequency(ax):
-    x0, x1 = ax.get_xlim()
-    y0, y1 = ax.get_ylim()
-    ymin, ymax = sorted((y0, y1))
-    for period in spectrum_period_reference_days:
-        freq = 1.0 / period
-        if ymin <= freq <= ymax:
-            ax.axhline(freq, color="0.25", lw=0.8, ls=":", alpha=0.8)
-            ax.text(x1, freq, f"{period:g} d", ha="right", va="bottom",
-                    fontsize=7, color="0.25")
+add_period_reference_lines_frequency = partial(
+    add_period_reference_lines_frequency,
+    periods=spectrum_period_reference_days,
+)
 
 
 def add_period_reference_lines_period(ax):

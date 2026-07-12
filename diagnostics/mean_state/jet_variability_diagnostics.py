@@ -20,6 +20,7 @@ The default configuration mirrors the other diagnostics in this directory.
 
 import os
 import sys
+from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("../..", "../../.."):
@@ -33,10 +34,7 @@ from matplotlib import pyplot as plt
 import xarray as xr
 import dask
 
-try:
-    from diagnostic_helpers import *
-except ModuleNotFoundError:
-    from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import *
 
 
 # -----------------------------------------------------------------------------
@@ -68,16 +66,9 @@ figures_to_run = [6]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 
-def should_run_figure(number):
-    return figure_should_run(figures_to_run, number)
-
-
-def should_run_any(numbers):
-    return figure_should_run_any(figures_to_run, numbers)
-
-
-def run_all_figures():
-    return all_figures_requested(figures_to_run)
+should_run_figure = partial(figure_should_run, figures_to_run)
+should_run_any = partial(figure_should_run_any, figures_to_run)
+run_all_figures = partial(all_figures_requested, figures_to_run)
 
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
@@ -128,10 +119,6 @@ dask.config.set({"array.slicing.split_large_chunks": True})
 # General helpers
 # -----------------------------------------------------------------------------
 
-def safe_name(value):
-    return str(value).replace(" ", "_").replace("/", "-").replace(".", "p").replace("-", "m")
-
-
 def pressure_name(value):
     return safe_name(f"{float(value):g}")
 
@@ -152,29 +139,7 @@ def add_right_margin_colorbar(fig, mappable, axes, label, pad=0.015, width=0.025
     return fig.colorbar(mappable, cax=cax, label=label)
 
 
-def subset_between(da, dim, bounds):
-    """Subset a coordinate range without assuming ascending coordinates."""
-    lo, hi = sorted(bounds)
-    coord = da[dim]
-    return da.where((coord >= lo) & (coord <= hi), drop=True)
-
-
-def time_step_days(da):
-    if "Time" not in da.dims or da.sizes["Time"] < 2:
-        return dt / 24.0
-
-    times = da.Time.values
-    if np.issubdtype(times.dtype, np.number):
-        deltas = np.diff(np.asarray(times, dtype=float)) * dt / 24.0
-    elif np.issubdtype(times.dtype, np.datetime64):
-        deltas = np.diff(times) / np.timedelta64(1, "D")
-    else:
-        times = pd.to_datetime(times)
-        deltas = np.asarray(np.diff(times) / pd.Timedelta(days=1), dtype=float)
-
-    deltas = np.asarray(deltas, dtype=float)
-    deltas = deltas[np.isfinite(deltas) & (deltas > 0)]
-    return float(np.nanmedian(deltas)) if deltas.size else dt / 24.0
+time_step_days = partial(time_step_days, dt_hours=dt)
 
 
 def time_days_since_start(da):
@@ -200,38 +165,6 @@ def time_average(da, days=time_average_days):
     return da.coarsen(Time=window, boundary="trim").mean()
 
 
-def pressure_layer_weights(pres):
-    """Positive pressure weights proportional to d ln(p), with p in hPa."""
-    if isinstance(pres, xr.DataArray):
-        pres_values = np.asarray(pres.values, dtype=float)
-        pres_coord = pres_values
-    else:
-        pres_values = np.asarray(pres, dtype=float)
-        pres_coord = pres_values
-
-    if np.any(pres_values <= 0):
-        raise ValueError("Pressure values must be positive before taking log(p)")
-
-    if pres_values.size == 1:
-        weights = np.ones_like(pres_values)
-    else:
-        lnp = np.log(pres_values)
-        bounds = np.empty(pres_values.size + 1)
-        bounds[1:-1] = 0.5 * (lnp[:-1] + lnp[1:])
-        bounds[0] = lnp[0] - 0.5 * (lnp[1] - lnp[0])
-        bounds[-1] = lnp[-1] + 0.5 * (lnp[-1] - lnp[-2])
-        weights = np.abs(np.diff(bounds))
-
-    return xr.DataArray(weights, dims=("pres",), coords={"pres": pres_coord}, name="dlnp_weight")
-
-
-def latitude_weights(latitude):
-    values = np.asarray(latitude.values if isinstance(latitude, xr.DataArray) else latitude, dtype=float)
-    weights = np.cos(np.deg2rad(values))
-    weights = np.where(weights > 0, weights, 0.0)
-    return xr.DataArray(weights, dims=("latitude",), coords={"latitude": values}, name="coslat_weight")
-
-
 def pressure_latitude_weights(field):
     pw, lw = xr.broadcast(pressure_layer_weights(field.pres), latitude_weights(field.latitude))
     return (pw * lw).transpose("pres", "latitude")
@@ -243,25 +176,6 @@ def weighted_pressure_mean(field):
     numerator = (field * weights).where(valid).sum(dim="pres", skipna=True)
     denominator = weights.where(valid).sum(dim="pres", skipna=True)
     return numerator / denominator
-
-
-def symmetric_percentile_levels_for_fields(fields, percentile=99.0, ndiv=12, fallback=1.0):
-    vals = []
-    for field in fields:
-        if field is None:
-            continue
-        arr = np.asarray(field.values, dtype=float)
-        arr = arr[np.isfinite(arr)]
-        if arr.size:
-            vals.append(np.abs(arr))
-
-    if vals:
-        vmax = np.nanpercentile(np.concatenate(vals), percentile)
-    else:
-        vmax = fallback
-    if not np.isfinite(vmax) or vmax <= 0:
-        vmax = fallback
-    return symmetric_levels(vmax, ndiv=ndiv)
 
 
 def model_height_time_mean_zonal_u(zds):

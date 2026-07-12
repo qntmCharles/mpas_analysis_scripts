@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import warnings
+from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _path in (
@@ -47,35 +48,12 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from scipy import ndimage
 
-from diagnostic_helpers import *
-from high_cloud_classification import (
+from diagnostics.diagnostic_helpers import *
+from diagnostics.convection.high_cloud_classification import (
     CLASSIFICATION_CACHE_VERSION,
     HighCloudThresholds,
     cached_classification_is_current as shared_cached_classification_is_current,
 )
-from pyflextrkr_contract import (
-    MIN_ORGANISED_TRACK_DURATION_HOURS,
-    MIN_ORGANISED_TRACK_OBSERVATIONS,
-    ORGANISED_TRACK_ACCEPTANCE_CRITERIA,
-    ORGANISED_TRACK_EMBEDDED_CORE_REQUIREMENT,
-    ORGANISED_TRACK_OBJECT_GEOMETRY,
-    ORGANISED_ENVELOPE_MIN_RAW_AREA_KM2,
-    PRIMARY_ANALYSIS_ROLE,
-    PRIMARY_TRACK_SOURCE,
-    PYFLEXTRKR_PRODUCT_VERSION,
-    PYFLEXTRKR_TRACK_MANIFEST_FILENAME,
-    TRACKED_SOURCES,
-    product_fingerprint,
-    manifest_accepted_mask,
-    read_product_metadata,
-    read_track_manifest,
-    sha256_file,
-    sha256_label_sequence,
-    time_signature,
-    track_manifest_path,
-    write_product_metadata,
-)
-
 from pyflextrkr.gettracks import gettracknumbers as pyflextrkr_gettracknumbers
 from pyflextrkr.idclouds_tbpf import olr_to_tb as pyflextrkr_olr_to_tb
 from pyflextrkr.label_and_grow_cold_clouds import (
@@ -83,13 +61,6 @@ from pyflextrkr.label_and_grow_cold_clouds import (
 )
 from pyflextrkr.ftfunctions import grow_cells as pyflextrkr_grow_cells
 from pyflextrkr.tracksingle import trackclouds as pyflextrkr_trackclouds
-
-
-def env_flag(name, default=False):
-    value = os.environ.get(name)
-    if value is None:
-        return bool(default)
-    return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
 # -----------------------------------------------------------------------------
@@ -325,12 +296,8 @@ latlon_chunks = {"Time": 8, "latitude": 90, "longitude": 180}
 dask.config.set({"array.slicing.split_large_chunks": True})
 
 
-def should_run_figure(number):
-    return figure_should_run(figures_to_run, number)
-
-
-def should_run_any(numbers):
-    return figure_should_run_any(figures_to_run, numbers)
+should_run_figure = partial(figure_should_run, figures_to_run)
+should_run_any = partial(figure_should_run_any, figures_to_run)
 
 
 def parse_command_line(argv=None):
@@ -570,20 +537,6 @@ def organisation_cache_path(name):
     return os.path.join(save_loc, ORGANISATION_CACHE_FILES[name])
 
 
-def jsonable_value(value):
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, (list, tuple)):
-        return [jsonable_value(v) for v in value]
-    if isinstance(value, dict):
-        return {str(k): jsonable_value(v) for k, v in value.items()}
-    if isinstance(value, float) and not np.isfinite(value):
-        return None
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
 def base_data_cache_signature():
     return dict(
         root_dir=root_dir,
@@ -678,24 +631,8 @@ def cache_force_enabled(kind):
     return FORCE_RECOMPUTE_PERSISTENCE_CACHE
 
 
-def read_cache_metadata(name):
-    path = organisation_cache_path(name)
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def write_cache_metadata(name, signature):
-    if not save:
-        return
-    os.makedirs(save_loc, exist_ok=True)
-    path = organisation_cache_path(name)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(jsonable_value(signature), handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.replace(tmp_path, path)
+read_cache_metadata = metadata_reader(organisation_cache_path)
+write_cache_metadata = metadata_writer(organisation_cache_path, enabled=save)
 
 
 def cache_metadata_status(name, signature, kind, label):
@@ -891,79 +828,20 @@ def write_pattern_persistence_cache(persistence_df):
 # Basic data helpers
 # -----------------------------------------------------------------------------
 
-
-def find_var(ds, key, required=False):
-    for name in VAR_ALIASES.get(key, [key]):
-        if name in ds.data_vars:
-            return name
-    if required:
-        raise KeyError(f"Could not find variable for {key!r}; tried {VAR_ALIASES.get(key, [key])}")
-    return None
-
-
-def subset_lat(da, lat_bounds=TROPICAL_LAT_BOUNDS):
-    if lat_bounds is None or "latitude" not in da.dims:
-        return da
-    lo, hi = sorted(lat_bounds)
-    return da.sel(latitude=slice(lo, hi))
-
-
-def get_precip_rate(ds):
-    direct = find_var(ds, "precip")
-    if direct is not None:
-        pr = finite_or_nan(ds[direct])
-        pr.name = "precip"
-        pr.attrs.setdefault("units", "mm day-1")
-        return pr
-
-    accum = total_precip_accum(ds)
-    pr = precip_rate_from_accum(accum, dt=dt)
-    pr = finite_or_nan(pr)
-    pr.name = "precip"
-    pr.attrs["units"] = "mm day-1"
-    return pr
-
-
-def select_common_time(da, ref):
-    if "Time" not in da.dims or "Time" not in ref.dims:
-        return da
-    common_time = da.Time.to_index().intersection(ref.Time.to_index())
-    return da.sel(Time=common_time)
-
-
-def time_aligned_field(ds, key, ref, required=False):
-    name = find_var(ds, key, required=required)
-    if name is None:
-        return None
-    out = finite_or_nan(ds[name])
-    out = select_common_time(out, ref)
-    out.name = key
-    return out
-
-
-def time_days_from_coord(time_coord):
-    values = np.asarray(time_coord.values)
-    if np.issubdtype(values.dtype, np.datetime64):
-        return (values - values[0]) / np.timedelta64(1, "D")
-    return values.astype(float) * dt / 24.0
-
-
-def median_time_step_days(da):
-    values = np.asarray(da.Time.values)
-    if values.size < 2:
-        return dt / 24.0
-    if np.issubdtype(values.dtype, np.datetime64):
-        return float(np.median(np.diff(values) / np.timedelta64(1, "D")))
-    return float(np.median(np.diff(values))) * dt / 24.0
-
-
-def weighted_tropical_mean(da, lat_bounds=TROPICAL_LAT_BOUNDS):
-    x = subset_lat(finite_or_nan(da), lat_bounds=lat_bounds)
-    dims = [dim for dim in ("latitude", "longitude") if dim in x.dims]
-    if "latitude" in x.dims:
-        weights = np.cos(np.deg2rad(x.latitude))
-        return x.weighted(weights).mean(dim=dims, skipna=True)
-    return x.mean(dim=dims, skipna=True)
+find_var = partial(find_variable, aliases=VAR_ALIASES)
+subset_lat = partial(subset_latitude, lat_bounds=TROPICAL_LAT_BOUNDS)
+get_precip_rate = partial(
+    precipitation_rate_from_dataset,
+    aliases=VAR_ALIASES,
+    dt_hours=dt,
+)
+time_aligned_field = partial(time_aligned_variable, aliases=VAR_ALIASES)
+time_days_from_coord = partial(time_days_from_coord, dt_hours=dt)
+median_time_step_days = partial(median_time_step_days, dt_hours=dt)
+weighted_tropical_mean = partial(
+    weighted_tropical_mean,
+    lat_bounds=TROPICAL_LAT_BOUNDS,
+)
 
 
 def source_label(source_name):
@@ -990,47 +868,12 @@ def ordered_sources(metrics_df):
 # Grid/object geometry
 # -----------------------------------------------------------------------------
 
-
-def coordinate_edges(values):
-    vals = np.asarray(values, dtype=float)
-    if vals.size == 1:
-        return np.array([vals[0] - 0.5, vals[0] + 0.5], dtype=float)
-    edges = np.empty(vals.size + 1, dtype=float)
-    edges[1:-1] = 0.5 * (vals[:-1] + vals[1:])
-    edges[0] = vals[0] - 0.5 * (vals[1] - vals[0])
-    edges[-1] = vals[-1] + 0.5 * (vals[-1] - vals[-2])
-    return edges
-
-
-def grid_cell_area_km2(lat, lon):
-    lat_edges = np.clip(coordinate_edges(lat), -90.0, 90.0)
-    lon_edges = coordinate_edges(lon)
-    dlon = np.abs(np.diff(lon_edges))
-    lat_factor = np.diff(np.sin(np.deg2rad(lat_edges)))
-    area = (EARTH_RADIUS_KM ** 2) * np.deg2rad(dlon)[None, :] * np.abs(lat_factor)[:, None]
-    return xr.DataArray(
-        area,
-        dims=("latitude", "longitude"),
-        coords={"latitude": lat, "longitude": lon},
-        name="cell_area",
-        attrs={"units": "km2"},
-    )
-
-
-def haversine_distances_km(lat1, lon1, lat2, lon2, lon_period=LONGITUDE_PERIOD_DEG):
-    lat1 = np.deg2rad(np.asarray(lat1, dtype=float))
-    lat2 = np.deg2rad(np.asarray(lat2, dtype=float))
-    lon1 = np.asarray(lon1, dtype=float)
-    lon2 = np.asarray(lon2, dtype=float)
-    dlat = lat2 - lat1
-    dlon_deg = lon2 - lon1
-    dlon_deg = (dlon_deg + 0.5 * lon_period) % lon_period - 0.5 * lon_period
-    dlon = np.deg2rad(dlon_deg)
-    a = (
-        np.sin(0.5 * dlat) ** 2
-        + np.cos(lat1) * np.cos(lat2) * np.sin(0.5 * dlon) ** 2
-    )
-    return 2.0 * EARTH_RADIUS_KM * np.arcsin(np.minimum(1.0, np.sqrt(a)))
+grid_cell_area_km2 = partial(grid_cell_area_km2, earth_radius_km=EARTH_RADIUS_KM)
+haversine_distances_km = partial(
+    haversine_distances_km,
+    lon_period=LONGITUDE_PERIOD_DEG,
+    earth_radius_km=EARTH_RADIUS_KM,
+)
 
 
 def max_domain_distance_km(lat_bounds=TROPICAL_LAT_BOUNDS):
@@ -2290,17 +2133,17 @@ def has_primary_cloud_masks(masks):
     return all(key in masks for key in CLOUD_OBJECT_KEYS_PRIMARY)
 
 
-def classification_thresholds():
-    return HighCloudThresholds(
-        cf_thresh=CF_THRESH,
-        high_cloud_top_pressure_hpa=P_HIGH_HPA,
-        surface_precip_min_mm_day=P_PRECIP_MIN,
-        convective_fraction_threshold=CONVECTIVE_FRACTION,
-    )
-
-
-def cached_classification_is_current(cached):
-    return shared_cached_classification_is_current(cached, classification_thresholds())
+classification_thresholds = partial(
+    HighCloudThresholds,
+    cf_thresh=CF_THRESH,
+    high_cloud_top_pressure_hpa=P_HIGH_HPA,
+    surface_precip_min_mm_day=P_PRECIP_MIN,
+    convective_fraction_threshold=CONVECTIVE_FRACTION,
+)
+cached_classification_is_current = partial(
+    shared_cached_classification_is_current,
+    thresholds=classification_thresholds(),
+)
 
 
 def cached_classification_path(sim_name):
@@ -2645,15 +2488,11 @@ def build_fields(ds):
     return fields
 
 
-def count_rows_to_frame(rows, stem):
-    df = pd.DataFrame(rows)
-    if len(df) == 0:
-        return df
-    print(f"\nSample counts for {stem}")
-    print(df.to_string(index=False, max_rows=240))
-    if save:
-        df.to_csv(os.path.join(save_loc, f"{stem}_bin_counts.csv"), index=False)
-    return df
+count_rows_to_frame = partial(
+    count_rows_to_frame,
+    save=save,
+    save_loc=save_loc,
+)
 
 
 # -----------------------------------------------------------------------------

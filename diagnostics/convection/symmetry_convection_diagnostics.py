@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import os, sys, numbers
+from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("..", "../..", "../../.."):
@@ -12,14 +13,12 @@ for _rel_path in ("..", "../..", "../../.."):
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
-from jfunctions import *
 from scipy.ndimage import uniform_filter1d
 import xarray as xr
 import dask
-from wavenumber_frequency_functions import *
-from tropopause import *
-from diagnostic_helpers import *
-from high_cloud_classification import (
+from tropopause import tropopause_profile
+from diagnostics.diagnostic_helpers import *
+from diagnostics.convection.high_cloud_classification import (
     HighCloudThresholds,
     cached_classification_is_current,
 )
@@ -63,16 +62,9 @@ def save_figure(number, fig, stem, dpi=300):
         plt.close(fig)
 
 
-def should_run_figure(number):
-    return figure_should_run(figures_to_run, number)
-
-
-def should_run_any(numbers):
-    return figure_should_run_any(figures_to_run, numbers)
-
-
-def run_all_figures():
-    return all_figures_requested(figures_to_run)
+should_run_figure = partial(figure_should_run, figures_to_run)
+should_run_any = partial(figure_should_run_any, figures_to_run)
+run_all_figures = partial(all_figures_requested, figures_to_run)
 
 
 # Avoid giant Dask chunks when selecting latitude/longitude subsets from full lat-lon fields.
@@ -333,13 +325,13 @@ def fraction_hemispheric_antisymmetry(da):
 _classification_cache = {}
 
 
-def classification_thresholds():
-    return HighCloudThresholds(
-        cf_thresh=CF_THRESH,
-        high_cloud_top_pressure_hpa=P_HIGH_HPA,
-        surface_precip_min_mm_day=P_PRECIP_MIN,
-        convective_fraction_threshold=CONVECTIVE_FRACTION,
-    )
+classification_thresholds = partial(
+    HighCloudThresholds,
+    cf_thresh=CF_THRESH,
+    high_cloud_top_pressure_hpa=P_HIGH_HPA,
+    surface_precip_min_mm_day=P_PRECIP_MIN,
+    convective_fraction_threshold=CONVECTIVE_FRACTION,
+)
 
 
 def shared_high_cloud_classification(ds):
@@ -516,16 +508,6 @@ def tropical_mean_latlon(da, lat_bounds=(-10, 10)):
     da = finite_or_nan(da).sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
     w = np.cos(np.deg2rad(da.latitude))
     return da.weighted(w).mean(dim="latitude").mean(dim="longitude")
-
-def safe_nanpercentile(arr, q, default=1.0):
-    vals = np.asarray(arr)
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        return default
-    out = np.nanpercentile(vals, q)
-    if not np.isfinite(out) or out == 0:
-        return default
-    return out
 
 def binned_statistic_1d(x, y, bins, min_count=20):
     """Return bin centres, mean, interquartile range and counts."""

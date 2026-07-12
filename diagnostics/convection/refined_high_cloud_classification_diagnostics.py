@@ -25,7 +25,7 @@ import os
 import sys
 import time
 import warnings
-from datetime import datetime
+from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in (".", "..", "../..", "../../.."):
@@ -41,8 +41,8 @@ from matplotlib import animation, colors, pyplot as plt
 from matplotlib.lines import Line2D
 from scipy import ndimage
 
-from diagnostic_helpers import *
-from high_cloud_classification import (
+from diagnostics.diagnostic_helpers import *
+from diagnostics.convection.high_cloud_classification import (
     HighCloudThresholds,
     cached_classification_is_current as shared_cached_classification_is_current,
     classification_dataset as shared_classification_dataset,
@@ -233,12 +233,8 @@ CLASSIFICATION_CACHE_VARS = (
     "convective_evidence_count",
 )
 
-def should_run_figure(number):
-    return figure_should_run(figures_to_run, number)
-
-
-def should_run_any(numbers):
-    return figure_should_run_any(figures_to_run, numbers)
+should_run_figure = partial(figure_should_run, figures_to_run)
+should_run_any = partial(figure_should_run_any, figures_to_run)
 
 
 def parse_command_line(argv=None):
@@ -335,10 +331,6 @@ def save_figure(number, fig, stem):
     if figsave is None:
         raise RuntimeError("FigureSaver has not been initialised")
     return figsave.save(fig, stem, number=number)
-
-
-def progress(message):
-    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
 
 
 def save_table(df, stem):
@@ -725,59 +717,31 @@ def classification_cache_encoding(ds):
 # General data and classification helpers
 # -----------------------------------------------------------------------------
 
-
-def find_var(ds, key, required=False):
-    for name in VAR_ALIASES.get(key, [key]):
-        if name in ds.data_vars:
-            return name
-    if required:
-        raise KeyError(f"Could not find variable for {key!r}; tried {VAR_ALIASES.get(key, [key])}")
-    return None
-
-
-def subset_lat(da, lat_bounds=TROPICAL_LAT_BOUNDS):
-    if lat_bounds is None or "latitude" not in da.dims:
-        return da
-    lo, hi = sorted(lat_bounds)
-    return da.sel(latitude=slice(lo, hi))
+find_var = partial(find_variable, aliases=VAR_ALIASES)
+subset_lat = subset_latitude
+get_precip_rate = partial(
+    precipitation_rate_from_dataset,
+    aliases=VAR_ALIASES,
+    dt_hours=dt,
+)
+time_aligned_field = partial(
+    time_aligned_variable,
+    aliases=VAR_ALIASES,
+    intersect=False,
+)
 
 
-def latitude_weight_array(da):
-    if "latitude" not in da.dims:
-        return xr.ones_like(da)
-    w = xr.DataArray(
-        np.cos(np.deg2rad(da.latitude.values)),
-        dims=("latitude",),
-        coords={"latitude": da.latitude},
-        name="latitude_weight",
-    )
-    return xr.broadcast(w, da)[0]
-
-
-def weighted_area_time_mean(da, lat_bounds=TROPICAL_LAT_BOUNDS):
-    x = subset_lat(da.astype(float), lat_bounds=lat_bounds)
-    dims = [d for d in ("Time", "latitude", "longitude") if d in x.dims]
-    if "latitude" not in x.dims:
-        return float(x.mean(dim=dims, skipna=True).values)
-    weights = np.cos(np.deg2rad(x.latitude))
-    return float(x.weighted(weights).mean(dim=dims, skipna=True).values)
-
-
-def time_step_days(da):
-    if "Time" not in da.dims or da.sizes["Time"] < 2:
-        return dt / 24.0
-    values = da.Time.values
-    if issubclass(values.dtype.type, np.integer):
-        return dt / 24.0
-    return float(np.nanmedian(da.Time.diff("Time") / np.timedelta64(1, "D")))
-
-
-def block_slices(da, block_days=BOOTSTRAP_BLOCK_DAYS):
-    if "Time" not in da.dims:
-        return [slice(None)]
-    ntime = int(da.sizes["Time"])
-    block_len = max(1, int(round(block_days / time_step_days(da))))
-    return [slice(start, min(start + block_len, ntime)) for start in range(0, ntime, block_len)]
+time_step_days = partial(
+    time_step_days,
+    dt_hours=dt,
+    numeric_step_values=False,
+)
+block_slices = partial(
+    time_block_slices,
+    block_days=BOOTSTRAP_BLOCK_DAYS,
+    dt_hours=dt,
+    numeric_step_values=False,
+)
 
 
 def block_area_fraction_values(da, block_days=BOOTSTRAP_BLOCK_DAYS):
@@ -822,38 +786,6 @@ def bootstrap_difference_1d(a, b, rng, n_boot=N_BOOTSTRAP):
         n_blocks_a=int(a.size),
         n_blocks_b=int(b.size),
     )
-
-
-def get_precip_rate(ds):
-    direct = find_var(ds, "precip")
-    if direct is not None:
-        pr = finite_or_nan(ds[direct])
-        pr.name = "precip"
-        return pr
-
-    rainc = find_var(ds, "rainc", required=True)
-    rainnc = find_var(ds, "rainnc", required=True)
-    i_rainc = find_var(ds, "i_rainc", required=True)
-    i_rainnc = find_var(ds, "i_rainnc", required=True)
-    accum = (
-        ds[rainnc] + ds[i_rainnc] * 100.0
-        + ds[rainc] + ds[i_rainc] * 100.0
-    )
-    pr = precip_rate_from_accum(accum, dt=dt)
-    pr.name = "precip"
-    pr.attrs["units"] = "mm day-1"
-    return finite_or_nan(pr)
-
-
-def time_aligned_field(ds, key, ref, required=False):
-    name = find_var(ds, key, required=required)
-    if name is None:
-        return None
-    out = finite_or_nan(ds[name])
-    if "Time" in out.dims and "Time" in ref.dims:
-        out = out.sel(Time=ref.Time)
-    out.name = key
-    return out
 
 
 def get_cloud_fraction(ds):
@@ -926,12 +858,16 @@ def classify_high_cloud(
     )
 
 
-def classification_dataset(classif):
-    return shared_classification_dataset(classif, classification_thresholds())
+classification_dataset = partial(
+    shared_classification_dataset,
+    thresholds=classification_thresholds(),
+)
 
 
-def cached_classification_is_current(cached):
-    return shared_cached_classification_is_current(cached, classification_thresholds())
+cached_classification_is_current = partial(
+    shared_cached_classification_is_current,
+    thresholds=classification_thresholds(),
+)
 
 
 def open_cached_classification(cache_path, sim_name):
@@ -1025,143 +961,7 @@ def get_or_build_classification(ds, fields, sim_name):
     return classif
 
 
-def compute_ttl_diagnostics(zds, precip_ref):
-    """Return optional N2_TTL and dudz_TTL as Time/latitude fields."""
-    out = {}
-    z_coord = zds["z"] if "z" in zds.coords else None
-    if z_coord is None:
-        return out
-
-    zvals = np.asarray(z_coord.values, dtype=float)
-    zkm = zvals / 1000.0 if np.nanmax(np.abs(zvals)) > 100.0 else zvals
-    ttl_mask = xr.DataArray((zkm >= 14.0) & (zkm <= 18.0), dims=("z",), coords={"z": z_coord})
-
-    n2_name = find_var(zds, "N2")
-    if n2_name is not None:
-        n2 = finite_or_nan(zds[n2_name])
-        if vertical_dim(n2) != "z":
-            n2 = n2.rename({vertical_dim(n2): "z"})
-        out["N2_TTL"] = n2.where(ttl_mask, drop=True).mean(dim="z", skipna=True)
-    else:
-        theta_name = find_var(zds, "theta")
-        if theta_name is not None:
-            theta = finite_or_nan(zds[theta_name])
-            if vertical_dim(theta) != "z":
-                theta = theta.rename({vertical_dim(theta): "z"})
-            try:
-                dtheta_dz = theta.differentiate("z")
-                n2 = 9.80665 / theta * dtheta_dz
-                out["N2_TTL"] = n2.where(ttl_mask, drop=True).mean(dim="z", skipna=True)
-            except Exception as exc:
-                warnings.warn(f"Could not compute N2_TTL from theta: {exc}")
-
-    dudz_name = find_var(zds, "dudz")
-    if dudz_name is not None:
-        dudz = finite_or_nan(zds[dudz_name])
-        if vertical_dim(dudz) != "z":
-            dudz = dudz.rename({vertical_dim(dudz): "z"})
-        out["dudz_TTL"] = dudz.where(ttl_mask, drop=True).mean(dim="z", skipna=True)
-    else:
-        u_name = find_var(zds, "u_zm")
-        if u_name is not None:
-            u = finite_or_nan(zds[u_name])
-            if vertical_dim(u) != "z":
-                u = u.rename({vertical_dim(u): "z"})
-            try:
-                dudz = u.differentiate("z")
-                out["dudz_TTL"] = dudz.where(ttl_mask, drop=True).mean(dim="z", skipna=True)
-            except Exception as exc:
-                warnings.warn(f"Could not compute dudz_TTL from uReconstructZonal: {exc}")
-
-    aligned = {}
-    for key, da in out.items():
-        if "Time" in da.dims:
-            da = da.sel(Time=precip_ref.Time)
-        da.name = key
-        aligned[key] = da
-    return aligned
-
-
-def latitude_field_like(ref):
-    lat = xr.DataArray(ref.latitude.values, dims=("latitude",), coords={"latitude": ref.latitude}, name="latitude")
-    return xr.broadcast(lat, ref)[0]
-
-
-def stride_indexers(arrays, max_time=None, max_lat=None, max_lon=None, time_mode="stride"):
-    limits = {"Time": max_time, "latitude": max_lat, "longitude": max_lon}
-    indexers = {}
-    for dim, max_n in limits.items():
-        if max_n is None:
-            continue
-        size = max((da.sizes[dim] for da in arrays if dim in da.dims), default=0)
-        if size <= max_n:
-            continue
-        if dim == "Time" and time_mode == "tail":
-            indexers[dim] = slice(size - max_n, None)
-        else:
-            indexers[dim] = slice(0, None, int(np.ceil(size / max_n)))
-    return indexers
-
-
-def sample_matching_arrays(
-    *arrays,
-    lat_bounds=TROPICAL_LAT_BOUNDS,
-    max_time=96,
-    max_lat=96,
-    max_lon=192,
-    return_weights=True,
-    time_mode="stride",
-):
-    prepared = []
-    for da in arrays:
-        x = finite_or_nan(da.astype(float)) if hasattr(da, "astype") else da
-        x = subset_lat(x, lat_bounds=lat_bounds)
-        prepared.append(x)
-    prepared = list(xr.align(*prepared, join="inner"))
-    indexers = stride_indexers(prepared, max_time=max_time, max_lat=max_lat, max_lon=max_lon, time_mode=time_mode)
-    if indexers:
-        prepared = [
-            da.isel({dim: slc for dim, slc in indexers.items() if dim in da.dims})
-            for da in prepared
-        ]
-
-    broadcasted = xr.broadcast(*prepared)
-    vals = [np.asarray(da.load().values).ravel() for da in broadcasted]
-    mask = np.ones(vals[0].shape, dtype=bool)
-    for val in vals:
-        mask &= np.isfinite(val)
-
-    if return_weights:
-        w_da = latitude_weight_array(broadcasted[0])
-        weights = np.asarray(w_da.load().values).ravel()
-        mask &= np.isfinite(weights) & (weights > 0)
-        return [val[mask] for val in vals], weights[mask]
-    return [val[mask] for val in vals]
-
-
-def weighted_quantile(values, quantiles, weights=None):
-    values = np.asarray(values, dtype=float)
-    quantiles = np.asarray(quantiles, dtype=float)
-    ok = np.isfinite(values)
-    values = values[ok]
-    if weights is None:
-        if values.size == 0:
-            return np.full_like(quantiles, np.nan, dtype=float)
-        return np.nanpercentile(values, quantiles * 100.0)
-
-    weights = np.asarray(weights, dtype=float)[ok]
-    ok = weights > 0
-    values = values[ok]
-    weights = weights[ok]
-    if values.size == 0:
-        return np.full_like(quantiles, np.nan, dtype=float)
-
-    order = np.argsort(values)
-    values = values[order]
-    weights = weights[order]
-    cdf = np.cumsum(weights) - 0.5 * weights
-    cdf /= np.sum(weights)
-    return np.interp(quantiles, cdf, values)
+compute_ttl_diagnostics = partial(compute_ttl_diagnostics, aliases=VAR_ALIASES)
 
 
 def class_overlap_sanity(classifications):
@@ -1456,117 +1256,18 @@ def plot_class_budget(classifications):
 #     residual summary is written to CSV.
 
 
-class SimpleRidgeRegressor:
-    """Small weighted ridge fallback with linear, squared, and pair terms."""
-
-    def __init__(self, alpha=1.0):
-        self.alpha = alpha
-        self.mean_ = None
-        self.scale_ = None
-        self.beta_ = None
-
-    def _design(self, X, fit=False):
-        X = np.asarray(X, dtype=float)
-        if fit:
-            self.mean_ = np.nanmean(X, axis=0)
-            self.scale_ = np.nanstd(X, axis=0)
-            self.scale_[self.scale_ == 0] = 1.0
-        Xn = (X - self.mean_) / self.scale_
-        cols = [np.ones(Xn.shape[0]), Xn, Xn ** 2]
-        pair_cols = []
-        for i in range(Xn.shape[1]):
-            for j in range(i + 1, Xn.shape[1]):
-                pair_cols.append(Xn[:, i] * Xn[:, j])
-        if pair_cols:
-            cols.append(np.column_stack(pair_cols))
-        return np.column_stack(cols)
-
-    def fit(self, X, y, sample_weight=None):
-        D = self._design(X, fit=True)
-        y = np.asarray(y, dtype=float)
-        w = np.ones_like(y) if sample_weight is None else np.asarray(sample_weight, dtype=float)
-        sw = np.sqrt(np.maximum(w, 0.0))
-        Dw = D * sw[:, None]
-        yw = y * sw
-        penalty = self.alpha * np.eye(D.shape[1])
-        penalty[0, 0] = 0.0
-        self.beta_ = np.linalg.solve(Dw.T @ Dw + penalty, Dw.T @ yw)
-        return self
-
-    def predict(self, X):
-        return self._design(X, fit=False) @ self.beta_
+fit_control_relationship = partial(fit_control_relationship, logger=progress)
 
 
-def fit_control_relationship(X, y, weights, target_label):
-    ok = np.all(np.isfinite(X), axis=1) & np.isfinite(y) & np.isfinite(weights) & (weights > 0)
-    X = X[ok]
-    y = y[ok]
-    weights = weights[ok]
-    progress(f"Fitting control high-cloud model for {target_label}: {X.shape[0]} samples")
-    try:
-        from sklearn.ensemble import HistGradientBoostingRegressor
-
-        model = HistGradientBoostingRegressor(
-            max_iter=160,
-            learning_rate=0.04,
-            max_leaf_nodes=31,
-            l2_regularization=0.01,
-            min_samples_leaf=40,
-            random_state=0,
-        )
-        model.fit(X, y, sample_weight=weights)
-        return model
-    except Exception as exc:
-        progress(f"Falling back to weighted ridge for {target_label}: {exc}")
-        model = SimpleRidgeRegressor(alpha=1.0)
-        return model.fit(X, y, sample_weight=weights)
+feature_arrays = residual_feature_arrays
+residual_target_da = residual_target_array
 
 
-def available_residual_features(fields_by_run):
-    feature_keys = ["precip_log"]
-    for key in ("pw", "cape", "cin"):
-        if all(key in fields for fields in fields_by_run):
-            feature_keys.append(key)
-        else:
-            warnings.warn(f"Residual model omits {key.upper()} because it is unavailable in at least one run.")
-    feature_keys.append("latitude")
-    return feature_keys
-
-
-def feature_arrays(fields, feature_keys):
-    arrays = []
-    for key in feature_keys:
-        if key == "latitude":
-            arrays.append(latitude_field_like(fields["precip"]))
-        elif key == "precip_log":
-            arrays.append(np.log1p(fields["precip"].clip(min=0.0)))
-        else:
-            arrays.append(fields[key])
-    return arrays
-
-
-def residual_target_da(classif, target_key):
-    if target_key == "total":
-        return classif["high_cloud_fraction"].clip(min=0.0, max=1.0)
-    if target_key == "convective":
-        return classif["convective_precipitating_high_cloud_mask"].astype(float)
-    if target_key == "stratiform":
-        return classif["stratiform_precipitating_high_cloud_mask"].astype(float)
-    if target_key == "nonprecipitating":
-        return classif["nonprecipitating_high_cloud_mask"].astype(float)
-    raise ValueError(target_key)
-
-
-def model_training_data(fields, classif, target_key, feature_keys):
-    arrays = feature_arrays(fields, feature_keys) + [residual_target_da(classif, target_key)]
-    vals, weights = sample_matching_arrays(
-        *arrays,
-        lat_bounds=TROPICAL_LAT_BOUNDS,
-        **RESIDUAL_FIT_SAMPLE_LIMITS,
-    )
-    X = np.column_stack(vals[:-1])
-    y = vals[-1]
-    return X, y, weights
+model_training_data = partial(
+    residual_model_training_data,
+    lat_bounds=TROPICAL_LAT_BOUNDS,
+    sample_limits=RESIDUAL_FIT_SAMPLE_LIMITS,
+)
 
 
 def feature_support_ranges(X, weights, feature_keys):

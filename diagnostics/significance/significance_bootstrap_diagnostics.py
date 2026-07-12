@@ -20,8 +20,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-import numbers
 import warnings
+from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("..", "../..", "../../.."):
@@ -39,17 +39,17 @@ try:
 except ModuleNotFoundError:
     dask = None
 
-from diagnostic_helpers import *
-from high_cloud_classification import (
+from diagnostics.diagnostic_helpers import *
+from diagnostics.convection.high_cloud_classification import (
     CLASSIFICATION_CACHE_VERSION,
     HighCloudThresholds,
     cached_classification_is_current as shared_cached_classification_is_current,
 )
-from equatorial_wave_config import (
+from diagnostics.waves.equatorial_wave_config import (
     WAVE_BOXES as SHARED_WAVE_BOXES,
     WAVE_LATITUDE_PROJECTION as SHARED_WAVE_LATITUDE_PROJECTION,
 )
-from pyflextrkr_contract import (
+from diagnostics.diagnostic_helpers import (
     PRIMARY_TRACK_SOURCE as PYFLEXTRKR_PRIMARY_TRACK_SOURCE,
     PYFLEXTRKR_PRODUCT_VERSION,
 )
@@ -58,13 +58,6 @@ try:
     from waveFilter import kf_filter
 except ModuleNotFoundError:
     kf_filter = None
-
-
-def env_flag(name, default=False):
-    value = os.environ.get(name)
-    if value is None:
-        return bool(default)
-    return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
 # -----------------------------------------------------------------------------
@@ -275,8 +268,7 @@ todo_diagnostics: list[str] = []
 scalar_metric_rows: list[dict] = []
 
 
-def should_run_figure(number):
-    return figure_should_run(figures_to_run, number)
+should_run_figure = partial(figure_should_run, figures_to_run)
 
 
 def record_implemented(message):
@@ -316,20 +308,6 @@ def bootstrap_cache_path(filename):
     return os.path.join(ensure_bootstrap_cache_dir(), filename)
 
 
-def jsonable_value(value):
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, (list, tuple, np.ndarray)):
-        return [jsonable_value(v) for v in value]
-    if isinstance(value, dict):
-        return {str(k): jsonable_value(v) for k, v in value.items()}
-    if isinstance(value, float) and not np.isfinite(value):
-        return None
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
 def base_bootstrap_cache_signature(family, extra=None):
     signature = dict(
         cache_version="significance_bootstrap_v1",
@@ -358,19 +336,8 @@ def base_bootstrap_cache_signature(family, extra=None):
     return signature
 
 
-def read_cache_metadata(path):
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def write_cache_metadata(path, signature):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(jsonable_value(signature), handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.replace(tmp, path)
+read_cache_metadata = read_json_file
+write_cache_metadata = write_json_file
 
 
 def bootstrap_cache_matches(cache_name, signature):
@@ -550,18 +517,6 @@ def diff_datasets_to_profile_table(diff_by_comp):
     return pd.DataFrame(rows)
 
 
-def subset_between(da, dim, bounds):
-    if bounds is None or dim not in da.dims:
-        return da
-    lo, hi = sorted(bounds)
-    coord = da[dim]
-    return da.where((coord >= lo) & (coord <= hi), drop=True)
-
-
-def subset_latitude(da, lat_bounds=TROPICAL_LAT_BOUNDS):
-    return subset_between(da, "latitude", lat_bounds)
-
-
 def z_values_m(da):
     z = np.asarray(da.z.values, dtype=float)
     return z if np.nanmax(np.abs(z)) > 100.0 else z * 1000.0
@@ -573,15 +528,6 @@ def subset_z_m(da, z_bounds_m):
     z_m = xr.DataArray(z_values_m(da), dims=("z",), coords={"z": da.z})
     lo, hi = sorted(z_bounds_m)
     return da.where((z_m >= lo) & (z_m <= hi), drop=True)
-
-
-def latitude_weights(da):
-    return xr.DataArray(
-        np.cos(np.deg2rad(da.latitude.values)),
-        dims=("latitude",),
-        coords={"latitude": da.latitude},
-        name="coslat_weight",
-    )
 
 
 def weighted_mean_dims(da, dims):
@@ -602,27 +548,20 @@ def weighted_variance_dims(da, dims):
     return weighted_mean_dims(anomaly2, dims)
 
 
-def time_step_days(da):
-    if "Time" not in da.dims or da.sizes["Time"] < 2:
-        return dt / 24.0
-    values = da.Time.values
-    if issubclass(values.dtype.type, numbers.Integral):
-        return dt / 24.0
-    return float(np.nanmedian(da.Time.diff("Time") / np.timedelta64(1, "D")))
-
-
-def block_slices(da, block_days=BOOTSTRAP_BLOCK_DAYS):
-    if "Time" not in da.dims:
-        raise ValueError(f"Cannot block-resample without Time dimension in {da.dims!r}")
-    ntime = int(da.sizes["Time"])
-    block_len = max(1, int(round(block_days / time_step_days(da))))
-    nblocks = ntime // block_len
-    if nblocks < MIN_BLOCKS:
-        raise ValueError(
-            f"Only {nblocks} complete blocks for {getattr(da, 'name', None)!r}; "
-            f"need at least {MIN_BLOCKS}. Try a shorter block length."
-        )
-    return [slice(k * block_len, (k + 1) * block_len) for k in range(nblocks)]
+time_step_days = partial(
+    time_step_days,
+    dt_hours=dt,
+    numeric_step_values=False,
+)
+block_slices = partial(
+    time_block_slices,
+    block_days=BOOTSTRAP_BLOCK_DAYS,
+    dt_hours=dt,
+    complete=True,
+    min_blocks=MIN_BLOCKS,
+    require_time=True,
+    numeric_step_values=False,
+)
 
 
 def scalar_from_dataarray(value):
@@ -1553,17 +1492,17 @@ def plot_cloud_profile_diffs(profile_diffs):
     plt.close(fig)
 
 
-def classification_thresholds():
-    return HighCloudThresholds(
-        cf_thresh=CF_THRESH,
-        high_cloud_top_pressure_hpa=P_HIGH_HPA,
-        surface_precip_min_mm_day=P_PRECIP_MIN,
-        convective_fraction_threshold=CONVECTIVE_FRACTION_THRESHOLD,
-    )
-
-
-def cached_classification_is_current(cached):
-    return shared_cached_classification_is_current(cached, classification_thresholds())
+classification_thresholds = partial(
+    HighCloudThresholds,
+    cf_thresh=CF_THRESH,
+    high_cloud_top_pressure_hpa=P_HIGH_HPA,
+    surface_precip_min_mm_day=P_PRECIP_MIN,
+    convective_fraction_threshold=CONVECTIVE_FRACTION_THRESHOLD,
+)
+cached_classification_is_current = partial(
+    shared_cached_classification_is_current,
+    thresholds=classification_thresholds(),
+)
 
 
 REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS = (
@@ -2259,18 +2198,13 @@ def run_convective_organisation_bootstrap():
 # Wave-mediated pathway: integrated CCEW wave-box variance
 # -----------------------------------------------------------------------------
 
-def wave_label(wave):
-    return WAVE_BOXES[wave]["label"]
+wave_label = partial(configured_label, WAVE_BOXES)
 
 
 def wave_cache_dir():
     path = diagnostic_cache_dir("significance_bootstrap_wave_cache", root_dir=root_dir)
     os.makedirs(path, exist_ok=True)
     return path
-
-
-def safe_name(text):
-    return str(text).replace(" ", "_").replace("/", "-").replace(".", "p").replace("-", "m")
 
 
 def get_surface_convection_field(ds, field_name, ref=None):
@@ -2840,35 +2774,6 @@ def subset_latpres_domain(blocks, lat_bounds, p_bounds):
     if x.sizes.get("pres", 0) == 0 or x.sizes.get("latitude", 0) == 0:
         raise ValueError("empty matched-pattern domain")
     return x
-
-
-def pressure_layer_weights(pres):
-    if isinstance(pres, xr.DataArray):
-        pres_values = np.asarray(pres.values, dtype=float)
-        pres_coord = pres_values
-    else:
-        pres_values = np.asarray(pres, dtype=float)
-        pres_coord = pres_values
-
-    if np.any(pres_values <= 0):
-        raise ValueError("Pressure values must be positive before taking log(p)")
-
-    if pres_values.size == 1:
-        weights = np.ones_like(pres_values)
-    else:
-        lnp = np.log(pres_values)
-        bounds = np.empty(pres_values.size + 1)
-        bounds[1:-1] = 0.5 * (lnp[:-1] + lnp[1:])
-        bounds[0] = lnp[0] - 0.5 * (lnp[1] - lnp[0])
-        bounds[-1] = lnp[-1] + 0.5 * (lnp[-1] - lnp[-2])
-        weights = np.abs(np.diff(bounds))
-
-    return xr.DataArray(
-        weights,
-        dims=("pres",),
-        coords={"pres": pres_coord},
-        name="dlnp_weight",
-    )
 
 
 def latpres_weights(template):

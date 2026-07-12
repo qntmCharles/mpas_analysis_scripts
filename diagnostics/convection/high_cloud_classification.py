@@ -33,7 +33,7 @@ import warnings
 import numpy as np
 import xarray as xr
 
-from diagnostic_helpers import finite_or_nan, vertical_dim
+from diagnostics.diagnostic_helpers import finite_or_nan, netcdf_safe_attrs, vertical_dim
 
 
 HYDROMETEOR_ALIASES = {
@@ -75,20 +75,6 @@ def classification_cache_metadata(thresholds=None, extra=None):
     if extra:
         out.update(extra)
     return out
-
-
-def netcdf_safe_attr_value(value):
-    if isinstance(value, (bool, np.bool_)):
-        return int(value)
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        return float(value)
-    return value
-
-
-def netcdf_safe_attrs(attrs):
-    return {key: netcdf_safe_attr_value(value) for key, value in attrs.items()}
 
 
 def cached_classification_is_current(cached, thresholds=None):

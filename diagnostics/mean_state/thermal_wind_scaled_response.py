@@ -3,7 +3,8 @@
 
 # In[1]:
 
-import os, glob, sys, numbers
+import os, sys
+from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("..", "../..", "../../.."):
@@ -14,16 +15,9 @@ for _rel_path in ("..", "../..", "../../.."):
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
-from scipy.interpolate import griddata, RegularGridInterpolator
-import pygeode as pyg
-from jfunctions import *
-import scipy.interpolate as intp
-from scipy.ndimage import uniform_filter1d
 import xarray as xr
-from wavenumber_frequency_functions import *
-from matplotlib import colors
-from tropopause import *
-from diagnostic_helpers import *
+from tropopause import tropopause_profile
+from diagnostics.diagnostic_helpers import *
 
 save = True
 save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/thermal_wind/')
@@ -76,16 +70,9 @@ needed_vars = [
 check_vars = ["theta", "pressure", "uReconstructZonal"]
 
 
-def should_run_figure(number):
-    return figure_should_run(figures_to_run, number)
-
-
-def should_run_any(numbers):
-    return figure_should_run_any(figures_to_run, numbers)
-
-
-def run_all_figures():
-    return all_figures_requested(figures_to_run)
+should_run_figure = partial(figure_should_run, figures_to_run)
+should_run_any = partial(figure_should_run_any, figures_to_run)
+run_all_figures = partial(all_figures_requested, figures_to_run)
 
 
 for i, d in enumerate(data_locs):
@@ -224,13 +211,6 @@ def tropical_mean_surface(da, lat_bounds=(-10, 10)):
     w = np.cos(np.deg2rad(da.latitude))
     dims = [d for d in ("latitude", "longitude") if d in da.dims]
     return da.weighted(w).mean(dim=dims)
-
-def subset_between(da, dim, bounds):
-    """Subset a coordinate range without assuming ascending or descending order."""
-    if bounds is None or dim not in da.dims:
-        return da
-    lo, hi = sorted(bounds)
-    return da.where((da[dim] >= lo) & (da[dim] <= hi), drop=True)
 
 def coordinate_layer_weights(coord, dim):
     """Positive finite-difference layer weights for a 1-D coordinate."""
@@ -466,24 +446,6 @@ def thermal_wind_temperature_gradient_terms(T_da, u_da, tw_equator_mask_deg=5.0)
 def add_tw_equator_guides(ax, lat=5.0):
     for x in (-lat, lat):
         ax.axvline(x, color="0.2", lw=0.9, ls="--", alpha=0.9)
-
-def symmetric_percentile_levels_for_fields(fields, percentile=99.0, ndiv=12, fallback=1.0):
-    vals = []
-    for field in fields:
-        if field is None:
-            continue
-        arr = np.asarray(field.values, dtype=float)
-        arr = arr[np.isfinite(arr)]
-        if arr.size:
-            vals.append(np.abs(arr))
-
-    if vals:
-        vmax = np.nanpercentile(np.concatenate(vals), percentile)
-    else:
-        vmax = fallback
-    if not np.isfinite(vmax) or vmax <= 0:
-        vmax = fallback
-    return symmetric_levels(vmax, ndiv=ndiv)
 
 def get_latheight_anomaly(run_index, control_index, var):
     """Time-mean latitude-height anomaly relative to control, on this run's grid."""

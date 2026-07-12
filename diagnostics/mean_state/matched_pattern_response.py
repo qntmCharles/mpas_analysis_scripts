@@ -5,6 +5,7 @@
 
 import os
 import sys
+from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("..", "../..", "../../.."):
@@ -19,10 +20,7 @@ import xarray as xr
 
 from tropopause import tropopause_profile
 
-try:
-    from diagnostic_helpers import *
-except ModuleNotFoundError:
-    from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import *
 
 
 save = True
@@ -38,16 +36,9 @@ figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 
-def should_run_figure(number):
-    return figure_should_run(figures_to_run, number)
-
-
-def should_run_any(numbers):
-    return figure_should_run_any(figures_to_run, numbers)
-
-
-def run_all_figures():
-    return all_figures_requested(figures_to_run)
+should_run_figure = partial(figure_should_run, figures_to_run)
+should_run_any = partial(figure_should_run_any, figures_to_run)
+run_all_figures = partial(all_figures_requested, figures_to_run)
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control_new", "u_nudge", "T_nudge"]
@@ -105,57 +96,7 @@ for i, d in enumerate(data_locs):
 
 # In[3]:
 
-def subset_between(da, dim, bounds):
-    """Subset a coordinate range without assuming ascending or descending order."""
-    if dim not in da.dims:
-        return da
-    lo, hi = sorted(bounds)
-    coord = da[dim]
-    return da.where((coord >= lo) & (coord <= hi), drop=True)
-
-
-def pressure_layer_weights(pres):
-    """
-    Positive layer weights proportional to d ln(p).
-
-    Input pressure is in hPa.  The returned DataArray is on dimension "pres" and
-    works for either ascending or descending pressure coordinates.
-    """
-    if isinstance(pres, xr.DataArray):
-        pres_values = np.asarray(pres.values, dtype=float)
-        pres_coord = pres_values
-    else:
-        pres_values = np.asarray(pres, dtype=float)
-        pres_coord = pres_values
-
-    if np.any(pres_values <= 0):
-        raise ValueError("Pressure values must be positive before taking log(p)")
-
-    if pres_values.size == 1:
-        weights = np.ones_like(pres_values)
-    else:
-        lnp = np.log(pres_values)
-        bounds = np.empty(pres_values.size + 1)
-        bounds[1:-1] = 0.5 * (lnp[:-1] + lnp[1:])
-        bounds[0] = lnp[0] - 0.5 * (lnp[1] - lnp[0])
-        bounds[-1] = lnp[-1] + 0.5 * (lnp[-1] - lnp[-2])
-        weights = np.abs(np.diff(bounds))
-
-    return xr.DataArray(weights, dims=("pres",), coords={"pres": pres_coord}, name="dlnp_weight")
-
-
-def lat_weights(latitude):
-    """Cosine-latitude area weights on dimension "latitude"."""
-    if isinstance(latitude, xr.DataArray):
-        lat_values = np.asarray(latitude.values, dtype=float)
-    else:
-        lat_values = np.asarray(latitude, dtype=float)
-    return xr.DataArray(
-        np.cos(np.deg2rad(lat_values)),
-        dims=("latitude",),
-        coords={"latitude": lat_values},
-        name="coslat_weight",
-    )
+lat_weights = latitude_weights
 
 
 def weighted_inner_product(a, b, lat_dim="latitude", pres_dim="pres", use_pressure_weights=True):

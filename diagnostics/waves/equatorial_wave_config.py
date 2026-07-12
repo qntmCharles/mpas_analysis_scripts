@@ -63,4 +63,3 @@ WAVE_LATITUDE_PROJECTION = {
     "Easterly": "direct",
     "ER": "symmetric",
 }
-

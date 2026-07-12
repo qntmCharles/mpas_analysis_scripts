@@ -4,6 +4,7 @@
 
 
 import os, glob, sys
+from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("..", "../..", "../../.."):
@@ -13,20 +14,16 @@ for _rel_path in ("..", "../..", "../../.."):
 
 import numpy as np
 from matplotlib import pyplot as plt
-from jfunctions import *
 import xarray as xr
 from dask import compute as dask_compute
-from wavenumber_frequency_functions import *
 from matplotlib import colors
-from tropopause import *
-from diagnostic_helpers import *
-from mean_state_memory_helpers import (
-    accumulated_precipitation_components,
-    domain_histograms,
-    duration_domain_histograms,
-    precipitation_rate,
-    relative_frequency_from_histogram,
+from tropopause import tropopause_profile, tropopause_profile_single
+from wavenumber_frequency_functions import (
+    genDispersionCurves,
+    smooth_wavefreq,
+    spacetime_power,
 )
+from diagnostics.diagnostic_helpers import *
 
 silence_hdf5_error_stack()
 
@@ -50,7 +47,7 @@ save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/mean_state/'
 #   12: olrtoa_maps
 #   13: ke_latheight
 #   14: eke_latpres
-#   15: moved to global_atmospheric_energy_budget_diagnostics.py
+#   15: moved to energy_budget.py
 #   16: temperature_wind_latheight, w_rh_latheight, tem_latheight
 #   17: mslp_maps
 #   18: scalar_constituents_latheight
@@ -76,31 +73,18 @@ def save_figure(fig, stem, number=None, dpi=None):
         plt.close(fig)
 
 
-def should_run_figure(number):
-    return figure_should_run(figures_to_run, number)
-
-
-def should_run_any(numbers):
-    return figure_should_run_any(figures_to_run, numbers)
-
-
-def run_all_figures():
-    return all_figures_requested(figures_to_run)
+should_run_figure = partial(figure_should_run, figures_to_run)
+should_run_any = partial(figure_should_run_any, figures_to_run)
+run_all_figures = partial(all_figures_requested, figures_to_run)
 
 
 spectrum_period_reference_days = [3.0, 6.0, 30.0]
 
 
-def add_period_reference_lines_frequency(ax, periods=spectrum_period_reference_days):
-    x0, x1 = ax.get_xlim()
-    y0, y1 = ax.get_ylim()
-    ymin, ymax = sorted((y0, y1))
-    for period in periods:
-        freq = 1.0 / period
-        if ymin <= freq <= ymax:
-            ax.axhline(freq, color="0.25", lw=0.8, ls=":", alpha=0.8)
-            ax.text(x1, freq, f"{period:g} d", ha="right", va="bottom",
-                    fontsize=7, color="0.25")
+add_period_reference_lines_frequency = partial(
+    add_period_reference_lines_frequency,
+    periods=spectrum_period_reference_days,
+)
 
 
 RD = 287.0
@@ -186,17 +170,6 @@ def latheight_time_mean_field(zds, spec):
     da = hemispheric_fold(da, parity=spec.get("hemispheric_parity", "even")).load()
     da.name = spec["label"]
     return da
-
-
-def safe_nanpercentile(values, q, default=1.0):
-    vals = np.asarray(values)
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        return default
-    out = np.nanpercentile(vals, q)
-    if not np.isfinite(out) or out == 0:
-        return default
-    return out
 
 
 def ensure_z_index_coord(da):
