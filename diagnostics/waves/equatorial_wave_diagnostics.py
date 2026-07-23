@@ -10,7 +10,7 @@ This script is intended to sit alongside:
   * thermal_wind_scaled_response.py
   * matched_pattern_response.py
 
-It deliberately does not assume that the aquaplanet contains an MJO analogue.
+It does not assign a planetary intraseasonal mode to this aquaplanet.
 Instead it asks whether the precipitation/cloud response is associated with
 particular convectively coupled equatorial wave (CCEW) bands, and whether the
 u-nudged/T-nudged UTLS changes alter the precipitation response to those waves.
@@ -23,9 +23,10 @@ The current analysis wave list is chosen for this simulation set:
   Easterly:     k=-28..-6,  period=2.5..7 d,   no depth constraint
   ER:           k=-10..-1,  period=10..40 d,   equivalent depth=8..90 m
 
-Wave-phase-conditioned cloud-classification analysis (previously figures 10
-and 12 here) lives in convective_pathway_diagnostics.py, which conditions the
-shared high-cloud classes on Kelvin, Easterly, and ER phase.
+Unfiltered cloud occurrence regressed on the filtered Kelvin, easterly-wave,
+and ER precipitation predictors lives in convective_pathway_diagnostics.py.
+Track-following composites reuse this script's caches in
+convective_lifecycle_composite_diagnostics.py.
 
 The easterly-wave definition follows Rios-Berrios et al. (2023). It is a
 rectangular TD/easterly-wave band rather than a shallow-water normal mode.
@@ -51,7 +52,20 @@ from matplotlib.lines import Line2D
 import xarray as xr
 import dask
 
-from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import (
+    ANALYSIS_END, ANALYSIS_START, FigureSaver, LATLON_PATTERN,
+    ZONAL_MEAN_PATTERN, add_period_reference_lines_frequency,
+    add_symmetric_colorbar,
+    annotate_panel_label,
+    binned_mean_1d, configured_label, diagnostic_cache_dir,
+    diagnostic_output_dir, difference_cmap, figure_should_run,
+    figure_should_run_any, jsonable_value,
+    load_latlon_dataset, make_spectrum_cmap, netcdf_safe_dataset,
+    numbered_figure_saver, precip_rate_from_accum, read_json_file,
+    safe_name, standardize_latlon_dataset, symmetric_levels,
+    total_precip_accum, vertical_dim, vertical_velocity_at_pressure,
+    write_json_file,
+)
 from diagnostics.waves.equatorial_wave_config import (
     MISSING_EQUIVALENT_DEPTH,
     WAVE_BOXES,
@@ -92,9 +106,8 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/waves/")
 #  10:  wave_phase_speed_power_distributions
 #   11: compact_wave_attribution_metrics
 #
-# Earlier figures 10 and 12 (Kelvin-conditioned cloud decomposition / cloud-top
-# pressure) moved to convective_pathway_diagnostics.py figure 10, which covers
-# Kelvin, Easterly, and ER phase conditioning.
+# Compact cloud-pathway and track-following MCS lifecycle composites live in
+# the convection diagnostics and reuse these wave caches.
 figures_to_run = [2, 7]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
@@ -110,16 +123,10 @@ force_recompute_caches = False
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control_new", "u_nudge", "T_nudge"]
-latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
-zm_latlon_file = ["zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
 cols = ["k", "b", "r"]
 
-# Use ndays of data ending at a fixed analysis date.
-ndays = 200
 dt = 6
-analysis_end_date = "2000-11-21"
-time_format = "time"  # or "int"
 obs_per_day = int(round(24 / dt))
 
 # User-defined filtering latitude band.  The cache filename includes this band,
@@ -144,14 +151,12 @@ wave_names = ["Kelvin", "EIG", "IG_antisym", "Easterly", "ER"]
 # Latitude projection by wave.  Choices are:
 #   symmetric:       average over filter_lat_bounds, suitable for even modes
 #   antisymmetric:   0.5 * (0..L - -L..0), suitable for odd modes
-#   hemispheric_sum: 0.5 * (0..L + -L..0), paired hemispheres without assigning
-#                    a Matsuno parity
-#   north/south:     one hemisphere only
+#   direct:          average without imposing parity
 #
 # Identifications used here:
 #   Kelvin and ER are symmetric/even.
 #   EIG is the eastward n=0 inertio-gravity branch, antisymmetric/odd.
-#   IG_sym and IG_antisym separate the westward n=1 and n=2 IG branches.
+#   IG_antisym isolates the westward n=2 IG branch.
 #   Easterly is the direct 10 S--10 N mean used by Rios-Berrios et al. (2023),
 #   without assigning the rectangular TD/easterly-wave box a Matsuno parity.
 wave_latitude_projection = dict(WAVE_LATITUDE_PROJECTION)
@@ -192,7 +197,6 @@ critical_level_phase_speed_xlim = (-40.0, 25.0)
 spectrum_outline_colors = {
     "Kelvin": "tab:orange",
     "EIG": "tab:red",
-    "IG_sym": "tab:pink",
     "IG_antisym": "tab:purple",
     "Easterly": "tab:green",
     "ER": "tab:blue",
@@ -211,19 +215,23 @@ os.makedirs(derived_cache_dir, exist_ok=True)
 # changes. Existing pressure-level filter inputs/wave caches without this marker
 # are regenerated automatically.
 PRESSURE_FIELD_CACHE_VERSION = "pressure-axis-fixed"
-PRESSURE_FIELD_PREFIXES = ("w", "u", "v", "T", "qv", "RH")
+PRESSURE_FIELD_PREFIXES = ("w", "u", "v", "T")
 DERIVED_CACHE_VERSION = "equatorial-wave-derived-v2"
 SPECTRUM_CACHE_VERSION = "equatorial-wave-spectrum-v1"
 
 # Avoid giant chunks when selecting latitude/longitude subsets.
 dask.config.set({"array.slicing.split_large_chunks": True})
 
-needed_vars = [
+latlon_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw", "olrtoa",
     "cldfrac",
     "uzonal_isobaric", "umeridional_isobaric",
     "rh_isobaric", "t_isobaric", "qv_isobaric",
     "theta", "pressure", "zgrid", "w",
+]
+zonal_mean_vars = [
+    "cldfrac", "uzonal_isobaric", "umeridional_isobaric", "rh_isobaric",
+    "t_isobaric", "qv_isobaric", "theta", "pressure", "w",
 ]
 
 # Keep full lat-lon fields chunked in both time and space.  The k-f filters
@@ -235,9 +243,6 @@ zm_chunks = {"Time": -1}
 
 should_run_figure = partial(figure_should_run, figures_to_run)
 should_run_any = partial(figure_should_run_any, figures_to_run)
-run_all_figures = partial(all_figures_requested, figures_to_run)
-
-
 def numbered_figure_path(number, stem):
     return os.path.join(save_loc, f"{number:02d}_{stem}.png")
 
@@ -280,13 +285,12 @@ def cache_signature(kind, extra=None):
         root_dir=os.path.abspath(root_dir),
         data_locs=list(data_locs),
         sim_names=list(sim_names),
-        latlon_file=list(latlon_file),
-        zm_latlon_file=list(zm_latlon_file),
-        ndays=ndays,
+        latlon_pattern=LATLON_PATTERN,
+        zonal_mean_pattern=ZONAL_MEAN_PATTERN,
+        analysis_start_date=ANALYSIS_START,
         dt_hours=dt,
         obs_per_day=obs_per_day,
-        analysis_end_date=analysis_end_date,
-        time_format=time_format,
+        analysis_end_date=ANALYSIS_END,
         filter_lat_bounds=jsonable_value(filter_lat_bounds),
         filter_avg_lat=filter_avg_lat,
         wave_names=list(wave_names),
@@ -460,24 +464,17 @@ dss_zm = []
 for i, d in enumerate(data_locs):
     ds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=LATLON_PATTERN,
         chunks=latlon_chunks,
     )
-    ds = standardize_latlon_dataset(ds, needed_vars)
+    ds = standardize_latlon_dataset(ds, latlon_vars)
 
     zds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=zm_latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=ZONAL_MEAN_PATTERN,
         chunks=zm_chunks,
-        prefer_pattern=True,
     )
-    zds = standardize_latlon_dataset(zds, needed_vars)
+    zds = standardize_latlon_dataset(zds, zonal_mean_vars)
 
     print(ds)
     print(zds)
@@ -496,10 +493,10 @@ wave_label = partial(configured_label, WAVE_BOXES)
 
 
 def precip_rate(ds):
-    pr = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
+    pr = precip_rate_from_accum(total_precip_accum(ds))
     pr.name = "Precip"
     pr.attrs["units"] = "mm day-1"
-    return finite_or_nan(pr)
+    return pr
 
 
 def cldfrac_level_field_name(height_km):
@@ -529,7 +526,7 @@ def get_cldfrac_field(ds, field_name):
     if "cldfrac" not in ds.data_vars:
         raise ValueError("cldfrac is not available in this dataset")
 
-    cf = finite_or_nan(ds.cldfrac)
+    cf = ds.cldfrac
     zdim = vertical_dim(cf)
     if zdim != "z":
         cf = cf.rename({zdim: "z"})
@@ -555,20 +552,18 @@ def get_filter_field(ds, field_name):
     if field_name == "Precip":
         return pr
     if field_name == "OLR":
-        return finite_or_nan(ds.olrtoa).sel(Time=pr.Time)
+        return ds.olrtoa.sel(Time=pr.Time)
     if field_name == "PW":
-        return finite_or_nan(ds.precipw).sel(Time=pr.Time)
+        return ds.precipw.sel(Time=pr.Time)
     if field_name == "cldfrac" or field_name.startswith("cldfrac"):
         return sel_common_times(get_cldfrac_field(ds, field_name), pr)
 
-    # Pressure-level fields encoded as u850, v250, w500, T100, qv700, RH500.
+    # Pressure-level fields encoded as u850, v250, w500, or T100.
     prefixes = [
         ("w", None),
         ("u", "uzonal_isobaric"),
         ("v", "umeridional_isobaric"),
         ("T", "t_isobaric"),
-        ("qv", "qv_isobaric"),
-        ("RH", "rh_isobaric"),
     ]
     for prefix, var in prefixes:
         if field_name.startswith(prefix):
@@ -580,9 +575,7 @@ def get_filter_field(ds, field_name):
                 out = vertical_velocity_at_pressure(ds, plev).sel(Time=pr.Time)
                 out.name = field_name
                 return out
-            if var not in ds.data_vars:
-                raise ValueError(f"{var} is not available in this dataset")
-            out = finite_or_nan(ds[var]).sel(pres=plev, method="nearest").sel(Time=pr.Time)
+            out = ds[var].sel(pres=plev).sel(Time=pr.Time)
             out.name = field_name
             return out
 
@@ -625,7 +618,7 @@ def field_units(field_name):
 
 def to_filter_input_dataset(da, obs_var="x"):
     """Standardise MPAS lat/lon DataArray to the file expected by kf_filter."""
-    x = finite_or_nan(da)
+    x = da
     rename = {}
     if "latitude" in x.dims:
         rename["latitude"] = "lat"
@@ -725,7 +718,7 @@ def hemisphere_bounds_from_lat_bounds(lat_bounds):
 
 def lat_projection_for_wave(wave_name, projection=None):
     """Return the configured latitude projection for a wave/disturbance band."""
-    valid = {"symmetric", "antisymmetric", "hemispheric_sum", "north", "south", "direct", "latitude_resolved"}
+    valid = {"symmetric", "antisymmetric", "direct"}
     if projection is None:
         projection = wave_latitude_projection.get(wave_name, "symmetric")
     if projection not in valid:
@@ -766,21 +759,13 @@ def wave_cache_matches(wave_da, field_name, wave_name, avgLat, lat_bounds, proje
 def read_cached_wave(cache_path, field_name, wave_name, avgLat, lat_bounds, projection, force=False):
     if force or not os.path.exists(cache_path):
         return None
-    try:
-        cached = xr.open_dataset(cache_path)
-        wave_cached = cached["wave"]
-        if wave_cache_matches(wave_cached, field_name, wave_name, avgLat, lat_bounds, projection):
-            print(f"Using cached filtered wave {cache_path}")
-            return wave_cached
-        print(f"Regenerating stale cached wave file {cache_path}")
-        cached.close()
-        os.remove(cache_path)
-    except Exception as exc:
-        print(f"Removing unreadable cached wave file {cache_path}: {exc}")
-        try:
-            os.remove(cache_path)
-        except OSError:
-            pass
+    cached = xr.open_dataset(cache_path)
+    wave_cached = cached["wave"]
+    if wave_cache_matches(wave_cached, field_name, wave_name, avgLat, lat_bounds, projection):
+        print(f"Using cached filtered wave {cache_path}")
+        return wave_cached
+    print(f"Regenerating stale cached wave file {cache_path}")
+    cached.close()
     return None
 
 
@@ -898,17 +883,11 @@ def projected_filtered_wave(ds, sim_index, field_name, wave_name, lat_bounds, pr
         ds, sim_index, field_name, wave_name, True, south_bounds,
         f"{projection}_south_component", force=force
     )
-    north, south = xr.align(north, south, join="inner")
-
-    if projection == "antisymmetric":
-        # Equivalent to adding the southern signal after flipping its odd sign.
-        wave = 0.5 * (north - south)
-        combination = "0.5*(north-south)"
-    elif projection == "hemispheric_sum":
-        wave = 0.5 * (north + south)
-        combination = "0.5*(north+south)"
-    else:
+    north, south = xr.align(north, south, join="exact")
+    if projection != "antisymmetric":
         raise ValueError(f"Projection {projection!r} does not use paired hemispheres")
+    wave = 0.5 * (north - south)
+    combination = "0.5*(north-south)"
 
     wave = wave.load()
     wave.name = "wave"
@@ -953,13 +932,7 @@ def get_filtered_wave(ds, sim_index, field_name, wave_name, avgLat=True, lat_bou
     projection = lat_projection_for_wave(wave_name, projection)
     if projection == "symmetric":
         return direct_filtered_wave(ds, sim_index, field_name, wave_name, True, lat_bounds, projection, force=force)
-    if projection == "north":
-        _, north_bounds = hemisphere_bounds_from_lat_bounds(lat_bounds)
-        return direct_filtered_wave(ds, sim_index, field_name, wave_name, True, north_bounds, projection, force=force)
-    if projection == "south":
-        south_bounds, _ = hemisphere_bounds_from_lat_bounds(lat_bounds)
-        return direct_filtered_wave(ds, sim_index, field_name, wave_name, True, south_bounds, projection, force=force)
-    if projection in ("antisymmetric", "hemispheric_sum"):
+    if projection == "antisymmetric":
         return projected_filtered_wave(ds, sim_index, field_name, wave_name, lat_bounds, projection, force=force)
     if projection == "direct":
         return direct_filtered_wave(ds, sim_index, field_name, wave_name, True, lat_bounds, projection, force=force)
@@ -976,23 +949,12 @@ def project_latitude_field(da, projection, lat_bounds=None):
     if projection in ("symmetric", "direct"):
         x = da.sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
         return x.mean(dim="latitude", skipna=True)
-    if projection == "north":
-        _, north_bounds = hemisphere_bounds_from_lat_bounds(lat_bounds)
-        x = da.sel(latitude=slice(north_bounds[0], north_bounds[1]))
-        return x.mean(dim="latitude", skipna=True)
-    if projection == "south":
-        south_bounds, _ = hemisphere_bounds_from_lat_bounds(lat_bounds)
-        x = da.sel(latitude=slice(south_bounds[0], south_bounds[1]))
-        return x.mean(dim="latitude", skipna=True)
-
     south_bounds, north_bounds = hemisphere_bounds_from_lat_bounds(lat_bounds)
     north = da.sel(latitude=slice(north_bounds[0], north_bounds[1])).mean(dim="latitude", skipna=True)
     south = da.sel(latitude=slice(south_bounds[0], south_bounds[1])).mean(dim="latitude", skipna=True)
-    north, south = xr.align(north, south, join="inner")
+    north, south = xr.align(north, south, join="exact")
     if projection == "antisymmetric":
         return 0.5 * (north - south)
-    if projection == "hemispheric_sum":
-        return 0.5 * (north + south)
     raise ValueError(f"Unhandled latitude projection {projection!r}")
 
 

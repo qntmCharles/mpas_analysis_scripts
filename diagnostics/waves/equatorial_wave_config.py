@@ -34,10 +34,6 @@ WAVE_BOXES = {
         k=(1, 14), period=(1.8, 4.5), depth=(8, 90),
         label="EIG", filter_name="IG0", components=("antisymmetric",),
     ),
-    "IG_sym": dict(
-        k=(-15, -1), period=(1.4, 2.6), depth=(8, 90),
-        label="IG sym", filter_name="IG1", components=("symmetric",),
-    ),
     "IG_antisym": dict(
         k=(-15, -1), period=(1.25, 2.0), depth=(8, 90),
         label="IG antisym", filter_name="IG2", components=("antisymmetric",),
