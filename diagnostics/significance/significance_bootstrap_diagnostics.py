@@ -39,7 +39,19 @@ try:
 except ModuleNotFoundError:
     dask = None
 
-from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import (
+    ANALYSIS_END, ANALYSIS_START, FigureSaver, LATLON_PATTERN,
+    ZONAL_MEAN_PATTERN, add_symmetric_colorbar,
+    configured_label, convective_organisation_cache_dir,
+    diagnostic_cache_dir, diagnostic_output_dir, difference_cmap, env_flag,
+    figure_should_run, finite_or_nan, hemispheric_fold, jsonable_value,
+    latitude_weights, load_latlon_dataset, precip_rate_from_accum,
+    pressure_layer_weights, read_json_file, safe_name,
+    standardize_latlon_dataset, subset_between,
+    subset_latitude, symmetric_levels, time_block_slices, time_step_days,
+    total_precip_accum, vertical_dim, vertical_velocity_at_pressure,
+    vertical_velocity_from_zm, write_json_file,
+)
 from diagnostics.convection.high_cloud_classification import (
     CLASSIFICATION_CACHE_VERSION,
     HighCloudThresholds,
@@ -51,7 +63,8 @@ from diagnostics.waves.equatorial_wave_config import (
 )
 from diagnostics.diagnostic_helpers import (
     PRIMARY_TRACK_SOURCE as PYFLEXTRKR_PRIMARY_TRACK_SOURCE,
-    PYFLEXTRKR_PRODUCT_VERSION,
+    PYFLEXTRKR_PRODUCT_VERSION, TRACK_POPULATION_LABELS, TRACK_POPULATIONS,
+    table_boolean_mask,
 )
 
 try:
@@ -72,7 +85,7 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/significance
 #   2: precipitation scalar/PDF block-consistency diagnostics
 #   3: cloud profile/cloud-type block-consistency diagnostics
 #   4: CCEW wave-box variance block-consistency diagnostics
-#   5: convective organisation block-consistency diagnostics
+#   5: persistent-DCS and Feng-MCS event-bootstrap diagnostics
 #   6: basic convection PDF block-consistency diagnostics
 #   7: vertical wave-power profile block-consistency diagnostics
 #   8: wave-amplitude lag-correlation block-consistency diagnostics
@@ -88,20 +101,15 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/significance
 #     shared thermal/static-stability/cloud-depth structures favour a
 #     temperature-driven pathway, while U-only wind/wave residuals favour a
 #     wind-driven pathway.
-figures_to_run = []
+figures_to_run = [2, 3, 4, 5]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control_new", "u_nudge", "T_nudge"]
-latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
-zm_latlon_file = ["zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
 cols = ["k", "b", "r"]
 
-ndays = 200
 dt = 6
-analysis_end_date = "2000-11-21"
-time_format = "time"
 obs_per_day = int(round(24 / dt))
 
 USE_BOOTSTRAP_CACHE = True
@@ -163,47 +171,29 @@ WAVE_LAG_TARGET_FIELDS = ["Precip", "OLR", "PW"]
 WAVE_LAG_MAX_DAYS = 8.0
 WAVE_LAG_BLOCK_DAYS = 30.0
 
-ORGANISATION_OUTPUT_DIR = "/home/cwp29/tmp/mpas/crf_on/final/organisation"
-ORGANISATION_TIMESERIES_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_lorg_timeseries.csv")
+ORGANISATION_OUTPUT_DIR = convective_organisation_cache_dir(root_dir=root_dir)
 ORGANISATION_TRACKS_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_track_lifetimes.csv")
-ORGANISATION_METRIC_METADATA_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_metric_cache_metadata.json")
 ORGANISATION_TRACK_METADATA_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_track_persistence_cache_metadata.json")
-ORGANISATION_BLOCK_DAYS = 5.0
-ORGANISATION_CONDITION_NBINS = 4
-ORGANISATION_MIN_CONDITION_SAMPLES = 3
-ORGANISATION_METRIC_SPECS = [
-    ("lorg_km", "km"),
-    ("lorg_normalised", ""),
-    ("object_count", "count"),
-    ("mean_object_area_km2", "km2"),
-    ("median_object_area_km2", "km2"),
-    ("largest_object_area_km2", "km2"),
-    ("largest_object_fraction", "fraction"),
-    ("convective_area_fraction", "fraction"),
-]
 ORGANISATION_TRACK_METRIC_SPECS = [
     ("lifetime_hours", "h"),
     ("max_area_km2", "km2"),
-    ("mean_area_km2", "km2"),
-    ("area_time_km2_h", "km2 h"),
-    ("precip_area_rate_time", "mm day-1 km2 h"),
+    ("max_pf_area_km2", "km2"),
+    ("max_pf_major_axis_km", "km"),
+    ("mean_pf_rain_mm_h", "mm h-1"),
+    ("mean_pf_rain_skewness", ""),
     ("max_area_convective_precipitating_high_cloud_mask_km2", "km2"),
+    ("max_area_stratiform_precipitating_high_cloud_mask_km2", "km2"),
+    ("max_area_nonprecipitating_high_cloud_mask_km2", "km2"),
     ("mean_frac_convective_precipitating_high_cloud_mask", "fraction"),
     ("max_translation_speed_kmh", "km h-1"),
-    ("starts_as_split", "fraction"),
-    ("ends_as_merge", "fraction"),
-    ("complete_lifecycle", "fraction"),
 ]
-# Track-persistence rows come from convective_organisation_diagnostics.py, which
-# uses PyFLEXTRKR overlap tracking on broad organised convective-system envelopes.
-# This script only performs the across-time chunk-consistency check; it never
-# creates or substitutes an alternative tracking product.
+# Rows come from the two retained PyFLEXTRKR track populations. This script only
+# performs event-equal bootstraps; it never creates another object product.
 
 # Shared coarse-grid precipitation-regime cloud thresholds.
 CF_THRESH = 0.05
 P_HIGH_HPA = 440.0
-P_PRECIP_MIN = 1.0
-CONVECTIVE_FRACTION_THRESHOLD = 0.50
+P_PRECIP_MIN = 12.0  # 0.5 mm h-1 PF threshold (Feng et al. 2021)
 CLOUD_CLASSIFICATION_CACHE_DIRS = [
     diagnostic_cache_dir("classification_cache", root_dir=root_dir),
 ]
@@ -241,13 +231,18 @@ WAVE_LATITUDE_PROJECTION = {
 }
 WAVE_FIELDS = ["Precip", "OLR", "PW"]
 
-needed_vars = [
+latlon_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw", "olrtoa", "cape",
     "qv", "relhum", "w",
     "theta", "pressure", "zgrid", "cldfrac",
     "uReconstructZonal", "uReconstructMeridional",
     "t_isobaric", "uzonal_isobaric", "umeridional_isobaric", "rh_isobaric",
     "qv_isobaric",
+]
+zonal_mean_vars = [
+    "relhum", "w", "theta", "pressure", "cldfrac", "uReconstructZonal",
+    "uReconstructMeridional", "t_isobaric", "uzonal_isobaric",
+    "umeridional_isobaric", "rh_isobaric", "qv_isobaric",
 ]
 
 latlon_chunks = {"Time": 8, "latitude": 90, "longitude": 180}
@@ -314,13 +309,12 @@ def base_bootstrap_cache_signature(family, extra=None):
         family=family,
         root_dir=root_dir,
         data_locs=list(data_locs),
-        latlon_file=list(latlon_file),
-        zm_latlon_file=list(zm_latlon_file),
+        latlon_pattern=LATLON_PATTERN,
+        zonal_mean_pattern=ZONAL_MEAN_PATTERN,
         sim_names=list(sim_names),
-        ndays=int(ndays),
+        analysis_start_date=ANALYSIS_START,
         dt=float(dt),
-        analysis_end_date=analysis_end_date,
-        time_format=time_format,
+        analysis_end_date=ANALYSIS_END,
         bootstrap_block_days=float(BOOTSTRAP_BLOCK_DAYS),
         cloud_type_block_days=float(CLOUD_TYPE_BLOCK_DAYS),
         n_bootstrap=int(N_BOOTSTRAP),
@@ -347,11 +341,7 @@ def bootstrap_cache_matches(cache_name, signature):
         print(f"Ignoring cached {cache_name}: force recompute is enabled.")
         return False
     metadata_path = bootstrap_cache_path(f"{cache_name}.metadata.json")
-    try:
-        cached = read_cache_metadata(metadata_path)
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"Ignoring cached {cache_name}: could not read metadata ({exc}).")
-        return False
+    cached = read_cache_metadata(metadata_path)
     if cached is None:
         return False
     signature = jsonable_value(signature)
@@ -374,10 +364,7 @@ def load_cached_table(cache_name, signature):
     path = bootstrap_cache_path(f"{cache_name}.csv")
     if not os.path.exists(path):
         return None
-    try:
-        df = pd.read_csv(path)
-    except pd.errors.EmptyDataError:
-        df = pd.DataFrame()
+    df = pd.read_csv(path)
     print(f"Using cached bootstrap table {path}")
     return df
 
@@ -434,21 +421,17 @@ def response_dataset_from_table(df, coord_col, coord_name, dim_name=None):
     data_vars = {}
     for col in ("mean_response", "ci_low", "ci_high", "bootstrap_noise", "response_to_noise", "sign_robustness"):
         if col in sub.columns:
-            data_vars[col] = (dim_name, pd.to_numeric(sub[col], errors="coerce").to_numpy(dtype=float))
+            data_vars[col] = (dim_name, pd.to_numeric(sub[col], errors="raise").to_numpy(dtype=float))
     if "robust" in sub.columns:
         robust = sub["robust"]
-        if robust.dtype == bool:
-            robust_values = robust.to_numpy()
-        else:
-            robust_values = robust.astype(str).str.lower().isin(["true", "1", "yes", "y"]).to_numpy()
-        data_vars["robust"] = (dim_name, robust_values)
+        if robust.dtype != bool:
+            raise TypeError("robust cache column must be boolean")
+        data_vars["robust"] = (dim_name, robust.to_numpy())
     if "ci_excludes_zero" in sub.columns:
         excludes = sub["ci_excludes_zero"]
-        if excludes.dtype == bool:
-            excludes_values = excludes.to_numpy()
-        else:
-            excludes_values = excludes.astype(str).str.lower().isin(["true", "1", "yes", "y"]).to_numpy()
-        data_vars["ci_excludes_zero"] = (dim_name, excludes_values)
+        if excludes.dtype != bool:
+            raise TypeError("ci_excludes_zero cache column must be boolean")
+        data_vars["ci_excludes_zero"] = (dim_name, excludes.to_numpy())
     return xr.Dataset(data_vars, coords={coord_name: (dim_name, coord)})
 
 
@@ -548,19 +531,12 @@ def weighted_variance_dims(da, dims):
     return weighted_mean_dims(anomaly2, dims)
 
 
-time_step_days = partial(
-    time_step_days,
-    dt_hours=dt,
-    numeric_step_values=False,
-)
 block_slices = partial(
     time_block_slices,
     block_days=BOOTSTRAP_BLOCK_DAYS,
-    dt_hours=dt,
     complete=True,
     min_blocks=MIN_BLOCKS,
     require_time=True,
-    numeric_step_values=False,
 )
 
 
@@ -636,20 +612,8 @@ def append_bootstrap_metric_rows(rows, values_by_run, category, diagnostic, metr
         rows.append(row)
 
 
-def interp_spatial_blocks_like(source, target):
-    out = source
-    interp_kwargs = {}
-    for dim in ("z", "pres", "latitude", "longitude", "precip_bin"):
-        if dim in out.dims and dim in target.dims and dim in out.coords and dim in target.coords:
-            if not np.array_equal(np.asarray(out[dim].values), np.asarray(target[dim].values)):
-                interp_kwargs[dim] = target[dim]
-    if interp_kwargs:
-        out = out.interp(interp_kwargs, kwargs={"fill_value": np.nan})
-    return out
-
-
 def bootstrap_field_difference(a_blocks, b_blocks, rng, n_boot=FIELD_N_BOOTSTRAP):
-    b_blocks = interp_spatial_blocks_like(b_blocks, a_blocks)
+    b_blocks, _ = xr.align(b_blocks, a_blocks, join="exact", exclude={"block"})
     template = a_blocks.isel(block=0, drop=True)
     a = np.asarray(a_blocks.values, dtype=np.float64)
     b = np.asarray(b_blocks.values, dtype=np.float64)
@@ -696,7 +660,6 @@ def bootstrap_field_difference(a_blocks, b_blocks, rng, n_boot=FIELD_N_BOOTSTRAP
 # Data loading
 # -----------------------------------------------------------------------------
 
-silence_hdf5_error_stack()
 
 print("Loading lat-lon and zonal-mean datasets")
 dss = []
@@ -704,24 +667,17 @@ dss_zm = []
 for i, d in enumerate(data_locs):
     ds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=LATLON_PATTERN,
         chunks=latlon_chunks,
     )
-    ds = standardize_latlon_dataset(ds, needed_vars)
+    ds = standardize_latlon_dataset(ds, latlon_vars)
 
     zds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=zm_latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=ZONAL_MEAN_PATTERN,
         chunks=zm_chunks,
-        prefer_pattern=True,
     )
-    zds = standardize_latlon_dataset(zds, needed_vars)
+    zds = standardize_latlon_dataset(zds, zonal_mean_vars)
 
     print(f"{sim_names[i]}: latlon vars={len(ds.data_vars)}, zm vars={len(zds.data_vars)}")
     dss.append(ds)
@@ -806,51 +762,25 @@ def zm_vertical_velocity(zds):
     return out
 
 
-def field_from_candidates(zds, candidates, name, scale=1.0):
-    for candidate in candidates:
-        if candidate in zds.data_vars:
-            out = rename_vertical_to_z(finite_or_nan(zds[candidate])) * scale
-            out.name = name
-            return out
-    raise ValueError(f"None of {candidates} available")
-
-
-def latlon_field_from_candidates(ds, candidates, name, scale=1.0):
-    for candidate in candidates:
-        if candidate in ds.data_vars:
-            out = assign_midlevel_height_from_zgrid(finite_or_nan(ds[candidate]), ds) * scale
-            out.name = name
-            return out
-    raise ValueError(f"None of {candidates} available")
-
-
 def water_vapour_field(ds, zds):
-    if "qv" in zds.data_vars:
-        return field_from_candidates(zds, ("qv",), "water_vapour", scale=1000.0)
-    return latlon_field_from_candidates(ds, ("qv",), "water_vapour", scale=1000.0)
+    return (assign_midlevel_height_from_zgrid(ds.qv, ds) * 1000.0).rename("water_vapour")
 
 
 def cloud_fraction_time_field(ds, zds):
-    cf = get_cloud_fraction(zds)
-    if cf is None:
-        cf = get_cloud_fraction(ds)
-    if cf is None:
-        raise ValueError("cldfrac unavailable or lacks a usable z coordinate")
-    cf.name = "cloud_fraction"
-    return cf
+    return zds.cldfrac.rename("cloud_fraction")
 
 
 LATHEIGHT_FIELD_SPECS = [
     dict(name="temperature", label="Temperature", units="K", diff_fallback=2.0,
          getter=lambda ds, zds: zm_temperature(zds), parity="even"),
     dict(name="zonal_wind", label="Zonal wind", units="m s-1", diff_fallback=5.0,
-         getter=lambda ds, zds: field_from_candidates(zds, ("uReconstructZonal",), "zonal_wind"), parity="even"),
+         getter=lambda ds, zds: zds.uReconstructZonal.rename("zonal_wind"), parity="even"),
     dict(name="static_stability_N2", label="Static stability N2", units="1e-4 s-2", diff_fallback=1.0,
          getter=lambda ds, zds: zm_static_stability(zds) * 1.0e4, parity="even"),
     dict(name="lapse_rate", label="Lapse rate", units="K km-1", diff_fallback=0.5,
          getter=lambda ds, zds: zm_lapse_rate(zds), parity="even"),
     dict(name="relative_humidity", label="Relative humidity", units="%", diff_fallback=10.0,
-         getter=lambda ds, zds: field_from_candidates(zds, ("relhum",), "relative_humidity"), parity="even"),
+         getter=lambda ds, zds: zds.relhum.rename("relative_humidity"), parity="even"),
     dict(name="water_vapour", label="Water vapour", units="g kg-1", diff_fallback=1.0,
          getter=water_vapour_field, parity="even"),
     dict(name="vertical_velocity", label="Vertical velocity", units="m s-1", diff_fallback=0.01,
@@ -1017,16 +947,10 @@ def run_mean_state_pathway():
 # -----------------------------------------------------------------------------
 
 def get_precip_rate(ds):
-    if "precip" in ds.data_vars:
-        pr = finite_or_nan(ds.precip)
-    else:
-        missing = [name for name in ("rainnc", "i_rainnc", "rainc", "i_rainc") if name not in ds.data_vars]
-        if missing:
-            raise ValueError(f"Missing precipitation accumulation variables: {missing}")
-        pr = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
+    pr = precip_rate_from_accum(total_precip_accum(ds))
     pr.name = "precip"
     pr.attrs["units"] = "mm day-1"
-    return finite_or_nan(pr)
+    return pr
 
 
 def precip_metric_values(pr):
@@ -1497,7 +1421,6 @@ classification_thresholds = partial(
     cf_thresh=CF_THRESH,
     high_cloud_top_pressure_hpa=P_HIGH_HPA,
     surface_precip_min_mm_day=P_PRECIP_MIN,
-    convective_fraction_threshold=CONVECTIVE_FRACTION_THRESHOLD,
 )
 cached_classification_is_current = partial(
     shared_cached_classification_is_current,
@@ -1653,19 +1576,9 @@ def run_cloud_response(precip_by_run):
 # Conditional diagnostics: strong/weak precipitation states
 # -----------------------------------------------------------------------------
 
-def aligned_optional_field(ds, key, ref):
-    aliases = {
-        "OLR": ("olrtoa", "olr", "OLR"),
-        "PW": ("precipw", "pw", "prw"),
-    }
-    for name in aliases.get(key, (key,)):
-        if name in ds.data_vars:
-            out = finite_or_nan(ds[name])
-            if "Time" in out.dims and "Time" in ref.dims:
-                out = out.sel(Time=ref.Time)
-            out.name = key
-            return out
-    return None
+def aligned_field(ds, key, ref):
+    variable = {"OLR": "olrtoa", "PW": "precipw"}[key]
+    return ds[variable].sel(Time=ref.Time).rename(key)
 
 
 def conditional_area_mean_blocks(target, condition):
@@ -1698,8 +1611,8 @@ def run_conditional_precipitation_states(precip_by_run):
         row_start = len(scalar_metric_rows)
         targets = {
             "precip": {i: precip_by_run[i] for i in range(len(dss))},
-            "OLR": {i: aligned_optional_field(dss[i], "OLR", precip_by_run[i]) for i in range(len(dss))},
-            "PW": {i: aligned_optional_field(dss[i], "PW", precip_by_run[i]) for i in range(len(dss))},
+            "OLR": {i: aligned_field(dss[i], "OLR", precip_by_run[i]) for i in range(len(dss))},
+            "PW": {i: aligned_field(dss[i], "PW", precip_by_run[i]) for i in range(len(dss))},
         }
         for target_name, by_run in list(targets.items()):
             if any(by_run[i] is None for i in range(len(dss))):
@@ -1739,14 +1652,14 @@ def run_conditional_precipitation_states(precip_by_run):
 
 
 # -----------------------------------------------------------------------------
-# Convective organisation: cached Lorg/object metrics from organisation script
+# Dual-population convective-system event properties from the organisation script
 # -----------------------------------------------------------------------------
 
 ORGANISATION_SOURCE_ORDER = [
     PYFLEXTRKR_PRIMARY_TRACK_SOURCE,
 ]
 ORGANISATION_PRIMARY_TRACK_SOURCE = PYFLEXTRKR_PRIMARY_TRACK_SOURCE
-ORGANISATION_TRACK_CACHE_VERSION = "pyflextrkr_ctp_basin_shield_tracks_v13"
+ORGANISATION_TRACK_CACHE_VERSION = "pyflextrkr_dual_population_tracks_v15"
 
 
 def require_current_organisation_metadata(path, label):
@@ -1765,36 +1678,6 @@ def require_current_organisation_metadata(path, label):
             "Run convective_organisation_diagnostics.py before this bootstrap script."
         )
     return metadata
-
-
-def load_organisation_timeseries():
-    if not os.path.exists(ORGANISATION_TIMESERIES_FILE):
-        record_skip(
-            "convective organisation bootstrap "
-            f"({ORGANISATION_TIMESERIES_FILE} not found; run convective_organisation_diagnostics.py first)"
-        )
-        record_todo(
-            "Import-safe organisation metric builder",
-            "Organisation changes are scientifically useful only if object metrics can be tested against internal variability without rerunning every figure workflow.",
-            "convective_organisation_diagnostics.py by exposing a reusable metric-table builder/cache interface",
-        )
-        return None
-
-    require_current_organisation_metadata(ORGANISATION_METRIC_METADATA_FILE, "organisation metric")
-    df = pd.read_csv(ORGANISATION_TIMESERIES_FILE)
-    required = {"source", "source_label", "simulation", "time_days"}
-    missing = sorted(required - set(df.columns))
-    if missing:
-        raise ValueError(f"organisation timeseries is missing columns: {missing}")
-
-    df = df[df["simulation"].isin(sim_names)].copy()
-    for col in (
-        ["time_days", "tropical_mean_precip", "convective_area_fraction"]
-        + [metric for metric, _ in ORGANISATION_METRIC_SPECS]
-    ):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
 
 
 def load_organisation_tracks():
@@ -1825,28 +1708,27 @@ def load_organisation_tracks():
             f"PyFLEXTRKR product version {PYFLEXTRKR_PRODUCT_VERSION!r}."
         )
     df = pd.read_csv(ORGANISATION_TRACKS_FILE)
-    required = {"source", "source_label", "simulation", "track_id"}
+    required = {
+        "source", "source_label", "simulation", "track_id",
+        "starts_as_split", "ends_as_merge",
+        *TRACK_POPULATIONS,
+        *[metric for metric, _ in ORGANISATION_TRACK_METRIC_SPECS],
+    }
     missing = sorted(required - set(df.columns))
     if missing:
         raise ValueError(f"organisation track table is missing columns: {missing}")
 
     df = df[df["simulation"].isin(sim_names)].copy()
     for col in ["starts_as_split", "ends_as_merge"]:
-        if col in df.columns:
-            if df[col].dtype == bool:
-                df[col] = df[col].astype(float)
-            else:
-                text = df[col].astype(str).str.lower()
-                df[col] = np.where(text.isin(["true", "1", "yes"]), 1.0, np.where(text.isin(["false", "0", "no"]), 0.0, np.nan))
-    if "starts_as_split" in df.columns and "ends_as_merge" in df.columns:
-        df["complete_lifecycle"] = np.where(
-            np.isfinite(df["starts_as_split"]) & np.isfinite(df["ends_as_merge"]),
-            ((df["starts_as_split"] == 0.0) & (df["ends_as_merge"] == 0.0)).astype(float),
-            np.nan,
-        )
+        if df[col].dtype != bool:
+            raise TypeError(f"organisation track column {col} must be boolean")
+    for population in TRACK_POPULATIONS:
+        df[population] = table_boolean_mask(df, population)
+    df["complete_lifecycle"] = (
+        ~df["starts_as_split"] & ~df["ends_as_merge"]
+    ).astype(float)
     for col in [metric for metric, _ in ORGANISATION_TRACK_METRIC_SPECS]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = pd.to_numeric(df[col], errors="raise")
     return df
 
 
@@ -1856,70 +1738,6 @@ def organisation_source_label(df, source):
         return source
     vals = sub["source_label"].dropna().unique()
     return str(vals[0]) if len(vals) else source
-
-
-def dataframe_time_block_values(
-    sub,
-    metric,
-    block_days=ORGANISATION_BLOCK_DAYS,
-    condition_key=None,
-    bin_edges=None,
-    bin_index=None,
-):
-    sub = sub.sort_values("time_days")
-    sub = sub[np.isfinite(sub["time_days"].values)]
-    if len(sub) == 0:
-        raise ValueError(f"no finite times for {metric}")
-
-    unique_times = np.unique(np.asarray(sub["time_days"].values, dtype=float))
-    dt_values = np.diff(unique_times)
-    dt_values = dt_values[np.isfinite(dt_values) & (dt_values > 0.0)]
-    dt_days = float(np.nanmedian(dt_values)) if dt_values.size else dt / 24.0
-    block_len = max(1, int(round(block_days / dt_days)))
-    nblocks = len(sub) // block_len
-    if nblocks < MIN_BLOCKS:
-        raise ValueError(
-            f"Only {nblocks} complete organisation blocks for {metric}; "
-            f"need at least {MIN_BLOCKS}."
-        )
-
-    vals = []
-    for bi in range(nblocks):
-        block = sub.iloc[bi * block_len:(bi + 1) * block_len]
-        if condition_key is not None:
-            lo = bin_edges[bin_index]
-            hi = bin_edges[bin_index + 1]
-            cond = block[condition_key]
-            if bin_index == len(bin_edges) - 2:
-                keep = (cond >= lo) & (cond <= hi)
-            else:
-                keep = (cond >= lo) & (cond < hi)
-            block = block[keep]
-            if len(block) < ORGANISATION_MIN_CONDITION_SAMPLES:
-                vals.append(np.nan)
-                continue
-        values = np.asarray(block[metric].values, dtype=float)
-        values = values[np.isfinite(values)]
-        vals.append(np.nanmean(values) if values.size else np.nan)
-
-    vals = np.asarray(vals, dtype=float)
-    vals = vals[np.isfinite(vals)]
-    if vals.size < MIN_BLOCKS:
-        raise ValueError(
-            f"Only {vals.size} finite organisation blocks for {metric}; "
-            f"need at least {MIN_BLOCKS}."
-        )
-    return vals
-
-
-def organisation_condition_edges(df, source, condition_key):
-    sub = df[df["source"] == source]
-    values = np.asarray(sub[condition_key].values, dtype=float)
-    values = values[np.isfinite(values)]
-    if values.size < ORGANISATION_CONDITION_NBINS:
-        return None
-    edges = np.unique(np.nanpercentile(values, np.linspace(0.0, 100.0, ORGANISATION_CONDITION_NBINS + 1)))
-    return edges if edges.size >= 3 else None
 
 
 def ordered_organisation_sources(df):
@@ -1948,13 +1766,14 @@ def plot_organisation_bootstrap_summary(org_df, org_source_labels):
         return
 
     display_metrics = [
-        ("lorg_km", "Lorg (km)"),
-        ("object_count", "Object count"),
-        ("convective_area_fraction", "Convective area fraction"),
-        ("largest_object_fraction", "Largest-object fraction"),
+        ("lifetime_hours", "MCS lifetime (h)"),
+        ("max_area_km2", "Maximum cold-shield area (km2)"),
+        ("max_pf_area_km2", "Maximum PF area (km2)"),
+        ("mean_pf_rain_mm_h", "Mean PF rain rate (mm h-1)"),
+        ("mean_pf_rain_skewness", "PF rain-rate skewness"),
     ]
     plot_df = org_df[
-        (org_df["category"] == "convective_organisation")
+        (org_df["category"] == "convective_system_event_properties")
         & (org_df["metric"].isin([metric for metric, _ in display_metrics]))
     ].copy()
     if len(plot_df) == 0:
@@ -2022,7 +1841,7 @@ def plot_organisation_bootstrap_summary(org_df, org_source_labels):
         ax.grid(axis="x", alpha=0.18)
         ax.set_xlabel(f"{label} response")
     axes.ravel()[0].legend(frameon=False, fontsize=8, loc="best")
-    fig.suptitle("Convective/object organisation block-consistency response; filled points pass the chunk-consistency rule")
+    fig.suptitle("Event-equal convective-system responses; filled points exclude zero")
     figsave.save(fig, "organisation_bootstrap_summary", number=5)
     plt.close(fig)
 
@@ -2031,21 +1850,20 @@ def run_convective_organisation_bootstrap():
     try:
         tracks = load_organisation_tracks()
         cache_signature = base_bootstrap_cache_signature(
-            "convective_organisation",
+            "convective_system_event_properties",
             extra=dict(
-                organisation_timeseries_file=ORGANISATION_TIMESERIES_FILE,
                 organisation_tracks_file=ORGANISATION_TRACKS_FILE,
-                organisation_block_days=float(ORGANISATION_BLOCK_DAYS),
-                condition_nbins=int(ORGANISATION_CONDITION_NBINS),
-                min_condition_samples=int(ORGANISATION_MIN_CONDITION_SAMPLES),
-                metric_specs=jsonable_value(ORGANISATION_METRIC_SPECS),
                 track_metric_specs=jsonable_value(ORGANISATION_TRACK_METRIC_SPECS),
                 primary_track_source=ORGANISATION_PRIMARY_TRACK_SOURCE,
                 organisation_track_cache_version=ORGANISATION_TRACK_CACHE_VERSION,
                 cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
+                track_populations=list(TRACK_POPULATIONS),
+                weighting="tracks are resampled equally within each population",
             ),
         )
-        cached_rows = load_cached_table("organisation_bootstrap_metrics", cache_signature)
+        cached_rows = load_cached_table(
+            "organisation_bootstrap_metrics", cache_signature
+        )
         if cached_rows is not None:
             append_cached_scalar_rows(cached_rows)
             save_table(cached_rows, "organisation_bootstrap_metrics.csv")
@@ -2054,143 +1872,64 @@ def run_convective_organisation_bootstrap():
                 .drop_duplicates("diagnostic")
                 .set_index("diagnostic")["source_label"]
                 .to_dict()
-                if {"diagnostic", "source_label"}.issubset(cached_rows.columns)
-                else {}
             )
             plot_organisation_bootstrap_summary(cached_rows, source_labels)
-            record_implemented("cached convective-organisation block-consistency checks")
+            record_implemented("cached dual-population event bootstrap")
             return
 
-        org = load_organisation_timeseries()
-        if org is None or len(org) == 0:
-            return
-
-        sources = ordered_organisation_sources(org)
-        source_labels = {source: organisation_source_label(org, source) for source in sources}
-        org_row_start = len(scalar_metric_rows)
-        skipped_pairs = 0
-
-        for source in sources:
-            sub_source = org[org["source"] == source]
-            for metric, units in ORGANISATION_METRIC_SPECS:
-                if metric not in sub_source.columns:
-                    continue
-                values_by_run = {}
-                for i, sim_name in enumerate(sim_names):
-                    sub = sub_source[sub_source["simulation"] == sim_name]
-                    try:
-                        values_by_run[i] = dataframe_time_block_values(sub, metric)
-                    except ValueError:
-                        skipped_pairs += 1
-                        values_by_run = None
-                        break
-                if values_by_run is None:
-                    continue
-                append_bootstrap_metric_rows(
-                    scalar_metric_rows,
-                    values_by_run,
-                    "convective_organisation",
-                    source,
-                    metric,
-                    units=units,
-                    extra={
-                        "source_label": source_labels[source],
-                        "organisation_role": organisation_source_role(source),
-                    },
-                )
-
-            for condition_key, condition_label in (
-                ("tropical_mean_precip", "fixed_tropical_mean_precip"),
-                ("convective_area_fraction", "fixed_convective_area_fraction"),
-            ):
-                if condition_key not in sub_source.columns:
-                    continue
-                edges = organisation_condition_edges(org, source, condition_key)
-                if edges is None:
-                    continue
-                for bin_index in range(len(edges) - 1):
-                    values_by_run = {}
-                    for i, sim_name in enumerate(sim_names):
-                        sub = sub_source[sub_source["simulation"] == sim_name]
-                        try:
-                            values_by_run[i] = dataframe_time_block_values(
-                                sub,
-                                "lorg_km",
-                                condition_key=condition_key,
-                                bin_edges=edges,
-                                bin_index=bin_index,
-                            )
-                        except ValueError:
-                            skipped_pairs += 1
-                            values_by_run = None
-                            break
-                    if values_by_run is None:
-                        continue
-                    append_bootstrap_metric_rows(
-                        scalar_metric_rows,
-                        values_by_run,
-                        "convective_organisation_conditioned",
-                        source,
-                        "lorg_km",
-                        units="km",
-                        extra={
-                            "source_label": source_labels[source],
-                            "organisation_role": organisation_source_role(source),
-                            "condition": condition_label,
-                            "bin_index": bin_index,
-                            "bin_low": float(edges[bin_index]),
-                            "bin_high": float(edges[bin_index + 1]),
-                            "bin_center": float(0.5 * (edges[bin_index] + edges[bin_index + 1])),
-                        },
-                    )
-
-        if tracks is not None and len(tracks) > 0:
-            for source in ordered_organisation_sources(tracks):
-                source_labels.setdefault(source, organisation_source_label(tracks, source))
-                sub_source = tracks[tracks["source"] == source]
+        source_labels = {}
+        row_start = len(scalar_metric_rows)
+        skipped = 0
+        for source in ordered_organisation_sources(tracks):
+            for population in TRACK_POPULATIONS:
+                diagnostic = f"{source}:{population}"
+                population_label = TRACK_POPULATION_LABELS[population]
+                source_labels[diagnostic] = population_label
+                source_tracks = tracks[
+                    (tracks.source == source) & tracks[population]
+                ]
                 for metric, units in ORGANISATION_TRACK_METRIC_SPECS:
-                    if metric not in sub_source.columns:
-                        continue
                     values_by_run = {}
-                    for i, sim_name in enumerate(sim_names):
-                        vals = np.asarray(sub_source.loc[sub_source["simulation"] == sim_name, metric].values, dtype=float)
-                        vals = vals[np.isfinite(vals)]
-                        if vals.size < MIN_BLOCKS:
-                            skipped_pairs += 1
+                    for simulation_index, simulation in enumerate(sim_names):
+                        values = source_tracks.loc[
+                            source_tracks.simulation == simulation, metric
+                        ].to_numpy(dtype=float)
+                        values = values[np.isfinite(values)]
+                        if values.size < MIN_BLOCKS:
                             values_by_run = None
+                            skipped += 1
                             break
-                        values_by_run[i] = vals
+                        values_by_run[simulation_index] = values
                     if values_by_run is None:
                         continue
                     append_bootstrap_metric_rows(
                         scalar_metric_rows,
                         values_by_run,
-                        "convective_organisation_persistence",
-                        source,
+                        "convective_system_event_properties",
+                        diagnostic,
                         metric,
                         units=units,
                         extra={
-                            "source_label": source_labels[source],
+                            "source_label": population_label,
+                            "track_population": population,
                             "organisation_role": organisation_source_role(source),
+                            "weighting": "tracks resampled equally within population",
                         },
                     )
 
-        org_df = pd.DataFrame(scalar_metric_rows[org_row_start:])
-        if len(org_df) == 0:
-            record_skip("convective organisation bootstrap (no source had enough finite time blocks)")
+        result = pd.DataFrame(scalar_metric_rows[row_start:])
+        if len(result) == 0:
+            record_skip("dual-population event bootstrap (too few events)")
             return
-        save_table(org_df, "organisation_bootstrap_metrics.csv")
-        plot_organisation_bootstrap_summary(org_df, source_labels)
-        write_cached_table("organisation_bootstrap_metrics", org_df, cache_signature)
-        message = (
-            "convective-organisation block-consistency checks for Lorg/object metrics, PyFLEXTRKR-method "
-            "track-persistence metrics, plus Lorg conditioned on tropical-mean precipitation and convective area fraction"
-        )
-        if skipped_pairs:
-            message += f" ({skipped_pairs} source/metric/bin entries skipped for insufficient blocks)"
+        save_table(result, "organisation_bootstrap_metrics.csv")
+        plot_organisation_bootstrap_summary(result, source_labels)
+        write_cached_table("organisation_bootstrap_metrics", result, cache_signature)
+        message = "event-equal bootstrap of persistent-DCS and Feng-MCS properties"
+        if skipped:
+            message += f" ({skipped} metric/run combinations skipped for small samples)"
         record_implemented(message)
     except Exception as exc:
-        record_failure("convective organisation bootstrap", exc)
+        record_failure("dual-population event bootstrap", exc)
         raise
 
 
@@ -2211,21 +1950,9 @@ def get_surface_convection_field(ds, field_name, ref=None):
     pr = get_precip_rate(ds)
     if field_name == "Precip":
         return pr
-    aliases = {
-        "OLR": ("olrtoa", "olr", "OLR"),
-        "PW": ("precipw", "pw", "prw"),
-        "CAPE": ("cape",),
-    }
-    for name in aliases.get(field_name, (field_name,)):
-        if name in ds.data_vars:
-            out = finite_or_nan(ds[name])
-            if ref is not None and "Time" in out.dims and "Time" in ref.dims:
-                out = out.sel(Time=ref.Time)
-            elif "Time" in out.dims and "Time" in pr.dims:
-                out = out.sel(Time=pr.Time)
-            out.name = field_name
-            return out
-    raise ValueError(f"{field_name} unavailable")
+    variable = {"OLR": "olrtoa", "PW": "precipw", "CAPE": "cape"}[field_name]
+    time = ref.Time if ref is not None else pr.Time
+    return ds[variable].sel(Time=time).rename(field_name)
 
 
 def get_wave_filter_field(ds, field_name):
@@ -2236,10 +1963,7 @@ def get_wave_filter_field(ds, field_name):
     pressure_fields = [
         ("w", None),
         ("u", "uzonal_isobaric"),
-        ("v", "umeridional_isobaric"),
         ("T", "t_isobaric"),
-        ("qv", "qv_isobaric"),
-        ("RH", "rh_isobaric"),
     ]
     for prefix, var in pressure_fields:
         if not field_name.startswith(prefix):
@@ -2251,9 +1975,7 @@ def get_wave_filter_field(ds, field_name):
         if var is None:
             out = vertical_velocity_at_pressure(ds, plev).sel(Time=pr.Time)
         else:
-            if var not in ds.data_vars:
-                raise ValueError(f"{var} unavailable")
-            out = finite_or_nan(ds[var]).sel(pres=plev, method="nearest").sel(Time=pr.Time)
+            out = ds[var].sel(pres=plev).sel(Time=pr.Time)
         out.name = field_name
         return out
 
@@ -2811,8 +2533,8 @@ def bootstrap_matched_pattern(blocks_control, blocks_u, blocks_T, domain_name, d
     u = subset_latpres_domain(blocks_u, domain["lat_bounds"], domain["p_bounds"])
     T = subset_latpres_domain(blocks_T, domain["lat_bounds"], domain["p_bounds"])
     c = subset_latpres_domain(blocks_control, domain["lat_bounds"], domain["p_bounds"])
-    T = interp_spatial_blocks_like(T, u)
-    c = interp_spatial_blocks_like(c, u)
+    T, _ = xr.align(T, u, join="exact", exclude={"block"})
+    c, _ = xr.align(c, u, join="exact", exclude={"block"})
     template = u.isel(block=0, drop=True)
     weight = latpres_weights(template)
 
@@ -2951,15 +2673,13 @@ def print_mechanism_cues(metrics_df, matched_df):
             print("  Robust wave-box changes are present; compare U-control and T-control rows in wave_box_variance_bootstrap_metrics.csv for wind-mediated organisation.")
         org_robust = metrics_df[
             (metrics_df["category"].isin([
-                "convective_organisation",
-                "convective_organisation_conditioned",
-                "convective_organisation_persistence",
+                "convective_system_event_properties",
             ]))
             & (metrics_df["comparison"].isin(["u_minus_control", "T_minus_control"]))
             & (metrics_df.get("robust", False) == True)
         ]
         if len(org_robust) > 0:
-            print("  Robust organisation/object/persistence changes are present; use organisation_bootstrap_metrics.csv to check Lorg, object metrics, and PyFLEXTRKR-method track lifetimes.")
+            print("  Robust convective-system property changes are present; use organisation_bootstrap_metrics.csv to compare event-equal persistent-DCS and Feng-MCS responses.")
         thermal_robust = metrics_df[
             (metrics_df["category"] == "mean_state_pathway")
             & (metrics_df["diagnostic"].isin(["temperature", "static_stability_N2", "lapse_rate", "cloud_fraction"]))
@@ -3007,7 +2727,7 @@ def print_final_summary(metrics_df, matched_df):
     print_mechanism_cues(metrics_df, matched_df)
 
     print("\nAnswering the headline question:")
-    print("  Use bootstrap_scalar_metrics.csv for scalar robustness, basic_convection_pdf_bootstrap_response.csv for PR/OLR/PW/CAPE distribution changes, wavenumber_variance_fraction_bootstrap_response.csv for planetary-scale organisation/noise checks, organisation_bootstrap_metrics.csv for Lorg/object robustness, the lat-height figures for coherent structures rather than isolated gridpoints, wave_box_variance_bootstrap_metrics.csv plus vertical_wave_power_profile_bootstrap_metrics.csv and wave_lag_correlation_bootstrap_metrics.csv for organised wave-mediated changes, and matched_pattern_bootstrap_metrics.csv for thermal-pattern attribution.")
+    print("  Use bootstrap_scalar_metrics.csv for scalar robustness, basic_convection_pdf_bootstrap_response.csv for PR/OLR/PW/CAPE distribution changes, wavenumber_variance_fraction_bootstrap_response.csv for planetary-scale organisation/noise checks, organisation_bootstrap_metrics.csv for persistent-DCS and Feng-MCS event properties, the lat-height figures for coherent structures rather than isolated gridpoints, wave_box_variance_bootstrap_metrics.csv plus vertical_wave_power_profile_bootstrap_metrics.csv and wave_lag_correlation_bootstrap_metrics.csv for organised wave-mediated changes, and matched_pattern_bootstrap_metrics.csv for thermal-pattern attribution.")
     print("  Robust U-control changes in zonal wind or CCEW variance that are absent from T-control point toward a wind-driven pathway; robust shared temperature/N2/cloud-depth structures with high matched-pattern correlation point toward a temperature-driven pathway.")
 
 

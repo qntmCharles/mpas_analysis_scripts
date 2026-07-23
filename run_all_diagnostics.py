@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -33,12 +32,6 @@ DEFAULT_DIAGNOSTIC_CACHE_ROOT = Path(
 )
 DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
 MODULE_SEARCH_DIRS = [
-    DIAGNOSTICS_DIR,
-    *(
-        path
-        for path in DIAGNOSTICS_DIR.iterdir()
-        if path.is_dir() and not path.name.startswith("__")
-    ),
     ANALYSIS_DIR,
     ANALYSIS_DIR.parent,
 ]
@@ -46,22 +39,22 @@ MODULE_SEARCH_DIRS = [
 DEFAULT_SCRIPT_ORDER = [
     "mean_state/mean_state_diagnostics.py",
     "mean_state/energy_budget.py",
+    "mean_state/vapour_transport_budget.py",
     "mean_state/thermal_wind_scaled_response.py",
     "mean_state/matched_pattern_response.py",
     "mean_state/jet_variability_diagnostics.py",
     "convection/refined_high_cloud_classification_diagnostics.py",
-    "convection/symmetry_convection_diagnostics.py",
-    "convection/convective_pathway_diagnostics.py",
     "convection/convective_organisation_diagnostics.py",
-    "convection/convective_lifecycle_composite_diagnostics.py",
     "waves/equatorial_wave_diagnostics.py",
+    "convection/convective_pathway_diagnostics.py",
+    "convection/convective_lifecycle_composite_diagnostics.py",
     "significance/significance_bootstrap_diagnostics.py",
 ]
 
-GUIDANCE_HEADER_RE = re.compile(
-    r"^\s*#\s*(WHAT TO LOOK FOR|What to look for|Interpretation)\s*:?\s*(.*)$"
-)
-
+QC_CAPABLE_SCRIPTS = {
+    "convection/refined_high_cloud_classification_diagnostics.py",
+    "convection/convective_organisation_diagnostics.py",
+}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -102,6 +95,15 @@ def parse_args() -> argparse.Namespace:
         help="Continue with later diagnostics if one fails.",
     )
     parser.add_argument(
+        "--qc",
+        action="store_true",
+        help=(
+            "Request validation figures from selected diagnostics that support "
+            "--qc (currently refined high-cloud classification and convective "
+            "organisation)."
+        ),
+    )
+    parser.add_argument(
         "--python",
         default=sys.executable,
         help="Python executable to use for each diagnostic.",
@@ -137,20 +139,14 @@ def normalise_name(name: str) -> str:
 
 
 def discover_diagnostic_scripts() -> list[str]:
-    """Find diagnostic scripts, preserving the usual analysis order first."""
-    discovered = set()
-    for pattern in ("*_diagnostics.py", "*_response.py"):
-        discovered.update(
-            path.relative_to(DIAGNOSTICS_DIR).as_posix()
-            for path in DIAGNOSTICS_DIR.rglob(pattern)
-        )
-    energy_budget = DIAGNOSTICS_DIR / "mean_state" / "energy_budget.py"
-    if energy_budget.exists():
-        discovered.add(energy_budget.relative_to(DIAGNOSTICS_DIR).as_posix())
-
-    ordered = [script for script in DEFAULT_SCRIPT_ORDER if script in discovered]
-    extras = sorted(discovered - set(ordered))
-    return ordered + extras
+    """Return the fixed workflow, failing if a configured script is missing."""
+    missing = [
+        script for script in DEFAULT_SCRIPT_ORDER
+        if not (DIAGNOSTICS_DIR / script).is_file()
+    ]
+    if missing:
+        raise SystemExit(f"Configured diagnostic scripts are missing: {', '.join(missing)}")
+    return list(DEFAULT_SCRIPT_ORDER)
 
 
 def resolve_script_name(name: str, available: list[str]) -> str:
@@ -216,70 +212,11 @@ def child_environment(args: argparse.Namespace) -> dict[str, str]:
     return env
 
 
-def extract_guidance_blocks(script_path: Path) -> list[tuple[int, str, list[str]]]:
-    """Extract comment guidance blocks so they appear in runner logs."""
-    lines = script_path.read_text(encoding="utf-8").splitlines()
-    blocks: list[tuple[int, str, list[str]]] = []
-    index = 0
-    while index < len(lines):
-        match = GUIDANCE_HEADER_RE.match(lines[index])
-        if not match:
-            index += 1
-            continue
-
-        start_line = index + 1
-        label = match.group(1).upper()
-        first_text = match.group(2).strip()
-        body = [first_text] if first_text else []
-        index += 1
-
-        while index < len(lines):
-            line = lines[index]
-            stripped = line.strip()
-            if not stripped:
-                break
-            if not stripped.startswith("#"):
-                break
-            text = stripped[1:].strip()
-            if GUIDANCE_HEADER_RE.match(line):
-                break
-            body.append(text)
-            index += 1
-
-        blocks.append((start_line, label, body))
-    return blocks
-
-
-def emit_guidance_blocks(script_path: Path, log_file) -> None:
-    blocks = extract_guidance_blocks(script_path)
-    if not blocks:
-        return
-
-    header = "\nGuidance extracted from script comments:\n"
-    print(header, end="", flush=True)
-    if log_file:
-        log_file.write(header)
-
-    for line_number, label, body in blocks:
-        title = f"  [{label} near line {line_number}]\n"
-        print(title, end="", flush=True)
-        if log_file:
-            log_file.write(title)
-        for text in body:
-            out = f"    {text}\n" if text else "\n"
-            print(out, end="", flush=True)
-            if log_file:
-                log_file.write(out)
-
-    print("", flush=True)
-    if log_file:
-        log_file.write("\n")
-        log_file.flush()
-
-
 def run_script(script: str, args: argparse.Namespace) -> int:
     script_path = DIAGNOSTICS_DIR / script
     command = [args.python, "-u", str(script_path)]
+    if args.qc and script in QC_CAPABLE_SCRIPTS:
+        command.append("--qc")
     command_text = shlex.join(command)
     env = child_environment(args)
 
@@ -297,8 +234,6 @@ def run_script(script: str, args: argparse.Namespace) -> int:
         log_file.write(f"Command: {command_text}\n\n")
         log_file.flush()
         print(f"Log: {log_path}", flush=True)
-
-    emit_guidance_blocks(script_path, log_file)
 
     return_code = 1
     try:
@@ -357,7 +292,10 @@ def main() -> int:
     if args.dry_run:
         print("\nDry run only; no diagnostics were executed.")
         for script in scripts:
-            command = shlex.join([args.python, "-u", str(DIAGNOSTICS_DIR / script)])
+            command_parts = [args.python, "-u", str(DIAGNOSTICS_DIR / script)]
+            if args.qc and script in QC_CAPABLE_SCRIPTS:
+                command_parts.append("--qc")
+            command = shlex.join(command_parts)
             if args.no_log or not args.log_dir:
                 print(command)
             else:

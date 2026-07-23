@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import os, sys, numbers
+import os, sys
 from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,7 +17,17 @@ from scipy.ndimage import uniform_filter1d
 import xarray as xr
 import dask
 from tropopause import tropopause_profile
-from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import (
+    FigureSaver, LATLON_PATTERN, N2_latheight, ZONAL_MEAN_PATTERN,
+    add_symmetric_colorbar, annotate_panel_label, control_diff_label,
+    diagnostic_cache_dir, diagnostic_output_dir, difference_cmap,
+    figure_should_run, figure_should_run_any, finite_or_nan, get_time_values,
+    hemispheric_fold, lat_height_mesh,
+    load_latlon_dataset, midlevel_height_from_latlon, model_lat_field,
+    positive_levels, precip_rate_from_accum, precipitation_rate_from_dataset,
+    safe_nanpercentile, set_latheight_labels, standardize_latlon_dataset,
+    symmetric_levels, time_step_days, total_precip_accum,
+)
 from diagnostics.convection.high_cloud_classification import (
     HighCloudThresholds,
     cached_classification_is_current,
@@ -36,18 +46,18 @@ save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/convection/'
 #   4:  diag_N2_latheight
 #   5:  diag_zonal_wind_shear_latheight
 #   6:  diag_tropopause_profiles
-#   7:  diag_high_cloud_maps
-#   8:  diag_cloud_top_height_hist
+#   7:  moved to refined_high_cloud_classification_diagnostics.py Figure 5
+#   8:  moved to refined_high_cloud_classification_diagnostics.py Figure 2
 #   9:  diag_convective_distributions
 #   10: diag_olr_precip_coupling
 #   11: diag_radiative_heating_precip
 #   12: diag_tropical_lag_correlations
 #   13: comp_zonalmean_convective_state
 #   14: comp_hydrometeor_latheight
-#   15: comp_cloudtop_highcloud_latitude
+#   15: superseded by refined high-cloud Figures 4-5
 #   16: comp_precip_conditioned_on_pw_cape_cin
-#   17: comp_olr_cloudtop_conditioned_on_precip
-#   18: comp_cloud_conditioned_on_precip_pw_cape_cin
+#   17: moved to refined high-cloud Figure 6
+#   18: rain-matched part moved to refined Figure 6; environment curves omitted
 #   19: comp_atmos_radiative_heating_proxy
 #   20: comp_tropical_timeseries_extended
 #   21: diag_meridional_wavenumber_variance
@@ -64,50 +74,28 @@ def save_figure(number, fig, stem, dpi=300):
 
 should_run_figure = partial(figure_should_run, figures_to_run)
 should_run_any = partial(figure_should_run_any, figures_to_run)
-run_all_figures = partial(all_figures_requested, figures_to_run)
 
 
 # Avoid giant Dask chunks when selecting latitude/longitude subsets from full lat-lon fields.
 dask.config.set({'array.slicing.split_large_chunks': True})
 
-# In[2]:
-
-##### config_microp_re on/off test #####
-#root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/'
-#data_locs = ['spinup/latlon_05deg.nc', 'microp_re_test/latlon_regridded_05deg.nc']
-#sim_names = ['default', 'microp_re']
-
-##### CRF on/off test #####
-#root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/qu_120km/'
-#data_locs = ['control', 'crf_test']
-#latlon_file = ['', 'latlon_spinup.nc']
-#sim_names = ['crf on', 'crf off']
-
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
 data_locs = ['control_new', 'u_nudge', 'T_nudge']
-latlon_file = ['latlon.2000-*.nc', 'latlon.2000-*.nc', 'latlon.2000-*.nc']
-zm_latlon_file = ['zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc']
 sim_names = ['control', 'nudged u', 'nudged T']
 
 CF_THRESH = 0.05
 P_HIGH_HPA = 440.0
-P_PRECIP_MIN = 1.0
-CONVECTIVE_FRACTION = 0.50
+P_PRECIP_MIN = 12.0  # 0.5 mm h-1 PF threshold (Feng et al. 2021)
 classification_cache_dir = diagnostic_cache_dir("classification_cache", root_dir=root_dir)
 
 cols = ['k', 'b', 'r']
 
-# Use ndays of data ending at a fixed analysis date
-ndays = 200
-dt = 6
-analysis_end_date = '2000-11-21'
 
-time_format = 'time' #or 'int'
 
 dss = []
 dss_zm = []
 
-needed_vars = [
+latlon_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw",
     "uzonal_isobaric", "umeridional_isobaric",
     "rh_isobaric", "t_isobaric", "qv_isobaric", "theta",
@@ -122,9 +110,13 @@ needed_vars = [
 # present in the zonal-mean files, so retain them from the lat-lon datasets and
 # let condensate_latheight fall back to a lazy zonal mean of those fields.
 if should_run_any([14, 20]):
-    needed_vars.extend(["qc", "qr", "qi", "qs", "qg"])
+    latlon_vars.extend(["qc", "qr", "qi", "qs", "qg"])
 
-check_vars = ['t_isobaric']
+zonal_mean_vars = [
+    "uzonal_isobaric", "umeridional_isobaric", "rh_isobaric", "t_isobaric",
+    "qv_isobaric", "theta", "uReconstructZonal", "cldfrac", "pressure",
+    "vorticity", "ke", "w",
+]
 
 # Chunk full latitude-longitude fields spatially as well as in time.
 # This avoids loading an entire global field when a diagnostic only needs the tropics.
@@ -133,57 +125,19 @@ zm_chunks = {"Time": -1}
 
 
 for i, d in enumerate(data_locs):
-    """
-    if i == 0:
-        dsd = xr.open_dataset(os.path.join(root_dir, 'control/latlon_diag.nc'), chunks={'Time': 4})
-        dsh = xr.open_dataset(os.path.join(root_dir, 'control/latlon_hist.nc'), chunks={'Time': 4})
-        #print(dsd)
-        #print(dsh)
-
-        # keep only times present in the 6h dataset
-        if time_format == 'int':
-            dsd_6h = dsd.isel(Time=slice(0, None, 2))
-        else:
-            dsd_6h = dsd.sel(Time=dsh.Time)
-
-        # merge variables into one dataset
-        ds = xr.merge([dsh, dsd_6h], join="exact")
-
-    else:
-        ds = xr.open_dataset(os.path.join(root_dir, d), chunks={'Time': 4})
-
-    # Dataset before time restriction
-    print(ds.data_vars)
-
-    if time_format == 'int':
-        ds = ds.sel(Time=slice(-1-ndays*int(24/dt), -1))
-    else:
-        # Restrict time
-        t_end = pd.to_datetime(ds.Time.max().item())
-        t_start = t_end - pd.Timedelta(days=ndays)
-        print(t_start, t_end)
-        ds = ds.sel(Time=slice(t_start, t_end))
-    """
     ds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=LATLON_PATTERN,
         chunks=latlon_chunks
     )
-    ds = standardize_latlon_dataset(ds, needed_vars)
+    ds = standardize_latlon_dataset(ds, latlon_vars)
 
     zds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=zm_latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=ZONAL_MEAN_PATTERN,
         chunks=zm_chunks,
-        prefer_pattern=True,
     )
-    zds = standardize_latlon_dataset(zds, needed_vars)
+    zds = standardize_latlon_dataset(zds, zonal_mean_vars)
 
     # cheaper if data are exactly 6-hourly and aligned
     #ds = ds.coarsen(Time=4, boundary="trim").mean()
@@ -206,7 +160,7 @@ if should_run_any([4, 5, 6, 14]):
         T = theta * (pressure / 100000.)**(287.0 / 1004.0)
         T = model_lat_field(T)
         pressure = model_lat_field(pressure)
-        z = height_from_zm_latlon(zds).values
+        z = zds.z.values
 
         ztps = []
         ptps = []
@@ -224,47 +178,17 @@ if should_run_any([4, 5, 6, 14]):
 # Additional mechanism diagnostics for QBO-like nudging experiments
 # -----------------------------------------------------------------------------
 # These diagnostics deliberately do *not* assume that the simulations contain an
-# MJO-like mode.  They first test whether zonal/hemispheric symmetry is broken,
+# propagating intraseasonal mode. They first test whether symmetry is broken,
 # then compare UTLS stability, cloud depth, convective thresholds, radiative
 # coupling, and simple moisture-convection lag relationships.
 #
 # Suggested reading of the figures:
 #   * Low zonal-asymmetric variance in precip/OLR means there is probably no
-#     useful MJO-like cloud/rain pattern to composite.
+#     useful coherent cloud/rain pattern to composite.
 #   * A strong T-nudge response in N2, cloud-top height, OLR-per-precipitation,
 #     or high-cloud fraction points to the thermal/static-stability pathway.
 #   * A strong U-nudge response in zonal asymmetry, k=1-3 power, eddy fluxes, or
 #     lag structure points more towards a dynamical/wave-mediated pathway.
-
-# If you want the radiative/convective diagnostics below, make sure these 2-D
-# fields are included in needed_vars before the data are loaded:
-#     "lwdnt", "lwdnb", "lwupb", "lwupt", "swdnt", "swdnb", "swupb", "swupt",
-#     "lh", "hfx", "cape", "cin", "lcl", "lfc"
-# The patched version of this script adds them automatically.
-
-def accumulated_precip(ds, component="total"):
-    """Accumulated precipitation in mm, including MPAS bucket counters."""
-    conv = ds["rainc"] + ds["i_rainc"] * 100.0
-    large = ds["rainnc"] + ds["i_rainnc"] * 100.0
-    if component == "convective":
-        return conv
-    if component == "resolved":
-        return large
-    if component == "total":
-        return conv + large
-    raise ValueError("component must be 'total', 'convective', or 'resolved'")
-
-def precip_rate(ds, component="total"):
-    """Precipitation rate in mm day-1 from accumulated MPAS precipitation."""
-    acc = accumulated_precip(ds, component=component)
-    if issubclass(acc.Time.values.dtype.type, numbers.Integral):
-        rate = acc.diff("Time") / (dt / 24.0)
-    else:
-        dt_days = acc.Time.diff("Time") / np.timedelta64(1, "D")
-        rate = acc.diff("Time") / dt_days
-    rate.name = f"precip_rate_{component}"
-    rate.attrs["units"] = "mm day-1"
-    return rate
 
 def sel_time_like(da, ref):
     """Select exact times from da matching ref.Time; used after precip differencing."""
@@ -330,7 +254,6 @@ classification_thresholds = partial(
     cf_thresh=CF_THRESH,
     high_cloud_top_pressure_hpa=P_HIGH_HPA,
     surface_precip_min_mm_day=P_PRECIP_MIN,
-    convective_fraction_threshold=CONVECTIVE_FRACTION,
 )
 
 
@@ -405,12 +328,6 @@ def binned_mean(x, y, bins, min_count=20):
             mean[i] = np.nanmean(y[m])
     return centres, mean, count
 
-def get_dt_days(da):
-    """Median output interval in days."""
-    if issubclass(da.Time.values.dtype.type, numbers.Integral):
-        return dt / 24.0
-    return float(np.median(da.Time.diff("Time") / np.timedelta64(1, "D")))
-
 def lag_corr(x, y, max_lag_steps):
     """
     Correlation between x(t) and y(t+lag).
@@ -444,9 +361,6 @@ def net_atmospheric_radiation(ds):
         net_down_TOA - net_down_surface
     using all-sky SW and LW fluxes.
     """
-    needed = ["swdnt", "swupt", "lwdnt", "lwupt", "swdnb", "swupb", "lwdnb", "lwupb"]
-    if any(v not in ds.data_vars for v in needed):
-        return None
     net_toa = (ds.swdnt - ds.swupt) + (ds.lwdnt - ds.lwupt)
     net_sfc = (ds.swdnb - ds.swupb) + (ds.lwdnb - ds.lwupb)
     ratm = net_toa - net_sfc
@@ -456,19 +370,15 @@ def net_atmospheric_radiation(ds):
 
 def time_aligned_fields(ds):
     """Common 2-D fields aligned to precipitation-rate time."""
-    pr = precip_rate(ds, component="total")
-    fields = {"Precip": pr}
-    if "olrtoa" in ds:
-        fields["OLR"] = sel_time_like(ds.olrtoa, pr)
-    if "precipw" in ds:
-        fields["PW"] = sel_time_like(ds.precipw, pr)
-    if "cape" in ds:
-        fields["CAPE"] = sel_time_like(ds.cape, pr)
-    if "cin" in ds:
-        fields["CIN"] = sel_time_like(ds.cin, pr)
-    hc = high_cloud_fraction(ds)
-    if hc is not None:
-        fields["High cloud"] = sel_time_like(hc, pr)
+    pr = precipitation_rate_from_dataset(ds)
+    fields = {
+        "Precip": pr,
+        "OLR": sel_time_like(ds.olrtoa, pr),
+        "PW": sel_time_like(ds.precipw, pr),
+        "CAPE": sel_time_like(ds.cape, pr),
+        "CIN": sel_time_like(ds.cin, pr),
+        "High cloud": sel_time_like(high_cloud_fraction(ds), pr),
+    }
     # Do not add R_atm here: it is a compound field made from eight fluxes,
     # so constructing it repeatedly inside generic diagnostics can create large
     # Dask graphs.  The dedicated radiative diagnostic below computes it once
@@ -534,27 +444,6 @@ def binned_statistic_1d(x, y, bins, min_count=20):
 
     return xc, mean, p25, p75, count
 
-def plot_binned_conditional_curve(
-    ax, x, y, bins, color, label=None, min_count=20, latmax=20,
-    max_time=48, max_lat=80, max_lon=160, show_spread=True
-):
-    """Plot a sampled, binned y(x) curve from matching lat-lon-time fields."""
-    x, y = xr.align(finite_or_nan(x), finite_or_nan(y), join="inner")
-    xv, yv = strided_matching_samples(
-        x, y, latmax=latmax, max_time=max_time, max_lat=max_lat, max_lon=max_lon
-    )
-    if xv.size == 0:
-        return False
-
-    xc, ym, y25, y75, count = binned_statistic_1d(xv, yv, bins, min_count=min_count)
-    if not np.any(np.isfinite(ym)):
-        return False
-
-    ax.plot(xc, ym, color=color, label=label)
-    if show_spread:
-        ax.fill_between(xc, y25, y75, color=color, alpha=0.15, linewidth=0)
-    return True
-
 def add_cpt_height(ax, i):
     ax.plot(dss_zm[i].latitude.values, CPTs[i][0] / 1000.0, color="k", lw=1, ls=":")
 
@@ -566,7 +455,7 @@ def condensate_latheight(ds, zds, varlist):
     if len(available_zm) > 0:
         q = sum(finite_or_nan(zds[v]) for v in available_zm).mean(dim="Time") * 1000.0
         q = hemispheric_fold(q, parity="even")
-        zmid = height_from_zm_latlon(zds)
+        zmid = zds.z
         return lat_height_mesh(q, zmid, zds.latitude.values)
 
     if len(available_ll) > 0:
@@ -606,7 +495,7 @@ def atmospheric_radiative_heating_proxy(ds):
 # 1. Symmetry-breaking diagnostics.
 # What to look for:
 #   * If tropical k>0 variance for precipitation/OLR is very small, do not use
-#     MJO-style phase composites.
+#     propagation-phase composites.
 #   * If nudging increases k>0 or antisymmetric variance, it is changing wave or
 #     instability behaviour rather than just the zonal-mean convective state.
 
@@ -621,7 +510,7 @@ if should_run_figure(1):
                 test_fields[key] = fields[key]
         if "uzonal_isobaric" in ds:
             try:
-                u850 = ds.uzonal_isobaric.sel(pres=850, method="nearest")
+                u850 = ds.uzonal_isobaric.sel(pres=850)
                 test_fields["u850"] = sel_time_like(u850, fields["Precip"])
             except Exception:
                 pass
@@ -668,7 +557,7 @@ else:
 # What to look for:
 #   * k=0 dominance: mostly zonally symmetric variability.
 #   * enhanced k=1-3 precip/OLR/PW variance: a necessary, but not sufficient,
-#     condition for MJO-like planetary-scale organisation.
+#     condition for planetary-scale organisation.
 
 def tropical_zonal_series(da, latmax=10):
     x = tropics(da, latmax=latmax)
@@ -713,7 +602,7 @@ if should_run_figure(2):
         for i, ds in enumerate(dss):
             try:
                 if label == "Precip":
-                    da = precip_rate(ds, component="total")
+                    da = precipitation_rate_from_dataset(ds)
                 else:
                     da = ds[vname]
                 k, frac = zonal_wavenumber_variance_fraction(da, latmax=10, max_k=15)
@@ -746,7 +635,7 @@ if should_run_figure(21):
         for i, ds in enumerate(dss):
             try:
                 if label == "Precip":
-                    da = precip_rate(ds, component="total")
+                    da = precipitation_rate_from_dataset(ds)
                 else:
                     da = ds[vname]
                 k, frac = meridional_wavenumber_variance_fraction(da, latmax=10, max_k=15)
@@ -780,7 +669,7 @@ if should_run_figure(3):
         fields = []
         for ds in dss:
             if label == "Precip":
-                da = precip_rate(ds, component="total")
+                da = precipitation_rate_from_dataset(ds)
             else:
                 da = ds[vname]
             x = tropical_zonal_series(da, latmax=10)
@@ -825,7 +714,7 @@ if should_run_figure(4):
     im = im2 = im3 = None
     for i, zds in enumerate(dss_zm):
         N2 = N2_latheight(zds)
-        zmid = height_from_zm_latlon(zds)
+        zmid = zds.z
         field, lat2d, z2d = lat_height_mesh(N2 * 1e4, zmid, zds.latitude.values)
         im = ax[i].contourf(lat2d, z2d/1000., field.values, levels=np.linspace(0, 8, 25), cmap="YlGnBu", extend="max")
         ax[i].plot(zds.latitude.values, CPTs[i][0]/1000., color="k", lw=1, ls=":")
@@ -868,7 +757,7 @@ if should_run_figure(4):
 def zonal_wind_shear_latheight(zds):
     u = model_lat_field(zds.uReconstructZonal.mean(dim="Time"))
     u = hemispheric_fold(u, parity="even")
-    z = height_from_zm_latlon(zds).values
+    z = zds.z.values
     du_dz = np.gradient(u.values, z, axis=0)
     shear = xr.DataArray(
         du_dz,
@@ -894,7 +783,7 @@ if should_run_figure(5):
 
         for i, zds in enumerate(dss_zm):
             shear = zonal_wind_shear_latheight(zds)
-            zmid = height_from_zm_latlon(zds)
+            zmid = zds.z
             field, lat2d, z2d = lat_height_mesh(shear * 1000.0, zmid, zds.latitude.values)
 
             im = ax[i].contourf(
@@ -983,80 +872,9 @@ if should_run_figure(6):
     save_figure(6, fig, "tropopause_profiles")
     print("Done with figure: diag_tropopause_profiles")
 
-# In[ ]:
-
-# 6. High-cloud maps and cloud-top-height distributions.
-# What to look for:
-#   * More high cloud / higher cloud tops at fixed or similar rainfall suggests
-#     a cloud-depth/radiative pathway rather than simply more precipitation.
-#   * These fields come from the mandatory shared classification cache.
-
-if should_run_figure(7):
-    hc_fields = []
-    for ds in dss:
-        hc = high_cloud_fraction(ds)
-        hc_fields.append(hemispheric_fold(hc.mean(dim="Time"), parity="even") if hc is not None else None)
-
-    if any(h is not None for h in hc_fields):
-        fig, ax = plt.subplots(1, len(dss), figsize=(3.6*len(dss), 3.2), constrained_layout=True, sharey=True)
-        fig2, ax2 = plt.subplots(1, len(dss), figsize=(3.6*len(dss), 3.2), constrained_layout=True, sharey=True)
-        if len(dss) == 1:
-            ax = [ax]
-            ax2 = [ax2]
-        control_hc = None
-        im = im2 = im3 = None
-        for i, hc in enumerate(hc_fields):
-            if hc is None:
-                ax[i].set_visible(False)
-                ax2[i].set_visible(False)
-                continue
-            im = ax[i].contourf(hc.longitude, hc.latitude, hc.values, levels=np.linspace(0, 1, 21), cmap="binary", extend="max")
-            annotate_panel_label(ax[i], sim_names[i])
-            ax[i].set_xlabel("Longitude")
-            if i == 0:
-                ax[i].set_ylabel("Latitude")
-                control_hc = hc
-                im2 = ax2[i].contourf(hc.longitude, hc.latitude, hc.values, levels=np.linspace(0, 1, 21), cmap="binary", extend="max")
-            else:
-                ax[i].tick_params(labelleft=False)
-                c = control_hc.interp(latitude=hc.latitude, longitude=hc.longitude)
-                high_cloud_diff_levels = symmetric_levels(0.15, ndiv=12)
-                im3 = ax2[i].contourf(hc.longitude, hc.latitude, (hc - c).values, levels=high_cloud_diff_levels, cmap=difference_cmap(high_cloud_diff_levels), extend="both")
-            annotate_panel_label(ax2[i], control_diff_label(sim_names, i))
-            ax2[i].set_xlabel("Longitude")
-            if i == 0:
-                ax2[i].set_ylabel("Latitude")
-            else:
-                ax2[i].tick_params(labelleft=False)
-
-        fig.colorbar(im, ax=ax[-1], location="right", label="High-cloud fraction (cloud top <= 440 hPa)")
-        fig2.colorbar(im2, ax=ax2[0], location="right", label="High-cloud fraction (cloud top <= 440 hPa)")
-        if im3 is not None:
-            add_symmetric_colorbar(fig2, im3, ax2[1:], symmetric_levels(0.15, ndiv=12), label="High-cloud difference")
-        save_figure(7, fig, "high_cloud_maps")
-        save_figure(7, fig2, "high_cloud_maps_diff")
-        print("Done with figure: diag_high_cloud_maps")
-
-if should_run_figure(8):
-    cth_available = False
-    fig, ax = plt.subplots(figsize=(7, 3.5), constrained_layout=True)
-    for i, ds in enumerate(dss):
-        cth = cloud_top_height(ds)
-        cth_available = True
-        vals = tropics(cth, latmax=10).values.ravel()
-        vals = vals[np.isfinite(vals)]
-        h, b = np.histogram(vals, bins=np.linspace(0, 22, 45), density=True)
-        h = uniform_filter1d(h, size=3)
-        ax.plot(0.5*(b[1:]+b[:-1]), h, color=cols[i], label=sim_names[i])
-    if cth_available:
-        ax.set_xlabel("Tropical cloud-top height from shared classification (km)")
-        ax.set_ylabel("Probability density")
-        ax.legend(loc="best")
-        save_figure(8, fig, "cloud_top_height_hist")
-        print("Done with figure: diag_cloud_top_height_hist")
-    else:
-        plt.close(fig)
-        print("Skipping cloud-top-height histogram: full lat/lon cldfrac unavailable")
+# High-cloud spatial responses and cloud-top distributions now use the shared
+# class decomposition in refined_high_cloud_classification_diagnostics.py
+# Figures 5 and 2, respectively.
 
 # In[ ]:
 
@@ -1069,7 +887,7 @@ if should_run_figure(8):
 
 if should_run_figure(9):
     hist_specs = [
-        ("Precip", lambda ds: precip_rate(ds, component="total"), np.linspace(0, 80, 121), "Rainfall rate (mm day$^{-1}$)", True),
+        ("Precip", precipitation_rate_from_dataset, np.linspace(0, 80, 121), "Rainfall rate (mm day$^{-1}$)", True),
         ("OLR", lambda ds: ds.olrtoa, np.linspace(100, 350, 121), r"OLR (W m$^{-2}$)", False),
         ("PW", lambda ds: ds.precipw, np.linspace(0, 80, 121), r"Precipitable water (kg m$^{-2}$)", False),
         ("CAPE", lambda ds: ds.cape if "cape" in ds else None, np.linspace(0, 5000, 121), r"CAPE (J kg$^{-1}$)", False),
@@ -1178,12 +996,12 @@ if should_run_figure(11):
                 continue
 
             ratm = net_atmospheric_radiation(ds)
-            pr = precip_rate(ds, component="total")
+            pr = precipitation_rate_from_dataset(ds)
             ratm_pr = sel_time_like(ratm, pr)
 
             # This is small after area_mean, so loading it is safe.
             tmean = area_mean(ratm, latmax=30).load()
-            ax[0].plot(get_time_values(tmean, dt=dt), tmean.values, color=cols[i], label=sim_names[i])
+            ax[0].plot(get_time_values(tmean), tmean.values, color=cols[i], label=sim_names[i])
 
             # Histogram: stride before .values.
             vals, = strided_matching_samples(ratm, latmax=30, max_time=32, max_lat=80, max_lon=160)
@@ -1223,7 +1041,7 @@ if should_run_figure(11):
 # What to look for:
 #   * PW leading precipitation is a recharge-discharge signature.
 #   * If nudging changes the lag of maximum correlation, it changes the timing of
-#     moistening relative to convection even without an MJO-like envelope.
+#     moistening relative to convection even without a coherent envelope.
 
 if should_run_figure(12):
     fig, ax = plt.subplots(1, 2, figsize=(9, 3.5), constrained_layout=True, sharey=True)
@@ -1235,7 +1053,7 @@ if should_run_figure(12):
         pw_ts = area_mean(fields["PW"], latmax=10)
         olr_ts = area_mean(fields["OLR"], latmax=10)
 
-        dt_days_here = get_dt_days(fields["Precip"])
+        dt_days_here = time_step_days(fields["Precip"])
         max_steps = max(1, int(round(10.0 / dt_days_here)))
         lags, c_pr = lag_corr(pw_ts.values, pr_ts.values, max_steps)
         _, c_olr = lag_corr(pw_ts.values, olr_ts.values, max_steps)
@@ -1291,7 +1109,7 @@ if should_run_figure(13):
         control = None
         for i, ds in enumerate(dss):
             if label == "Precip":
-                x = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
+                x = precip_rate_from_accum(total_precip_accum(ds))
             else:
                 if var not in ds.data_vars:
                     continue
@@ -1398,61 +1216,8 @@ if should_run_figure(14):
             if fig2 is not None:
                 plt.close(fig2)
 
-# ============================================================
-# 6. Cloud-top height and high-cloud fraction from the shared classification
-# ============================================================
-# What to look for:
-#   - Higher tropical cloud tops / more high cloud in T_nudge would support
-#     a UTLS-temperature/cloud-depth interpretation.
-
-if should_run_figure(15):
-    try:
-        fig, ax = plt.subplots(2, 1, figsize=(8, 5.5), constrained_layout=True, sharex=True)
-        fig2, ax2 = plt.subplots(2, 1, figsize=(8, 5.5), constrained_layout=True, sharex=True)
-
-        control_ctop = None
-        control_hcld = None
-
-        for i, ds in enumerate(dss):
-            ctop = hemispheric_fold(
-                cloud_top_height(ds).mean(dim=("Time", "longitude")), parity="even"
-            )
-            hcld = hemispheric_fold(
-                high_cloud_fraction(ds).mean(dim=("Time", "longitude")), parity="even"
-            )
-
-            ax[0].plot(ctop.latitude, ctop, color=cols[i], label=sim_names[i])
-            ax[1].plot(hcld.latitude, hcld, color=cols[i], label=sim_names[i])
-
-            if i == 0:
-                control_ctop = ctop
-                control_hcld = hcld
-                ax2[0].axhline(0, color="k", lw=0.7)
-                ax2[1].axhline(0, color="k", lw=0.7)
-            else:
-                ax2[0].plot(ctop.latitude, ctop - control_ctop.interp(latitude=ctop.latitude), color=cols[i], label=sim_names[i])
-                ax2[1].plot(hcld.latitude, hcld - control_hcld.interp(latitude=hcld.latitude), color=cols[i], label=sim_names[i])
-
-        ax[0].set_ylabel("Cloud-top height (km)")
-        ax[1].set_ylabel("High cloud fraction\ncloud top <= 440 hPa")
-        ax2[0].set_ylabel(r"$\Delta$ cloud top (km)")
-        ax2[1].set_ylabel(r"$\Delta$ high cloud")
-
-        for a in list(ax) + list(ax2):
-            a.axvline(0, color="grey", lw=0.5)
-            a.set_xlim(-90, 90)
-            a.grid(alpha=0.2)
-        ax[1].set_xlabel("Latitude")
-        ax2[1].set_xlabel("Latitude")
-        ax[0].legend(loc="best")
-        ax2[0].legend(loc="best")
-
-        if save:
-            save_figure(15, fig, "cloudtop_highcloud_latitude")
-            save_figure(15, fig2, "cloudtop_highcloud_latitude_diff")
-        print("Done with figure: comp_cloudtop_highcloud_latitude")
-    except ValueError as e:
-        print(f"Skipping cloud-top/high-cloud diagnostic: {e}")
+# Class-separated spatial/latitude responses now appear in refined high-cloud
+# Figure 5; vertical class responses appear in Figure 4.
 
 # ============================================================
 # 7. Conditional convective relationships
@@ -1477,7 +1242,7 @@ if should_run_figure(16):
         for i, ds in enumerate(dss):
             if var not in ds.data_vars:
                 continue
-            pr = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
+            pr = precip_rate_from_accum(total_precip_accum(ds))
             x = finite_or_nan(ds[var]).sel(Time=pr.Time)
             x = x.sel(latitude=slice(-20, 20))
             pr_sub = pr.sel(latitude=slice(-20, 20))
@@ -1494,117 +1259,12 @@ if should_run_figure(16):
         save_figure(16, fig, "precip_conditioned_on_pw_cape_cin")
     print("Done with figure: comp_precip_conditioned_on_pw_cape_cin")
 
-if should_run_figure(17):
-    # OLR and cloud-top conditioned on precipitation.
-    fig, ax = plt.subplots(1, 2, figsize=(10, 3.6), constrained_layout=True)
-    precip_bins = np.linspace(0, 60, 41)
-
-    for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        pr = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
-        olr = finite_or_nan(ds.olrtoa).sel(Time=pr.Time)
-
-        pr_trop = pr.sel(latitude=slice(-20, 20))
-        olr_trop = olr.sel(latitude=slice(-20, 20))
-        pr_trop, olr_trop = xr.align(pr_trop, olr_trop, join="inner")
-
-        xc, ym, y25, y75, count = binned_statistic_1d(pr_trop.values, olr_trop.values, precip_bins)
-        ax[0].plot(xc, ym, color=cols[i], label=sim_names[i])
-        ax[0].fill_between(xc, y25, y75, color=cols[i], alpha=0.15)
-
-        ctop_lat = hemispheric_fold(
-            cloud_top_height(ds).mean(dim=("Time", "longitude")), parity="even"
-        )
-        pr_lat = hemispheric_fold(pr.mean(dim=("Time", "longitude")), parity="even")
-        pr_lat, ctop_lat = xr.align(pr_lat, ctop_lat, join="inner")
-        xc2, ym2, y252, y752, count2 = binned_statistic_1d(
-            pr_lat.values, ctop_lat.values, precip_bins, min_count=2
-        )
-        ax[1].plot(xc2, ym2, color=cols[i], label=sim_names[i])
-
-    ax[0].set_xlabel(r"Precipitation (mm day$^{-1}$)")
-    ax[0].set_ylabel(r"OLR (W m$^{-2}$)")
-    ax[1].set_xlabel(r"Latitude-mean precipitation (mm day$^{-1}$)")
-    ax[1].set_ylabel("Cloud-top height (km)")
-    for a in ax:
-        a.grid(alpha=0.2)
-    ax[0].legend(loc="best")
-
-    if save:
-        save_figure(17, fig, "olr_cloudtop_conditioned_on_precip")
-    print("Done with figure: comp_olr_cloudtop_conditioned_on_precip")
-
-# Full-grid cloud-top and high-cloud diagnostics conditioned on rain and
-# convective-environment variables.
-if should_run_figure(18):
-    fig, ax = plt.subplots(1, 5, figsize=(16, 3.6), constrained_layout=True)
-    panel_plotted = [False] * len(ax)
-
-    precip_bins_cloud = np.linspace(0, 80, 41)
-    pw_bins_cloud = np.linspace(0, 80, 41)
-    cape_bins_cloud = np.linspace(0, 6000, 41)
-    cin_bins_cloud = np.linspace(-500, 100, 41)
-
-    for i, ds in enumerate(dss):
-        cth = cloud_top_height(ds)
-        hcld = high_cloud_fraction(ds)
-
-        pr = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
-        fields = {"Precip": pr}
-        if "precipw" in ds.data_vars:
-            fields["PW"] = finite_or_nan(ds.precipw).sel(Time=pr.Time)
-        if "cape" in ds.data_vars:
-            fields["CAPE"] = finite_or_nan(ds.cape).sel(Time=pr.Time)
-        if "cin" in ds.data_vars:
-            fields["CIN"] = finite_or_nan(ds.cin).sel(Time=pr.Time)
-
-        if cth is not None:
-            cth_km = finite_or_nan(cth).sel(Time=pr.Time)
-            panel_plotted[0] |= plot_binned_conditional_curve(
-                ax[0], fields["Precip"], cth_km, precip_bins_cloud, cols[i],
-                label=sim_names[i], min_count=30, latmax=20
-            )
-            if "PW" in fields:
-                panel_plotted[2] |= plot_binned_conditional_curve(
-                    ax[2], fields["PW"], cth_km, pw_bins_cloud, cols[i],
-                    label=sim_names[i], min_count=30, latmax=20
-                )
-
-        if hcld is not None:
-            hcld = finite_or_nan(hcld).sel(Time=pr.Time)
-            panel_plotted[1] |= plot_binned_conditional_curve(
-                ax[1], fields["Precip"], hcld, precip_bins_cloud, cols[i],
-                label=sim_names[i], min_count=30, latmax=20
-            )
-            if "CAPE" in fields:
-                panel_plotted[3] |= plot_binned_conditional_curve(
-                    ax[3], fields["CAPE"], hcld, cape_bins_cloud, cols[i],
-                    label=sim_names[i], min_count=30, latmax=20
-                )
-            if "CIN" in fields:
-                panel_plotted[4] |= plot_binned_conditional_curve(
-                    ax[4], fields["CIN"], hcld, cin_bins_cloud, cols[i],
-                    label=sim_names[i], min_count=30, latmax=20
-                )
-
-    labels = [
-        (r"Precipitation (mm day$^{-1}$)", "Cloud-top height (km)", "CTH vs precip"),
-        (r"Precipitation (mm day$^{-1}$)", "High-cloud fraction\ncloud top <= 440 hPa", "High cloud vs precip"),
-        (r"Precipitable water (kg m$^{-2}$)", "Cloud-top height (km)", "CTH vs PW"),
-        (r"CAPE (J kg$^{-1}$)", "High-cloud fraction\ncloud top <= 440 hPa", "High cloud vs CAPE"),
-        (r"CIN (J kg$^{-1}$)", "High-cloud fraction\ncloud top <= 440 hPa", "High cloud vs CIN"),
-    ]
-    for j, (xlabel, ylabel, title) in enumerate(labels):
-        ax[j].set_xlabel(xlabel)
-        ax[j].set_ylabel(ylabel)
-        ax[j].set_title(title)
-        ax[j].grid(alpha=0.2)
-        if not panel_plotted[j]:
-            ax[j].text(0.5, 0.5, "not loaded", transform=ax[j].transAxes, ha="center", va="center")
-
-    legend_ax = next((a for a, ok in zip(ax, panel_plotted) if ok), ax[0])
-    legend_ax.legend(loc="best")
-    save_figure(18, fig, "cloud_conditioned_on_precip_pw_cape_cin")
-    print("Done with figure: comp_cloud_conditioned_on_precip_pw_cape_cin")
+if should_run_any([17, 18]):
+    print(
+        "Figures 17-18 moved to refined_high_cloud_classification_diagnostics.py "
+        "Figure 6. PW/CAPE/CIN-conditioned high-cloud curves were not retained; "
+        "the broader precipitation-environment diagnostic remains in Figure 16."
+    )
 
 # ============================================================
 # 8. Radiation budget proxy
@@ -1664,29 +1324,29 @@ if should_run_figure(19):
 # ============================================================
 # What to look for:
 #   - Coherent changes in PW -> rain -> OLR/high-cloud timing indicate changed
-#     convection-radiation coupling even without MJO-like propagation.
+#     convection-radiation coupling even without coherent propagation.
 
 if should_run_figure(20):
     fig, ax = plt.subplots(5, 1, figsize=(8, 8), constrained_layout=True, sharex=True)
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        pr = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
+        pr = precip_rate_from_accum(total_precip_accum(ds))
         pr_trop = tropical_mean_latlon(pr)
         pw_trop = tropical_mean_latlon(ds.precipw)
         olr_trop = tropical_mean_latlon(ds.olrtoa)
 
-        ax[0].plot(get_time_values(pr_trop, dt=dt), pr_trop, color=cols[i], label=sim_names[i])
-        ax[1].plot(get_time_values(pw_trop, dt=dt), pw_trop, color=cols[i])
-        ax[2].plot(get_time_values(olr_trop, dt=dt), olr_trop, color=cols[i])
+        ax[0].plot(get_time_values(pr_trop), pr_trop, color=cols[i], label=sim_names[i])
+        ax[1].plot(get_time_values(pw_trop), pw_trop, color=cols[i])
+        ax[2].plot(get_time_values(olr_trop), olr_trop, color=cols[i])
 
         high_cld_ts = tropical_mean_latlon(high_cloud_fraction(ds))
-        ax[3].plot(get_time_values(high_cld_ts, dt=dt), high_cld_ts, color=cols[i])
+        ax[3].plot(get_time_values(high_cld_ts), high_cld_ts, color=cols[i])
 
         hydro = [v for v in ["qc", "qr", "qi", "qs", "qg"] if v in ds.data_vars]
         if len(hydro) > 0:
             qtot = sum(finite_or_nan(ds[v]) for v in hydro)
             qtot_trop = qtot.sel(latitude=slice(-20, 20)).mean(dim=[d for d in qtot.dims if d not in ("Time",)]) * 1000.0
-            ax[4].plot(get_time_values(qtot_trop, dt=dt), qtot_trop, color=cols[i])
+            ax[4].plot(get_time_values(qtot_trop), qtot_trop, color=cols[i])
 
     ax[0].set_ylabel(r"Rain\n(mm day$^{-1}$)")
     ax[1].set_ylabel("PW")
