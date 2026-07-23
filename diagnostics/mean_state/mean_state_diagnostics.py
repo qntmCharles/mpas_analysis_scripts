@@ -23,9 +23,26 @@ from wavenumber_frequency_functions import (
     smooth_wavefreq,
     spacetime_power,
 )
-from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import (
+    FigureSaver, LATLON_PATTERN, ZONAL_MEAN_PATTERN,
+    accumulated_precipitation_components, add_period_reference_lines_frequency,
+    add_split_difference_colorbars, add_symmetric_colorbar,
+    annotate_panel_label, contourf_split_difference,
+    control_diff_label, diagnostic_output_dir, difference_cmap,
+    domain_histograms, duration_domain_histograms, figure_should_run,
+    figure_should_run_any, get_time_values,
+    hemispheric_fold, isobaric_lat_mean,
+    isobaric_vertical_velocity_from_zm, lat_height_mesh, lat_mean,
+    load_latlon_dataset, make_spectrum_cmap, midlevel_height_from_latlon,
+    model_lat_field, nice_levels, plot_Tu_latpres, plot_rhw_latpres,
+    positive_levels, precip_rate_from_accum, region_symmetric_levels,
+    relative_frequency_from_histogram, safe_nanpercentile,
+    set_latheight_labels, set_latpres_axis,
+    split_scales_warranted, standardize_latlon_dataset, symmetric_levels,
+    tropopause_on_latitudes, tropopause_region_masks,
+    vertical_velocity_from_zm,
+)
 
-silence_hdf5_error_stack()
 
 save = True
 save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/mean_state/')
@@ -75,7 +92,6 @@ def save_figure(fig, stem, number=None, dpi=None):
 
 should_run_figure = partial(figure_should_run, figures_to_run)
 should_run_any = partial(figure_should_run_any, figures_to_run)
-run_all_figures = partial(all_figures_requested, figures_to_run)
 
 
 spectrum_period_reference_days = [3.0, 6.0, 30.0]
@@ -92,12 +108,8 @@ CP = 1004.0
 P0_PA = 100000.0
 G = 9.80665
 def isobaric_eddy_kinetic_energy(ds):
-    missing = [v for v in ("uzonal_isobaric", "umeridional_isobaric") if v not in ds.data_vars]
-    if missing:
-        raise ValueError(f"Missing isobaric wind variables for EKE: {missing}")
-
-    u = finite_or_nan(ds.uzonal_isobaric)
-    v = finite_or_nan(ds.umeridional_isobaric)
+    u = ds.uzonal_isobaric
+    v = ds.umeridional_isobaric
     eddy_dims = [dim for dim in ("Time", "longitude") if dim in u.dims]
     ua = u - u.mean(dim=eddy_dims, skipna=True)
     va = v - v.mean(dim=eddy_dims, skipna=True)
@@ -121,47 +133,21 @@ def symmetric_contour_levels(fields, ndiv=11, fallback=1.0):
     return symmetric_levels(vmax, ndiv=ndiv)
 
 
-def latlon_time_mean_field(ds, candidates, level_index=0, scale=1.0, name=None, hemispheric_parity=None):
-    for candidate in candidates:
-        if candidate not in ds.data_vars:
-            continue
-
-        da = finite_or_nan(ds[candidate])
-        if any(dim in da.dims for dim in ("z", "nVertLevels", "nVertLevelsP1")):
-            da = da.isel({vertical_dim(da): level_index}, drop=True)
-
-        extra_dims = [dim for dim in da.dims if dim not in ("Time", "latitude", "longitude")]
-        if extra_dims:
-            raise ValueError(f"{candidate} has unsupported dimensions for a lat/lon map: {da.dims}")
-
-        if "Time" in da.dims:
-            da = da.mean(dim="Time", skipna=True)
-
-        da = (da * scale).transpose("latitude", "longitude")
-        da = hemispheric_fold(da, parity=hemispheric_parity).load()
-        da.name = name or candidate
-        return da
-
-    raise ValueError(f"None of {candidates} found")
+def latlon_time_mean_field(ds, variable, scale=1.0, name=None, hemispheric_parity=None):
+    da = ds[variable].mean(dim="Time", skipna=True)
+    da = (da * scale).transpose("latitude", "longitude")
+    da = hemispheric_fold(da, parity=hemispheric_parity).load()
+    da.name = name or variable
+    return da
 
 
 def latheight_time_mean_field(zds, spec):
     if spec.get("derived") == "temperature":
-        missing = [v for v in ("theta", "pressure") if v not in zds.data_vars]
-        if missing:
-            raise ValueError(f"Missing variables for temperature: {missing}")
-        theta = finite_or_nan(zds.theta)
-        pressure = finite_or_nan(zds.pressure)
-        da = theta * (pressure / P0_PA) ** (RD / CP)
+        da = zds.theta * (zds.pressure / P0_PA) ** (RD / CP)
     elif spec.get("derived") == "vertical_velocity":
         da = vertical_velocity_from_zm(zds)
     else:
-        for candidate in spec["candidates"]:
-            if candidate in zds.data_vars:
-                da = finite_or_nan(zds[candidate])
-                break
-        else:
-            raise ValueError(f"None of {spec['candidates']} found")
+        da = zds[spec["var"]]
 
     if "Time" in da.dims:
         da = da.mean(dim="Time", skipna=True)
@@ -186,7 +172,7 @@ def scalar_constituent_latheight(ds, spec, zmid=None):
 
     da = None
     for varname in varnames:
-        term = finite_or_nan(ds[varname])
+        term = ds[varname]
         da = term if da is None else da + term
     mean_dims = [dim for dim in ("Time", "longitude") if dim in da.dims]
     if mean_dims:
@@ -347,7 +333,7 @@ LATHEIGHT_MEAN_STATE_SPECS = [
     },
     {
         "label": "Zonal wind",
-        "candidates": ("uReconstructZonal",),
+        "var": "uReconstructZonal",
         "units": r"m s$^{-1}$",
         "cmap": "seismic",
         "raw_symmetric": True,
@@ -358,7 +344,7 @@ LATHEIGHT_MEAN_STATE_SPECS = [
     },
     {
         "label": "Meridional wind",
-        "candidates": ("uReconstructMeridional",),
+        "var": "uReconstructMeridional",
         "units": r"m s$^{-1}$",
         "cmap": "seismic",
         "raw_symmetric": True,
@@ -383,7 +369,7 @@ LATHEIGHT_W_RH_SPECS = [
     },
     {
         "label": "Relative humidity",
-        "candidates": ("relhum",),
+        "var": "relhum",
         "units": "%",
         "cmap": "BrBG",
         "raw_symmetric": False,
@@ -394,55 +380,9 @@ LATHEIGHT_W_RH_SPECS = [
     },
 ]
 
-LATHEIGHT_TEM_SPECS = [
-    {
-        "label": "Wave forcing",
-        "candidates": ("EPFd", "divF", "dF"),
-        "units": r"m s$^{-1}$ day$^{-1}$",
-        "scale": 86400.0,
-        "cmap": "seismic",
-        "raw_symmetric": True,
-        "raw_fallback": 1.0,
-        "raw_percentile": 99.0,
-        "diff_fallback": 0.5,
-        "diff_percentile": 99.0,
-        "diff_split_tropopause": True,
-        "level_min_height_m": 1000.0,
-        "hemispheric_parity": "even",
-    },
-    {
-        "label": "Residual vertical velocity",
-        "candidates": ("wres",),
-        "units": r"m s$^{-1}$",
-        "cmap": "seismic",
-        "raw_symmetric": True,
-        "raw_fallback": 0.01,
-        "raw_percentile": 99.0,
-        "diff_fallback": 0.002,
-        "diff_percentile": 99.0,
-        "diff_split_tropopause": True,
-        "level_min_height_m": 1000.0,
-        "hemispheric_parity": "even",
-    },
-    {
-        "label": "Residual meridional velocity",
-        "candidates": ("vres",),
-        "units": r"m s$^{-1}$",
-        "cmap": "seismic",
-        "raw_symmetric": True,
-        "raw_fallback": 1.0,
-        "raw_percentile": 99.0,
-        "diff_fallback": 0.5,
-        "diff_percentile": 99.0,
-        "diff_split_tropopause": True,
-        "level_min_height_m": 1000.0,
-        "hemispheric_parity": "odd",
-    },
-]
-
 MSLP_LATLON_SPEC = {
     "label": "MSLP",
-    "candidates": ("mslp",),
+    "var": "mslp",
     "units": "hPa",
     "scale": 0.01,
     "cmap": "viridis",
@@ -509,38 +449,18 @@ SCALAR_CONSTITUENT_GROUPS = [
     },
 ]
 
-
-
-##### config_microp_re on/off test #####
-#root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/'
-#data_locs = ['spinup/latlon_05deg.nc', 'microp_re_test/latlon_regridded_05deg.nc']
-#sim_names = ['default', 'microp_re']
-
-##### CRF on/off test #####
-#root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/qu_120km/'
-#data_locs = ['control', 'crf_test']
-#latlon_file = ['', 'latlon_spinup.nc']
-#sim_names = ['crf on', 'crf off']
-
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
 data_locs = ['control_new', 'u_nudge', 'T_nudge']
-latlon_file = ['latlon.2000-*.nc', 'latlon.2000-*.nc', 'latlon.2000-*.nc']
-zm_latlon_file = ['zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc']
 sim_names = ['control', 'nudged u', 'nudged T']
 
 cols = ['k', 'b', 'r']
 
-# Use ndays of data ending at a fixed analysis date
-ndays = 200
-dt = 6
-analysis_end_date = '2000-11-21'
 
-time_format = 'time' #or 'int'
 
 dss = []
 dss_zm = []
 
-needed_vars = [
+latlon_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw",
     "qv", "qc", "qr", "qi", "qs", "qg", "relhum", "w",
     "mslp",
@@ -548,10 +468,12 @@ needed_vars = [
     "rh_isobaric", "t_isobaric", "qv_isobaric", "theta",
     "uReconstructZonal", "uReconstructMeridional",
     "cldfrac", "olrtoa", "zgrid", "pressure", "vorticity", "ke",
-    "EPFd", "wres", "vres",
 ]
-
-check_vars = ['t_isobaric']
+zonal_mean_vars = [
+    "qv_isobaric", "relhum", "rh_isobaric", "t_isobaric", "theta",
+    "uReconstructZonal", "uReconstructMeridional", "uzonal_isobaric",
+    "umeridional_isobaric", "cldfrac", "pressure", "vorticity", "ke", "w",
+]
 
 # Match the native 4-D isobaric chunks spatially. The previous 60x120 chunks
 # split every 180x360 HDF5 chunk into nine Dask tasks and made figure 4 spend
@@ -561,57 +483,19 @@ zm_chunks = {"Time": -1}
 
 
 for i, d in enumerate(data_locs):
-    """
-    if i == 0:
-        dsd = xr.open_dataset(os.path.join(root_dir, 'control/latlon_diag.nc'), chunks={'Time': 4})
-        dsh = xr.open_dataset(os.path.join(root_dir, 'control/latlon_hist.nc'), chunks={'Time': 4})
-        #print(dsd)
-        #print(dsh)
-
-        # keep only times present in the 6h dataset
-        if time_format == 'int':
-            dsd_6h = dsd.isel(Time=slice(0, None, 2))
-        else:
-            dsd_6h = dsd.sel(Time=dsh.Time)
-
-        # merge variables into one dataset
-        ds = xr.merge([dsh, dsd_6h], join="exact")
-
-    else:
-        ds = xr.open_dataset(os.path.join(root_dir, d), chunks={'Time': 4})
-
-    # Dataset before time restriction
-    print(ds.data_vars)
-
-    if time_format == 'int':
-        ds = ds.sel(Time=slice(-1-ndays*int(24/dt), -1))
-    else:
-        # Restrict time
-        t_end = pd.to_datetime(ds.Time.max().item())
-        t_start = t_end - pd.Timedelta(days=ndays)
-        print(t_start, t_end)
-        ds = ds.sel(Time=slice(t_start, t_end))
-    """
     ds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=LATLON_PATTERN,
         chunks=latlon_chunks
     )
-    ds = standardize_latlon_dataset(ds, needed_vars)
+    ds = standardize_latlon_dataset(ds, latlon_vars)
 
     zds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=zm_latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=ZONAL_MEAN_PATTERN,
         chunks=zm_chunks,
-        prefer_pattern=True,
     )
-    zds = standardize_latlon_dataset(zds, needed_vars)
+    zds = standardize_latlon_dataset(zds, zonal_mean_vars)
 
     # cheaper if data are exactly 6-hourly and aligned
     #ds = ds.coarsen(Time=4, boundary="trim").mean()
@@ -633,12 +517,12 @@ if should_run_figure(1):
         precip_water = lat_mean(ds.precipw.mean(dim="longitude"))
 
         # Use this dataset's own time coordinate
-        t_pw = get_time_values(precip_water, dt=dt)
+        t_pw = get_time_values(precip_water)
 
         # Rainfall rate has one fewer Time point, so use diff() and its own Time coord
-        precip_rate = precipitation_rate(precip_mean, dt_hours=dt)
+        precip_rate = precip_rate_from_accum(precip_mean)
 
-        t_rate = get_time_values(precip_rate, dt=dt)
+        t_rate = get_time_values(precip_rate)
 
         ax[0].plot(t_pw, precip_water.values, color=cols[i], label=sim_names[i])
         ax[1].plot(t_rate, precip_rate.values, color=cols[i])
@@ -669,7 +553,7 @@ if should_run_figure(2):
 
         T = theta * (pressure / P0_PA) ** (RD / CP)
 
-        z = height_from_zm_latlon(zds).values
+        z = zds.z.values
 
         # Brunt-Väisälä frequency squared: N^2 = (g/theta) dtheta/dz
         g = 9.80665
@@ -715,7 +599,7 @@ if should_run_any([3, 10, 11, 13, 14, 16, 18]):
         T = theta * (pressure / P0_PA) ** (RD / CP)
         T = model_lat_field(T)
         pressure = model_lat_field(pressure)
-        z = height_from_zm_latlon(zds).values
+        z = zds.z.values
 
         ztps = []
         ptps = []
@@ -873,7 +757,7 @@ if should_run_figure(5):
         precip, precip_con, precip_res = accumulated_precipitation_components(ds)
 
         for i, precip_var in enumerate([precip, precip_con, precip_res]):
-            rate = precipitation_rate(precip_var, dt_hours=dt)
+            rate = precip_rate_from_accum(precip_var)
             histograms = domain_histograms(
                 rate, bins=300, value_range=(0, 300),
                 tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
@@ -916,7 +800,7 @@ if should_run_figure(6):
         precip, precip_con, precip_res = accumulated_precipitation_components(ds)
 
         for i, precip_var in enumerate([precip, precip_con, precip_res]):
-            rate = precipitation_rate(precip_var, dt_hours=dt)
+            rate = precip_rate_from_accum(precip_var)
             histograms = duration_domain_histograms(
                 rate, threshold=5, bins=59, value_range=(1, 60),
                 tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
@@ -968,7 +852,7 @@ if should_run_figure(7):
 
     for d, ds in enumerate(dss):
         precip, _, _ = accumulated_precipitation_components(ds)
-        rate = precipitation_rate(precip, dt_hours=dt)
+        rate = precip_rate_from_accum(precip)
 
         # The spectrum only uses 10S-10N. Subset while the field is lazy so
         # load() materialises about one ninth of the former global array.
@@ -1109,7 +993,7 @@ if should_run_figure(8):
         precip, _, _ = accumulated_precipitation_components(ds)
         precip = precip.sel(latitude=slice(-10, 10)).mean(dim='latitude')
 
-        pr = precipitation_rate(precip, dt_hours=dt)
+        pr = precip_rate_from_accum(precip)
 
         hovmoller_im = ax[d].contourf(precip.longitude, pr.Time, pr.values, levels=levels, norm=precip_norm, cmap=precip_cmap, extend='max')
 
@@ -1210,7 +1094,7 @@ if should_run_figure(10):
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
         cldfrac = zds.cldfrac.mean(dim="Time")
         cldfrac = hemispheric_fold(cldfrac, parity="even")
-        zmid = height_from_zm_latlon(zds)
+        zmid = zds.z
         cldfrac, lat2d, z2d = lat_height_mesh(cldfrac, zmid, zds.latitude.values)
         lat_for_cpt = zds.latitude.values
 
@@ -1231,13 +1115,7 @@ if should_run_figure(10):
                 extend='max'
             )
         else:
-            # Put control cloud fraction onto this simulation's z/latitude grid
-            c_cldfrac = control_cldfrac.interp(
-                z=cldfrac.z,
-                kwargs={"fill_value": np.nan}
-            )
-
-            # Then subtract arrays
+            cldfrac, c_cldfrac = xr.align(cldfrac, control_cldfrac, join="exact")
             cldfrac_diff = cldfrac.values - c_cldfrac.values
 
             im3 = ax2[i].contourf(
@@ -1275,11 +1153,9 @@ if should_run_figure(11):
 
     vort_plots = {}
     for i, zds in enumerate(dss_zm):
-        if 'vorticity' not in zds.data_vars:
-            continue
         vort = zds.vorticity.mean(dim="Time")
         vort = hemispheric_fold(vort, parity="odd")
-        zmid = height_from_zm_latlon(zds)
+        zmid = zds.z
         vort, lat2d, z2d = lat_height_mesh(vort, zmid, zds.latitude.values)
         vort_plots[i] = (vort, lat2d, z2d)
 
@@ -1289,7 +1165,7 @@ if should_run_figure(11):
         for i, (vort, lat2d, z2d) in vort_plots.items():
             if i == 0:
                 continue
-            c_vort = control_vort.interp(z=vort.z, latitude=vort.latitude)
+            vort, c_vort = xr.align(vort, control_vort, join="exact")
             vort_diffs[i] = vort - c_vort
 
     dlevels = (
@@ -1442,7 +1318,7 @@ if should_run_figure(12):
             )
         else:
             ax[i].tick_params(labelleft=False)
-            control_interp = control_olr.interp(latitude=olr_mean.latitude, longitude=olr_mean.longitude)
+            olr_mean, control_interp = xr.align(olr_mean, control_olr, join="exact")
             olr_diff = (olr_mean - control_interp).load()
             im3 = ax2[i].contourf(
                 ds.longitude.values,
@@ -1517,12 +1393,6 @@ if should_run_figure(16):
             "raw_name": "w_rh_latheight",
             "diff_name": "w_rh_latheight_diff",
         },
-        {
-            "title": "TEM circulation and forcing",
-            "specs": LATHEIGHT_TEM_SPECS,
-            "raw_name": "tem_latheight",
-            "diff_name": "tem_latheight_diff",
-        },
     ]
 
     for group in latheight_groups:
@@ -1530,14 +1400,7 @@ if should_run_figure(16):
         for spec in group["specs"]:
             fields_by_sim = {}
             for i, zds in enumerate(dss_zm):
-                try:
-                    fields_by_sim[i] = latheight_time_mean_field(zds, spec)
-                except ValueError as e:
-                    print(f"Skipping {spec['label']} latitude-height plot for {sim_names[i]}: {e}")
-
-            if 0 not in fields_by_sim:
-                print(f"Skipping {spec['label']} latitude-height plots: control field is missing")
-                continue
+                fields_by_sim[i] = latheight_time_mean_field(zds, spec)
 
             latheight_entries.append((spec, fields_by_sim))
 
@@ -1585,7 +1448,7 @@ if should_run_figure(16):
             for i, field in fields_by_sim.items():
                 if i == 0:
                     continue
-                control_interp = control_field.interp(z=field.z, latitude=field.latitude)
+                field, control_interp = xr.align(field, control_field, join="exact")
                 diff_fields[i] = (field - control_interp).load()
             diff_level_fields = fields_for_level_limits(list(diff_fields.values()), spec)
 
@@ -1610,7 +1473,7 @@ if should_run_figure(16):
             diff_plots = {}
             for i, diff in diff_fields.items():
                 diff_plot, diff_lat2d, diff_z2d = lat_height_mesh(
-                    diff, height_from_zm_latlon(dss_zm[i]), diff.latitude.values
+                    diff, dss_zm[i].z, diff.latitude.values
                 )
                 diff_plots[i] = (diff_plot.values, diff_z2d, diff.latitude.values, diff_lat2d)
 
@@ -1640,7 +1503,7 @@ if should_run_figure(16):
                     ax2[row, i].set_visible(False)
                     continue
 
-                zmid = height_from_zm_latlon(dss_zm[i])
+                zmid = dss_zm[i].z
                 field_plot, lat2d, z2d = lat_height_mesh(field, zmid, field.latitude.values)
                 raw_im = ax[row, i].contourf(
                     lat2d,
@@ -1723,16 +1586,13 @@ if should_run_figure(17):
     spec = MSLP_LATLON_SPEC
     fields_by_sim = {}
     for i, ds in enumerate(dss):
-        try:
-            fields_by_sim[i] = latlon_time_mean_field(
-                ds,
-                spec["candidates"],
-                scale=spec.get("scale", 1.0),
-                name=spec["label"],
-                hemispheric_parity=spec.get("hemispheric_parity", "even"),
-            )
-        except ValueError as e:
-            print(f"Skipping {spec['label']} map for {sim_names[i]}: {e}")
+        fields_by_sim[i] = latlon_time_mean_field(
+            ds,
+            spec["var"],
+            scale=spec.get("scale", 1.0),
+            name=spec["label"],
+            hemispheric_parity=spec.get("hemispheric_parity", "even"),
+        )
 
     if 0 in fields_by_sim:
         map_profile_widths = [1.0] * len(dss) + [0.72]
@@ -1767,7 +1627,7 @@ if should_run_figure(17):
         for i, field in fields_by_sim.items():
             if i == 0:
                 continue
-            control_interp = control_field.interp(latitude=field.latitude, longitude=field.longitude)
+            field, control_interp = xr.align(field, control_field, join="exact")
             diff_fields[i] = (field - control_interp).load()
 
         diff_levels = (
@@ -1936,11 +1796,7 @@ if should_run_figure(18):
             for i, field in fields_by_sim.items():
                 if i == 0:
                     continue
-                control_interp = control_field.interp(
-                    z=field.z,
-                    latitude=field.latitude,
-                    kwargs={"fill_value": np.nan},
-                )
+                field, control_interp = xr.align(field, control_field, join="exact")
                 diff_fields[i] = (field - control_interp).load()
 
             diff_levels = (
@@ -2075,11 +1931,9 @@ if should_run_figure(13):
 
     ke_plots = {}
     for i, zds in enumerate(dss_zm):
-        if 'ke' not in zds.data_vars:
-            continue
         ke = zds.ke.mean(dim="Time")
         ke = hemispheric_fold(ke, parity="even")
-        zmid = height_from_zm_latlon(zds)
+        zmid = zds.z
         ke, lat2d, z2d = lat_height_mesh(ke, zmid, zds.latitude.values)
         ke_plots[i] = (ke, lat2d, z2d)
 
@@ -2089,7 +1943,7 @@ if should_run_figure(13):
         for i, (ke, lat2d, z2d) in ke_plots.items():
             if i == 0:
                 continue
-            c_ke = control_ke.interp(z=ke.z, latitude=ke.latitude)
+            ke, c_ke = xr.align(ke, control_ke, join="exact")
             ke_diffs[i] = ke - c_ke
 
     ke_diff_levels = symmetric_levels(100.0, ndiv=11)
@@ -2154,12 +2008,7 @@ if should_run_figure(14):
     eke_entries = []
 
     for i, ds in enumerate(dss):
-        try:
-            eke = isobaric_eddy_kinetic_energy(ds).load()
-        except ValueError as e:
-            print(f"Skipping EKE latitude-pressure plot for {sim_names[i]}: {e}")
-            continue
-        eke_entries.append((i, eke))
+        eke_entries.append((i, isobaric_eddy_kinetic_energy(ds).load()))
 
     if eke_entries:
         nrows = len(eke_entries)
@@ -2176,7 +2025,7 @@ if should_run_figure(14):
         control_index, control_eke = eke_entries[0]
 
         for i, eke in eke_entries[1:]:
-            c_eke = control_eke.interp(pres=eke.pres, latitude=eke.latitude)
+            eke, c_eke = xr.align(eke, control_eke, join="exact")
             diff_by_sim[i] = eke - c_eke
 
         diff_levels = (

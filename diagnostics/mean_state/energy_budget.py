@@ -30,10 +30,14 @@ import pandas as pd
 from matplotlib import pyplot as plt
 import xarray as xr
 
-from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import (
+    FigureSaver, LATLON_PATTERN, annotate_panel_label, diagnostic_output_dir,
+    figure_should_run,
+    load_latlon_dataset, precip_rate_from_accum,
+    standardize_latlon_dataset, total_precip_accum, vertical_dim,
+)
 
 
-silence_hdf5_error_stack()
 
 save = True
 save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/global_atmospheric_energy_budget/")
@@ -68,13 +72,7 @@ DT_HOURS = 6
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control_new", "u_nudge", "T_nudge"]
-latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
-
-# Use ndays of data ending at a fixed analysis date.
-ndays = 200
-analysis_end_date = "2000-11-21"
-time_format = "time"
 
 latlon_chunks = {
     "Time": 8,
@@ -124,22 +122,10 @@ def global_area_mean(obj, lat_dim="latitude", lon_dim="longitude"):
 
 def time_seconds_since_start(da, origin=None):
     times = da.Time.values
-    if np.issubdtype(times.dtype, np.number):
-        seconds = np.asarray(times, dtype=float) * DT_HOURS * 3600.0
-        origin_seconds = (
-            float(origin) * DT_HOURS * 3600.0 if origin is not None else seconds[0]
-        )
-    elif np.issubdtype(times.dtype, np.datetime64):
-        origin_time = origin if origin is not None else times[0]
-        seconds = (times - origin_time) / np.timedelta64(1, "s")
-        seconds = np.asarray(seconds, dtype=float)
-        origin_seconds = 0.0
-    else:
-        times = pd.to_datetime(times)
-        origin_time = pd.to_datetime(origin) if origin is not None else times[0]
-        seconds = np.asarray((times - origin_time) / pd.Timedelta(seconds=1), dtype=float)
-        origin_seconds = 0.0
-    return seconds - origin_seconds
+    if not np.issubdtype(times.dtype, np.datetime64):
+        raise TypeError(f"Expected decoded datetime Time coordinate, got {times.dtype}")
+    origin_time = origin if origin is not None else times[0]
+    return np.asarray((times - origin_time) / np.timedelta64(1, "s"), dtype=float)
 
 
 def time_days_since_start(da, origin=None):
@@ -172,41 +158,14 @@ def storage_tendency(energy_ts, name):
     return out
 
 
-def _same_vertical_coord(source, target_dim, template):
-    if source.sizes[target_dim] != template.sizes[vertical_dim(template)]:
-        raise ValueError(
-            f"Layer geometry has {source.sizes[target_dim]} levels, "
-            f"but {template.name} has {template.sizes[vertical_dim(template)]}"
-        )
-
-    template_dim = vertical_dim(template)
-    if target_dim != template_dim:
-        source = source.rename({target_dim: template_dim})
-        target_dim = template_dim
-
-    if target_dim in template.coords:
-        coord = template[target_dim]
-    else:
-        coord = np.arange(template.sizes[target_dim])
-    return source.assign_coords({target_dim: coord})
-
-
 def layer_geometry(ds, template):
-    if "zgrid" not in ds.data_vars:
-        raise ValueError("Missing zgrid for layer thickness and dry-static height")
-
-    zgrid = finite_or_nan(ds.zgrid)
-    interface_dim = vertical_dim(zgrid)
-    target_dim = vertical_dim(template)
-    lower = zgrid.isel({interface_dim: slice(0, -1)})
-    upper = zgrid.isel({interface_dim: slice(1, None)})
-
-    if interface_dim in lower.coords:
-        lower = lower.assign_coords({interface_dim: np.arange(lower.sizes[interface_dim])})
-        upper = upper.assign_coords({interface_dim: np.arange(upper.sizes[interface_dim])})
-
-    lower = _same_vertical_coord(lower, interface_dim, template)
-    upper = _same_vertical_coord(upper, interface_dim, template)
+    layer_coord = np.arange(template.sizes["nVertLevels"])
+    lower = ds.zgrid.isel(nVertLevelsP1=slice(0, -1)).rename(
+        {"nVertLevelsP1": "nVertLevels"}
+    ).assign_coords(nVertLevels=layer_coord)
+    upper = ds.zgrid.isel(nVertLevelsP1=slice(1, None)).rename(
+        {"nVertLevelsP1": "nVertLevels"}
+    ).assign_coords(nVertLevels=layer_coord)
 
     dz = np.abs(upper - lower)
     zmid = 0.5 * (upper + lower)
@@ -218,27 +177,16 @@ def layer_geometry(ds, template):
 
 
 def air_temperature(ds):
-    missing = [name for name in ("theta", "pressure") if name not in ds.data_vars]
-    if missing:
-        raise ValueError(f"Missing variables for temperature/storage: {missing}")
-    theta = finite_or_nan(ds.theta)
-    pressure = finite_or_nan(ds.pressure)
-    temperature = theta * (pressure / P0_PA) ** (RD / CP)
+    temperature = ds.theta * (ds.pressure / P0_PA) ** (RD / CP)
     temperature.name = "temperature"
     temperature.attrs["units"] = "K"
     return temperature
 
 
 def layer_mass_per_area(ds, temperature):
-    pressure = finite_or_nan(ds.pressure)
-    if "qv" in ds.data_vars:
-        qv_for_density = finite_or_nan(ds.qv).fillna(0.0)
-    else:
-        qv_for_density = xr.zeros_like(temperature)
-
     dz, zmid = layer_geometry(ds, temperature)
-    virtual_temperature = temperature * (1.0 + 0.61 * qv_for_density)
-    rho = pressure / (RD * virtual_temperature)
+    virtual_temperature = temperature * (1.0 + 0.61 * ds.qv)
+    rho = ds.pressure / (RD * virtual_temperature)
     layer_mass = rho * dz
     layer_mass.name = "layer_mass_per_area"
     layer_mass.attrs["units"] = "kg m-2"
@@ -246,20 +194,9 @@ def layer_mass_per_area(ds, temperature):
 
 
 def kinetic_energy_specific(ds, template):
-    if "ke" in ds.data_vars:
-        ke = finite_or_nan(ds.ke)
-        source = "ke"
-    elif all(name in ds.data_vars for name in ("uReconstructZonal", "uReconstructMeridional")):
-        u = finite_or_nan(ds.uReconstructZonal)
-        v = finite_or_nan(ds.uReconstructMeridional)
-        ke = 0.5 * (u * u + v * v)
-        source = "0.5*(uReconstructZonal^2 + uReconstructMeridional^2)"
-    else:
-        raise ValueError("Missing ke and wind components for kinetic-energy storage")
-
-    ke = ke.rename({vertical_dim(ke): vertical_dim(template)}) if vertical_dim(ke) != vertical_dim(template) else ke
+    ke = ds.ke
     ke.name = "specific_kinetic_energy"
-    ke.attrs.update(units="m2 s-2", source=source)
+    ke.attrs.update(units="m2 s-2", source="ke")
     return ke
 
 
@@ -272,25 +209,14 @@ def atmospheric_column_storage(ds):
     dry_static_column.name = "dry_static_energy"
     dry_static_column.attrs["units"] = "J m-2"
 
-    if "qv" in ds.data_vars:
-        qv = finite_or_nan(ds.qv)
-        latent_column = (LV * qv * layer_mass).sum(dim=z_dim, skipna=True)
-        latent_note = "water-vapour latent storage"
-    else:
-        latent_column = xr.zeros_like(dry_static_column)
-        latent_note = "qv missing; set to zero"
+    latent_column = (LV * ds.qv * layer_mass).sum(dim=z_dim, skipna=True)
     latent_column.name = "latent_energy"
-    latent_column.attrs.update(units="J m-2", note=latent_note)
+    latent_column.attrs.update(units="J m-2", note="water-vapour latent storage")
 
-    try:
-        ke = kinetic_energy_specific(ds, temperature)
-        kinetic_column = (ke * layer_mass).sum(dim=z_dim, skipna=True)
-        kinetic_note = ke.attrs.get("source", "")
-    except ValueError as exc:
-        kinetic_column = xr.zeros_like(dry_static_column)
-        kinetic_note = f"{exc}; set to zero"
+    ke = kinetic_energy_specific(ds, temperature)
+    kinetic_column = (ke * layer_mass).sum(dim=z_dim, skipna=True)
     kinetic_column.name = "kinetic_energy"
-    kinetic_column.attrs.update(units="J m-2", note=kinetic_note)
+    kinetic_column.attrs.update(units="J m-2", note="ke")
 
     storage_ds = xr.Dataset(
         {
@@ -311,22 +237,17 @@ def global_energy_budget_fields(ds):
     mean-state convention. Atmospheric forcing is external atmospheric energy
     input: atmospheric radiation plus surface sensible and latent heat.
     """
-    required = ["swdnt", "swupt", "lwdnt", "lwupt", "swdnb", "swupb", "lwdnb", "lwupb"]
-    missing = [v for v in required if v not in ds.data_vars]
-    if missing:
-        raise ValueError(f"Missing radiation variables for energy budget: {missing}")
-
-    net_toa_sw = finite_or_nan(ds.swdnt) - finite_or_nan(ds.swupt)
-    net_toa_lw = finite_or_nan(ds.lwdnt) - finite_or_nan(ds.lwupt)
-    net_sfc_sw = finite_or_nan(ds.swdnb) - finite_or_nan(ds.swupb)
-    net_sfc_lw = finite_or_nan(ds.lwdnb) - finite_or_nan(ds.lwupb)
+    net_toa_sw = ds.swdnt - ds.swupt
+    net_toa_lw = ds.lwdnt - ds.lwupt
+    net_sfc_sw = ds.swdnb - ds.swupb
+    net_sfc_lw = ds.lwdnb - ds.lwupb
 
     net_toa = net_toa_sw + net_toa_lw
     surface_radiation = net_sfc_sw + net_sfc_lw
     atmospheric_radiation = net_toa - surface_radiation
 
-    surface_latent = finite_or_nan(ds.lh) if "lh" in ds.data_vars else xr.zeros_like(atmospheric_radiation)
-    surface_sensible = finite_or_nan(ds.hfx) if "hfx" in ds.data_vars else xr.zeros_like(atmospheric_radiation)
+    surface_latent = ds.lh
+    surface_sensible = ds.hfx
     surface_turbulent = surface_latent + surface_sensible
 
     fields = {
@@ -339,9 +260,8 @@ def global_energy_budget_fields(ds):
         "atmospheric_forcing": atmospheric_radiation + surface_turbulent,
     }
 
-    if all(v in ds.data_vars for v in ("rainnc", "i_rainnc", "rainc", "i_rainc")):
-        precip = precip_rate_from_accum(total_precip_accum(ds), dt=DT_HOURS)
-        fields["precip_latent_release"] = finite_or_nan(precip) * LV / 86400.0
+    precip = precip_rate_from_accum(total_precip_accum(ds))
+    fields["precip_latent_release"] = precip * LV / 86400.0
 
     for name, field in fields.items():
         field.name = name
@@ -674,10 +594,7 @@ def load_simulations():
     for i, d in enumerate(data_locs):
         ds = load_latlon_dataset(
             os.path.join(root_dir, d),
-            latlon_pattern=latlon_file[i],
-            time_format=time_format,
-            ndays=ndays,
-            end_date=analysis_end_date,
+            latlon_pattern=LATLON_PATTERN,
             chunks=latlon_chunks,
         )
         ds = standardize_latlon_dataset(ds, needed_vars)
@@ -695,11 +612,7 @@ def main():
     ts_rows = []
 
     for i, ds in enumerate(dss):
-        try:
-            series, storage_energy = derive_budget_series(ds)
-        except ValueError as exc:
-            print(f"Skipping global atmospheric energy budget for {sim_names[i]}: {exc}")
-            continue
+        series, storage_energy = derive_budget_series(ds)
 
         origin = ds.Time.values[0]
         entries.append(

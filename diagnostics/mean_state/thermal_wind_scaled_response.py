@@ -17,7 +17,17 @@ import pandas as pd
 from matplotlib import pyplot as plt
 import xarray as xr
 from tropopause import tropopause_profile
-from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import (
+    FigureSaver, LATLON_PATTERN, N2_latheight, ZONAL_MEAN_PATTERN,
+    add_symmetric_colorbar, all_figures_requested,
+    annotate_panel_label, control_diff_label, diagnostic_output_dir,
+    difference_cmap, figure_should_run, figure_should_run_any,
+    hemispheric_fold, lat_height_mesh,
+    load_latlon_dataset, model_lat_field, precip_rate_from_accum,
+    set_latheight_labels, standardize_latlon_dataset, subset_between,
+    symmetric_levels, symmetric_percentile_levels_for_fields,
+    total_precip_accum, vertical_velocity_from_zm,
+)
 
 save = True
 save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/thermal_wind/')
@@ -45,29 +55,24 @@ figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
 data_locs = ['control_new', 'u_nudge', 'T_nudge']
-latlon_file = ['latlon.2000-*.nc', 'latlon.2000-*.nc', 'latlon.2000-*.nc']
-zm_latlon_file = ['zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc', 'zm_latlon.2000-*.nc']
 sim_names = ['control', 'nudged u', 'nudged T']
 
 cols = ['k', 'b', 'r']
 
-# Use ndays of data ending at a fixed analysis date
-ndays = 200
-dt = 6
-analysis_end_date = '2000-11-21'
 
-time_format = 'time' #or 'int'
 
 dss = []
 dss_zm = []
 
-needed_vars = [
+latlon_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw",
     "theta", "pressure", "uReconstructZonal", "relhum", "w",
     "cldfrac", "olrtoa", "zgrid", "vorticity", "ke"
 ]
-
-check_vars = ["theta", "pressure", "uReconstructZonal"]
+zonal_mean_vars = [
+    "theta", "pressure", "uReconstructZonal", "relhum", "w",
+    "cldfrac", "vorticity", "ke",
+]
 
 
 should_run_figure = partial(figure_should_run, figures_to_run)
@@ -76,57 +81,19 @@ run_all_figures = partial(all_figures_requested, figures_to_run)
 
 
 for i, d in enumerate(data_locs):
-    """
-    if i == 0:
-        dsd = xr.open_dataset(os.path.join(root_dir, 'control/latlon_diag.nc'), chunks={'Time': 4})
-        dsh = xr.open_dataset(os.path.join(root_dir, 'control/latlon_hist.nc'), chunks={'Time': 4})
-        #print(dsd)
-        #print(dsh)
-
-        # keep only times present in the 6h dataset
-        if time_format == 'int':
-            dsd_6h = dsd.isel(Time=slice(0, None, 2))
-        else:
-            dsd_6h = dsd.sel(Time=dsh.Time)
-
-        # merge variables into one dataset
-        ds = xr.merge([dsh, dsd_6h], join="exact")
-
-    else:
-        ds = xr.open_dataset(os.path.join(root_dir, d), chunks={'Time': 4})
-
-    # Dataset before time restriction
-    print(ds.data_vars)
-
-    if time_format == 'int':
-        ds = ds.sel(Time=slice(-1-ndays*int(24/dt), -1))
-    else:
-        # Restrict time
-        t_end = pd.to_datetime(ds.Time.max().item())
-        t_start = t_end - pd.Timedelta(days=ndays)
-        print(t_start, t_end)
-        ds = ds.sel(Time=slice(t_start, t_end))
-    """
     ds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=LATLON_PATTERN,
         chunks={"Time": -1}
     )
-    ds = standardize_latlon_dataset(ds, needed_vars)
+    ds = standardize_latlon_dataset(ds, latlon_vars)
 
     zds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=zm_latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=ZONAL_MEAN_PATTERN,
         chunks={"Time": -1},
-        prefer_pattern=True,
     )
-    zds = standardize_latlon_dataset(zds, needed_vars)
+    zds = standardize_latlon_dataset(zds, zonal_mean_vars)
 
     # cheaper if data are exactly 6-hourly and aligned
     #ds = ds.coarsen(Time=4, boundary="trim").mean()
@@ -158,7 +125,7 @@ if should_run_any([1, 7, 8, 9, 10, 11, 12, 13, 14]):
         T = theta * (pressure / 100000.)**(287.0 / 1004.0)
         T = model_lat_field(T)
         pressure = model_lat_field(pressure)
-        z = height_from_zm_latlon(zds).values
+        z = zds.z.values
 
         ztps = []
         ptps = []
@@ -270,84 +237,37 @@ def pattern_corr_latheight(a, b, lat_bounds=(-60, 60), z_bounds=(10000, 22000)):
 
 def precip_rate_mean_map(ds):
     """Time-mean precipitation-rate map in mm/day."""
-    pr = precip_rate_from_accum(total_precip_accum(ds), dt=dt)
+    pr = precip_rate_from_accum(total_precip_accum(ds))
     return hemispheric_fold(pr.mean(dim="Time"), parity="even")
-
-def zmean_time_mean(da):
-    """Time mean, zonal mean if longitude is present."""
-    dims = [d for d in ("Time", "longitude") if d in da.dims]
-    out = da.mean(dim=dims)
-    return hemispheric_fold(out, parity="even")
 
 # -----------------------
 # Thermal wind helpers
 # -----------------------
 
-def canonical_latheight_var(var):
-    aliases = {
-        "T": "temperature",
-        "t": "temperature",
-        "temperature": "temperature",
-        "u": "uReconstructZonal",
-        "uReconstructZonal": "uReconstructZonal",
-        "RH": "relhum",
-        "rh": "relhum",
-        "relhum": "relhum",
-        "w": "w",
-        "vertical_velocity": "w",
-    }
-    return aliases.get(var, var)
-
-def required_latheight_vars(var):
-    var = canonical_latheight_var(var)
-    if var == "temperature":
-        return ("theta", "pressure")
-    if var == "w":
-        return ("w",)
-    return (var,)
-
-def latheight_field_available(zds, var):
-    return all(name in zds.data_vars for name in required_latheight_vars(var))
-
-def latheight_var_hemispheric_parity(var):
-    var = canonical_latheight_var(var)
-    if var in ("temperature", "uReconstructZonal", "relhum", "w"):
-        return "even"
-    if var in ("uReconstructMeridional", "v", "umeridional"):
-        return "odd"
-    return "even"
-
 def model_level_temperature(zds):
-    theta = finite_or_nan(zds.theta)
-    pressure = finite_or_nan(zds.pressure)
-    return theta * (pressure / P0_PA) ** (RD / CP)
+    return zds.theta * (zds.pressure / P0_PA) ** (RD / CP)
 
 def latheight_time_mean_field(zds, var):
     """Time-mean zonal-mean model-height field as (z, latitude)."""
-    var = canonical_latheight_var(var)
-    if not latheight_field_available(zds, var):
-        missing = [name for name in required_latheight_vars(var) if name not in zds.data_vars]
-        raise ValueError(f"Missing variables for {var}: {missing}")
-
     if var == "temperature":
         da = model_level_temperature(zds)
     elif var == "w":
         da = vertical_velocity_from_zm(zds)
     else:
-        da = finite_or_nan(zds[var])
+        da = zds[var]
 
     if "Time" in da.dims:
         da = da.mean(dim="Time", skipna=True)
 
     da = model_lat_field(da)
-    da = hemispheric_fold(da, parity=latheight_var_hemispheric_parity(var)).load()
+    da = hemispheric_fold(da, parity="even").load()
     da.name = var
     return da
 
 _latheight_field_cache = {}
 
 def get_latheight_field(run_index, var):
-    key = (run_index, canonical_latheight_var(var))
+    key = (run_index, var)
     if key not in _latheight_field_cache:
         _latheight_field_cache[key] = latheight_time_mean_field(dss_zm[run_index], key[1])
     return _latheight_field_cache[key]
@@ -450,9 +370,7 @@ def add_tw_equator_guides(ax, lat=5.0):
 def get_latheight_anomaly(run_index, control_index, var):
     """Time-mean latitude-height anomaly relative to control, on this run's grid."""
     field = get_latheight_field(run_index, var)
-    control = get_latheight_field(control_index, var).interp(
-        z=field.z, latitude=field.latitude, kwargs={"fill_value": np.nan}
-    )
+    field, control = xr.align(field, get_latheight_field(control_index, var), join="exact")
     return field - control
 
 def mean_TTL_latheight_anomaly(var, run_index, control_index=0, z_bounds=(14000, 18000), lat_bounds=(-10, 10)):
@@ -466,7 +384,7 @@ def scaled_residual_latheight(var, alpha, run_u=1, run_T=2, control=0):
     """
     dXu = get_latheight_anomaly(run_u, control, var)
     dXT = get_latheight_anomaly(run_T, control, var)
-    dXT_on_u = dXT.interp(z=dXu.z, latitude=dXu.latitude, kwargs={"fill_value": np.nan})
+    dXu, dXT_on_u = xr.align(dXu, dXT, join="exact")
     resid = dXu - alpha * dXT_on_u
     return dXu, dXT, resid
 
@@ -484,9 +402,10 @@ def scaled_residual_map(var, alpha, run_u=1, run_T=2, control=0):
         Xu = hemispheric_fold(dss[run_u][var].mean(dim="Time"), parity="even")
         XT = hemispheric_fold(dss[run_T][var].mean(dim="Time"), parity="even")
 
-    dXu = Xu - Xc.interp(latitude=Xu.latitude, longitude=Xu.longitude, kwargs={"fill_value": np.nan})
-    dXT = XT - Xc.interp(latitude=XT.latitude, longitude=XT.longitude, kwargs={"fill_value": np.nan})
-    dXT_on_u = dXT.interp(latitude=dXu.latitude, longitude=dXu.longitude, kwargs={"fill_value": np.nan})
+    Xc, Xu, XT = xr.align(Xc, Xu, XT, join="exact")
+    dXu = Xu - Xc
+    dXT = XT - Xc
+    dXu, dXT_on_u = xr.align(dXu, dXT, join="exact")
     resid = dXu - alpha * dXT_on_u
     return dXu, dXT, resid
 
@@ -702,9 +621,7 @@ if should_run_figure(14):
         diff_fields = {}
         for i in range(1, ncols):
             field = gradient_shear_by_sim[i][spec["key"]]
-            control_interp = control_field.interp(
-                z=field.z, latitude=field.latitude, kwargs={"fill_value": np.nan}
-            )
+            field, control_interp = xr.align(field, control_field, join="exact")
             diff_fields[i] = (field - control_interp).load()
 
         raw_levels = symmetric_percentile_levels_for_fields(
@@ -800,7 +717,7 @@ if should_run_any([2, 3]):
 
         olr = tropical_mean_surface(ds.olrtoa, lat_bounds=(-10, 10)).mean(dim="Time").values.item()
         pw = tropical_mean_surface(ds.precipw, lat_bounds=(-10, 10)).mean(dim="Time").values.item()
-        pr = tropical_mean_surface(precip_rate_from_accum(total_precip_accum(ds), dt=dt), lat_bounds=(-10, 10)).mean(dim="Time").values.item()
+        pr = tropical_mean_surface(precip_rate_from_accum(total_precip_accum(ds)), lat_bounds=(-10, 10)).mean(dim="Time").values.item()
 
         summary_rows.append([sim_names[i], T16, u16, Tttl, uttl, N2_1418, olr, pw, pr])
 
@@ -939,10 +856,6 @@ for fig_num, var, label, max_abs, fname in latheight_residual_specs:
     if not should_run_figure(fig_num):
         continue
 
-    if not all(latheight_field_available(zds, var) for zds in dss_zm[:3]):
-        print(f"Skipping {var}: required height-level variables are not present in all zm datasets")
-        continue
-
     dXu, dXT, resid = scaled_residual_latheight(var, alpha_TTL)
     levels = symmetric_levels(max_abs, ndiv=13)
 
@@ -990,9 +903,10 @@ if should_run_figure(11):
     N2_u = N2_latheight(dss_zm[1])
     N2_T = N2_latheight(dss_zm[2])
 
-    dN2_u = N2_u - N2_control.interp(z=N2_u.z, latitude=N2_u.latitude, kwargs={"fill_value": np.nan})
-    dN2_T = N2_T - N2_control.interp(z=N2_T.z, latitude=N2_T.latitude, kwargs={"fill_value": np.nan})
-    dN2_T_on_u = dN2_T.interp(z=dN2_u.z, latitude=dN2_u.latitude, kwargs={"fill_value": np.nan})
+    N2_control, N2_u, N2_T = xr.align(N2_control, N2_u, N2_T, join="exact")
+    dN2_u = N2_u - N2_control
+    dN2_T = N2_T - N2_control
+    dN2_u, dN2_T_on_u = xr.align(dN2_u, dN2_T, join="exact")
     dN2_resid = dN2_u - alpha_TTL * dN2_T_on_u
 
     fig, ax = plt.subplots(1, 3, figsize=(11, 3.5), constrained_layout=True, sharex=True, sharey=True)
@@ -1038,7 +952,7 @@ if should_run_figure(12):
         zds = dss_zm[i]
         cld = zds.cldfrac.mean(dim="Time")
         cld = hemispheric_fold(cld, parity="even")
-        zmid = height_from_zm_latlon(zds)
+        zmid = zds.z
         cld, _, _ = lat_height_mesh(cld, zmid, zds.latitude.values)
         return cld
 
@@ -1047,9 +961,10 @@ if should_run_figure(12):
     cld_T = get_zm_cldfrac_for_run(2)
 
     if cld_control is not None and cld_u is not None and cld_T is not None:
-        dcld_u = cld_u - cld_control.interp(z=cld_u.z, latitude=cld_u.latitude, kwargs={"fill_value": np.nan})
-        dcld_T = cld_T - cld_control.interp(z=cld_T.z, latitude=cld_T.latitude, kwargs={"fill_value": np.nan})
-        dcld_T_on_u = dcld_T.interp(z=dcld_u.z, latitude=dcld_u.latitude, kwargs={"fill_value": np.nan})
+        cld_control, cld_u, cld_T = xr.align(cld_control, cld_u, cld_T, join="exact")
+        dcld_u = cld_u - cld_control
+        dcld_T = cld_T - cld_control
+        dcld_u, dcld_T_on_u = xr.align(dcld_u, dcld_T, join="exact")
         dcld_resid = dcld_u - alpha_TTL * dcld_T_on_u
 
         fig, ax = plt.subplots(1, 3, figsize=(11, 3.5), constrained_layout=True, sharex=True, sharey=True)
@@ -1104,16 +1019,15 @@ if run_all_figures():
 
     # Height-level metrics: TTL tropical mean residuals
     for var, pretty in [("temperature", "T"), ("uReconstructZonal", "u"), ("relhum", "RH"), ("w", "w")]:
-        if all(latheight_field_available(zds, var) for zds in dss_zm[:3]):
-            dXu, dXT, resid = scaled_residual_latheight(var, alpha_TTL)
-            values = []
-            for field in (dXu, dXT, resid):
-                values.append(
-                    tropical_mean_latheight(
-                        field, z_bounds=TTL_z_bounds, lat_bounds=TTL_lat_bounds
-                    ).values.item()
-                )
-            residual_rows.append([pretty, "TTL_14_18km_tropical_mean", values[0], values[1], values[2]])
+        dXu, dXT, resid = scaled_residual_latheight(var, alpha_TTL)
+        values = []
+        for field in (dXu, dXT, resid):
+            values.append(
+                tropical_mean_latheight(
+                    field, z_bounds=TTL_z_bounds, lat_bounds=TTL_lat_bounds
+                ).values.item()
+            )
+        residual_rows.append([pretty, "TTL_14_18km_tropical_mean", values[0], values[1], values[2]])
 
     residual_df = pd.DataFrame(
         residual_rows,

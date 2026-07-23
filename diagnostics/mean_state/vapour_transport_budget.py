@@ -19,6 +19,7 @@ import argparse
 import gc
 import os
 import sys
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -60,7 +61,7 @@ LV = 2.5e6
 SECONDS_PER_DAY = 86_400.0
 EARTH_RADIUS_M = 6_371_000.0
 FIXED_TOP_PA = 20_000.0
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 MAX_TROPOPAUSE_SURFACE_JUMP_M = 2_000.0
 PLOT_LATITUDE_BOUNDS = (-40.0, 40.0)
 TEST_LATITUDE_BOUNDS = (-42.0, 42.0)
@@ -113,6 +114,8 @@ STATE_CHUNKS = {
 DASK_NUM_WORKERS = 2
 LATITUDE_BATCH_SIZE = 30
 LATITUDE_HALO_POINTS = 2
+TIME_BATCH_SIZE = 48
+TIME_HALO_POINTS = 2
 
 
 def mixing_ratio_to_specific_humidity(mixing_ratio):
@@ -385,13 +388,11 @@ def time_tendency(field, step=1):
     return (field.shift(Time=-step) - field.shift(Time=step)) / seconds
 
 
-def trapezoidal_time_mean(field):
-    """Time mean consistent with the interval spanned by endpoint storage."""
-    if "Time" not in field.dims:
-        raise ValueError("field must contain a Time dimension")
-    if field.sizes["Time"] < 2:
+def trapezoidal_time_weights(time):
+    """Global sample weights for a trapezoidal mean."""
+    if time.size < 2:
         raise ValueError("at least two times are required for a time mean")
-    times = np.asarray(field.Time.values)
+    times = np.asarray(time.values)
     intervals = np.diff(times) / np.timedelta64(1, "s")
     if np.any(~np.isfinite(intervals)) or np.any(intervals <= 0.0):
         raise ValueError("Time must be finite and strictly increasing")
@@ -400,9 +401,16 @@ def trapezoidal_time_mean(field):
     weights[-1] = 0.5 * intervals[-1]
     if times.size > 2:
         weights[1:-1] = 0.5 * (intervals[:-1] + intervals[1:])
-    weights = xr.DataArray(
-        weights, dims="Time", coords={"Time": field.Time}, name="time_weight"
+    return xr.DataArray(
+        weights, dims="Time", coords={"Time": time}, name="time_weight"
     )
+
+
+def trapezoidal_time_mean(field):
+    """Time mean consistent with the interval spanned by endpoint storage."""
+    if "Time" not in field.dims:
+        raise ValueError("field must contain a Time dimension")
+    weights = trapezoidal_time_weights(field.Time)
     valid_weights = weights.where(np.isfinite(field))
     denominator = valid_weights.sum("Time", skipna=True)
     result = (field * weights).sum("Time", skipna=True) / denominator.where(
@@ -970,6 +978,453 @@ def native_mean_state(ds):
     return state
 
 
+def _time_batches(ds, batch_size=TIME_BATCH_SIZE):
+    """Yield unique core time samples with a two-sample diagnostic halo."""
+    time_size = ds.sizes["Time"]
+    if batch_size < 1:
+        raise ValueError("time batch size must be positive")
+    for start in range(0, time_size, batch_size):
+        stop = min(start + batch_size, time_size)
+        halo_start = max(0, start - TIME_HALO_POINTS)
+        halo_stop = min(time_size, stop + TIME_HALO_POINTS)
+        yield (
+            start,
+            stop,
+            halo_start,
+            ds.isel(Time=slice(halo_start, halo_stop)),
+        )
+
+
+def _weighted_time_parts(field, weights):
+    """Weighted numerator and valid-data denominator for one time block."""
+    valid = np.isfinite(field)
+    numerator = (field.where(valid, 0.0) * weights).sum(
+        "Time", skipna=True
+    )
+    denominator = weights.where(valid).sum("Time", skipna=True)
+    return numerator, denominator
+
+
+def _add_weighted_statistic(statistics, name, field, weights):
+    numerator, denominator = _weighted_time_parts(field, weights)
+    statistics[f"{name}__weighted_sum"] = numerator
+    statistics[f"{name}__weight_sum"] = denominator
+
+
+def _time_batch_statistics(
+    subset, global_weights, core_start, core_stop, halo_start,
+):
+    """Sufficient statistics for exact reconstruction of all time means."""
+    tropopauses = diagnose_tropopauses(subset)
+    instantaneous = instantaneous_budget(subset, tropopauses)
+
+    local_start = core_start - halo_start
+    local_stop = local_start + (core_stop - core_start)
+    core_slice = slice(local_start, local_stop)
+    weights = global_weights.sel(Time=subset.Time).copy()
+    retain = np.zeros(weights.size, dtype=bool)
+    retain[core_slice] = True
+    weights = weights.where(
+        xr.DataArray(retain, dims="Time", coords={"Time": subset.Time}),
+        0.0,
+    )
+
+    layer_coord = subset.qv.nVertLevels
+    lower_interface = subset.zgrid.isel(
+        nVertLevelsP1=slice(0, -1)
+    ).rename({"nVertLevelsP1": "nVertLevels"}).assign_coords(
+        nVertLevels=layer_coord
+    )
+    upper_interface = subset.zgrid.isel(
+        nVertLevelsP1=slice(1, None)
+    ).rename({"nVertLevelsP1": "nVertLevels"}).assign_coords(
+        nVertLevels=layer_coord
+    )
+    layer_thickness = np.abs(upper_interface - lower_interface)
+    condensate_mixing_ratio = sum(
+        finite_or_nan(subset[name]) for name in ("qc", "qr", "qi", "qs", "qg")
+    )
+    condensate_column = (
+        finite_or_nan(subset.rho)
+        * condensate_mixing_ratio
+        * layer_thickness
+    ).sum("nVertLevels", skipna=True)
+
+    mixing_ratio = finite_or_nan(subset.qv)
+    density = finite_or_nan(subset.rho)
+    zonal_wind = finite_or_nan(subset.uReconstructZonal)
+    meridional_wind = finite_or_nan(subset.uReconstructMeridional)
+    temperature = finite_or_nan(
+        subset.theta * (subset.pressure / P0_PA) ** (RD / CP)
+    )
+    specific_humidity = mixing_ratio_to_specific_humidity(mixing_ratio)
+    relative_humidity = specific_humidity / saturation_specific_humidity(
+        temperature, finite_or_nan(subset.pressure)
+    )
+
+    statistics = xr.Dataset()
+    sources = {
+        "column_vapour": instantaneous.column_vapour,
+        "ivt_u": instantaneous.ivt_u,
+        "ivt_v": instantaneous.ivt_v,
+        "top_influx": instantaneous.top_influx,
+        "top_influx_24h": instantaneous.top_influx_24h,
+        "boundary_pressure": instantaneous.boundary_pressure,
+        "boundary_height": instantaneous.boundary_height,
+        "boundary_temperature": instantaneous.boundary_temperature,
+        "top_vertical_velocity_component": (
+            instantaneous.top_vertical_velocity_component
+        ),
+        "top_local_motion_component": (
+            instantaneous.top_local_motion_component
+        ),
+        "top_horizontal_motion_component": (
+            instantaneous.top_horizontal_motion_component
+        ),
+        "full_column_vapour": instantaneous.full_column_vapour,
+        "evaporation": finite_or_nan(subset.lh) / LV,
+        "archived_precipw": finite_or_nan(subset.precipw),
+        "condensate_column": condensate_column,
+        "mixing_ratio": mixing_ratio,
+        "density": density,
+        "pressure": finite_or_nan(subset.pressure),
+        "temperature": temperature,
+        "zonal_wind": zonal_wind,
+        "meridional_wind": meridional_wind,
+        "vapour_density": density * mixing_ratio,
+        "zonal_vapour_flux": density * mixing_ratio * zonal_wind,
+        "meridional_vapour_flux": density * mixing_ratio * meridional_wind,
+        "specific_humidity": specific_humidity,
+        "relative_humidity": relative_humidity,
+    }
+    for name, field in sources.items():
+        _add_weighted_statistic(statistics, name, field, weights)
+
+    statistics["cold_point_valid_count"] = np.isfinite(
+        tropopauses.cold_point_pressure.isel(Time=core_slice)
+    ).sum("Time")
+    statistics["top_flux_valid_count"] = (
+        instantaneous.top_flux_surface_valid.isel(Time=core_slice)
+        .astype(np.int64)
+        .sum("Time")
+    )
+    statistics["sample_count"] = xr.DataArray(core_stop - core_start)
+    return statistics
+
+
+def _endpoint_statistics(ds):
+    """Only the exact first/last fields required by interval tendencies."""
+    endpoints = ds.isel(Time=[0, -1])
+    tropopauses = diagnose_tropopauses(endpoints)
+    _, top_height, _ = boundary_arrays(endpoints, tropopauses)
+    vapour_density = finite_or_nan(endpoints.rho) * finite_or_nan(endpoints.qv)
+    column_vapour = native_bounded_height_integral(
+        vapour_density, endpoints, top_height
+    )
+
+    layer_coord = endpoints.qv.nVertLevels
+    lower_interface = endpoints.zgrid.isel(
+        nVertLevelsP1=slice(0, -1)
+    ).rename({"nVertLevelsP1": "nVertLevels"}).assign_coords(
+        nVertLevels=layer_coord
+    )
+    upper_interface = endpoints.zgrid.isel(
+        nVertLevelsP1=slice(1, None)
+    ).rename({"nVertLevelsP1": "nVertLevels"}).assign_coords(
+        nVertLevels=layer_coord
+    )
+    condensate = sum(
+        finite_or_nan(endpoints[name])
+        for name in ("qc", "qr", "qi", "qs", "qg")
+    )
+    condensate_column = (
+        finite_or_nan(endpoints.rho)
+        * condensate
+        * np.abs(upper_interface - lower_interface)
+    ).sum("nVertLevels", skipna=True)
+    return xr.Dataset(
+        {
+            "column_vapour_endpoint": column_vapour,
+            "condensate_column_endpoint": condensate_column,
+            "precipitation_accum_endpoint": total_precip_accum(endpoints),
+            "zgrid": finite_or_nan(ds.zgrid),
+        }
+    )
+
+
+def _means_from_statistics(statistics):
+    names = {
+        name.removesuffix("__weighted_sum")
+        for name in statistics.data_vars
+        if name.endswith("__weighted_sum")
+    }
+    return {
+        name: (
+            statistics[f"{name}__weighted_sum"]
+            / statistics[f"{name}__weight_sum"].where(
+                statistics[f"{name}__weight_sum"] > 0.0
+            )
+        )
+        for name in names
+    }
+
+
+def _set_product_metadata(products, ds, simulation, elapsed_seconds):
+    for name in (
+        "column_vapour_mean", "full_column_vapour_mean",
+        "archived_precipw_mean", "precipw_integration_bias",
+        "condensate_column_mean",
+    ):
+        products[name].attrs["units"] = "kg m-2"
+    for name in ("relative_precipw_error", "budget_closure_fraction"):
+        products[name].attrs["units"] = "1"
+    for name in (
+        "ivt_u_mean", "ivt_v_mean", "fixed_mean_flow_ivt_u",
+        "fixed_mean_flow_ivt_v", "fixed_transient_ivt_u",
+        "fixed_transient_ivt_v",
+    ):
+        products[name].attrs["units"] = "kg m-1 s-1"
+    for name in (
+        "top_vertical_velocity_component", "top_local_motion_component",
+        "top_horizontal_motion_component",
+    ):
+        products[name].attrs["units"] = "mm day-1"
+    products.native_temperature_zonal_mean.attrs["units"] = "K"
+    products.native_specific_humidity_zonal_mean.attrs["units"] = "kg kg-1"
+    products.native_relative_humidity_zonal_mean.attrs["units"] = "1"
+    products.native_pressure_zonal_mean.attrs["units"] = "Pa"
+    products.native_midlevel_height_zonal_mean.attrs["units"] = "m"
+    products.top_flux_valid_fraction.attrs["units"] = "1"
+    products.attrs.update(
+        schema_version=SCHEMA_VERSION,
+        cache_kind="mean_products",
+        simulation=simulation,
+        analysis_start=ANALYSIS_START,
+        analysis_end=ANALYSIS_END,
+        budget_equation=(
+            "storage = evaporation - precipitation + moisture_convergence "
+            "+ top_influx + residual"
+        ),
+        top_influx_sign="positive downward into the diagnosed column",
+        column_integration=(
+            "native MPAS model levels: sum(rho_d * qv_dry_mixing_ratio * dz), "
+            "with a fractional layer at the upper boundary"
+        ),
+        ivt_integration=(
+            "native MPAS model levels: sum(rho_d * qv_dry_mixing_ratio * "
+            "horizontal_wind * dz), with a fractional upper layer"
+        ),
+        top_flux_method=(
+            "native height coordinate: rho_d*qv*(dz_top/dt + "
+            "u_top*grad_x(z_top) + v_top*grad_y(z_top) - w_top)"
+        ),
+        top_flux_surface_filter=(
+            "moving-tropopause flux is retained only where the surface is "
+            "finite and adjacent time, latitude, and longitude tropopause "
+            f"heights differ by no more than {MAX_TROPOPAUSE_SURFACE_JUMP_M:g} m"
+        ),
+        closure_fraction_definition=(
+            "abs(residual) / (abs(storage) + abs(evaporation) + "
+            "abs(precipitation) + abs(moisture_convergence) + abs(top_influx))"
+        ),
+        horizontal_grid_note=(
+            "native vertical levels retained, but fields were archived on the "
+            "regular latitude-longitude analysis grid"
+        ),
+        time_averaging=(
+            "global trapezoidal sample weights accumulated in bounded time "
+            "blocks; precipitation and storage from exact endpoints"
+        ),
+        sampling_interval_hours=float(
+            np.median(np.diff(ds.Time.values) / np.timedelta64(1, "h"))
+        ),
+        averaging_window_days=float(elapsed_seconds / SECONDS_PER_DAY),
+    )
+    return products
+
+
+def _products_and_state_from_statistics(
+    statistics, endpoints, ds, simulation,
+):
+    means = _means_from_statistics(statistics)
+    elapsed_seconds = float(
+        (ds.Time.values[-1] - ds.Time.values[0]) / np.timedelta64(1, "s")
+    )
+    storage = (
+        endpoints.column_vapour_endpoint.isel(Time=-1)
+        - endpoints.column_vapour_endpoint.isel(Time=0)
+    ) / elapsed_seconds
+    precipitation = (
+        endpoints.precipitation_accum_endpoint.isel(Time=-1)
+        - endpoints.precipitation_accum_endpoint.isel(Time=0)
+    ) / elapsed_seconds
+    condensate_storage = (
+        endpoints.condensate_column_endpoint.isel(Time=-1)
+        - endpoints.condensate_column_endpoint.isel(Time=0)
+    ) / elapsed_seconds
+    convergence = -spherical_flux_divergence(
+        means["ivt_u"], means["ivt_v"]
+    )
+    residual = storage - (
+        means["evaporation"] - precipitation
+        + convergence + means["top_influx"]
+    )
+    conventional_residual = storage - (
+        means["evaporation"] - precipitation + convergence
+    )
+    closure_scale = (
+        np.abs(storage) + np.abs(means["evaporation"])
+        + np.abs(precipitation) + np.abs(convergence)
+        + np.abs(means["top_influx"])
+    )
+    closure_fraction = xr.where(
+        closure_scale > 0.0, np.abs(residual) / closure_scale, np.nan
+    )
+
+    state = xr.Dataset(
+        {
+            "mixing_ratio": means["mixing_ratio"],
+            "density": means["density"],
+            "pressure": means["pressure"],
+            "temperature": means["temperature"],
+            "zonal_wind": means["zonal_wind"],
+            "meridional_wind": means["meridional_wind"],
+            "vapour_density": means["vapour_density"],
+            "zonal_vapour_flux": means["zonal_vapour_flux"],
+            "meridional_vapour_flux": means["meridional_vapour_flux"],
+            "zgrid": endpoints.zgrid,
+        }
+    )
+    state.attrs.update(
+        schema_version=SCHEMA_VERSION,
+        cache_kind="native_mean_state",
+        simulation=simulation,
+        analysis_start=ANALYSIS_START,
+        analysis_end=ANALYSIS_END,
+        vertical_grid="native MPAS model levels",
+        time_averaging=(
+            "global trapezoidal sample weights accumulated in bounded time blocks"
+        ),
+    )
+
+    fixed_top_height = means["boundary_height"].sel(
+        boundary="fixed_200hpa", drop=True
+    )
+    mean_flow_u = native_bounded_height_integral(
+        state.vapour_density * state.zonal_wind, state, fixed_top_height
+    )
+    mean_flow_v = native_bounded_height_integral(
+        state.vapour_density * state.meridional_wind, state, fixed_top_height
+    )
+    full_column_vapour = means["full_column_vapour"]
+    precipw_bias = full_column_vapour - means["archived_precipw"]
+    relative_precipw_error = xr.where(
+        np.abs(means["archived_precipw"]) > 0.0,
+        np.abs(precipw_bias) / np.abs(means["archived_precipw"]),
+        np.nan,
+    )
+    native_height_zonal = native_midlevel_height(
+        state, state.temperature
+    ).mean("longitude", skipna=True)
+    sample_count = statistics.sample_count
+
+    rates = xr.Dataset(
+        {
+            "storage": storage * SECONDS_PER_DAY,
+            "moisture_convergence": convergence * SECONDS_PER_DAY,
+            "evaporation": means["evaporation"] * SECONDS_PER_DAY,
+            "precipitation": precipitation * SECONDS_PER_DAY,
+            "top_influx": means["top_influx"] * SECONDS_PER_DAY,
+            "top_influx_24h": means["top_influx_24h"] * SECONDS_PER_DAY,
+            "residual": residual * SECONDS_PER_DAY,
+            "conventional_residual": (
+                conventional_residual * SECONDS_PER_DAY
+            ),
+            "condensate_storage": condensate_storage * SECONDS_PER_DAY,
+        }
+    )
+    for variable in rates.data_vars:
+        rates[variable].attrs["units"] = "mm day-1"
+
+    products = xr.merge(
+        [
+            rates,
+            xr.Dataset(
+                {
+                    "column_vapour_mean": means["column_vapour"],
+                    "ivt_u_mean": means["ivt_u"],
+                    "ivt_v_mean": means["ivt_v"],
+                    "boundary_pressure_mean": means["boundary_pressure"],
+                    "boundary_height_mean": means["boundary_height"],
+                    "boundary_temperature_mean": means[
+                        "boundary_temperature"
+                    ],
+                    "cold_point_valid_fraction": (
+                        statistics.cold_point_valid_count / sample_count
+                    ),
+                    "top_vertical_velocity_component": (
+                        means["top_vertical_velocity_component"]
+                        * SECONDS_PER_DAY
+                    ),
+                    "top_local_motion_component": (
+                        means["top_local_motion_component"] * SECONDS_PER_DAY
+                    ),
+                    "top_horizontal_motion_component": (
+                        means["top_horizontal_motion_component"]
+                        * SECONDS_PER_DAY
+                    ),
+                    "full_column_vapour_mean": full_column_vapour,
+                    "archived_precipw_mean": means["archived_precipw"],
+                    "precipw_integration_bias": precipw_bias,
+                    "relative_precipw_error": relative_precipw_error,
+                    "budget_closure_fraction": closure_fraction,
+                    "condensate_column_mean": means["condensate_column"],
+                    "fixed_mean_flow_ivt_u": mean_flow_u,
+                    "fixed_mean_flow_ivt_v": mean_flow_v,
+                    "fixed_transient_ivt_u": (
+                        means["ivt_u"].sel(
+                            boundary="fixed_200hpa", drop=True
+                        ) - mean_flow_u
+                    ),
+                    "fixed_transient_ivt_v": (
+                        means["ivt_v"].sel(
+                            boundary="fixed_200hpa", drop=True
+                        ) - mean_flow_v
+                    ),
+                    "native_temperature_zonal_mean": (
+                        means["temperature"].mean("longitude", skipna=True)
+                    ),
+                    "native_specific_humidity_zonal_mean": (
+                        means["specific_humidity"].mean(
+                            "longitude", skipna=True
+                        )
+                    ),
+                    "native_relative_humidity_zonal_mean": (
+                        means["relative_humidity"].mean(
+                            "longitude", skipna=True
+                        )
+                    ),
+                    "native_pressure_zonal_mean": (
+                        means["pressure"].mean("longitude", skipna=True)
+                    ),
+                    "native_midlevel_height_zonal_mean": native_height_zonal,
+                    "native_midlevel_height": native_height_zonal.mean(
+                        "latitude", skipna=True
+                    ),
+                    "top_flux_valid_fraction": (
+                        statistics.top_flux_valid_count / sample_count
+                    ),
+                }
+            ),
+        ],
+        compat="override",
+    )
+    return (
+        _set_product_metadata(products, ds, simulation, elapsed_seconds),
+        state,
+    )
+
+
 def _latitude_batches(ds, batch_size=LATITUDE_BATCH_SIZE):
     """Yield core latitude bands with a two-point derivative halo."""
     latitude_size = ds.sizes["latitude"]
@@ -1011,9 +1466,55 @@ def _combine_product_latitude_batches(batches):
     return combined
 
 
+def compute_latitude_slab_in_time_batches(
+    ds, simulation, time_batch_size=TIME_BATCH_SIZE,
+):
+    """Compute one spatial slab with a bounded graph for each time block."""
+    global_weights = trapezoidal_time_weights(ds.Time)
+    statistics = None
+    number_of_batches = (
+        ds.sizes["Time"] + time_batch_size - 1
+    ) // time_batch_size
+    for number, (
+        core_start, core_stop, halo_start, subset,
+    ) in enumerate(
+        _time_batches(ds, batch_size=time_batch_size), start=1
+    ):
+        if number == 1 or number == number_of_batches or number % 4 == 0:
+            progress(
+                f"{simulation}: time batch {number}/{number_of_batches} "
+                f"({str(ds.Time.values[core_start])[:10]} to "
+                f"{str(ds.Time.values[core_stop - 1])[:10]})"
+            )
+        lazy_statistics = _time_batch_statistics(
+            subset,
+            global_weights,
+            core_start,
+            core_stop,
+            halo_start,
+        )
+        computed = bounded_compute(lazy_statistics)[0]
+        statistics = (
+            computed
+            if statistics is None
+            else statistics + computed
+        )
+        del lazy_statistics, computed, subset
+        gc.collect()
+
+    endpoints = bounded_compute(_endpoint_statistics(ds))[0]
+    products, state = _products_and_state_from_statistics(
+        statistics, endpoints, ds, simulation
+    )
+    del statistics, endpoints
+    gc.collect()
+    return products, state
+
+
 def compute_simulation_in_latitude_batches(
     ds, simulation, need_products=True, need_state=True,
     batch_size=LATITUDE_BATCH_SIZE,
+    time_batch_size=TIME_BATCH_SIZE,
 ):
     """Compute compact outputs in bounded latitude bands.
 
@@ -1035,27 +1536,20 @@ def compute_simulation_in_latitude_batches(
             f"({float(core_latitude.min()):.2f} to "
             f"{float(core_latitude.max()):.2f} degrees)"
         )
-        pending = []
-        labels = []
-        if need_products:
-            pending.append(derive_products(subset, simulation))
-            labels.append("products")
-        if need_state:
-            state = native_mean_state(subset)
-            state.attrs["simulation"] = simulation
-            pending.append(state)
-            labels.append("state")
-        computed = bounded_compute(*pending)
-        computed_by_label = dict(zip(labels, computed))
+        computed_products, computed_state = (
+            compute_latitude_slab_in_time_batches(
+                subset, simulation, time_batch_size=time_batch_size
+            )
+        )
         if need_products:
             product_batches.append(
-                computed_by_label["products"].sel(latitude=core_latitude)
+                computed_products.sel(latitude=core_latitude)
             )
         if need_state:
             state_batches.append(
-                computed_by_label["state"].sel(latitude=core_latitude)
+                computed_state.sel(latitude=core_latitude)
             )
-        del pending, computed, computed_by_label, subset
+        del computed_products, computed_state, subset
         gc.collect()
 
     products = (
@@ -1076,14 +1570,125 @@ def compute_simulation_in_latitude_batches(
     if products is not None:
         products.attrs["memory_strategy"] = (
             f"{batch_size}-point latitude batches with "
-            f"{LATITUDE_HALO_POINTS}-point derivative halos"
+            f"{LATITUDE_HALO_POINTS}-point derivative halos; "
+            f"{TIME_BATCH_SIZE}-sample time batches with "
+            f"{TIME_HALO_POINTS}-sample tendency halos"
         )
     if state is not None:
         state.attrs["memory_strategy"] = (
             f"{batch_size}-point latitude batches with "
-            f"{LATITUDE_HALO_POINTS}-point derivative halos"
+            f"{LATITUDE_HALO_POINTS}-point derivative halos; "
+            f"{TIME_BATCH_SIZE}-sample time batches with "
+            f"{TIME_HALO_POINTS}-sample tendency halos"
         )
     return products, state
+
+
+def build_simulation_caches_on_disk(
+    ds, simulation, product_path, state_path,
+    need_products=True, need_state=True,
+    latitude_batch_size=LATITUDE_BATCH_SIZE,
+    time_batch_size=TIME_BATCH_SIZE,
+):
+    """Spill completed latitude slabs and assemble final caches from disk."""
+    working_root = os.path.dirname(
+        product_path if need_products else state_path
+    )
+    os.makedirs(working_root, exist_ok=True)
+    safe_simulation = simulation.replace(" ", "_")
+    product_parts = []
+    state_parts = []
+    number_of_batches = (
+        ds.sizes["latitude"] + latitude_batch_size - 1
+    ) // latitude_batch_size
+    with tempfile.TemporaryDirectory(
+        prefix=f".{safe_simulation}_vapour_parts_",
+        dir=working_root,
+    ) as temporary_dir:
+        for number, (
+            _start, _stop, core_latitude, subset,
+        ) in enumerate(
+            _latitude_batches(ds, batch_size=latitude_batch_size), start=1
+        ):
+            progress(
+                f"{simulation}: latitude batch {number}/{number_of_batches} "
+                f"({float(core_latitude.min()):.2f} to "
+                f"{float(core_latitude.max()):.2f} degrees)"
+            )
+            products, state = compute_latitude_slab_in_time_batches(
+                subset, simulation, time_batch_size=time_batch_size
+            )
+            if need_products:
+                product_part = os.path.join(
+                    temporary_dir, f"products_{number:03d}.nc"
+                )
+                netcdf_safe_dataset(
+                    products.sel(latitude=core_latitude)
+                ).to_netcdf(product_part)
+                product_parts.append(product_part)
+            if need_state:
+                state_part = os.path.join(
+                    temporary_dir, f"state_{number:03d}.nc"
+                )
+                netcdf_safe_dataset(
+                    state.sel(latitude=core_latitude)
+                ).to_netcdf(state_part)
+                state_parts.append(state_part)
+            del products, state, subset
+            gc.collect()
+
+        result_products = None
+        if need_products:
+            opened_products = [
+                xr.open_dataset(path, chunks=STATE_CHUNKS)
+                for path in product_parts
+            ]
+            try:
+                combined_products = _combine_product_latitude_batches(
+                    opened_products
+                )
+                combined_products.attrs["memory_strategy"] = (
+                    f"disk-backed {latitude_batch_size}-point latitude "
+                    f"batches and {time_batch_size}-sample time batches"
+                )
+                write_dataset_cache(
+                    combined_products,
+                    product_path,
+                    "vapour-budget product",
+                )
+            finally:
+                for dataset in opened_products:
+                    dataset.close()
+            with xr.open_dataset(product_path) as cached:
+                result_products = cached.load()
+
+        if need_state:
+            opened_states = [
+                xr.open_dataset(path, chunks=STATE_CHUNKS)
+                for path in state_parts
+            ]
+            try:
+                combined_state = xr.concat(
+                    opened_states,
+                    dim="latitude",
+                    data_vars="all",
+                    coords="minimal",
+                    compat="override",
+                    join="exact",
+                ).sortby("latitude")
+                combined_state.attrs["memory_strategy"] = (
+                    f"disk-backed {latitude_batch_size}-point latitude "
+                    f"batches and {time_batch_size}-sample time batches"
+                )
+                write_dataset_cache(
+                    combined_state,
+                    state_path,
+                    "native mean-state",
+                )
+            finally:
+                for dataset in opened_states:
+                    dataset.close()
+    return result_products
 
 
 def prepare_simulation(data_loc, simulation, force=False, test=False,
@@ -1119,25 +1724,16 @@ def prepare_simulation(data_loc, simulation, force=False, test=False,
             f"{simulation}: computing latitude-batched compact caches with "
             f"{DASK_NUM_WORKERS} Dask workers"
         )
-        computed_products, computed_state = (
-            compute_simulation_in_latitude_batches(
-                ds,
-                simulation,
-                need_products=not product_current,
-                need_state=not state_current,
-            )
+        computed_products = build_simulation_caches_on_disk(
+            ds,
+            simulation,
+            product_path,
+            state_path,
+            need_products=not product_current,
+            need_state=not state_current,
         )
         if not product_current:
             products = computed_products
-            write_dataset_cache(
-                products, product_path, "vapour-budget product"
-            )
-        if not state_current:
-            state = computed_state
-            write_dataset_cache(
-                state, state_path, "native mean-state"
-            )
-            del state
     finally:
         ds.close()
         del ds

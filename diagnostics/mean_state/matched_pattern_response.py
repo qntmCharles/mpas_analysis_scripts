@@ -20,7 +20,16 @@ import xarray as xr
 
 from tropopause import tropopause_profile
 
-from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import (
+    FigureSaver, LATLON_PATTERN, ZONAL_MEAN_PATTERN, add_symmetric_colorbar,
+    annotate_panel_label, diagnostic_output_dir, difference_cmap,
+    figure_should_run, figure_should_run_any,
+    hemispheric_fold, isobaric_lat_mean,
+    isobaric_vertical_velocity_from_zm, latitude_weights, load_latlon_dataset,
+    model_lat_field, precip_rate_from_accum, pressure_layer_weights,
+    set_latpres_axis, standardize_latlon_dataset, subset_between,
+    symmetric_levels, total_precip_accum,
+)
 
 
 save = True
@@ -38,26 +47,23 @@ figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 should_run_figure = partial(figure_should_run, figures_to_run)
 should_run_any = partial(figure_should_run_any, figures_to_run)
-run_all_figures = partial(all_figures_requested, figures_to_run)
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control_new", "u_nudge", "T_nudge"]
-latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
-zm_latlon_file = ["zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
 
 cols = ["k", "b", "r"]
 
-ndays = 200
-dt = 6
-analysis_end_date = "2000-11-21"
-time_format = "time"
 
-needed_vars = [
+latlon_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw", "olrtoa",
     "uzonal_isobaric", "umeridional_isobaric",
     "rh_isobaric", "t_isobaric", "theta", "zgrid", "pressure",
     "w",
+]
+zonal_mean_vars = [
+    "uzonal_isobaric", "umeridional_isobaric", "rh_isobaric", "t_isobaric",
+    "theta", "pressure", "w",
 ]
 
 
@@ -69,24 +75,17 @@ dss_zm = []
 for i, d in enumerate(data_locs):
     ds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=LATLON_PATTERN,
         chunks={"Time": -1},
     )
-    ds = standardize_latlon_dataset(ds, needed_vars)
+    ds = standardize_latlon_dataset(ds, latlon_vars)
 
     zds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=zm_latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=ZONAL_MEAN_PATTERN,
         chunks={"Time": -1},
-        prefer_pattern=True,
     )
-    zds = standardize_latlon_dataset(zds, needed_vars)
+    zds = standardize_latlon_dataset(zds, zonal_mean_vars)
 
     print(ds)
     print(zds)
@@ -220,7 +219,7 @@ def compute_cpts(zm_datasets):
         T = theta * (pressure / 100000.0) ** (287.0 / 1004.0)
         T = model_lat_field(T)
         pressure = model_lat_field(pressure)
-        z = height_from_zm_latlon(zds).values
+        z = zds.z.values
 
         ztps = []
         ptps = []
@@ -253,30 +252,22 @@ def anomaly_latpres(var, run_index, control_index=0):
         parity = latpres_var_hemispheric_parity(var)
         field = isobaric_lat_mean(dss_zm[run_index][var], hemispheric_parity=parity)
         control_field = isobaric_lat_mean(dss_zm[control_index][var], hemispheric_parity=parity)
-    control = control_field.interp(
-        pres=field.pres,
-        latitude=field.latitude,
-        kwargs={"fill_value": np.nan},
-    )
+    field, control = xr.align(field, control_field, join="exact")
     return field - control
 
 
 def anomaly_surface_map(var, run_index, control_index=0):
     """Time-mean lat-lon anomaly on the run grid."""
     if var == "precip_rate":
-        run_field = precip_rate_from_accum(total_precip_accum(dss[run_index]), dt=dt).mean(dim="Time")
-        control_field = precip_rate_from_accum(total_precip_accum(dss[control_index]), dt=dt).mean(dim="Time")
+        run_field = precip_rate_from_accum(total_precip_accum(dss[run_index])).mean(dim="Time")
+        control_field = precip_rate_from_accum(total_precip_accum(dss[control_index])).mean(dim="Time")
     else:
-        run_field = finite_or_nan(dss[run_index][var]).mean(dim="Time")
-        control_field = finite_or_nan(dss[control_index][var]).mean(dim="Time")
+        run_field = dss[run_index][var].mean(dim="Time")
+        control_field = dss[control_index][var].mean(dim="Time")
     run_field = hemispheric_fold(run_field, parity="even")
     control_field = hemispheric_fold(control_field, parity="even")
 
-    control_on_run = control_field.interp(
-        latitude=run_field.latitude,
-        longitude=run_field.longitude,
-        kwargs={"fill_value": np.nan},
-    )
+    run_field, control_on_run = xr.align(run_field, control_field, join="exact")
     return run_field - control_on_run
 
 
@@ -305,21 +296,17 @@ T_control = isobaric_lat_mean(dss_zm[0].t_isobaric, hemispheric_parity="even")
 T_u = isobaric_lat_mean(dss_zm[1].t_isobaric, hemispheric_parity="even")
 T_T = isobaric_lat_mean(dss_zm[2].t_isobaric, hemispheric_parity="even")
 
-dT_u = T_u - T_control.interp(pres=T_u.pres, latitude=T_u.latitude, kwargs={"fill_value": np.nan})
-dT_T = T_T - T_control.interp(pres=T_T.pres, latitude=T_T.latitude, kwargs={"fill_value": np.nan})
-dT_T_on_u = dT_T.interp(pres=dT_u.pres, latitude=dT_u.latitude, kwargs={"fill_value": np.nan})
+dT_u = T_u - T_control
+dT_T = T_T - T_control
+dT_u, dT_T_on_u = xr.align(dT_u, dT_T, join="exact")
 
-alpha_TTL = np.nan
-try:
-    dT_TTL_u = weighted_mean_latpres(dT_u, lat_bounds=(-10, 10), p_bounds=(70, 150)).values.item()
-    dT_TTL_T = weighted_mean_latpres(dT_T_on_u, lat_bounds=(-10, 10), p_bounds=(70, 150)).values.item()
-    alpha_TTL = dT_TTL_u / dT_TTL_T if np.isfinite(dT_TTL_T) and abs(dT_TTL_T) > 1e-12 else np.nan
-    print("\nScalar TTL temperature scaling")
-    print(f"  u-nudged mean dT_TTL = {dT_TTL_u:.3f} K")
-    print(f"  T-nudged mean dT_TTL = {dT_TTL_T:.3f} K")
-    print(f"  alpha_TTL = {alpha_TTL:.3f}")
-except Exception as exc:
-    print(f"Skipping scalar alpha_TTL calculation: {exc}")
+dT_TTL_u = weighted_mean_latpres(dT_u, lat_bounds=(-10, 10), p_bounds=(70, 150)).values.item()
+dT_TTL_T = weighted_mean_latpres(dT_T_on_u, lat_bounds=(-10, 10), p_bounds=(70, 150)).values.item()
+alpha_TTL = dT_TTL_u / dT_TTL_T if np.isfinite(dT_TTL_T) and abs(dT_TTL_T) > 1e-12 else np.nan
+print("\nScalar TTL temperature scaling")
+print(f"  u-nudged mean dT_TTL = {dT_TTL_u:.3f} K")
+print(f"  T-nudged mean dT_TTL = {dT_TTL_T:.3f} K")
+print(f"  alpha_TTL = {alpha_TTL:.3f}")
 
 CPTs = compute_cpts(dss_zm)
 
@@ -435,13 +422,9 @@ for domain_name, result in projection_results.items():
     alpha_pattern = result["alpha"]
 
     for var, label, max_abs in latpres_specs:
-        if any(var not in zds.data_vars for zds in dss_zm):
-            print(f"Skipping pattern-scaled residual for {var}: not present in all zm datasets")
-            continue
-
         dXu = anomaly_latpres(var, run_index=1)
         dXT = anomaly_latpres(var, run_index=2)
-        dXT_on_u = dXT.interp(pres=dXu.pres, latitude=dXu.latitude, kwargs={"fill_value": np.nan})
+        dXu, dXT_on_u = xr.align(dXu, dXT, join="exact")
         residual = dXu - alpha_pattern * dXT_on_u
         projection = alpha_pattern * dXT_on_u
         levels = symmetric_levels(max_abs, ndiv=16)
@@ -518,7 +501,7 @@ def plot_pattern_scaled_surface_zonalmean_residuals(alpha_pattern, domain_name):
     for j, (var, ylabel) in enumerate(surface_specs):
         dXu = anomaly_surface_map(var, run_index=1)
         dXT = anomaly_surface_map(var, run_index=2)
-        dXT_on_u = dXT.interp(latitude=dXu.latitude, longitude=dXu.longitude, kwargs={"fill_value": np.nan})
+        dXu, dXT_on_u = xr.align(dXu, dXT, join="exact")
         projection = alpha_pattern * dXT_on_u
         residual = dXu - projection
 

@@ -34,7 +34,15 @@ from matplotlib import pyplot as plt
 import xarray as xr
 import dask
 
-from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import (
+    FigureSaver, LATLON_PATTERN, ZONAL_MEAN_PATTERN, add_symmetric_colorbar,
+    annotate_panel_label, control_diff_label, diagnostic_output_dir,
+    difference_cmap, figure_should_run, figure_should_run_any,
+    latitude_weights, load_latlon_dataset, model_lat_field,
+    pressure_layer_weights, safe_name, set_latheight_labels, set_latpres_axis,
+    standardize_latlon_dataset, subset_between, symmetric_levels,
+    symmetric_percentile_levels_for_fields, time_step_days,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -68,20 +76,13 @@ figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 should_run_figure = partial(figure_should_run, figures_to_run)
 should_run_any = partial(figure_should_run_any, figures_to_run)
-run_all_figures = partial(all_figures_requested, figures_to_run)
 
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control_new", "u_nudge", "T_nudge"]
-latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
-zm_latlon_file = ["zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
 cols = ["k", "b", "r"]
 
-ndays = 200
-dt = 6
-analysis_end_date = "2000-11-21"
-time_format = "time"
 
 fixed_pressure_level = 250.0
 jet_profile_pressure_levels = [700.0, 200.0]
@@ -139,19 +140,13 @@ def add_right_margin_colorbar(fig, mappable, axes, label, pad=0.015, width=0.025
     return fig.colorbar(mappable, cax=cax, label=label)
 
 
-time_step_days = partial(time_step_days, dt_hours=dt)
-
-
 def time_days_since_start(da):
     times = da.Time.values
     if times.size == 0:
         return np.asarray([])
-    if np.issubdtype(times.dtype, np.number):
-        return (np.asarray(times, dtype=float) - float(times[0])) * dt / 24.0
-    if np.issubdtype(times.dtype, np.datetime64):
-        return np.asarray((times - times[0]) / np.timedelta64(1, "D"), dtype=float)
-    times = pd.to_datetime(times)
-    return np.asarray((times - times[0]) / pd.Timedelta(days=1), dtype=float)
+    if not np.issubdtype(times.dtype, np.datetime64):
+        raise TypeError(f"Expected decoded datetime Time coordinate, got {times.dtype}")
+    return np.asarray((times - times[0]) / np.timedelta64(1, "D"), dtype=float)
 
 
 def time_average(da, days=time_average_days):
@@ -182,7 +177,7 @@ def model_height_time_mean_zonal_u(zds):
     if "uReconstructZonal" not in zds.data_vars:
         raise ValueError("uReconstructZonal is required for model-height jet structure")
 
-    u = finite_or_nan(zds.uReconstructZonal)
+    u = zds.uReconstructZonal
     mean_dims = [dim for dim in ("Time", "longitude") if dim in u.dims]
     if mean_dims:
         u = u.mean(dim=mean_dims, skipna=True)
@@ -377,10 +372,7 @@ dss = []
 for i, d in enumerate(data_locs):
     ds = load_latlon_dataset(
         os.path.join(root_dir, d),
-        latlon_pattern=latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
+        latlon_pattern=LATLON_PATTERN,
         chunks=latlon_chunks,
     )
     ds = standardize_latlon_dataset(ds, needed_vars)
@@ -393,12 +385,8 @@ if should_run_figure(6):
     for i, d in enumerate(data_locs):
         zds = load_latlon_dataset(
             os.path.join(root_dir, d),
-            latlon_pattern=zm_latlon_file[i],
-            time_format=time_format,
-            ndays=ndays,
-            end_date=analysis_end_date,
+            latlon_pattern=ZONAL_MEAN_PATTERN,
             chunks={"Time": -1},
-            prefer_pattern=True,
         )
         zds = standardize_latlon_dataset(zds, needed_vars_zm)
         print(zds)
@@ -408,7 +396,7 @@ if should_run_figure(6):
 def zonal_mean_u_at_level(ds, plev=fixed_pressure_level):
     if "uzonal_isobaric" not in ds.data_vars:
         raise ValueError("uzonal_isobaric is required for fixed-level jet diagnostics")
-    u = finite_or_nan(ds.uzonal_isobaric).sel(pres=plev, method="nearest")
+    u = ds.uzonal_isobaric.sel(pres=plev)
     selected_pressure = float(u.pres.values)
     if "longitude" in u.dims:
         u = u.mean(dim="longitude", skipna=True)
@@ -434,7 +422,7 @@ def time_mean_zonal_mean_u_at_level(ds, plev):
 def zonal_mean_u_profile(ds):
     if "uzonal_isobaric" not in ds.data_vars:
         raise ValueError("uzonal_isobaric is required for annular-mode diagnostics")
-    u = finite_or_nan(ds.uzonal_isobaric)
+    u = ds.uzonal_isobaric
     if "longitude" in u.dims:
         u = u.mean(dim="longitude", skipna=True)
     u = time_average(u.transpose("Time", "pres", "latitude")).load()
@@ -1071,11 +1059,7 @@ if should_run_figure(6) and jet_structure_fields:
         control_field = jet_structure_fields[0]
         diff_fields = {}
         for i, field in jet_structure_fields.items():
-            control_interp = control_field.interp(
-                z=field.z,
-                latitude=field.latitude,
-                kwargs={"fill_value": np.nan},
-            )
+            field, control_interp = xr.align(field, control_field, join="exact")
             diff_fields[i] = (field - control_interp).load()
 
         raw_levels = symmetric_percentile_levels_for_fields(
