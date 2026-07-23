@@ -4,19 +4,12 @@
 """
 Refined high-cloud classification diagnostics for MPAS-A nudging experiments.
 
-This script owns the shared high-cloud classification product and focuses on a
-small set of interpretable tests:
-
-  * high-cloud class budgets and nudged-control differences;
-  * observed-minus-control-predicted high-cloud residual maps/zonal means;
-  * lat/lon overlay snapshots that validate the class masks visually;
-  * explicit precipitation-source, vertical-velocity, and cloud-top validation;
-  * lightweight cloud-fraction threshold sensitivity checks.
-  * all-time lat/lon classification-validation movies.
-
-The diagnostics deliberately avoid tercile splits of N2_TTL.  If N2_TTL is
-available, a single common-support range is reported in the residual summary
-tables rather than plotted as multiple weakly supported conditional regimes.
+This script owns the shared high-cloud/PyFLEXTRKR scene product. Its primary
+figures report class occurrence/composition, cloud-top-pressure distributions,
+TTL-reaching frequency, domain-contribution vertical cloud profiles,
+class-conditioned OLR, spatial occurrence responses, and rain-matched cloud
+depth/OLR responses. Core/cold-shield/warm-shield scene regions and vertical
+slices provide the validation view behind ``--qc``.
 """
 
 import argparse
@@ -24,7 +17,6 @@ import gc
 import os
 import sys
 import time
-import warnings
 from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,17 +29,27 @@ import dask
 import numpy as np
 import pandas as pd
 import xarray as xr
-from matplotlib import animation, colors, pyplot as plt
+from matplotlib import colors, pyplot as plt
 from matplotlib.lines import Line2D
 from scipy import ndimage
 
-from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import (
+    FigureSaver, HIGH_CLOUD_CLASS_SPECS, LATLON_PATTERN,
+    QUICK_TEST_LAT_BOUNDS, QUICK_TEST_LON_BOUNDS,
+    diagnostic_cache_dir, diagnostic_output_dir, figure_should_run,
+    high_cloud_class_cmap_norm, high_cloud_class_legend_handles,
+    load_latlon_dataset, precip_rate_cmap_norm,
+    precipitation_rate_from_dataset, progress,
+    sample_matching_arrays, standardize_latlon_dataset,
+    subset_latitude, time_block_slices, weighted_area_time_mean,
+)
 from diagnostics.convection.high_cloud_classification import (
     HighCloudThresholds,
     cached_classification_is_current as shared_cached_classification_is_current,
     classification_dataset as shared_classification_dataset,
     classify_high_cloud_from_dataset,
-    precip_component_rate_from_dataset,
+    corrected_cached_warm_shield_masks,
+    standardize_cloud_fraction,
     standardize_pressure_hpa,
 )
 
@@ -64,48 +66,37 @@ default_save_loc = save_loc
 #
 # Figure numbers:
 #   1: high_cloud_class_budget
-#   2: residual_high_cloud_maps_zonal
+#   2: literature_high_cloud_structure (CTP, TTL, OLR, vertical profiles)
 #   3: cloud_classification_validation_snapshots
-#   4: cloud_regime_vertical_validation
-#   5: cloud_regime_precip_and_cloud_top_validation
-#   6: cloud_classification_threshold_sensitivity
-#   7: cloud_classification_validation_movies
-figures_to_run = []
+#   4: high_cloud_vertical_contribution_profiles
+#   5: high_cloud_class_spatial_response
+#   6: rain_matched_high_cloud_structure_response
+figures_to_run = [1, 2, 4, 5, 6]
 figsave = None
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control_new", "u_nudge", "T_nudge"]
-latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
-zm_latlon_file = ["zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
 cols = ["k", "b", "r"]
 
-ndays = 200
 dt = 6
-analysis_end_date = "2000-11-21"
-time_format = "time"
 
 TROPICAL_LAT_BOUNDS = (-20.0, 20.0)
 SNAPSHOT_LAT_BOUNDS = (-20.0, 20.0)
 
 # Cloud-top pressure avoids tying tropical high cloud to one geometric height.
 # The 440 hPa parent follows the standard ISCCP high-cloud boundary. Continuous
-# cloud-top pressure is retained for the QBO-MJO cloud-deepening analysis.
+# cloud-top pressure is retained for the UTLS cloud-deepening analysis.
 CF_THRESH = 0.05
 P_HIGH_HPA = 440.0
-P_PRECIP_MIN = 1.0
-P_HEAVY = 10.0
-W_STRONG = 0.10
-CONVECTIVE_FRACTION = 0.50
-CONVECTIVE_EVIDENCE_REQUIRED = 2
-
+P_PRECIP_MIN = 12.0  # 0.5 mm h-1 PF threshold (Feng et al. 2021)
 WRITE_CLASSIFICATION_PRODUCT = True
 classification_cache_dir = diagnostic_cache_dir("classification_cache", root_dir=root_dir)
 
 TEST_MODE = False
 TEST_TIME_STEPS = 16
 TEST_START = None
-TEST_DEFAULT_FIGURES = [1, 3, 4, 5, 6, 7]
+TEST_DEFAULT_FIGURES = [1, 2, 3, 4, 5, 6]
 SIMULATION_ARGUMENTS = {
     "control": 0,
     "nudged-u": 1,
@@ -123,118 +114,265 @@ N_BOOTSTRAP = 600
 BOOTSTRAP_SEED = 20240610
 CI_PERCENTILES = (2.5, 97.5)
 
-LATITUDE_BIN_WIDTH = 2.0
-MIN_BIN_COUNT = 50
-
-RESIDUAL_FIT_SAMPLE_LIMITS = dict(max_time=120, max_lat=120, max_lon=240)
-RESIDUAL_PLOT_SAMPLE_LIMITS = dict(max_time=144, max_lat=120, max_lon=240)
-PROCESS_SAMPLE_LIMITS = dict(max_time=144, max_lat=120, max_lon=240)
-SENSITIVITY_SAMPLE_LIMITS = dict(max_time=144, max_lat=100, max_lon=220)
-
-SENSITIVITY_CF_THRESHOLDS = [0.03, CF_THRESH, 0.10]
-SENSITIVITY_PRECIP_MIN_THRESHOLDS = [0.5, P_PRECIP_MIN, 2.0]
-SENSITIVITY_INDICATOR_SETTINGS = [
-    (5.0, 0.05),
-    (P_HEAVY, W_STRONG),
-    (20.0, 0.20),
-]
-SENSITIVITY_CONVECTIVE_FRACTIONS = [0.33, CONVECTIVE_FRACTION, 0.67]
+CLOUD_STRUCTURE_TIME_BATCH = 4
+# Match the source Time chunk so each expensive 3-D cloud-fraction chunk is read
+# once while still yielding regular progress updates in a full-period run.
+VERTICAL_PROFILE_TIME_BATCH = 8
+RAIN_CONDITIONED_TIME_BATCH_DAYS = BOOTSTRAP_BLOCK_DAYS
+MIN_RAIN_CONDITIONED_BLOCKS = 4
+RAIN_RATE_BINS_MM_H = np.array(
+    [0.0, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.0, 1.5, 2.0,
+     3.0, 5.0, 8.0, np.inf]
+)
 SNAPSHOT_LON_WINDOW_DEG = 90.0
 SNAPSHOT_Z_MAX_KM = 19.0
 CLOUD_TOP_HEIGHT_MAP_MIN_KM = 6.0
 CLOUD_TOP_HEIGHT_MAP_MAX_KM = 20.0
-CLOUD_TOP_PRESSURE_BINS_HPA = np.arange(0.0, P_HIGH_HPA + 1.0, 40.0)
-CLOUD_TOP_HISTOGRAM_TIME_BATCH = 32
-VALIDATION_MOVIE_FPS = 6
-VALIDATION_MOVIE_DPI = 110
-
+PROFILE_Z_BOUNDS_KM = (10.0, 20.0)
+UTLS_LAYER_BOUNDS_KM = (14.0, 18.0)
 latlon_chunks = {"Time": 8, "latitude": 90, "longitude": 180}
-zm_chunks = {"Time": -1}
 dask.config.set({"array.slicing.split_large_chunks": True})
 
-VAR_ALIASES = {
-    "precip": ["precip", "precip_rate", "pr", "rain_rate"],
-    "rainc": ["rainc"],
-    "rainnc": ["rainnc"],
-    "i_rainc": ["i_rainc"],
-    "i_rainnc": ["i_rainnc"],
-    "olr": ["olr", "olrtoa", "OLR"],
-    "pw": ["pw", "precipw", "prw"],
-    "cape": ["cape", "CAPE"],
-    "cin": ["cin", "CIN"],
-    "cldfrac": ["cldfrac", "cloud_fraction", "cl"],
-    "theta": ["theta", "potential_temperature"],
-    "pressure": ["pressure", "p"],
-    "w": ["w", "vertical_velocity"],
-    "zgrid": ["zgrid"],
-    "u_zm": ["uReconstructZonal", "u", "uzonal"],
-    "N2": ["N2", "n2", "static_stability"],
-    "dudz": ["dudz", "du_dz", "vertical_shear"],
-}
-
-needed_vars = sorted(
-    set(
-        VAR_ALIASES["rainc"]
-        + VAR_ALIASES["rainnc"]
-        + VAR_ALIASES["i_rainc"]
-        + VAR_ALIASES["i_rainnc"]
-        + VAR_ALIASES["precip"]
-        + VAR_ALIASES["olr"]
-        + VAR_ALIASES["pw"]
-        + VAR_ALIASES["cape"]
-        + VAR_ALIASES["cin"]
-        + VAR_ALIASES["cldfrac"]
-        + VAR_ALIASES["theta"]
-        + VAR_ALIASES["pressure"]
-        + VAR_ALIASES["w"]
-        + VAR_ALIASES["zgrid"]
-        + VAR_ALIASES["u_zm"]
-        + VAR_ALIASES["N2"]
-        + VAR_ALIASES["dudz"]
-    )
-)
+latlon_vars = [
+    "rainc", "rainnc", "i_rainc", "i_rainnc",
+    "olrtoa", "cldfrac", "pressure", "t_isobaric", "zgrid",
+]
 
 BUDGET_SPECS = [
     ("high_cloud_mask", "Total high cloud", "0.25"),
-    ("convective_precipitating_high_cloud_mask", "Convective precipitating", "tab:red"),
+    ("convective_precipitating_high_cloud_mask", "PyFLEXTRKR convective core", "tab:red"),
     ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating", "tab:blue"),
     ("nonprecipitating_high_cloud_mask", "Non-precipitating", "tab:green"),
-    ("unclassified_high_cloud_mask", "Invalid/unclassified", "0.55"),
 ]
 
-RESIDUAL_TARGET_SPECS = [
-    ("total", "Total high cloud", "high_cloud_fraction"),
-    ("convective", "Convective precipitating", "convective_precipitating_high_cloud_mask"),
-    ("stratiform", "Stratiform precipitating", "stratiform_precipitating_high_cloud_mask"),
-    ("nonprecipitating", "Non-precipitating", "nonprecipitating_high_cloud_mask"),
-]
+SPATIAL_CLASS_SPECS = BUDGET_SPECS
+RAIN_CONDITIONED_CLASS_SPECS = BUDGET_SPECS
 
 REGIME_SPECS = [
-    ("convective_precipitating_high_cloud_mask", "Convective precipitating", "tab:red"),
+    ("convective_precipitating_high_cloud_mask", "PyFLEXTRKR convective core", "tab:red"),
     ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating", "tab:blue"),
     ("nonprecipitating_high_cloud_mask", "Non-precipitating", "tab:green"),
 ]
 
-# Persist only fields shared by downstream diagnostics. Full-resolution process
-# evidence would make this product unnecessarily large; Figures 4-5 recompute it
-# on the lightweight validation sample below.
+PRECIPITATING_COMPOSITION_SPECS = [
+    ("rainy_pyflextrkr_core_mask", "Rainy PyFLEXTRKR core", "tab:red"),
+    ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating", "tab:blue"),
+]
+
+CIRRUS_COMPARISON_SPECS = [
+    ("noncore_high_cloud_aggregate", "Non-core aggregate", "tab:purple"),
+    ("nonprecipitating_high_cloud_mask", "Non-precipitating", "tab:green"),
+]
+
+NONPRECIP_SHIELD_SPECS = [
+    (
+        "nonprecip_within_core_bearing_warm_shield",
+        "Within core-bearing 261-K shield",
+        "tab:orange",
+    ),
+    (
+        "nonprecip_outside_core_bearing_warm_shield",
+        "Outside core-bearing 261-K shield",
+        "0.45",
+    ),
+]
+
+# Published percentages used only where their denominator is explicit. The
+# AIRS/IASI value is the closest like-for-like check on the parent high-cloud
+# mask. The MODIS result helps compare the core share, but its optical-
+# depth classification is not equivalent to the PyFLEXTRKR 225-K core.
+LITERATURE_CLOUD_PERCENTAGES = [
+    dict(
+        metric="total_high_cloud_domain_occurrence",
+        plotted_class_key="high_cloud_mask",
+        value_percent=35.0,
+        bound="approximately",
+        comparison_role="closest like-for-like observational benchmark",
+        definition="all upper-tropospheric cloud with cloud-top pressure < 440 hPa",
+        denominator="all observations from 30S-30N",
+        region="30S-30N",
+        grid="0.5 degree",
+        reference="Stubenrauch et al. (2023), Atmospheric Chemistry and Physics",
+        doi="10.5194/acp-23-5867-2023",
+    ),
+    dict(
+        metric="total_high_cloud_domain_occurrence",
+        plotted_class_key="high_cloud_mask",
+        value_percent=22.7,
+        bound="reported tropical mean",
+        comparison_role="observational benchmark with lower thin-cloud sensitivity",
+        definition="MODIS high ice cloud classified using the ISCCP pressure boundary",
+        denominator="all daytime observations from 30S-30N",
+        region="30S-30N",
+        grid="MODIS Collection 4 level-3 products",
+        reference="Hong et al. (2007), Journal of Applied Meteorology and Climatology",
+        doi="10.1175/2007JAMC1583.1",
+    ),
+    dict(
+        metric="deep_convective_share_of_high_cloud",
+        plotted_class_key="convective_precipitating_high_cloud_mask",
+        value_percent=20.0,
+        bound="upper bound (<20%)",
+        comparison_role="optical-class comparison; not an equivalent class definition",
+        definition="MODIS/ISCCP optical-depth deep-convective class",
+        denominator="total MODIS high-cloud amount from 30S-30N",
+        region="30S-30N",
+        grid="MODIS Collection 4 level-3 products",
+        reference="Hong et al. (2007), Journal of Applied Meteorology and Climatology",
+        doi="10.1175/2007JAMC1583.1",
+    ),
+    dict(
+        metric="cirriform_share_of_high_cloud",
+        plotted_class_key="not plotted against one model class",
+        value_percent=80.0,
+        bound="lower bound (>80%)",
+        comparison_role="optical-class comparison; cirriform spans more than one model class",
+        definition="MODIS/ISCCP cirriform optical-depth classes",
+        denominator="total MODIS high-cloud amount from 30S-30N",
+        region="30S-30N",
+        grid="MODIS Collection 4 level-3 products",
+        reference="Hong et al. (2007), Journal of Applied Meteorology and Climatology",
+        doi="10.1175/2007JAMC1583.1",
+    ),
+    dict(
+        metric="tropical_cirrus_domain_occurrence",
+        plotted_class_key="nonprecipitating_high_cloud_mask",
+        value_percent=38.4,
+        bound="lower endpoint of retrieval range",
+        comparison_role="cirrus-occurrence comparison; closest latitude band but not an equivalent class",
+        definition="CALIOP NASA level-2 non-opaque cirrus with maximum temperature < -40 C and optical depth > 0.001",
+        denominator="all profiles from 15S-15N",
+        region="15S-15N",
+        grid="CALIOP profile sampling, June 2006-December 2008",
+        reference="Martins et al. (2011), Journal of Geophysical Research: Atmospheres",
+        doi="10.1029/2010JD014519",
+    ),
+    dict(
+        metric="tropical_cirrus_domain_occurrence",
+        plotted_class_key="nonprecipitating_high_cloud_mask",
+        value_percent=43.5,
+        bound="upper endpoint of retrieval range",
+        comparison_role="cirrus-occurrence comparison; closest latitude band but not an equivalent class",
+        definition="CALIOP selectively extracted non-opaque cirrus with maximum temperature < -40 C and optical depth > 0.001",
+        denominator="all profiles from 15S-15N",
+        region="15S-15N",
+        grid="CALIOP profile sampling, June 2006-December 2008",
+        reference="Martins et al. (2011), Journal of Geophysical Research: Atmospheres",
+        doi="10.1029/2010JD014519",
+    ),
+    dict(
+        metric="convective_share_of_tropical_raining_area",
+        plotted_class_key="rainy_pyflextrkr_core_mask",
+        value_percent=27.0,
+        bound="derived complement of reported 73% stratiform area",
+        comparison_role="closest radar-area benchmark; classification method differs",
+        definition="TRMM PR convective rain area with reflectivity >= 17 dBZ",
+        denominator="total tropical area covered by rain",
+        region="20S-20N",
+        grid="TRMM Precipitation Radar native sampling",
+        reference="Schumacher and Houze (2003), Journal of Climate",
+        doi="10.1175/1520-0442(2003)016<1739:SRITTA>2.0.CO;2",
+    ),
+    dict(
+        metric="stratiform_share_of_tropical_raining_area",
+        plotted_class_key="stratiform_precipitating_high_cloud_mask",
+        value_percent=73.0,
+        bound="reported mean",
+        comparison_role="closest radar-area benchmark; classification method differs",
+        definition="TRMM PR stratiform rain area with reflectivity >= 17 dBZ",
+        denominator="total tropical area covered by rain",
+        region="20S-20N",
+        grid="TRMM Precipitation Radar native sampling",
+        reference="Schumacher and Houze (2003), Journal of Climate",
+        doi="10.1175/1520-0442(2003)016<1739:SRITTA>2.0.CO;2",
+    ),
+]
+
+LITERATURE_CLOUD_STRUCTURE_VALUES = [
+    dict(
+        metric="mean_cloud_top_pressure",
+        cloud_type="cirriform",
+        value=281.4,
+        units="hPa",
+        definition="MODIS ISCCP cirriform high-cloud optical classes",
+        region="30S-30N",
+        reference="Hong et al. (2007), Journal of Applied Meteorology and Climatology",
+        doi="10.1175/2007JAMC1583.1",
+    ),
+    dict(
+        metric="mean_cloud_top_pressure",
+        cloud_type="deep convective",
+        value=223.3,
+        units="hPa",
+        definition="MODIS ISCCP deep-convective high-cloud optical class",
+        region="30S-30N",
+        reference="Hong et al. (2007), Journal of Applied Meteorology and Climatology",
+        doi="10.1175/2007JAMC1583.1",
+    ),
+    dict(
+        metric="mean_cloud_top_temperature",
+        cloud_type="cirriform",
+        value=231.0,
+        units="K",
+        definition="MODIS ISCCP cirriform high-cloud optical classes",
+        region="30S-30N",
+        reference="Hong et al. (2007), Journal of Applied Meteorology and Climatology",
+        doi="10.1175/2007JAMC1583.1",
+    ),
+    dict(
+        metric="mean_cloud_top_temperature",
+        cloud_type="deep convective",
+        value=234.9,
+        units="K",
+        definition="MODIS ISCCP deep-convective high-cloud optical class",
+        region="30S-30N",
+        reference="Hong et al. (2007), Journal of Applied Meteorology and Climatology",
+        doi="10.1175/2007JAMC1583.1",
+    ),
+    dict(
+        metric="class_conditioned_olr",
+        cloud_type="thin cirrus",
+        value=260.0,
+        units="W m-2",
+        definition="OLR associated with optically thin tropical-ocean cirrus in a high-resolution model",
+        region="tropical ocean",
+        reference="Seiki et al. (2015), Geophysical Research Letters",
+        doi="10.1002/2015GL064282",
+    ),
+    dict(
+        metric="deep_convection_olr_threshold",
+        cloud_type="deep convective system",
+        value=205.0,
+        units="W m-2",
+        definition="satellite OLR threshold used to identify tropical deep-convective systems",
+        region="0-20N identification domain; globally applied threshold",
+        reference="Gu et al. (2002), Journal of Geophysical Research: Atmospheres",
+        doi="10.1029/2002JD002089",
+    ),
+]
+
+# Persist only fields used by the scientific and validation consumers.
 CLASSIFICATION_CACHE_VARS = (
+    "brightness_temperature",
+    "pyflextrkr_valid_tb_mask",
+    "pyflextrkr_core_mask",
+    "pyflextrkr_cold_cloud_shield_mask",
+    "pyflextrkr_core_bearing_cold_shield_mask",
+    "pyflextrkr_warm_cloud_shield_mask",
+    "pyflextrkr_core_bearing_warm_shield_mask",
+    "pyflextrkr_cold_cloud_shield_label",
     "cloud_top_pressure",
     "cloud_top_height",
-    "column_max_updraft",
     "high_cloud_fraction",
     "high_cloud_mask",
-    "precipitating_high_cloud_mask",
     "convective_precipitating_high_cloud_mask",
     "stratiform_precipitating_high_cloud_mask",
     "nonprecipitating_high_cloud_mask",
     "unclassified_high_cloud_mask",
     "high_cloud_regime_code",
-    "convective_evidence_count",
 )
 
 should_run_figure = partial(figure_should_run, figures_to_run)
-should_run_any = partial(figure_should_run_any, figures_to_run)
 
 
 def parse_command_line(argv=None):
@@ -278,13 +416,18 @@ def parse_command_line(argv=None):
         ),
     )
     parser.add_argument(
+        "--qc",
+        action="store_true",
+        help="Add the classification map and vertical-slice validation (Figure 3).",
+    )
+    parser.add_argument(
         "--figures",
         type=int,
         nargs="+",
-        choices=range(1, 8),
+        choices=range(1, 7),
         default=None,
         metavar="N",
-        help="Run only the listed figure numbers (1-7).",
+        help="Run only the listed figure numbers (1-6).",
     )
     parser.set_defaults(write_classification=True)
     args = parser.parse_args(argv)
@@ -297,7 +440,7 @@ def configure_run(args):
     global TEST_MODE, TEST_TIME_STEPS, TEST_START
     global WRITE_CLASSIFICATION_PRODUCT, classification_cache_dir
     global save_loc, figures_to_run
-    global data_locs, latlon_file, zm_latlon_file, sim_names, cols
+    global data_locs, sim_names, cols
 
     TEST_MODE = bool(args.test)
     TEST_TIME_STEPS = int(args.test_times)
@@ -305,17 +448,17 @@ def configure_run(args):
     WRITE_CLASSIFICATION_PRODUCT = bool(args.write_classification)
 
     if args.figures is not None:
-        figures_to_run = list(args.figures)
+        figures_to_run[:] = args.figures
+    elif args.qc:
+        figures_to_run[:] = [1, 2, 3, 4, 5, 6]
     elif TEST_MODE:
-        figures_to_run = list(TEST_DEFAULT_FIGURES)
+        figures_to_run[:] = TEST_DEFAULT_FIGURES
 
     if not TEST_MODE:
         return
 
     index = SIMULATION_ARGUMENTS[args.simulation]
     data_locs = [data_locs[index]]
-    latlon_file = [latlon_file[index]]
-    zm_latlon_file = [zm_latlon_file[index]]
     sim_names = [sim_names[index]]
     cols = [cols[index]]
 
@@ -342,217 +485,16 @@ def save_table(df, stem):
 
 def write_classification_method_table():
     rows = [
-        dict(
-            component="cloudy model level",
-            implementation=f"cldfrac >= {CF_THRESH:g}",
-            threshold_origin="analysis convention; not percentile-derived",
-            calibration_population="none",
-            published_comparator=(
-                "ISCCP supplies cloud-top-pressure classes, not a model-level "
-                "cldfrac cutoff"
-            ),
-            reason_for_difference=(
-                "A finite cldfrac cutoff is needed to convert fractional MPAS cloud "
-                "into a diagnosed cloud top"
-            ),
-            sensitivity_values="cldfrac = 0.03, 0.05, 0.10",
-            reference="Rossow and Schiffer (1999), BAMS / ISCCP",
-            url="https://doi.org/10.1175/1520-0477(1999)080%3C2261:AIUCFI%3E2.0.CO;2",
-            caveat="The central value is not claimed as a published threshold.",
-        ),
-        dict(
-            component="high-cloud boundary",
-            implementation=f"cloud-top pressure <= {P_HIGH_HPA:g} hPa",
-            threshold_origin="published categorical boundary",
-            calibration_population="none",
-            published_comparator="ISCCP high-cloud boundary: cloud-top pressure <= 440 hPa",
-            reason_for_difference="none; the published pressure boundary is used directly",
-            sensitivity_values="not varied; retained as the fixed published boundary",
-            reference="Rossow and Schiffer (1999), BAMS / ISCCP",
-            url="https://doi.org/10.1175/1520-0477(1999)080%3C2261:AIUCFI%3E2.0.CO;2",
-            caveat="Pressure, rather than a fixed geometric height, defines high cloud.",
-        ),
-        dict(
-            component="precipitation occurrence",
-            implementation=f"rainc + rainnc >= {P_PRECIP_MIN:g} mm day-1",
-            threshold_origin="adapted literature convention; not percentile-derived",
-            calibration_population="none",
-            published_comparator=(
-                "Kooperman et al. compare 0.1 and 1.0 mm day-1 dry-day thresholds "
-                "for daily approximately 1-degree precipitation"
-            ),
-            reason_for_difference=(
-                "The larger published comparison threshold is used to suppress drizzle, "
-                "but applied here to a rate derived from precipitation-accumulation "
-                "increments between 6-hourly instantaneous snapshots"
-            ),
-            sensitivity_values="rainc + rainnc = 0.5, 1.0, 2.0 mm day-1",
-            reference="Kooperman et al. (2016), JAMES",
-            url="https://doi.org/10.1002/2015MS000574",
-            caveat="This is an adaptation, not a direct reproduction of their daily statistic.",
-        ),
-        dict(
-            component="convective rain-intensity indicator",
-            implementation=f"rainc + rainnc >= {P_HEAVY:g} mm day-1",
-            threshold_origin=(
-                "rounded percentile-informed threshold from the preliminary coarse-grid sample"
-            ),
-            calibration_population=(
-                "approximately the 68th percentile of sampled precipitating high-cloud "
-                "columns in the preliminary calibration sample"
-            ),
-            published_comparator=(
-                "Schumacher and Houze describe convective rain >5 mm h-1; "
-                "Shu et al. test a 20 mm h-1 surface-rain criterion"
-            ),
-            reason_for_difference=(
-                f"The implemented {P_HEAVY:g} mm day-1 is {P_HEAVY / 24.0:.3g} mm h-1; "
-                "0.5-degree spatial averaging and the use of precipitation-accumulation "
-                "increments between snapshots dilute instantaneous kilometre-scale rates. "
-                "cldfrac and w themselves are instantaneous snapshots"
-            ),
-            sensitivity_values=(
-                "tested jointly with w: (5 mm day-1, 0.05 m s-1), "
-                "(10, 0.10), (20, 0.20)"
-            ),
-            reference="Schumacher and Houze (2003); Shu et al. (2020)",
-            url="https://doi.org/10.1029/2019JD031510",
-            caveat=(
-                "The original exploratory sample was not persisted as a calibration "
-                "artifact. The approximate rank records the development-time diagnostic; "
-                "current runs write realised ranks and do not retune by simulation."
-            ),
-        ),
-        dict(
-            component="convective vertical-velocity indicator",
-            implementation=(
-                f"max(w) over levels with cldfrac >= {CF_THRESH:g} is >= "
-                f"{W_STRONG:g} m s-1"
-            ),
-            threshold_origin=(
-                "rounded percentile-informed threshold from the preliminary coarse-grid sample"
-            ),
-            calibration_population=(
-                "approximately the 90th percentile of sampled max(w) over cloudy levels "
-                "in the preliminary calibration sample"
-            ),
-            published_comparator=(
-                "Schumacher and Houze describe intermittent |w| >1 m s-1; Shu et al. "
-                "test 3 m s-1 column and 0.5 m s-1 low-level criteria"
-            ),
-            reason_for_difference=(
-                "Resolved w is strongly damped by 0.5-degree averaging and is diagnosed "
-                "over all model levels satisfying the cldfrac cutoff, not within a resolved core"
-            ),
-            sensitivity_values=(
-                "tested jointly with rain: (0.05 m s-1, 5 mm day-1), "
-                "(0.10, 10), (0.20, 20)"
-            ),
-            reference="Schumacher and Houze (2003); Shu et al. (2020)",
-            url="https://doi.org/10.1029/2019JD031510",
-            caveat=(
-                "The original exploratory sample was not persisted as a calibration "
-                "artifact. The approximate rank records the development-time diagnostic; "
-                "current runs write realised ranks and do not retune by simulation."
-            ),
-        ),
-        dict(
-            component="parameterized-rain indicator",
-            implementation=f"rainc / (rainc + rainnc) >= {CONVECTIVE_FRACTION:g}",
-            threshold_origin="equal-contribution convention; not percentile-derived",
-            calibration_population="none",
-            published_comparator=(
-                "Kysely et al. evaluate parameterized convective and grid-scale model "
-                "precipitation as process categories; they do not establish a universal "
-                "0.5 physical convective/stratiform boundary"
-            ),
-            reason_for_difference=(
-                "0.5 means rainc exceeds rainnc and is used only as one supporting indicator"
-            ),
-            sensitivity_values="rainc fraction = 0.33, 0.50, 0.67",
-            reference="Kysely et al. (2016), Climate Dynamics",
-            url="https://doi.org/10.1007/s00382-015-2580-7",
-            caveat=(
-                "rainc and rainnc identify parameterized and grid-scale model processes, "
-                "not physical convective and stratiform rain. Neither source can determine "
-                "the class by itself."
-            ),
-        ),
-        dict(
-            component="convective evidence rule",
-            implementation=(
-                f"convective when at least {CONVECTIVE_EVIDENCE_REQUIRED} of the 3 "
-                "rain-intensity, vertical-velocity, and parameterized-rain indicators pass"
-            ),
-            threshold_origin="analysis design; not a published algorithm",
-            calibration_population="none",
-            published_comparator=(
-                "Published radar/cloud-resolving methods combine intensity, texture, "
-                "reflectivity, and vertical-motion evidence at much finer resolution"
-            ),
-            reason_for_difference=(
-                "The 2-of-3 rule prevents any one coarse-grid indicator from defining convection"
-            ),
-            sensitivity_values="all three constituent thresholds are varied as listed above",
-            reference="Schumacher and Houze (2003); Shu et al. (2020)",
-            url="https://doi.org/10.1175/1520-0442(2003)016%3C1739:SRITTA%3E2.0.CO;2",
-            caveat="The rule is intentionally simple and exhaustive, but remains an analysis choice.",
-        ),
-        dict(
-            component="exhaustive class closure",
-            implementation=(
-                "non-precipitating if rain is below the occurrence threshold; "
-                "otherwise convective if the evidence rule passes and stratiform if it does not"
-            ),
-            threshold_origin="logical closure; no additional threshold",
-            calibration_population="none",
-            published_comparator="not applicable",
-            reason_for_difference="not applicable",
-            sensitivity_values="closure is checked for every tested threshold set",
-            reference="Schumacher and Houze (2003), Journal of Climate",
-            url="https://doi.org/10.1175/1520-0442(2003)016%3C1739:SRITTA%3E2.0.CO;2",
-            caveat="Unclassified is retained only for missing precipitation-component data.",
-        ),
-        dict(
-            component="object tracking",
-            implementation="PyFLEXTRKR 2-D connected features and bidirectional overlap linking",
-            threshold_origin="published tracking framework with resolution-dependent configuration",
-            calibration_population="not part of the cloud-class threshold calibration",
-            published_comparator="PyFLEXTRKR methodology",
-            reason_for_difference="tracking settings are documented by the organisation diagnostic",
-            sensitivity_values="not part of Figure 6 cloud-class sensitivity",
-            reference="Feng et al. (2023), Geoscientific Model Development",
-            url="https://doi.org/10.5194/gmd-16-2753-2023",
-            caveat="Segmentation and overlap thresholds remain resolution dependent and are exposed in snapshots and movies.",
-        ),
+        dict(component="parent high cloud", implementation=f"cldfrac >= {CF_THRESH:g}; cloud-top pressure <= {P_HIGH_HPA:g} hPa", origin="ISCCP pressure category plus stated model-cloud cutoff", reference="Rossow and Schiffer (1999), BAMS", doi="10.1175/1520-0477(1999)080<2261:AIUCFI>2.0.CO;2"),
+        dict(component="convective core", implementation="PyFLEXTRKR OLR-derived Tb < 225 K core pixels", origin="published 50-km configuration", reference="Feng et al. (2021), Journal of Climate", doi="10.1175/JCLI-D-20-0136.1"),
+        dict(component="PyFLEXTRKR scene regions", implementation="mutually exclusive display of Tb < 225 K cold core, 241-K cold-shield shell, and connected 261-K warm-shield shell; shields do not define high-cloud classes", origin="published core/cold thresholds plus a displayed warm-shield sensitivity", reference="Feng et al. (2021); PyFLEXTRKR", doi="10.1175/JCLI-D-20-0136.1"),
+        dict(component="precipitation feature", implementation=f"surface rain >= {P_PRECIP_MIN / 24.0:g} mm h-1 ({P_PRECIP_MIN:g} mm day-1)", origin="published PF definition", reference="Feng et al. (2021), Journal of Climate", doi="10.1175/JCLI-D-20-0136.1"),
+        dict(component="stratiform high cloud", implementation=f"all non-core high cloud with surface rain >= {P_PRECIP_MIN / 24.0:g} mm h-1", origin="baseline core/rain decomposition", reference="Feng et al. (2021) PF rain threshold", doi="10.1175/JCLI-D-20-0136.1"),
+        dict(component="non-precipitating high cloud", implementation=f"all remaining non-core high cloud with surface rain < {P_PRECIP_MIN / 24.0:g} mm h-1", origin="baseline core/rain decomposition", reference="this analysis", doi="not applicable"),
+        dict(component="vertical rain attribution", implementation="none in the baseline; surface rain is associated with the high-cloud column", origin="deliberately deferred sensitivity", reference="not applicable", doi="not applicable"),
+        dict(component="spatial class response", implementation="unfiltered time-mean occurrence difference for each high-cloud class; grey contours show the control occurrence", origin="class-aware analogue of published cloud-regime occurrence maps", reference="Jin et al. (2023), Nature Communications", doi="10.1038/s41467-023-39465-7"),
+        dict(component="rain-matched cloud structure", implementation="cloud-top pressure and OLR conditioned on the same surface-rain-rate bins; nudged-minus-control response from 10-day block ratios", origin="combines published cloud-depth/radiative property comparisons with precipitation matching", reference="Jin et al. (2023), Nature Communications; Sakaeda et al. (2020), JGR Atmospheres", doi="10.1038/s41467-023-39465-7; 10.1029/2020JD033196"),
     ]
-    sensitivity_components = {
-        "cloudy model level",
-        "precipitation occurrence",
-        "convective rain-intensity indicator",
-        "convective vertical-velocity indicator",
-        "parameterized-rain indicator",
-        "convective evidence rule",
-        "exhaustive class closure",
-    }
-    percentile_components = {
-        "precipitation occurrence",
-        "convective rain-intensity indicator",
-        "convective vertical-velocity indicator",
-        "parameterized-rain indicator",
-    }
-    for row in rows:
-        row["sensitivity_output"] = (
-            "06_cloud_classification_threshold_sensitivity.png and "
-            "cloud_classification_threshold_sensitivity.csv"
-            if row["component"] in sensitivity_components
-            else "not included in the cloud-threshold sensitivity figure"
-        )
-        row["realised_percentile_output"] = (
-            "cloud_classification_threshold_percentile_ranks.csv"
-            if row["component"] in percentile_components
-            else "not percentile-calibrated"
-        )
     save_table(pd.DataFrame(rows), "cloud_classification_method_and_references")
 
 
@@ -717,30 +659,13 @@ def classification_cache_encoding(ds):
 # General data and classification helpers
 # -----------------------------------------------------------------------------
 
-find_var = partial(find_variable, aliases=VAR_ALIASES)
 subset_lat = subset_latitude
-get_precip_rate = partial(
-    precipitation_rate_from_dataset,
-    aliases=VAR_ALIASES,
-    dt_hours=dt,
-)
-time_aligned_field = partial(
-    time_aligned_variable,
-    aliases=VAR_ALIASES,
-    intersect=False,
-)
+get_precip_rate = precipitation_rate_from_dataset
 
 
-time_step_days = partial(
-    time_step_days,
-    dt_hours=dt,
-    numeric_step_values=False,
-)
 block_slices = partial(
     time_block_slices,
     block_days=BOOTSTRAP_BLOCK_DAYS,
-    dt_hours=dt,
-    numeric_step_values=False,
 )
 
 
@@ -788,42 +713,247 @@ def bootstrap_difference_1d(a, b, rng, n_boot=N_BOOTSTRAP):
     )
 
 
+def bootstrap_ratio_1d(numerator, denominator, rng, n_boot=N_BOOTSTRAP):
+    """Paired block bootstrap for a share with a common time denominator."""
+    numerator = np.asarray(numerator, dtype=float)
+    denominator = np.asarray(denominator, dtype=float)
+    n = min(numerator.size, denominator.size)
+    numerator = numerator[:n]
+    denominator = denominator[:n]
+    finite = np.isfinite(numerator) & np.isfinite(denominator)
+    numerator = numerator[finite]
+    denominator = denominator[finite]
+    if numerator.size == 0 or np.nanmean(denominator) <= 0.0:
+        return dict(mean=np.nan, ci_low=np.nan, ci_high=np.nan, n_blocks=0)
+    boot = np.empty(n_boot, dtype=float)
+    for i in range(n_boot):
+        index = rng.integers(0, numerator.size, numerator.size)
+        sampled_denominator = np.nanmean(denominator[index])
+        boot[i] = (
+            np.nanmean(numerator[index]) / sampled_denominator
+            if sampled_denominator > 0.0 else np.nan
+        )
+    ci_low, ci_high = np.nanpercentile(boot, CI_PERCENTILES)
+    return dict(
+        mean=float(np.nanmean(numerator) / np.nanmean(denominator)),
+        ci_low=float(ci_low),
+        ci_high=float(ci_high),
+        n_blocks=int(numerator.size),
+    )
+
+
 def get_cloud_fraction(ds):
-    name = find_var(ds, "cldfrac", required=False)
-    if name is None:
-        warnings.warn("No cloud-fraction variable found; high-cloud diagnostics will be skipped.")
-        return None
-    cf = finite_or_nan(ds[name])
-    zdim = vertical_dim(cf)
-    if zdim != "z":
-        cf = cf.rename({zdim: "z"})
-    if "z" not in cf.coords:
-        warnings.warn("Cloud fraction has no usable z coordinate; high-cloud diagnostics will be skipped.")
-        return None
-    zvals = np.asarray(cf.z.values, dtype=float)
-    if zvals.size != cf.sizes["z"] or not np.all(np.isfinite(zvals)):
-        warnings.warn("Cloud fraction z coordinate is not usable; high-cloud diagnostics will be skipped.")
-        return None
-    if np.nanmax(zvals) < 100.0:
-        cf = cf.assign_coords(z=cf.z * 1000.0)
-    return cf
+    return ds.cldfrac
+
+
+def diagnosed_cloud_top_temperature(ds, classif):
+    """Interpolate model isobaric temperature to diagnosed cloud-top pressure."""
+    if "t_isobaric" not in ds:
+        raise KeyError("t_isobaric is required for cloud-top temperature")
+    temperature = ds["t_isobaric"]
+    if "pres" not in temperature.dims:
+        raise ValueError(
+            "t_isobaric must have a 'pres' dimension after lat-lon standardisation"
+        )
+    temperature, cloud_top_pressure = xr.align(
+        temperature,
+        classif["cloud_top_pressure"],
+        join="inner",
+    )
+    # xarray requires a monotonic interpolation coordinate.  The source files
+    # currently store pressure from the top downward, but sorting makes this
+    # robust to either ordering.
+    temperature = temperature.sortby("pres")
+    out = temperature.interp(pres=cloud_top_pressure)
+    out.name = "diagnosed_cloud_top_temperature"
+    out.attrs.update(
+        units="K",
+        long_name="model isobaric temperature at diagnosed cloud-top pressure",
+        method=(
+            "linear interpolation of t_isobaric to the pressure of the highest "
+            f"model layer with cloud fraction at or above {CF_THRESH:g}"
+        ),
+    )
+    return out
+
+
+def full_class_structure_statistics(
+    ds,
+    fields,
+    classif,
+    sim_name,
+    ctp_bins=None,
+    time_batch=CLOUD_STRUCTURE_TIME_BATCH,
+):
+    """Accumulate exact tropical class statistics in memory-bounded time blocks."""
+    class_keys = [key for key, _label, _color in REGIME_SPECS]
+    aligned = xr.align(
+        subset_lat(classif["cloud_top_pressure"], TROPICAL_LAT_BOUNDS),
+        subset_lat(fields["olr"], TROPICAL_LAT_BOUNDS),
+        subset_lat(classif["brightness_temperature"], TROPICAL_LAT_BOUNDS),
+        *[
+            subset_lat(classif[key].astype(bool), TROPICAL_LAT_BOUNDS)
+            for key in class_keys
+        ],
+        join="inner",
+    )
+    cloud_top_pressure, olr, brightness_temperature = aligned[:3]
+    class_masks = dict(zip(class_keys, aligned[3:]))
+    tropical_ds = subset_lat(ds, TROPICAL_LAT_BOUNDS).sel(
+        latitude=cloud_top_pressure.latitude,
+        longitude=cloud_top_pressure.longitude,
+    )
+
+    field_names = (
+        "cloud_top_pressure",
+        "olr",
+        "brightness_temperature",
+        "cloud_top_temperature",
+    )
+    accumulators = {
+        key: {
+            "class_weight": 0.0,
+            "ttl_weight": 0.0,
+            **{f"{name}_sum": 0.0 for name in field_names},
+            **{f"{name}_weight": 0.0 for name in field_names},
+            "ctp_histogram": (
+                np.zeros(len(ctp_bins) - 1, dtype=float)
+                if ctp_bins is not None else None
+            ),
+        }
+        for key in class_keys
+    }
+    latitude_weights = np.cos(
+        np.deg2rad(np.asarray(cloud_top_pressure.latitude.values, dtype=float))
+    )[None, :, None]
+    domain_weight = (
+        cloud_top_pressure.sizes["Time"]
+        * cloud_top_pressure.sizes["longitude"]
+        * float(np.sum(latitude_weights))
+    )
+    ntime = cloud_top_pressure.sizes["Time"]
+    time_slices = [
+        slice(start, min(start + time_batch, ntime))
+        for start in range(0, ntime, time_batch)
+    ]
+    started = time.monotonic()
+    progress(
+        f"{sim_name}: computing full-period cloud structure in "
+        f"{len(time_slices)} blocks of at most {time_batch} times"
+    )
+
+    for iblock, time_slice in enumerate(time_slices, start=1):
+        block_reference = cloud_top_pressure.isel(Time=time_slice)
+        block_ds = tropical_ds.sel(Time=block_reference.Time)
+        cloud_top_temperature = diagnosed_cloud_top_temperature(
+            block_ds,
+            {"cloud_top_pressure": block_reference},
+        ).load()
+        block = xr.Dataset(
+            {
+                "cloud_top_pressure": block_reference,
+                "olr": olr.isel(Time=time_slice),
+                "brightness_temperature": brightness_temperature.isel(Time=time_slice),
+                **{
+                    key: class_masks[key].isel(Time=time_slice)
+                    for key in class_keys
+                },
+            }
+        ).load()
+        block_values = {
+            "cloud_top_pressure": np.asarray(
+                block["cloud_top_pressure"].values, dtype=float
+            ),
+            "olr": np.asarray(block["olr"].values, dtype=float),
+            "brightness_temperature": np.asarray(
+                block["brightness_temperature"].values, dtype=float
+            ),
+            "cloud_top_temperature": np.asarray(
+                cloud_top_temperature.values, dtype=float
+            ),
+        }
+        sample_weights = np.broadcast_to(
+            latitude_weights, block_values["cloud_top_pressure"].shape
+        )
+
+        for key in class_keys:
+            mask_values = np.asarray(block[key].values, dtype=bool)
+            accumulator = accumulators[key]
+            accumulator["class_weight"] += float(
+                np.sum(sample_weights[mask_values])
+            )
+            ttl = (
+                mask_values
+                & np.isfinite(block_values["cloud_top_pressure"])
+                & (block_values["cloud_top_pressure"] <= 180.0)
+            )
+            accumulator["ttl_weight"] += float(np.sum(sample_weights[ttl]))
+            for field_name, values in block_values.items():
+                valid = mask_values & np.isfinite(values)
+                weights = sample_weights[valid]
+                accumulator[f"{field_name}_sum"] += float(
+                    np.sum(values[valid] * weights)
+                )
+                accumulator[f"{field_name}_weight"] += float(np.sum(weights))
+            if ctp_bins is not None:
+                valid = mask_values & np.isfinite(
+                    block_values["cloud_top_pressure"]
+                )
+                histogram, _ = np.histogram(
+                    block_values["cloud_top_pressure"][valid],
+                    bins=ctp_bins,
+                    weights=sample_weights[valid],
+                )
+                accumulator["ctp_histogram"] += histogram
+
+        del block, block_values, cloud_top_temperature
+        elapsed = time.monotonic() - started
+        eta = elapsed / iblock * (len(time_slices) - iblock)
+        progress(
+            f"{sim_name}: cloud structure block {iblock}/{len(time_slices)} "
+            f"({100.0 * iblock / len(time_slices):.0f}%); "
+            f"elapsed {format_duration(elapsed)}, ETA {format_duration(eta)}"
+        )
+        if iblock % 10 == 0:
+            gc.collect()
+
+    statistics = {}
+    for key, accumulator in accumulators.items():
+        class_weight = accumulator["class_weight"]
+        result = {
+            "occurrence_fraction": (
+                class_weight / domain_weight if domain_weight > 0.0 else np.nan
+            ),
+            "ttl_fraction": (
+                accumulator["ttl_weight"] / class_weight
+                if class_weight > 0.0 else np.nan
+            ),
+        }
+        for field_name in field_names:
+            weight = accumulator[f"{field_name}_weight"]
+            result[f"mean_{field_name}"] = (
+                accumulator[f"{field_name}_sum"] / weight
+                if weight > 0.0 else np.nan
+            )
+        histogram = accumulator["ctp_histogram"]
+        if histogram is not None:
+            result["ctp_histogram"] = (
+                histogram / histogram.sum()
+                if histogram.sum() > 0.0 else histogram
+            )
+        statistics[key] = result
+    progress(f"{sim_name}: full-period cloud-structure statistics ready")
+    return statistics
 
 
 def classification_thresholds(
     cf_thresh=CF_THRESH,
     precip_min=P_PRECIP_MIN,
-    heavy_precip=P_HEAVY,
-    strong_updraft=W_STRONG,
-    convective_fraction=CONVECTIVE_FRACTION,
 ):
     return HighCloudThresholds(
         cf_thresh=float(cf_thresh),
         high_cloud_top_pressure_hpa=P_HIGH_HPA,
         surface_precip_min_mm_day=float(precip_min),
-        heavy_precip_mm_day=float(heavy_precip),
-        strong_updraft_m_s=float(strong_updraft),
-        convective_fraction_threshold=float(convective_fraction),
-        convective_evidence_required=int(CONVECTIVE_EVIDENCE_REQUIRED),
     )
 
 
@@ -833,28 +963,16 @@ def classify_high_cloud(
     fields,
     cf_thresh=CF_THRESH,
     precip_min=P_PRECIP_MIN,
-    heavy_precip=P_HEAVY,
-    strong_updraft=W_STRONG,
-    convective_fraction=CONVECTIVE_FRACTION,
-    include_process_diagnostics=False,
 ):
     """Shared 0.5-degree high-cloud precipitation-regime decomposition."""
     return classify_high_cloud_from_dataset(
         ds,
         precip=fields["precip"],
         cldfrac=cldfrac,
-        convective_precip=fields["convective_precip"],
-        grid_scale_precip=fields["grid_scale_precip"],
         thresholds=classification_thresholds(
             cf_thresh,
             precip_min=precip_min,
-            heavy_precip=heavy_precip,
-            strong_updraft=strong_updraft,
-            convective_fraction=convective_fraction,
         ),
-        warn_missing=False,
-        dt_hours=dt,
-        include_process_diagnostics=include_process_diagnostics,
     )
 
 
@@ -870,7 +988,7 @@ cached_classification_is_current = partial(
 )
 
 
-def open_cached_classification(cache_path, sim_name):
+def open_cached_classification(cache_path, sim_name, expected_time=None):
     cached = xr.open_dataset(cache_path, chunks={})
     if not cached_classification_is_current(cached):
         progress(f"{sim_name}: cached high-cloud classification is stale: {cache_path}")
@@ -884,8 +1002,31 @@ def open_cached_classification(cache_path, sim_name):
         )
         cached.close()
         return None
+    if expected_time is not None:
+        cached_time = np.asarray(cached.Time.values) if "Time" in cached.coords else None
+        expected_time = np.asarray(expected_time)
+        if (
+            cached_time is None
+            or cached_time.shape != expected_time.shape
+            or not np.array_equal(cached_time, expected_time)
+        ):
+            cached_count = 0 if cached_time is None else cached_time.size
+            progress(
+                f"{sim_name}: classification cache has the wrong Time axis "
+                f"({cached_count} cached, {expected_time.size} expected): {cache_path}"
+            )
+            cached.close()
+            return None
+    variables = {name: cached[name] for name in cached.data_vars}
+    corrected_warm, reconstructed = corrected_cached_warm_shield_masks(cached)
+    variables.update(corrected_warm)
+    if reconstructed:
+        progress(
+            f"{sim_name}: reconstructing corrected warm-shield validation "
+            "masks lazily; retaining the expensive classification cache"
+        )
     progress(f"{sim_name}: using cached high-cloud classification {cache_path}")
-    return {name: cached[name] for name in cached.data_vars}
+    return variables
 
 
 def classification_product_path(sim_name):
@@ -893,56 +1034,45 @@ def classification_product_path(sim_name):
     return os.path.join(classification_cache_dir, filename)
 
 
-def invalidate_classification_products():
-    """Ensure an interrupted rebuild cannot expose an older final product."""
-    for sim_name in sim_names:
-        path = classification_product_path(sim_name)
-        for candidate in (path, path + ".tmp"):
-            if os.path.exists(candidate):
-                progress(f"{sim_name}: removing previous classification product {candidate}")
-                os.remove(candidate)
-
-
 def get_or_build_classification(ds, fields, sim_name):
     cache_path = classification_product_path(sim_name)
+    precip = fields["precip"]
 
-    if not WRITE_CLASSIFICATION_PRODUCT:
-        if not os.path.exists(cache_path):
+    if os.path.exists(cache_path):
+        cached = open_cached_classification(
+            cache_path,
+            sim_name,
+            expected_time=precip.Time.values,
+        )
+        if cached is not None:
+            return cached
+        if not WRITE_CLASSIFICATION_PRODUCT:
+            raise RuntimeError(
+                f"{sim_name}: --no-write-classification requires a current, "
+                f"complete classification product: {cache_path}. Run without "
+                "--no-write-classification to rebuild it."
+            )
+        progress(
+            f"{sim_name}: rebuilding stale or incomplete high-cloud "
+            f"classification {cache_path}"
+        )
+    else:
+        if not WRITE_CLASSIFICATION_PRODUCT:
             raise RuntimeError(
                 f"{sim_name}: --no-write-classification requires an existing "
                 f"classification product: {cache_path}. Run without "
                 "--no-write-classification to create it."
             )
-        cached = open_cached_classification(cache_path, sim_name)
-        if cached is None:
-            raise RuntimeError(
-                f"{sim_name}: --no-write-classification requires a current, complete "
-                f"classification product: {cache_path}. Run without "
-                "--no-write-classification to rebuild it."
-            )
-        return cached
+        progress(
+            f"{sim_name}: no high-cloud classification cache found; "
+            f"building {cache_path}"
+        )
 
     progress(f"{sim_name}: preparing high-cloud classification")
-    cf = get_cloud_fraction(ds)
-    if cf is None:
-        progress(f"{sim_name}: no usable cloud fraction; skipping high-cloud classification")
-        return None
-
-    precip = fields["precip"]
-    if "Time" in cf.dims and "Time" in precip.dims:
-        common_time = cf.Time.to_index().intersection(precip.Time.to_index())
-        if len(common_time) == 0:
-            warnings.warn(f"{sim_name}: cloud fraction and precipitation have no overlapping times.")
-            return None
-        cf = cf.sel(Time=common_time)
-        precip = precip.sel(Time=common_time)
+    cf = get_cloud_fraction(ds).sel(Time=precip.Time)
 
     progress(f"{sim_name}: building high-cloud classification graph")
-    class_fields = dict(fields)
-    class_fields["precip"] = precip
-    class_fields["convective_precip"] = fields["convective_precip"].sel(Time=precip.Time)
-    class_fields["grid_scale_precip"] = fields["grid_scale_precip"].sel(Time=precip.Time)
-    classif = classify_high_cloud(ds, cf, class_fields)
+    classif = classify_high_cloud(ds, cf, {"precip": precip})
     progress(f"{sim_name}: high-cloud classification graph built")
 
     if WRITE_CLASSIFICATION_PRODUCT:
@@ -955,13 +1085,14 @@ def get_or_build_classification(ds, fields, sim_name):
             label=f"{sim_name}: high-cloud classification product",
             encoding=encoding,
         )
-        cached = open_cached_classification(cache_path, sim_name)
+        cached = open_cached_classification(
+            cache_path,
+            sim_name,
+            expected_time=precip.Time.values,
+        )
         if cached is not None:
             return cached
     return classif
-
-
-compute_ttl_diagnostics = partial(compute_ttl_diagnostics, aliases=VAR_ALIASES)
 
 
 def class_overlap_sanity(classifications):
@@ -972,7 +1103,6 @@ def class_overlap_sanity(classifications):
         "nonprecipitating_high_cloud_mask",
         "unclassified_high_cloud_mask",
     ]
-    overlay_keys = ["precipitating_high_cloud_mask"]
     for sim_name, classif in classifications.items():
         if classif is None:
             continue
@@ -987,7 +1117,7 @@ def class_overlap_sanity(classifications):
                 note="All class fractions in budget use this domain denominator unless marked within_high_cloud.",
             )
         )
-        for key in exclusive_keys + overlay_keys:
+        for key in exclusive_keys:
             mask = classif[key].astype(bool)
             rows.append(
                 dict(
@@ -1021,22 +1151,6 @@ def class_overlap_sanity(classifications):
                         value=overlap,
                         denominator="all tropical grid-cell/time samples",
                         note="science classes and unclassified mask should be mutually exclusive",
-                    )
-                )
-
-        for key_a in overlay_keys:
-            for key_b in exclusive_keys:
-                overlap = weighted_area_time_mean(
-                    classif[key_a].astype(bool) & classif[key_b].astype(bool),
-                    TROPICAL_LAT_BOUNDS,
-                )
-                rows.append(
-                    dict(
-                        simulation=sim_name,
-                        metric=f"overlap_{key_a}__{key_b}",
-                        value=overlap,
-                        denominator="all tropical grid-cell/time samples",
-                        note="precipitating high cloud is the union of convective and stratiform regimes",
                     )
                 )
 
@@ -1086,7 +1200,7 @@ def class_overlap_sanity(classifications):
 # -----------------------------------------------------------------------------
 # WHAT TO LOOK FOR:
 #   * The robust signal should appear as more total high cloud in the nudged
-#     runs, with the difference carried mainly by convective precipitating,
+#     runs, with the difference carried mainly by PyFLEXTRKR cores,
 #     stratiform precipitating, or non-precipitating high cloud.
 #   * Invalid/unclassified high cloud should be near zero; a substantial value
 #     indicates missing precipitation-component data rather than a fourth regime.
@@ -1094,11 +1208,12 @@ def class_overlap_sanity(classifications):
 #     formal observational confidence intervals.
 
 
-def compute_budget_table(classifications):
+def compute_budget_table(classifications, fields_by_run):
     rng = np.random.default_rng(BOOTSTRAP_SEED)
     rows = []
     block_values = {}
     control_name = sim_names[0]
+    fields_by_name = dict(zip(sim_names, fields_by_run))
 
     for sim_name in sim_names:
         classif = classifications.get(sim_name)
@@ -1120,6 +1235,192 @@ def compute_budget_table(classifications):
                     ci_high=stats["ci_high"],
                     n_blocks=stats["n_blocks"],
                     denominator="all tropical grid-cell/time samples",
+                )
+            )
+
+        high_key = "high_cloud_mask"
+        high_fraction = weighted_area_time_mean(
+            classif[high_key], TROPICAL_LAT_BOUNDS
+        )
+        for key, label, _color in REGIME_SPECS:
+            stats = bootstrap_ratio_1d(
+                block_values[(sim_name, key)],
+                block_values[(sim_name, high_key)],
+                rng,
+            )
+            class_fraction = weighted_area_time_mean(
+                classif[key], TROPICAL_LAT_BOUNDS
+            )
+            rows.append(
+                dict(
+                    simulation=sim_name,
+                    class_key=key,
+                    class_label=label,
+                    statistic="share_of_high_cloud",
+                    value=(
+                        class_fraction / high_fraction
+                        if high_fraction > 0.0 else np.nan
+                    ),
+                    block_mean=stats["mean"],
+                    ci_low=stats["ci_low"],
+                    ci_high=stats["ci_high"],
+                    n_blocks=stats["n_blocks"],
+                    denominator="total tropical high-cloud area-time occurrence",
+                )
+            )
+
+        stratiform_mask = classif[
+            "stratiform_precipitating_high_cloud_mask"
+        ].astype(bool)
+        nonprecip_mask = classif["nonprecipitating_high_cloud_mask"].astype(bool)
+        noncore_mask = stratiform_mask | nonprecip_mask
+        noncore_blocks = block_area_fraction_values(noncore_mask)
+        noncore_stats = bootstrap_ratio_1d(
+            noncore_blocks,
+            block_values[(sim_name, high_key)],
+            rng,
+        )
+        noncore_fraction = weighted_area_time_mean(
+            noncore_mask, TROPICAL_LAT_BOUNDS
+        )
+        rows.append(
+            dict(
+                simulation=sim_name,
+                class_key="noncore_high_cloud_aggregate",
+                class_label="Non-core aggregate",
+                statistic="share_of_high_cloud",
+                value=(
+                    noncore_fraction / high_fraction
+                    if high_fraction > 0.0 else np.nan
+                ),
+                block_mean=noncore_stats["mean"],
+                ci_low=noncore_stats["ci_low"],
+                ci_high=noncore_stats["ci_high"],
+                n_blocks=noncore_stats["n_blocks"],
+                denominator="total tropical high-cloud area-time occurrence",
+            )
+        )
+        nonprecip_of_noncore_stats = bootstrap_ratio_1d(
+            block_values[(sim_name, "nonprecipitating_high_cloud_mask")],
+            noncore_blocks,
+            rng,
+        )
+        nonprecip_fraction = weighted_area_time_mean(
+            nonprecip_mask, TROPICAL_LAT_BOUNDS
+        )
+        rows.append(
+            dict(
+                simulation=sim_name,
+                class_key="nonprecipitating_high_cloud_mask",
+                class_label="Non-precipitating",
+                statistic="share_of_noncore_high_cloud",
+                value=(
+                    nonprecip_fraction / noncore_fraction
+                    if noncore_fraction > 0.0 else np.nan
+                ),
+                block_mean=nonprecip_of_noncore_stats["mean"],
+                ci_low=nonprecip_of_noncore_stats["ci_low"],
+                ci_high=nonprecip_of_noncore_stats["ci_high"],
+                n_blocks=nonprecip_of_noncore_stats["n_blocks"],
+                denominator="stratiform plus non-precipitating tropical high-cloud area-time occurrence",
+            )
+        )
+
+        shield_key = "pyflextrkr_core_bearing_warm_shield_mask"
+        if shield_key in classif:
+            nonprecip_aligned, shield = xr.align(
+                nonprecip_mask,
+                classif[shield_key].fillna(False).astype(bool),
+                join="inner",
+            )
+            nonprecip_shield_masks = {
+                "nonprecip_within_core_bearing_warm_shield": (
+                    nonprecip_aligned & shield
+                ),
+                "nonprecip_outside_core_bearing_warm_shield": (
+                    nonprecip_aligned & ~shield
+                ),
+            }
+            nonprecip_blocks = block_area_fraction_values(nonprecip_aligned)
+            nonprecip_aligned_fraction = weighted_area_time_mean(
+                nonprecip_aligned, TROPICAL_LAT_BOUNDS
+            )
+            for key, label, _color in NONPRECIP_SHIELD_SPECS:
+                mask = nonprecip_shield_masks[key]
+                mask_fraction = weighted_area_time_mean(
+                    mask, TROPICAL_LAT_BOUNDS
+                )
+                stats = bootstrap_ratio_1d(
+                    block_area_fraction_values(mask),
+                    nonprecip_blocks,
+                    rng,
+                )
+                rows.append(
+                    dict(
+                        simulation=sim_name,
+                        class_key=key,
+                        class_label=label,
+                        statistic="share_of_nonprecipitating_high_cloud",
+                        value=(
+                            mask_fraction / nonprecip_aligned_fraction
+                            if nonprecip_aligned_fraction > 0.0 else np.nan
+                        ),
+                        block_mean=stats["mean"],
+                        ci_low=stats["ci_low"],
+                        ci_high=stats["ci_high"],
+                        n_blocks=stats["n_blocks"],
+                        denominator="tropical non-precipitating high-cloud area-time occurrence",
+                    )
+                )
+
+        precip = fields_by_name[sim_name]["precip"]
+        core, stratiform, precip = xr.align(
+            classif["convective_precipitating_high_cloud_mask"].astype(bool),
+            classif["stratiform_precipitating_high_cloud_mask"].astype(bool),
+            precip,
+            join="inner",
+        )
+        rainy_core = (
+            core & precip.notnull() & (precip >= P_PRECIP_MIN)
+        ).fillna(False)
+        rainy_core.name = "rainy_pyflextrkr_core_mask"
+        precipitating_high_cloud = rainy_core | stratiform
+        precipitating_fraction = weighted_area_time_mean(
+            precipitating_high_cloud, TROPICAL_LAT_BOUNDS
+        )
+        precipitating_blocks = block_area_fraction_values(
+            precipitating_high_cloud
+        )
+        precipitating_masks = {
+            "rainy_pyflextrkr_core_mask": rainy_core,
+            "stratiform_precipitating_high_cloud_mask": stratiform,
+        }
+        for key, label, _color in PRECIPITATING_COMPOSITION_SPECS:
+            mask = precipitating_masks[key]
+            mask_fraction = weighted_area_time_mean(mask, TROPICAL_LAT_BOUNDS)
+            stats = bootstrap_ratio_1d(
+                block_area_fraction_values(mask),
+                precipitating_blocks,
+                rng,
+            )
+            rows.append(
+                dict(
+                    simulation=sim_name,
+                    class_key=key,
+                    class_label=label,
+                    statistic="share_of_precipitating_high_cloud",
+                    value=(
+                        mask_fraction / precipitating_fraction
+                        if precipitating_fraction > 0.0 else np.nan
+                    ),
+                    block_mean=stats["mean"],
+                    ci_low=stats["ci_low"],
+                    ci_high=stats["ci_high"],
+                    n_blocks=stats["n_blocks"],
+                    denominator=(
+                        "tropical high-cloud area-time with surface rain >= "
+                        f"{P_PRECIP_MIN / 24.0:g} mm h-1"
+                    ),
                 )
             )
 
@@ -1145,6 +1446,10 @@ def compute_budget_table(classifications):
 
     df = pd.DataFrame(rows)
     save_table(df, "high_cloud_class_budget")
+    save_table(
+        pd.DataFrame(LITERATURE_CLOUD_PERCENTAGES),
+        "high_cloud_literature_validation_values",
+    )
     return df
 
 
@@ -1154,7 +1459,7 @@ def draw_errorbarh(ax, y, value, lo, hi, color):
     ax.errorbar(
         value,
         y,
-        xerr=np.array([[value - lo], [hi - value]]),
+        xerr=np.array([[max(value - lo, 0.0)], [max(hi - value, 0.0)]]),
         color=color,
         fmt="none",
         lw=1.1,
@@ -1163,375 +1468,353 @@ def draw_errorbarh(ax, y, value, lo, hi, color):
     )
 
 
-def plot_class_budget(classifications):
+def label_percentage(ax, x, y, suffix=""):
+    if not np.isfinite(x):
+        return
+    ax.annotate(
+        f"{x:.1f}{suffix}",
+        xy=(x, y),
+        xytext=(4, 0),
+        textcoords="offset points",
+        ha="left",
+        va="center",
+        fontsize=6.5,
+        color="0.12",
+        clip_on=False,
+        zorder=6,
+    )
+
+
+def plot_class_budget(classifications, fields_by_run):
     if not should_run_figure(1):
         return
     progress("Starting Figure 1: high_cloud_class_budget")
-    budget = compute_budget_table(classifications)
+    budget = compute_budget_table(classifications, fields_by_run)
     if len(budget) == 0:
         print("Skipping Figure 1: high-cloud classifications are unavailable.")
         return
 
-    labels = [label for _key, label, _color in BUDGET_SPECS]
-    keys = [key for key, _label, _color in BUDGET_SPECS]
-    y = np.arange(len(keys))
+    occurrence_labels = [label for _key, label, _color in BUDGET_SPECS]
+    occurrence_keys = [key for key, _label, _color in BUDGET_SPECS]
+    composition_labels = [label for _key, label, _color in REGIME_SPECS]
+    composition_keys = [key for key, _label, _color in REGIME_SPECS]
+    precip_labels = [
+        label for _key, label, _color in PRECIPITATING_COMPOSITION_SPECS
+    ]
+    precip_keys = [
+        key for key, _label, _color in PRECIPITATING_COMPOSITION_SPECS
+    ]
+    cirrus_comparison_labels = [
+        label for _key, label, _color in CIRRUS_COMPARISON_SPECS
+    ]
+    cirrus_comparison_keys = [
+        key for key, _label, _color in CIRRUS_COMPARISON_SPECS
+    ]
+    shield_association_labels = [
+        label for _key, label, _color in NONPRECIP_SHIELD_SPECS
+    ]
+    shield_association_keys = [
+        key for key, _label, _color in NONPRECIP_SHIELD_SPECS
+    ]
+    occurrence_y = np.arange(len(occurrence_keys))
+    composition_y = np.arange(len(composition_keys))
+    precip_y = np.arange(len(precip_keys))
+    cirrus_comparison_y = np.arange(len(cirrus_comparison_keys))
+    shield_association_y = np.arange(len(shield_association_keys))
     height = 0.22
 
     has_differences = len(sim_names) > 1
-    ncols = 2 if has_differences else 1
-    fig, ax = plt.subplots(
-        1,
-        ncols,
-        figsize=(11.4 if has_differences else 6.2, 5.3),
+    fig, axes = plt.subplots(
+        2,
+        3,
+        figsize=(19.0, 9.0),
         constrained_layout=True,
-        sharey=True,
         squeeze=False,
     )
-    ax = ax[0]
+    (
+        occurrence_ax,
+        composition_ax,
+        precip_ax,
+        difference_ax,
+        cirrus_comparison_ax,
+        shield_association_ax,
+    ) = axes.ravel()
     abs_df = budget[budget.statistic == "absolute_fraction"].set_index(["simulation", "class_key"])
+    composition_df = budget[budget.statistic == "share_of_high_cloud"].set_index(["simulation", "class_key"])
+    precip_composition_df = budget[
+        budget.statistic == "share_of_precipitating_high_cloud"
+    ].set_index(["simulation", "class_key"])
+    shield_association_df = budget[
+        budget.statistic == "share_of_nonprecipitating_high_cloud"
+    ].set_index(["simulation", "class_key"])
     diff_df = budget[budget.statistic == "difference_from_control"].set_index(["simulation", "class_key"])
 
     for i, sim_name in enumerate(sim_names):
-        yy = y + (i - (len(sim_names) - 1) / 2.0) * height
-        vals = [
+        occurrence_yy = occurrence_y + (i - (len(sim_names) - 1) / 2.0) * height
+        occurrence_values = [
             100.0 * abs_df.loc[(sim_name, key), "value"] if (sim_name, key) in abs_df.index else np.nan
-            for key in keys
+            for key in occurrence_keys
         ]
-        ax[0].barh(yy, vals, height=height, color=cols[i], alpha=0.82, label=sim_name)
-        for j, key in enumerate(keys):
+        occurrence_ax.barh(
+            occurrence_yy, occurrence_values, height=height,
+            color=cols[i], alpha=0.82, label=sim_name,
+        )
+        for j, key in enumerate(occurrence_keys):
             if (sim_name, key) in abs_df.index:
                 row = abs_df.loc[(sim_name, key)]
                 draw_errorbarh(
-                    ax[0], yy[j], 100.0 * row["value"],
+                    occurrence_ax, occurrence_yy[j], 100.0 * row["value"],
                     100.0 * row["ci_low"], 100.0 * row["ci_high"], color="0.15"
+                )
+                label_percentage(
+                    occurrence_ax, 100.0 * row["value"], occurrence_yy[j]
+                )
+
+        composition_yy = composition_y + (i - (len(sim_names) - 1) / 2.0) * height
+        composition_values = [
+            100.0 * composition_df.loc[(sim_name, key), "value"]
+            if (sim_name, key) in composition_df.index else np.nan
+            for key in composition_keys
+        ]
+        composition_ax.barh(
+            composition_yy, composition_values, height=height,
+            color=cols[i], alpha=0.82, label=sim_name,
+        )
+        for j, key in enumerate(composition_keys):
+            if (sim_name, key) in composition_df.index:
+                row = composition_df.loc[(sim_name, key)]
+                draw_errorbarh(
+                    composition_ax, composition_yy[j], 100.0 * row["value"],
+                    100.0 * row["ci_low"], 100.0 * row["ci_high"], color="0.15"
+                )
+                label_percentage(
+                    composition_ax, 100.0 * row["value"], composition_yy[j]
+                )
+
+        precip_yy = precip_y + (i - (len(sim_names) - 1) / 2.0) * height
+        precip_values = [
+            100.0 * precip_composition_df.loc[(sim_name, key), "value"]
+            if (sim_name, key) in precip_composition_df.index else np.nan
+            for key in precip_keys
+        ]
+        precip_ax.barh(
+            precip_yy, precip_values, height=height,
+            color=cols[i], alpha=0.82, label=sim_name,
+        )
+        for j, key in enumerate(precip_keys):
+            if (sim_name, key) in precip_composition_df.index:
+                row = precip_composition_df.loc[(sim_name, key)]
+                draw_errorbarh(
+                    precip_ax, precip_yy[j], 100.0 * row["value"],
+                    100.0 * row["ci_low"], 100.0 * row["ci_high"], color="0.15"
+                )
+                label_percentage(
+                    precip_ax, 100.0 * row["value"], precip_yy[j]
+                )
+
+        cirrus_yy = (
+            cirrus_comparison_y
+            + (i - (len(sim_names) - 1) / 2.0) * height
+        )
+        cirrus_values = [
+            100.0 * composition_df.loc[(sim_name, key), "value"]
+            if (sim_name, key) in composition_df.index else np.nan
+            for key in cirrus_comparison_keys
+        ]
+        cirrus_comparison_ax.barh(
+            cirrus_yy, cirrus_values, height=height,
+            color=cols[i], alpha=0.82, label=sim_name,
+        )
+        for j, key in enumerate(cirrus_comparison_keys):
+            if (sim_name, key) in composition_df.index:
+                row = composition_df.loc[(sim_name, key)]
+                draw_errorbarh(
+                    cirrus_comparison_ax, cirrus_yy[j], 100.0 * row["value"],
+                    100.0 * row["ci_low"], 100.0 * row["ci_high"], color="0.15"
+                )
+                label_percentage(
+                    cirrus_comparison_ax, 100.0 * row["value"], cirrus_yy[j]
+                )
+
+        shield_yy = (
+            shield_association_y
+            + (i - (len(sim_names) - 1) / 2.0) * height
+        )
+        shield_values = [
+            100.0 * shield_association_df.loc[(sim_name, key), "value"]
+            if (sim_name, key) in shield_association_df.index else np.nan
+            for key in shield_association_keys
+        ]
+        shield_association_ax.barh(
+            shield_yy, shield_values, height=height,
+            color=cols[i], alpha=0.82, label=sim_name,
+        )
+        for j, key in enumerate(shield_association_keys):
+            if (sim_name, key) in shield_association_df.index:
+                row = shield_association_df.loc[(sim_name, key)]
+                draw_errorbarh(
+                    shield_association_ax, shield_yy[j], 100.0 * row["value"],
+                    100.0 * row["ci_low"], 100.0 * row["ci_high"], color="0.15"
+                )
+                label_percentage(
+                    shield_association_ax, 100.0 * row["value"], shield_yy[j]
                 )
 
     if has_differences:
         for i, sim_name in enumerate(sim_names[1:], start=1):
-            yy = y + (i - 1.5) * height
+            yy = occurrence_y + (i - 1.5) * height
             vals = [
                 100.0 * diff_df.loc[(sim_name, key), "value"] if (sim_name, key) in diff_df.index else np.nan
-                for key in keys
+                for key in occurrence_keys
             ]
-            ax[1].barh(yy, vals, height=height, color=cols[i], alpha=0.82, label=f"{sim_name} - control")
-            for j, key in enumerate(keys):
+            difference_ax.barh(
+                yy, vals, height=height, color=cols[i], alpha=0.82,
+                label=f"{sim_name} - control",
+            )
+            for j, key in enumerate(occurrence_keys):
                 if (sim_name, key) in diff_df.index:
                     row = diff_df.loc[(sim_name, key)]
                     draw_errorbarh(
-                        ax[1], yy[j], 100.0 * row["value"],
+                        difference_ax, yy[j], 100.0 * row["value"],
                         100.0 * row["ci_low"], 100.0 * row["ci_high"], color="0.15"
                     )
 
-    ax[0].set_yticks(y)
-    ax[0].set_yticklabels(labels)
-    ax[0].invert_yaxis()
-    ax[0].set_xlabel("Tropical area-time (%)")
-    ax[0].set_title("Class occurrence")
-    ax[0].grid(axis="x", alpha=0.22)
-    ax[0].legend(frameon=False, fontsize=8)
+    occurrence_ax.scatter(
+        [35.0], [occurrence_y[0]], marker="D", s=52,
+        facecolor="white", edgecolor="#7a4e00", linewidth=1.4, zorder=7,
+        label="CIRS all UT cloud: ~35% (30S-30N; CTP < 440 hPa)",
+    )
+    occurrence_ax.annotate(
+        "35", (35.0, occurrence_y[0]), xytext=(0, 8),
+        textcoords="offset points", ha="center", va="bottom",
+        fontsize=6.5, color="#7a4e00",
+    )
+    occurrence_ax.scatter(
+        [22.7], [occurrence_y[0]], marker="v", s=54,
+        facecolor="white", edgecolor="#375a7f", linewidth=1.3, zorder=7,
+        label="MODIS daytime high ice cloud: 22.7% (30S-30N)",
+    )
+    occurrence_ax.annotate(
+        "22.7", (22.7, occurrence_y[0]), xytext=(0, -10),
+        textcoords="offset points", ha="center", va="top",
+        fontsize=6.5, color="#375a7f",
+    )
+    nonprecip_occurrence_y = occurrence_y[
+        occurrence_keys.index("nonprecipitating_high_cloud_mask")
+    ]
+    occurrence_ax.plot(
+        [38.4, 43.5],
+        [nonprecip_occurrence_y, nonprecip_occurrence_y],
+        color="#7a4e00", lw=4.0, alpha=0.85, solid_capstyle="round",
+        zorder=7,
+        label="CALIOP cirrus occurrence: 38-44% (15S-15N)",
+    )
+    occurrence_ax.scatter(
+        [38.4, 43.5], [nonprecip_occurrence_y, nonprecip_occurrence_y],
+        marker="|", s=70, color="#7a4e00", linewidth=1.1, zorder=8,
+    )
+    precip_ax.scatter(
+        [27.0, 73.0], precip_y, marker="D", s=52,
+        facecolor="white", edgecolor="#7a4e00", linewidth=1.4, zorder=7,
+        label="TRMM PR raining area: 27% convective / 73% stratiform (20S-20N)",
+    )
+    for value, y_value in zip((27.0, 73.0), precip_y):
+        precip_ax.annotate(
+            f"{value:.0f}", (value, y_value), xytext=(0, 8),
+            textcoords="offset points", ha="center", va="bottom",
+            fontsize=6.5, color="#7a4e00",
+        )
+    cirrus_comparison_ax.scatter(
+        [80.0], [cirrus_comparison_y[0]], marker=">", s=60,
+        facecolor="white", edgecolor="#7a4e00", linewidth=1.4, zorder=7,
+        label="MODIS high-cloud optical classes: cirriform >80% (30S-30N)",
+    )
+    cirrus_comparison_ax.annotate(
+        ">80", (80.0, cirrus_comparison_y[0]), xytext=(0, 8),
+        textcoords="offset points", ha="center", va="bottom",
+        fontsize=6.5, color="#7a4e00",
+    )
+
+    occurrence_ax.set_yticks(occurrence_y)
+    occurrence_ax.set_yticklabels(occurrence_labels)
+    occurrence_ax.invert_yaxis()
+    occurrence_ax.set_xlabel("Tropical area-time (%)")
+    occurrence_ax.set_title("(a) Domain occurrence")
+    occurrence_ax.grid(axis="x", alpha=0.22)
+    occurrence_ax.legend(frameon=False, fontsize=7)
+    occurrence_ax.margins(x=0.14)
+
+    composition_ax.set_yticks(composition_y)
+    composition_ax.set_yticklabels(composition_labels)
+    composition_ax.invert_yaxis()
+    composition_ax.set_xlabel("Share of all diagnosed high cloud (%)")
+    composition_ax.set_title("(b) High-cloud composition")
+    composition_ax.grid(axis="x", alpha=0.22)
+    composition_ax.legend(frameon=False, fontsize=7)
+    composition_ax.margins(x=0.14)
+
+    precip_ax.set_yticks(precip_y)
+    precip_ax.set_yticklabels(precip_labels)
+    precip_ax.invert_yaxis()
+    precip_ax.set_xlim(0.0, 108.0)
+    precip_ax.set_xlabel("Share of precipitating high-cloud area (%)")
+    precip_ax.set_title("(c) Rainy-core/stratiform validation")
+    precip_ax.grid(axis="x", alpha=0.22)
+    precip_ax.legend(frameon=False, fontsize=7)
 
     if has_differences:
-        ax[1].axvline(0.0, color="0.45", lw=0.8)
-        ax[1].set_xlabel("Simulation minus control (percentage points)")
-        ax[1].set_title("Difference from control")
-        ax[1].grid(axis="x", alpha=0.22)
-        ax[1].legend(frameon=False, fontsize=8)
+        difference_ax.set_yticks(occurrence_y)
+        difference_ax.set_yticklabels(occurrence_labels)
+        difference_ax.invert_yaxis()
+        difference_ax.axvline(0.0, color="0.45", lw=0.8)
+        difference_ax.set_xlabel("Simulation minus control (percentage points)")
+        difference_ax.set_title("(d) Domain-occurrence response")
+        difference_ax.grid(axis="x", alpha=0.22)
+        difference_ax.legend(frameon=False, fontsize=8)
+    else:
+        difference_ax.axis("off")
+        difference_ax.text(
+            0.5, 0.5,
+            "Single-simulation test\n(no response relative to control)",
+            transform=difference_ax.transAxes,
+            ha="center", va="center", color="0.35", fontsize=10,
+        )
 
-    fig.suptitle("High-cloud class occurrence as a percentage of tropical area-time")
+    cirrus_comparison_ax.set_yticks(cirrus_comparison_y)
+    cirrus_comparison_ax.set_yticklabels(cirrus_comparison_labels)
+    cirrus_comparison_ax.invert_yaxis()
+    cirrus_comparison_ax.set_xlim(0.0, 108.0)
+    cirrus_comparison_ax.set_xlabel("Share of all diagnosed high cloud (%)")
+    cirrus_comparison_ax.set_title("(e) Cirrus comparison")
+    cirrus_comparison_ax.grid(axis="x", alpha=0.22)
+    cirrus_comparison_ax.legend(frameon=False, fontsize=7)
+
+    shield_association_ax.set_yticks(shield_association_y)
+    shield_association_ax.set_yticklabels(shield_association_labels)
+    shield_association_ax.invert_yaxis()
+    shield_association_ax.set_xlim(0.0, 108.0)
+    shield_association_ax.set_xlabel("Share of non-precipitating high cloud (%)")
+    shield_association_ax.set_title("(f) Non-precipitating shield association")
+    shield_association_ax.grid(axis="x", alpha=0.22)
+    if len(shield_association_df) > 0:
+        shield_association_ax.legend(frameon=False, fontsize=7)
+    else:
+        shield_association_ax.text(
+            0.5, 0.5, "Shield association unavailable",
+            transform=shield_association_ax.transAxes,
+            ha="center", va="center", color="0.35", fontsize=9,
+        )
+
+    fig.suptitle(
+        "Cloud-radiation-on high-cloud occurrence and composition\n"
+        "Model bars use 20S-20N. Panel (b) uses all high cloud; panel (c) uses only "
+        f"high-cloud columns with rain >= {P_PRECIP_MIN / 24.0:g} mm h$^{{-1}}$. "
+        "Literature symbols use the denominators stated in their legends.",
+        fontsize=11,
+    )
     save_figure(1, fig, "high_cloud_class_budget")
     plt.close(fig)
     progress("Done with figure: high_cloud_class_budget")
-
-
-# -----------------------------------------------------------------------------
-# Figure 2. Residual high-cloud signal
-# -----------------------------------------------------------------------------
-# WHAT TO LOOK FOR:
-#   * Positive nudged residuals mean more high cloud than expected from the
-#     control relationship with local precipitation, moisture, instability, and
-#     latitude.
-#   * The control model is evaluated only inside the robust control feature
-#     support; unsupported extrapolated samples are masked.
-#   * N2_TTL is not split into terciles here.  If available, one common-support
-#     residual summary is written to CSV.
-
-
-fit_control_relationship = partial(fit_control_relationship, logger=progress)
-
-
-feature_arrays = residual_feature_arrays
-residual_target_da = residual_target_array
-
-
-model_training_data = partial(
-    residual_model_training_data,
-    lat_bounds=TROPICAL_LAT_BOUNDS,
-    sample_limits=RESIDUAL_FIT_SAMPLE_LIMITS,
-)
-
-
-def feature_support_ranges(X, weights, feature_keys):
-    ranges = {}
-    for j, key in enumerate(feature_keys):
-        lo, hi = weighted_quantile(X[:, j], [0.01, 0.99], weights)
-        ranges[key] = (float(lo), float(hi))
-    return ranges
-
-
-def inside_feature_support(X, support_ranges, feature_keys):
-    ok = np.ones(X.shape[0], dtype=bool)
-    for j, key in enumerate(feature_keys):
-        lo, hi = support_ranges[key]
-        ok &= np.isfinite(X[:, j]) & (X[:, j] >= lo) & (X[:, j] <= hi)
-    return ok
-
-
-def prepare_residual_grid(fields, classif, target_key, feature_keys, model, support_ranges):
-    target = residual_target_da(classif, target_key)
-    arrays = feature_arrays(fields, feature_keys) + [target]
-    n2_available = "N2_TTL" in fields
-    if n2_available:
-        arrays.append(fields["N2_TTL"])
-
-    prepared = [subset_lat(finite_or_nan(da.astype(float)), TROPICAL_LAT_BOUNDS) for da in arrays]
-    prepared = list(xr.align(*prepared, join="inner"))
-    indexers = stride_indexers(prepared, **RESIDUAL_PLOT_SAMPLE_LIMITS, time_mode="stride")
-    if indexers:
-        prepared = [
-            da.isel({dim: slc for dim, slc in indexers.items() if dim in da.dims})
-            for da in prepared
-        ]
-    broadcasted = xr.broadcast(*prepared)
-
-    dims = [dim for dim in ("Time", "latitude", "longitude") if dim in broadcasted[-1].dims]
-    broadcasted = [da.transpose(*dims) for da in broadcasted]
-    vals = [np.asarray(da.load().values, dtype=float) for da in broadcasted]
-    shape = vals[0].shape
-    flat = [v.ravel() for v in vals]
-
-    nfeat = len(feature_keys)
-    X = np.column_stack(flat[:nfeat])
-    y = flat[nfeat]
-    finite = np.all(np.isfinite(X), axis=1) & np.isfinite(y)
-    supported = finite & inside_feature_support(X, support_ranges, feature_keys)
-
-    pred = np.full(y.shape, np.nan, dtype=float)
-    if np.any(supported):
-        pred[supported] = np.clip(model.predict(X[supported]), 0.0, 1.0)
-    residual = np.full(y.shape, np.nan, dtype=float)
-    residual[supported] = y[supported] - pred[supported]
-
-    template = broadcasted[nfeat]
-    residual_da = xr.DataArray(residual.reshape(shape), dims=dims, coords={dim: template[dim] for dim in dims}, name="residual")
-    support_da = xr.DataArray(supported.reshape(shape), dims=dims, coords=residual_da.coords, name="support_mask")
-    n2_da = None
-    if n2_available:
-        n2_values = flat[nfeat + 1].reshape(shape)
-        n2_da = xr.DataArray(n2_values, dims=dims, coords=residual_da.coords, name="N2_TTL")
-    return residual_da, support_da, n2_da
-
-
-def n2_common_support(fields_by_run, classifications):
-    if not all("N2_TTL" in fields for fields in fields_by_run):
-        return None
-    per_run = []
-    for sim_name, fields in zip(sim_names, fields_by_run):
-        classif = classifications.get(sim_name)
-        if classif is None:
-            continue
-        vals, weights = sample_matching_arrays(
-            fields["N2_TTL"],
-            classif["high_cloud_mask"].astype(float),
-            lat_bounds=TROPICAL_LAT_BOUNDS,
-            **RESIDUAL_FIT_SAMPLE_LIMITS,
-        )
-        q02, q98 = weighted_quantile(vals[0], [0.02, 0.98], weights)
-        per_run.append((sim_name, float(q02), float(q98)))
-    if len(per_run) != len(sim_names):
-        return None
-    common_lo = max(row[1] for row in per_run)
-    common_hi = min(row[2] for row in per_run)
-    if not np.isfinite(common_lo) or not np.isfinite(common_hi) or common_hi <= common_lo:
-        return dict(common_lo=np.nan, common_hi=np.nan, per_run=per_run)
-    return dict(common_lo=common_lo, common_hi=common_hi, per_run=per_run)
-
-
-def residual_summary_rows(residual_data, support_data, n2_data, n2_support):
-    rows = []
-    for target_key, target_label, _source in RESIDUAL_TARGET_SPECS:
-        for sim_name in sim_names:
-            residual = residual_data[(target_key, sim_name)]
-            support = support_data[(target_key, sim_name)]
-            weights = latitude_weight_array(residual)
-            valid = np.isfinite(residual)
-            weighted_mean = residual.where(valid).weighted(weights).mean(
-                dim=[d for d in ("Time", "latitude", "longitude") if d in residual.dims],
-                skipna=True,
-            )
-            rows.append(
-                dict(
-                    simulation=sim_name,
-                    target=target_label,
-                    support_subset="control_feature_support",
-                    mean_residual=float(weighted_mean.values),
-                    supported_fraction=float(support.astype(float).mean().values),
-                    denominator="sampled tropical grid-cell/time samples inside control feature support",
-                    N2_TTL_common_lo=np.nan,
-                    N2_TTL_common_hi=np.nan,
-                )
-            )
-            n2 = n2_data.get((target_key, sim_name))
-            if n2_support is not None and n2 is not None and np.isfinite(n2_support.get("common_lo", np.nan)):
-                in_common = valid & (n2 >= n2_support["common_lo"]) & (n2 <= n2_support["common_hi"])
-                common_mean = residual.where(in_common).weighted(weights).mean(
-                    dim=[d for d in ("Time", "latitude", "longitude") if d in residual.dims],
-                    skipna=True,
-                )
-                rows.append(
-                    dict(
-                        simulation=sim_name,
-                        target=target_label,
-                        support_subset="control_feature_and_N2_TTL_common_support",
-                        mean_residual=float(common_mean.values),
-                        supported_fraction=float(in_common.astype(float).mean().values),
-                        denominator="sampled tropical grid-cell/time samples inside control feature support and one common N2_TTL range",
-                        N2_TTL_common_lo=float(n2_support["common_lo"]),
-                        N2_TTL_common_hi=float(n2_support["common_hi"]),
-                    )
-                )
-    return rows
-
-
-def plot_residual_diagnostics(fields_by_run, classifications):
-    if not should_run_figure(2):
-        return
-    progress("Starting Figure 2: residual_high_cloud_maps_zonal")
-    if any(classifications.get(sim_name) is None for sim_name in sim_names):
-        print("Skipping Figure 2: high-cloud classification is unavailable for at least one run.")
-        return
-
-    feature_keys = available_residual_features(fields_by_run)
-    residual_data = {}
-    support_data = {}
-    n2_data = {}
-    models = {}
-    support_ranges_by_target = {}
-
-    for target_key, target_label, _source in RESIDUAL_TARGET_SPECS:
-        Xc, yc, wc = model_training_data(fields_by_run[0], classifications[sim_names[0]], target_key, feature_keys)
-        support_ranges = feature_support_ranges(Xc, wc, feature_keys)
-        model = fit_control_relationship(Xc, yc, wc, target_label)
-        models[target_key] = model
-        support_ranges_by_target[target_key] = support_ranges
-        for i, sim_name in enumerate(sim_names):
-            residual, support, n2 = prepare_residual_grid(
-                fields_by_run[i],
-                classifications[sim_name],
-                target_key,
-                feature_keys,
-                model,
-                support_ranges,
-            )
-            residual_data[(target_key, sim_name)] = residual
-            support_data[(target_key, sim_name)] = support
-            if n2 is not None:
-                n2_data[(target_key, sim_name)] = n2
-
-    support_rows = []
-    for target_key, ranges in support_ranges_by_target.items():
-        for key, (lo, hi) in ranges.items():
-            support_rows.append(dict(target=target_key, feature=key, control_q01=lo, control_q99=hi))
-    save_table(pd.DataFrame(support_rows), "residual_control_feature_support")
-
-    n2_support = n2_common_support(fields_by_run, classifications)
-    if n2_support is not None:
-        n2_rows = [
-            dict(simulation=sim_name, N2_TTL_q02=q02, N2_TTL_q98=q98)
-            for sim_name, q02, q98 in n2_support["per_run"]
-        ]
-        for row in n2_rows:
-            row["N2_TTL_common_lo"] = n2_support.get("common_lo", np.nan)
-            row["N2_TTL_common_hi"] = n2_support.get("common_hi", np.nan)
-        save_table(pd.DataFrame(n2_rows), "N2_TTL_common_support_summary")
-
-    summary = pd.DataFrame(residual_summary_rows(residual_data, support_data, n2_data, n2_support))
-    save_table(summary, "residual_high_cloud_summary")
-
-    nrows = len(RESIDUAL_TARGET_SPECS)
-    ncols = len(sim_names) + 1
-    fig, ax = plt.subplots(
-        nrows,
-        ncols,
-        figsize=(3.35 * ncols, 2.65 * nrows),
-        constrained_layout=True,
-        sharex=False,
-        sharey=False,
-    )
-    last_im = None
-
-    for r, (target_key, target_label, _source) in enumerate(RESIDUAL_TARGET_SPECS):
-        row_maps = []
-        for sim_name in sim_names:
-            residual = residual_data[(target_key, sim_name)]
-            m = 100.0 * (
-                residual.mean(dim="Time", skipna=True)
-                if "Time" in residual.dims
-                else residual
-            )
-            row_maps.append(m)
-        row_abs = np.nanpercentile(np.abs(np.concatenate([np.ravel(m.values) for m in row_maps])), 98)
-        row_abs = float(row_abs) if np.isfinite(row_abs) and row_abs > 0 else 0.05
-        row_levels = symmetric_levels(max(3.0, row_abs), ndiv=15)
-
-        for c, sim_name in enumerate(sim_names):
-            a = ax[r, c]
-            m = row_maps[c]
-            last_im = a.contourf(
-                m.longitude,
-                m.latitude,
-                m,
-                levels=row_levels,
-                cmap=difference_cmap(row_levels, cmap="RdBu_r"),
-                extend="both",
-            )
-            if r == 0:
-                a.set_title(sim_name)
-            if c == 0:
-                a.set_ylabel(f"{target_label}\nLatitude")
-            if r == nrows - 1:
-                a.set_xlabel("Longitude")
-            a.set_xlim(-180, 180)
-            a.set_ylim(*TROPICAL_LAT_BOUNDS)
-
-        a = ax[r, -1]
-        for i, sim_name in enumerate(sim_names):
-            residual = residual_data[(target_key, sim_name)]
-            dims = [d for d in ("Time", "longitude") if d in residual.dims]
-            z = 100.0 * residual.mean(dim=dims, skipna=True)
-            a.plot(z.latitude, z, color=cols[i], lw=1.5, label=sim_name if r == 0 else None)
-        a.axhline(0.0, color="0.55", lw=0.8)
-        a.grid(alpha=0.22)
-        if r == 0:
-            a.set_title("Time- and longitude-mean residual")
-        if r == nrows - 1:
-            a.set_xlabel("Latitude")
-        a.set_xlim(*TROPICAL_LAT_BOUNDS)
-        a.set_ylabel("Actual minus control-model prediction\n(percentage points)")
-
-    if last_im is not None:
-        fig.colorbar(
-            last_im,
-            ax=ax[:, :-1].ravel().tolist(),
-            label="Actual minus control-model prediction (percentage points)",
-        )
-    ax[0, -1].legend(frameon=False, fontsize=8)
-    subtitle = "masked outside control q01-q99 feature support"
-    if n2_support is not None and np.isfinite(n2_support.get("common_lo", np.nan)):
-        subtitle += f"; N2_TTL common-support summary: {n2_support['common_lo']:.3g} to {n2_support['common_hi']:.3g}"
-    fig.suptitle(f"Actual minus control-model-predicted high cloud ({subtitle})")
-    save_figure(2, fig, "residual_high_cloud_maps_zonal")
-    plt.close(fig)
-    progress("Done with figure: residual_high_cloud_maps_zonal")
 
 
 # -----------------------------------------------------------------------------
@@ -1686,10 +1969,11 @@ def add_rain_ticks(ax, x, precip_values):
 
 def classification_threshold_summary():
     return (
-        f"High: cldfrac >= {CF_THRESH:g}, cloud-top p <= {P_HIGH_HPA:g} hPa | "
-        f"Convective: >={CONVECTIVE_EVIDENCE_REQUIRED}/3 "
-        f"[P >= {P_HEAVY:g} mm/d, wmax >= {W_STRONG:g} m/s, "
-        f"rainc/P >= {CONVECTIVE_FRACTION:g}]"
+        f"High cloud: cldfrac >= {CF_THRESH:g}, CTP <= {P_HIGH_HPA:g} hPa\n"
+        "Core: PyFLEXTRKR Tb < 225 K; "
+        f"stratiform: other high cloud with rain >= {P_PRECIP_MIN / 24.0:g} mm h-1; "
+        "non-precipitating: leftover\n"
+        "Cold-core, cold-shield-shell, and warm-shield-shell regions are shown for PyFLEXTRKR validation and do not alter the three cloud classes"
     )
 
 
@@ -1741,36 +2025,11 @@ def plot_precip_map(ax, precip, class_code, focus_lon, focus_lat):
     overlay_class_tint(ax, classes)
     ax.axvline(focus_lon, color="0.1", lw=1.0, ls=":")
     ax.axhline(focus_lat, color="0.1", lw=1.0, ls=":")
-    ax.set_xlim(float(focus_lon) - 0.5 * SNAPSHOT_LON_WINDOW_DEG, float(focus_lon) + 0.5 * SNAPSHOT_LON_WINDOW_DEG)
+    ax.set_xlim(float(p.longitude.min()), float(p.longitude.max()))
     ax.set_ylim(*SNAPSHOT_LAT_BOUNDS)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title("P = rainc + rainnc; high-cloud class tint")
-    return im
-
-
-def plot_updraft_map(ax, column_max_w, class_code, focus_lon, focus_lat):
-    w = crop_longitude_window(column_max_w, focus_lon)
-    classes = crop_longitude_window(class_code, focus_lon)
-    norm = colors.TwoSlopeNorm(vmin=-0.1, vcenter=0.0, vmax=0.4)
-    im = ax.pcolormesh(
-        w.longitude,
-        w.latitude,
-        w,
-        shading="auto",
-        cmap="RdBu_r",
-        norm=norm,
-    )
-    overlay_class_tint(ax, classes)
-    ax.axvline(focus_lon, color="0.1", lw=1.0, ls=":")
-    ax.axhline(focus_lat, color="0.1", lw=1.0, ls=":")
-    ax.set_xlim(float(focus_lon) - 0.5 * SNAPSHOT_LON_WINDOW_DEG, float(focus_lon) + 0.5 * SNAPSHOT_LON_WINDOW_DEG)
-    ax.set_ylim(*SNAPSHOT_LAT_BOUNDS)
-    ax.set_xlabel("Longitude")
-    ax.tick_params(labelleft=False)
-    ax.set_title(
-        f"max(w) over cldfrac >= {CF_THRESH:g} levels; high-cloud class tint"
-    )
     return im
 
 
@@ -1799,14 +2058,42 @@ def plot_cloud_top_height_map(
     overlay_high_cloud_tint(ax, high)
     ax.axvline(focus_lon, color="0.1", lw=1.0, ls=":")
     ax.axhline(focus_lat, color="0.1", lw=1.0, ls=":")
-    ax.set_xlim(
-        float(focus_lon) - 0.5 * SNAPSHOT_LON_WINDOW_DEG,
-        float(focus_lon) + 0.5 * SNAPSHOT_LON_WINDOW_DEG,
-    )
+    ax.set_xlim(float(height.longitude.min()), float(height.longitude.max()))
     ax.set_ylim(*SNAPSHOT_LAT_BOUNDS)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title("Cloud-top height; cyan tint = high-cloud mask")
+    return im
+
+
+def plot_pyflextrkr_hierarchy_map(
+    ax, core, cold_shield, warm_shield, focus_lon, focus_lat
+):
+    core = crop_longitude_window(core, focus_lon)
+    cold = crop_longitude_window(cold_shield, focus_lon)
+    warm = crop_longitude_window(warm_shield, focus_lon)
+    core_values = np.asarray(core, dtype=bool)
+    cold_values = np.asarray(cold, dtype=bool)
+    warm_values = np.asarray(warm, dtype=bool)
+    cold_shell = cold_values & ~core_values
+    warm_shell = warm_values & ~cold_values
+    code = np.zeros(core.shape, dtype=np.int8)
+    code[warm_shell] = 1
+    code[cold_shell] = 2
+    code[core_values] = 3
+    cmap = colors.ListedColormap(["white", "#67a9cf", "#fdae61", "#b2182b"])
+    norm = colors.BoundaryNorm(np.arange(-0.5, 4.5, 1.0), cmap.N)
+    im = ax.pcolormesh(
+        core.longitude, core.latitude, np.ma.masked_where(code == 0, code),
+        shading="auto", cmap=cmap, norm=norm,
+    )
+    ax.axvline(focus_lon, color="0.1", lw=1.0, ls=":")
+    ax.axhline(focus_lat, color="0.1", lw=1.0, ls=":")
+    ax.set_xlim(float(core.longitude.min()), float(core.longitude.max()))
+    ax.set_ylim(*SNAPSHOT_LAT_BOUNDS)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title("PyFLEXTRKR scene: warm-shield shell / cold-shield shell / cold core")
     return im
 
 
@@ -1825,7 +2112,7 @@ def plot_class_map(ax, class_code, focus_lon, focus_lat):
     )
     ax.axvline(focus_lon, color="0.1", lw=1.0, ls=":")
     ax.axhline(focus_lat, color="0.1", lw=1.0, ls=":")
-    ax.set_xlim(float(focus_lon) - 0.5 * SNAPSHOT_LON_WINDOW_DEG, float(focus_lon) + 0.5 * SNAPSHOT_LON_WINDOW_DEG)
+    ax.set_xlim(float(cls.longitude.min()), float(cls.longitude.max()))
     ax.set_ylim(*SNAPSHOT_LAT_BOUNDS)
     ax.set_xlabel("Longitude")
     ax.tick_params(labelleft=False)
@@ -1838,7 +2125,9 @@ def save_validation_map_figure(
     snap_time,
     precip,
     high_cloud,
-    column_max_w,
+    pyflextrkr_core,
+    core_bearing_cold_shield,
+    core_bearing_warm_shield,
     cloud_top_height,
     class_code,
     focus_lon,
@@ -1849,15 +2138,16 @@ def save_validation_map_figure(
         left=0.06,
         right=0.94,
         bottom=0.15,
-        top=0.87,
+        top=0.80,
         wspace=0.24,
         hspace=0.32,
     )
     precip_im = plot_precip_map(
         axes[0, 0], precip, class_code, focus_lon, focus_lat
     )
-    updraft_im = plot_updraft_map(
-        axes[0, 1], column_max_w, class_code, focus_lon, focus_lat
+    hierarchy_im = plot_pyflextrkr_hierarchy_map(
+        axes[0, 1], pyflextrkr_core, core_bearing_cold_shield,
+        core_bearing_warm_shield, focus_lon, focus_lat
     )
     height_im = plot_cloud_top_height_map(
         axes[1, 0], cloud_top_height, high_cloud, focus_lon, focus_lat
@@ -1883,11 +2173,9 @@ def save_validation_map_figure(
         pad=0.025,
     )
     fig.colorbar(
-        updraft_im,
-        ax=axes[0, 1],
-        label=f"max(w) over levels with cldfrac >= {CF_THRESH:g} (m s$^{{-1}}$)",
-        fraction=0.046,
-        pad=0.025,
+        hierarchy_im, ax=axes[0, 1], ticks=[1, 2, 3],
+        label="1 warm-shield shell; 2 cold-shield shell; 3 cold core",
+        fraction=0.046, pad=0.025,
     )
     fig.colorbar(
         height_im,
@@ -1906,7 +2194,8 @@ def save_validation_map_figure(
     )
     fig.suptitle(
         f"{sim_name}: high-cloud classification at {format_time_value(snap_time)}\n"
-        f"{classification_threshold_summary()}"
+        f"{classification_threshold_summary()}",
+        fontsize=9,
     )
     safe_sim = sim_name.replace(" ", "_")
     stem = (
@@ -1995,8 +2284,7 @@ def plot_cloud_slice(
 
 
 def snapshot_pressure(ds, cf_snapshot, snap_time):
-    name = find_var(ds, "pressure", required=True)
-    raw = select_time_value(finite_or_nan(ds[name]), snap_time)
+    raw = select_time_value(ds.pressure, snap_time)
     return standardize_pressure_hpa(raw, cf_snapshot)
 
 
@@ -2035,17 +2323,13 @@ def plot_validation_snapshots(dss, fields_by_run, classifications):
             continue
 
         precip = subset_lat(
-            (
-                fields_by_run[i]["convective_precip"]
-                + fields_by_run[i]["grid_scale_precip"]
-            ).sel(Time=snap_time),
+            fields_by_run[i]["precip"].sel(Time=snap_time),
             SNAPSHOT_LAT_BOUNDS,
         ).load()
         high = subset_lat(classif["high_cloud_mask"].sel(Time=snap_time).astype(float), SNAPSHOT_LAT_BOUNDS).load()
-        column_max_w = subset_lat(
-            classif["column_max_updraft"].sel(Time=snap_time),
-            SNAPSHOT_LAT_BOUNDS,
-        ).load()
+        pyflextrkr_core = subset_lat(classif["pyflextrkr_core_mask"].sel(Time=snap_time).astype(bool), SNAPSHOT_LAT_BOUNDS).load()
+        core_bearing_cold_shield = subset_lat(classif["pyflextrkr_core_bearing_cold_shield_mask"].sel(Time=snap_time).astype(bool), SNAPSHOT_LAT_BOUNDS).load()
+        core_bearing_warm_shield = subset_lat(classif["pyflextrkr_core_bearing_warm_shield_mask"].sel(Time=snap_time).astype(bool), SNAPSHOT_LAT_BOUNDS).load()
         cloud_top_height = subset_lat(
             classif["cloud_top_height"].sel(Time=snap_time),
             SNAPSHOT_LAT_BOUNDS,
@@ -2065,7 +2349,9 @@ def plot_validation_snapshots(dss, fields_by_run, classifications):
             snap_time,
             precip,
             high,
-            column_max_w,
+            pyflextrkr_core,
+            core_bearing_cold_shield,
+            core_bearing_warm_shield,
             cloud_top_height,
             class_code,
             focus_lon,
@@ -2097,7 +2383,7 @@ def plot_validation_snapshots(dss, fields_by_run, classifications):
                 focus_latitude=float(focus_lat),
                 focus_longitude=float(focus_lon),
                 high_cloud_fraction=weighted_area_time_mean(high, SNAPSHOT_LAT_BOUNDS),
-                convective_precipitating_fraction=weighted_area_time_mean(convective, SNAPSHOT_LAT_BOUNDS),
+                pyflextrkr_convective_core_fraction=weighted_area_time_mean(convective, SNAPSHOT_LAT_BOUNDS),
                 stratiform_precipitating_fraction=weighted_area_time_mean(stratiform, SNAPSHOT_LAT_BOUNDS),
                 nonprecipitating_fraction=weighted_area_time_mean(nonprecipitating, SNAPSHOT_LAT_BOUNDS),
                 unclassified_fraction=weighted_area_time_mean(unclassified, SNAPSHOT_LAT_BOUNDS),
@@ -2123,1100 +2409,6 @@ def plot_validation_snapshots(dss, fields_by_run, classifications):
     plt.close(slice_fig)
     progress("Done with figure: cloud_classification_validation_snapshots")
 
-
-
-# -----------------------------------------------------------------------------
-# Figures 4-5. Cloud-top and precipitation-source validation
-# -----------------------------------------------------------------------------
-
-
-REGIME_CODE_LABELS = {
-    1: "Convective precipitating",
-    2: "Stratiform precipitating",
-    3: "Non-precipitating high cloud",
-    4: "Invalid",
-}
-REGIME_CODE_COLORS = {1: "tab:red", 2: "tab:blue", 3: "tab:green", 4: "0.55"}
-
-
-def sampled_regime_table(sim_name, classif):
-    keys = [
-        "cloud_top_pressure",
-        "cloud_top_height",
-        "column_max_updraft",
-        "high_cloud_fraction",
-        "surface_precip_rate",
-        "convective_precip_rate",
-        "grid_scale_precip_rate",
-        "convective_precip_fraction",
-        "precip_source_dominance_index",
-        "heavy_precipitation_evidence",
-        "strong_updraft_evidence",
-        "parameterized_source_evidence",
-        "convective_evidence_count",
-        "high_cloud_regime_code",
-        "high_cloud_mask",
-    ]
-    arrays = [subset_lat(classif[key], TROPICAL_LAT_BOUNDS) for key in keys]
-    arrays = list(xr.align(*arrays, join="inner"))
-    indexers = stride_indexers(
-        arrays,
-        **PROCESS_SAMPLE_LIMITS,
-        time_mode="stride",
-    )
-    if indexers:
-        arrays = [
-            da.isel({dim: slc for dim, slc in indexers.items() if dim in da.dims})
-            for da in arrays
-        ]
-    sampled = xr.Dataset(dict(zip(keys, arrays))).load()
-    frame = sampled.to_dataframe().reset_index()
-    frame = frame[frame.high_cloud_mask >= 0.5].copy()
-    frame["simulation"] = sim_name
-    frame["regime"] = frame.high_cloud_regime_code.map(REGIME_CODE_LABELS)
-    return frame
-
-
-def regime_process_summary(frame):
-    variables = [
-        "cloud_top_pressure",
-        "cloud_top_height",
-        "high_cloud_fraction",
-        "surface_precip_rate",
-        "column_max_updraft",
-        "convective_precip_fraction",
-        "precip_source_dominance_index",
-        "convective_evidence_count",
-    ]
-    rows = []
-    for (simulation, regime), group in frame.groupby(["simulation", "regime"], dropna=False):
-        for variable in variables:
-            values = pd.to_numeric(group[variable], errors="coerce").to_numpy(dtype=float)
-            values = values[np.isfinite(values)]
-            rows.append(
-                dict(
-                    simulation=simulation,
-                    regime=regime,
-                    variable=variable,
-                    count=int(values.size),
-                    median=float(np.nanmedian(values)) if values.size else np.nan,
-                    p10=float(np.nanpercentile(values, 10)) if values.size else np.nan,
-                    p90=float(np.nanpercentile(values, 90)) if values.size else np.nan,
-                )
-            )
-    return pd.DataFrame(rows)
-
-
-def weighted_percentile_rank(values, threshold, weights):
-    values = np.asarray(values, dtype=float)
-    weights = np.asarray(weights, dtype=float)
-    valid = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
-    if not np.any(valid):
-        return np.nan
-    return float(100.0 * weights[valid & (values <= threshold)].sum() / weights[valid].sum())
-
-
-def threshold_percentile_table(frame):
-    """Report realised ranks; these diagnose, but do not retune, common thresholds."""
-    if frame is None or len(frame) == 0:
-        return pd.DataFrame()
-    rows = []
-    specs = [
-        dict(
-            indicator="precipitation occurrence",
-            variable="surface_precip_rate",
-            threshold=P_PRECIP_MIN,
-            population="all sampled tropical high-cloud columns",
-            percentile_selected=False,
-            preliminary_rank="not percentile-selected",
-        ),
-        dict(
-            indicator="convective rain intensity",
-            variable="surface_precip_rate",
-            threshold=P_HEAVY,
-            population="sampled tropical precipitating high-cloud columns (P >= 1 mm day-1)",
-            percentile_selected=True,
-            preliminary_rank="approximately p68",
-        ),
-        dict(
-            indicator="convective vertical velocity",
-            variable="column_max_updraft",
-            threshold=W_STRONG,
-            population="all sampled tropical high-cloud columns with finite max(w)",
-            percentile_selected=True,
-            preliminary_rank="approximately p90",
-        ),
-        dict(
-            indicator="parameterized-rain contribution",
-            variable="convective_precip_fraction",
-            threshold=CONVECTIVE_FRACTION,
-            population="sampled tropical precipitating high-cloud columns (P >= 1 mm day-1)",
-            percentile_selected=False,
-            preliminary_rank="not percentile-selected; equal-contribution boundary",
-        ),
-    ]
-    for sim_name in sim_names:
-        sim = frame[frame.simulation == sim_name].copy()
-        if len(sim) == 0:
-            continue
-        if "latitude" in sim.columns:
-            latitude = pd.to_numeric(sim["latitude"], errors="coerce").to_numpy(dtype=float)
-            base_weights = np.cos(np.deg2rad(latitude))
-        else:
-            base_weights = np.ones(len(sim), dtype=float)
-        precip = pd.to_numeric(sim.surface_precip_rate, errors="coerce").to_numpy(dtype=float)
-        for spec in specs:
-            values = pd.to_numeric(sim[spec["variable"]], errors="coerce").to_numpy(dtype=float)
-            population_mask = np.ones(len(sim), dtype=bool)
-            if "precipitating" in spec["population"]:
-                population_mask &= precip >= P_PRECIP_MIN
-            rank = weighted_percentile_rank(
-                values[population_mask],
-                spec["threshold"],
-                base_weights[population_mask],
-            )
-            rows.append(
-                dict(
-                    simulation=sim_name,
-                    indicator=spec["indicator"],
-                    variable=spec["variable"],
-                    implemented_threshold=float(spec["threshold"]),
-                    calibration_was_percentile_informed=bool(spec["percentile_selected"]),
-                    preliminary_calibration_rank=spec["preliminary_rank"],
-                    realised_weighted_percentile_rank=rank,
-                    realised_sample_count=int(
-                        np.count_nonzero(
-                            population_mask
-                            & np.isfinite(values)
-                            & np.isfinite(base_weights)
-                            & (base_weights > 0.0)
-                        )
-                    ),
-                    percentile_population=spec["population"],
-                    weighting="cosine(latitude)",
-                    role=(
-                        "diagnostic only; one common threshold is retained across simulations"
-                    ),
-                )
-            )
-    return pd.DataFrame(rows)
-
-
-def build_process_validation_frame(dss, fields_by_run):
-    frames = []
-    for sim_name, ds, fields in zip(sim_names, dss, fields_by_run):
-        progress(f"{sim_name}: preparing sampled cloud-top validation")
-        classif = sampled_classification_for_threshold(
-            ds,
-            fields,
-            CF_THRESH,
-            sample_limits=PROCESS_SAMPLE_LIMITS,
-            include_process_diagnostics=False,
-        )
-        if classif is not None:
-            frames.append(sampled_regime_table(sim_name, classif))
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-
-def plot_regime_process_validation(frame):
-    if not should_run_figure(4):
-        return
-    progress("Starting Figure 4: cloud_regime_vertical_validation")
-    if frame is None or len(frame) == 0:
-        return
-    save_table(regime_process_summary(frame), "cloud_regime_process_summary")
-    specs = [
-        ("cloud_top_pressure", f"Pressure of highest level with cldfrac >= {CF_THRESH:g} (hPa)", False),
-        ("surface_precip_rate", "rainc + rainnc (mm day$^{-1}$)", True),
-        ("column_max_updraft", f"max(w) where cldfrac >= {CF_THRESH:g} (m s$^{{-1}}$)", False),
-        ("convective_precip_fraction", "rainc / (rainc + rainnc)", False),
-    ]
-    regime_codes = [1, 2, 3]
-    fig, axes = plt.subplots(
-        len(sim_names),
-        len(specs),
-        figsize=(15.5, max(3.8, 2.8 * len(sim_names))),
-        constrained_layout=True,
-        squeeze=False,
-    )
-    for i, sim_name in enumerate(sim_names):
-        sub = frame[frame.simulation == sim_name]
-        for j, (variable, label, log_transform) in enumerate(specs):
-            ax = axes[i, j]
-            values_by_regime = []
-            for code in regime_codes:
-                values = pd.to_numeric(
-                    sub.loc[sub.high_cloud_regime_code == code, variable], errors="coerce"
-                ).to_numpy(dtype=float)
-                values = values[np.isfinite(values)]
-                if log_transform:
-                    values = np.log10(np.maximum(values, 1.0e-6))
-                values_by_regime.append(values)
-            bp = ax.boxplot(values_by_regime, patch_artist=True, showfliers=False)
-            for patch, code in zip(bp["boxes"], regime_codes):
-                patch.set_facecolor(REGIME_CODE_COLORS[code])
-                patch.set_alpha(0.65)
-            ax.set_xticks([1, 2, 3], ["Conv.", "Strat.", "Non-precip."])
-            ax.set_ylabel(("log10 " if log_transform else "") + label)
-            if variable == "cloud_top_pressure":
-                ax.invert_yaxis()
-            elif variable == "surface_precip_rate":
-                ax.axhline(np.log10(P_HEAVY), color="0.2", lw=0.9, ls="--")
-            elif variable == "column_max_updraft":
-                ax.axhline(W_STRONG, color="0.2", lw=0.9, ls="--")
-            elif variable == "convective_precip_fraction":
-                ax.axhline(CONVECTIVE_FRACTION, color="0.2", lw=0.9, ls="--")
-            if i == 0:
-                ax.set_title(label)
-            if j == 0:
-                ax.text(-0.30, 0.5, sim_name, transform=ax.transAxes, rotation=90, va="center")
-            ax.grid(axis="y", alpha=0.2)
-    fig.suptitle(
-        f"Inputs to the {CONVECTIVE_EVIDENCE_REQUIRED}-of-3 convective classification, grouped by assigned high-cloud class"
-    )
-    save_figure(4, fig, "cloud_regime_vertical_validation")
-    plt.close(fig)
-    progress("Done with figure: cloud_regime_vertical_validation")
-
-
-def cloud_top_pressure_budget_rows(classifications):
-    """Return class contributions to tropical area-time in cloud-top-pressure bins."""
-    rows = []
-    profile_specs = REGIME_SPECS + [
-        ("unclassified_high_cloud_mask", "Invalid/unclassified", "0.55")
-    ]
-    needed = ["cloud_top_pressure"] + [key for key, _label, _color in profile_specs]
-    for sim_name in sim_names:
-        classif = classifications.get(sim_name)
-        if classif is None:
-            continue
-        data = xr.Dataset(
-            {key: subset_lat(classif[key], TROPICAL_LAT_BOUNDS) for key in needed}
-        )
-        if "Time" not in data.dims:
-            data = data.expand_dims(Time=[0])
-        lat_weights = np.cos(np.deg2rad(np.asarray(data.latitude.values, dtype=float)))
-        histograms = {
-            key: np.zeros(len(CLOUD_TOP_PRESSURE_BINS_HPA) - 1, dtype=float)
-            for key, _label, _color in profile_specs
-        }
-        class_weight_totals = {
-            key: 0.0 for key, _label, _color in profile_specs
-        }
-        denominator = 0.0
-        for start in range(0, data.sizes["Time"], CLOUD_TOP_HISTOGRAM_TIME_BATCH):
-            stop = min(start + CLOUD_TOP_HISTOGRAM_TIME_BATCH, data.sizes["Time"])
-            block = data.isel(Time=slice(start, stop)).load()
-            cloud_top_pressure = np.asarray(
-                block["cloud_top_pressure"].transpose("Time", "latitude", "longitude").values,
-                dtype=float,
-            )
-            weights = np.broadcast_to(
-                lat_weights[None, :, None], cloud_top_pressure.shape
-            )
-            denominator += float(
-                (stop - start) * data.sizes["longitude"] * lat_weights.sum()
-            )
-            for key, _label, _color in profile_specs:
-                mask = np.asarray(
-                    block[key].transpose("Time", "latitude", "longitude").values,
-                    dtype=bool,
-                )
-                valid = mask & np.isfinite(cloud_top_pressure)
-                class_weight_totals[key] += float(weights[mask].sum())
-                counts, _ = np.histogram(
-                    cloud_top_pressure[valid],
-                    bins=CLOUD_TOP_PRESSURE_BINS_HPA,
-                    weights=weights[valid],
-                )
-                histograms[key] += counts
-            del block, cloud_top_pressure, weights
-
-        if denominator <= 0.0:
-            continue
-        for key, label, _color in profile_specs:
-            omitted = class_weight_totals[key] - histograms[key].sum()
-            if abs(omitted) > max(1.0e-8 * denominator, 1.0e-8):
-                raise RuntimeError(
-                    f"{sim_name}: cloud-top-pressure bins omit {omitted / denominator:.3e} "
-                    f"of tropical area-time for {label}"
-                )
-        for key, label, _color in profile_specs:
-            for lower, upper, weighted_count in zip(
-                CLOUD_TOP_PRESSURE_BINS_HPA[:-1],
-                CLOUD_TOP_PRESSURE_BINS_HPA[1:],
-                histograms[key],
-            ):
-                rows.append(
-                    dict(
-                        simulation=sim_name,
-                        class_key=key,
-                        class_label=label,
-                        cloud_top_pressure_lower_hpa=float(lower),
-                        cloud_top_pressure_upper_hpa=float(upper),
-                        cloud_top_pressure_midpoint_hpa=float(0.5 * (lower + upper)),
-                        tropical_area_time_percent=float(100.0 * weighted_count / denominator),
-                        denominator="all tropical grid cells and times, cosine-latitude weighted",
-                    )
-                )
-    return pd.DataFrame(rows)
-
-
-def plot_precip_component_validation(frame, classifications):
-    if not should_run_figure(5):
-        return
-    progress("Starting Figure 5: cloud_regime_precip_and_cloud_top_validation")
-    if frame is None or len(frame) == 0:
-        return
-    pressure_frame = cloud_top_pressure_budget_rows(classifications)
-    save_table(pressure_frame, "cloud_top_pressure_class_area_time_budget")
-    fig, axes = plt.subplots(
-        3,
-        len(sim_names),
-        figsize=(max(6.2, 4.7 * len(sim_names)), 12.0),
-        constrained_layout=True,
-        squeeze=False,
-    )
-    rng = np.random.default_rng(20240630)
-    for i, sim_name in enumerate(sim_names):
-        sub = frame[frame.simulation == sim_name]
-        for code in (3, 2, 1):
-            group = sub[sub.high_cloud_regime_code == code]
-            if len(group) > 5000:
-                group = group.iloc[rng.choice(len(group), size=5000, replace=False)]
-            color = REGIME_CODE_COLORS[code]
-            label = REGIME_CODE_LABELS[code]
-            axes[0, i].scatter(
-                np.log10(np.maximum(group.surface_precip_rate, 1.0e-4)),
-                group.column_max_updraft,
-                s=5,
-                alpha=0.28,
-                color=color,
-                label=label,
-            )
-            axes[1, i].scatter(
-                np.log10(np.maximum(group.grid_scale_precip_rate, 1.0e-4)),
-                np.log10(np.maximum(group.convective_precip_rate, 1.0e-4)),
-                s=5,
-                alpha=0.28,
-                color=color,
-                label=label,
-            )
-        axes[0, i].set_title(sim_name)
-        axes[0, i].axvline(np.log10(P_HEAVY), color="0.2", lw=0.9, ls="--")
-        axes[0, i].axhline(W_STRONG, color="0.2", lw=0.9, ls="--")
-        axes[0, i].set_xlabel("log10(rainc + rainnc [mm day$^{-1}$])")
-        axes[0, i].set_ylabel(f"max(w) where cldfrac >= {CF_THRESH:g} (m s$^{{-1}}$)")
-
-        finite_sources = np.concatenate(
-            [
-                pd.to_numeric(sub.grid_scale_precip_rate, errors="coerce").to_numpy(dtype=float),
-                pd.to_numeric(sub.convective_precip_rate, errors="coerce").to_numpy(dtype=float),
-            ]
-        )
-        finite_sources = finite_sources[np.isfinite(finite_sources)]
-        source_upper = max(
-            1.0,
-            float(np.ceil(np.log10(max(np.nanpercentile(finite_sources, 99.5), 1.0))))
-            if finite_sources.size
-            else 1.0,
-        )
-        source_lower = -4.0
-        axes[1, i].plot(
-            [source_lower, source_upper],
-            [source_lower, source_upper],
-            color="0.15",
-            lw=1.0,
-            ls="--",
-            label=f"rainc/(rainc + rainnc) = {CONVECTIVE_FRACTION:g}",
-        )
-        rainnc_curve = np.geomspace(1.0e-4, P_HEAVY - 1.0e-4, 250)
-        rainc_curve = P_HEAVY - rainnc_curve
-        axes[1, i].plot(
-            np.log10(rainnc_curve),
-            np.log10(rainc_curve),
-            color="#b21878",
-            lw=1.0,
-            ls=":",
-            label=f"rainc + rainnc = {P_HEAVY:g} mm day$^{{-1}}$",
-        )
-        axes[1, i].set_xlim(source_lower, source_upper)
-        axes[1, i].set_ylim(source_lower, source_upper)
-        axes[1, i].set_aspect("equal", adjustable="box")
-        axes[1, i].set_xlabel("log10(rainnc [mm day$^{-1}$])")
-        axes[1, i].set_ylabel("log10(rainc [mm day$^{-1}$])")
-
-        pressure_sub = pressure_frame[pressure_frame.simulation == sim_name]
-        left = np.zeros(len(CLOUD_TOP_PRESSURE_BINS_HPA) - 1, dtype=float)
-        pressure_midpoints = 0.5 * (
-            CLOUD_TOP_PRESSURE_BINS_HPA[:-1] + CLOUD_TOP_PRESSURE_BINS_HPA[1:]
-        )
-        for class_key, label, color in REGIME_SPECS + [
-            ("unclassified_high_cloud_mask", "Invalid/unclassified", "0.55")
-        ]:
-            values = (
-                pressure_sub[pressure_sub.class_key == class_key]
-                .set_index("cloud_top_pressure_midpoint_hpa")
-                .reindex(pressure_midpoints)
-                .tropical_area_time_percent
-                .fillna(0.0)
-                .to_numpy(dtype=float)
-            )
-            axes[2, i].barh(
-                pressure_midpoints,
-                values,
-                left=left,
-                height=32.0,
-                color=color,
-                edgecolor="none",
-                label=label,
-            )
-            left += values
-        axes[2, i].set_ylim(P_HIGH_HPA, 0.0)
-        axes[2, i].set_xlabel("Tropical area-time (%) per 40 hPa cloud-top-pressure bin")
-        axes[2, i].set_ylabel("Cloud-top pressure (hPa)")
-        axes[0, i].grid(alpha=0.18)
-        axes[1, i].grid(alpha=0.18)
-        axes[2, i].grid(axis="x", alpha=0.18)
-    axes[0, 0].legend(frameon=False, fontsize=8)
-    axes[1, 0].legend(frameon=False, fontsize=7)
-    axes[2, 0].legend(frameon=False, fontsize=8)
-    fig.suptitle(
-        "Classification evidence by assigned high-cloud class\n"
-        "Absolute tropical area-time occurrence by cloud-top pressure"
-    )
-    save_figure(5, fig, "cloud_regime_precip_and_cloud_top_validation")
-    plt.close(fig)
-    progress("Done with figure: cloud_regime_precip_and_cloud_top_validation")
-
-
-# -----------------------------------------------------------------------------
-# Figure 6. Lightweight definition sensitivity
-# -----------------------------------------------------------------------------
-# WHAT TO LOOK FOR:
-#   * The three science classes should keep the same qualitative interpretation
-#     under the small requested tests of cldfrac, precipitation occurrence,
-#     paired rain/w evidence, and rainc contribution thresholds.
-#   * Only cldfrac requires re-reading 3-D model fields; the other tests
-#     reclassify already sampled 2-D evidence fields.
-#   * Large changes in the dominant class or class share are flagged in the CSV.
-
-
-def sampled_classification_for_threshold(
-    ds,
-    fields,
-    cf_thresh,
-    precip_min=P_PRECIP_MIN,
-    convective_fraction=CONVECTIVE_FRACTION,
-    sample_limits=None,
-    include_process_diagnostics=False,
-):
-    cf = get_cloud_fraction(ds)
-    if cf is None:
-        return None
-    precip = fields["precip"]
-    if "Time" in cf.dims and "Time" in precip.dims:
-        common_time = cf.Time.to_index().intersection(precip.Time.to_index())
-        if len(common_time) == 0:
-            return None
-        cf = cf.sel(Time=common_time)
-        precip = precip.sel(Time=common_time)
-    cf2d = cf.isel(z=0, drop=True)
-    aligned_for_sampling = list(xr.align(cf2d, precip, join="inner"))
-    indexers = stride_indexers(
-        aligned_for_sampling,
-        **(sample_limits or SENSITIVITY_SAMPLE_LIMITS),
-        time_mode="stride",
-    )
-    if indexers:
-        cf = cf.isel({dim: slc for dim, slc in indexers.items() if dim in cf.dims})
-        precip = precip.isel({dim: slc for dim, slc in indexers.items() if dim in precip.dims})
-    sampled_fields = dict(fields)
-    sampled_fields["precip"] = precip
-    for key in ("convective_precip", "grid_scale_precip"):
-        da = fields[key].sel(Time=precip.Time)
-        if indexers:
-            da = da.isel({dim: slc for dim, slc in indexers.items() if dim in da.dims})
-        sampled_fields[key] = da
-    return classify_high_cloud(
-        ds,
-        cf,
-        sampled_fields,
-        cf_thresh=cf_thresh,
-        precip_min=precip_min,
-        convective_fraction=convective_fraction,
-        include_process_diagnostics=include_process_diagnostics,
-    )
-
-
-def reclassify_convective_indicators(
-    classif,
-    heavy_precip=P_HEAVY,
-    strong_updraft=W_STRONG,
-    precip_min=P_PRECIP_MIN,
-    convective_fraction=CONVECTIVE_FRACTION,
-):
-    """Reapply cheap 2-D thresholds using already-computed coarse fields."""
-    high = classif["high_cloud_mask"].astype(bool)
-    valid_high = (
-        classif["convective_precipitating_high_cloud_mask"].astype(bool)
-        | classif["stratiform_precipitating_high_cloud_mask"].astype(bool)
-        | classif["nonprecipitating_high_cloud_mask"].astype(bool)
-    )
-    precipitating = classif["surface_precip_rate"] >= precip_min
-    count = (
-        (classif["surface_precip_rate"] >= heavy_precip).astype("int8")
-        + (classif["column_max_updraft"] >= strong_updraft).astype("int8")
-        + (classif["convective_precip_fraction"] >= convective_fraction).astype("int8")
-    )
-    convective = valid_high & precipitating & (count >= CONVECTIVE_EVIDENCE_REQUIRED)
-    stratiform = valid_high & precipitating & ~convective
-    nonprecipitating = valid_high & ~precipitating
-    out = dict(classif)
-    out.update(
-        convective_precipitating_high_cloud_mask=convective,
-        stratiform_precipitating_high_cloud_mask=stratiform,
-        nonprecipitating_high_cloud_mask=nonprecipitating,
-        precipitating_high_cloud_mask=valid_high & precipitating,
-        convective_evidence_count=count,
-    )
-    return out
-
-
-def append_sensitivity_rows(
-    rows,
-    sim_name,
-    classif,
-    parameter,
-    threshold_value,
-    threshold_label,
-    cf_thresh,
-    precip_min,
-    heavy_precip,
-    strong_updraft,
-    convective_fraction,
-):
-    high_frac = weighted_area_time_mean(
-        classif["high_cloud_mask"], TROPICAL_LAT_BOUNDS
-    )
-    for key, label, _color in BUDGET_SPECS:
-        frac = weighted_area_time_mean(classif[key], TROPICAL_LAT_BOUNDS)
-        rows.append(
-            dict(
-                simulation=sim_name,
-                sensitivity_parameter=parameter,
-                threshold_value=float(threshold_value),
-                threshold_label=threshold_label,
-                cldfrac_threshold=float(cf_thresh),
-                precipitation_threshold_mm_day=float(precip_min),
-                heavy_precipitation_threshold_mm_day=float(heavy_precip),
-                strong_updraft_threshold_m_s=float(strong_updraft),
-                convective_source_fraction=float(convective_fraction),
-                convective_evidence_required=int(CONVECTIVE_EVIDENCE_REQUIRED),
-                class_key=key,
-                class_label=label,
-                domain_fraction=float(frac),
-                within_high_cloud_fraction=(
-                    float(frac / high_frac) if high_frac > 0 else np.nan
-                ),
-                high_cloud_denominator=float(high_frac),
-                denominator=(
-                    "sampled tropical area-time fraction for domain_fraction; "
-                    "sampled high-cloud area-time fraction for within_high_cloud_fraction"
-                ),
-            )
-        )
-
-
-def threshold_sensitivity_rows(dss, fields_by_run):
-    rows = []
-    for sim_name, ds, fields in zip(sim_names, dss, fields_by_run):
-        baseline = None
-        for cf_thresh in SENSITIVITY_CF_THRESHOLDS:
-            progress(f"{sim_name}: sensitivity classification for cldfrac={cf_thresh:g}")
-            classif = sampled_classification_for_threshold(
-                ds,
-                fields,
-                cf_thresh,
-            )
-            if classif is None:
-                continue
-            if np.isclose(cf_thresh, CF_THRESH):
-                baseline = classif
-            append_sensitivity_rows(
-                rows,
-                sim_name,
-                classif,
-                "cldfrac_threshold",
-                cf_thresh,
-                f"{cf_thresh:g}",
-                cf_thresh,
-                P_PRECIP_MIN,
-                P_HEAVY,
-                W_STRONG,
-                CONVECTIVE_FRACTION,
-            )
-
-        if baseline is None:
-            continue
-        for precip_min in SENSITIVITY_PRECIP_MIN_THRESHOLDS:
-            label = f"rainc + rainnc >= {precip_min:g} mm day-1"
-            progress(f"{sim_name}: precipitation-occurrence sensitivity {label}")
-            trial = (
-                baseline
-                if np.isclose(precip_min, P_PRECIP_MIN)
-                else reclassify_convective_indicators(
-                    baseline, precip_min=precip_min
-                )
-            )
-            append_sensitivity_rows(
-                rows,
-                sim_name,
-                trial,
-                "precipitation_occurrence_threshold",
-                precip_min,
-                label,
-                CF_THRESH,
-                precip_min,
-                P_HEAVY,
-                W_STRONG,
-                CONVECTIVE_FRACTION,
-            )
-
-        for setting_index, (heavy_precip, strong_updraft) in enumerate(
-            SENSITIVITY_INDICATOR_SETTINGS
-        ):
-            label = (
-                f"rainc + rainnc >= {heavy_precip:g} mm day-1; "
-                f"max(w) over levels with cldfrac >= {CF_THRESH:g} >= "
-                f"{strong_updraft:g} m s-1"
-            )
-            progress(
-                f"{sim_name}: indicator sensitivity {label}"
-            )
-            trial = (
-                baseline
-                if np.isclose(heavy_precip, P_HEAVY)
-                and np.isclose(strong_updraft, W_STRONG)
-                else reclassify_convective_indicators(
-                    baseline, heavy_precip, strong_updraft
-                )
-            )
-            append_sensitivity_rows(
-                rows,
-                sim_name,
-                trial,
-                "convective_indicator_thresholds",
-                setting_index,
-                label,
-                CF_THRESH,
-                P_PRECIP_MIN,
-                heavy_precip,
-                strong_updraft,
-                CONVECTIVE_FRACTION,
-            )
-
-        for convective_fraction in SENSITIVITY_CONVECTIVE_FRACTIONS:
-            label = (
-                f"rainc / (rainc + rainnc) >= {convective_fraction:g}"
-            )
-            progress(f"{sim_name}: parameterized-rain sensitivity {label}")
-            trial = (
-                baseline
-                if np.isclose(convective_fraction, CONVECTIVE_FRACTION)
-                else reclassify_convective_indicators(
-                    baseline, convective_fraction=convective_fraction
-                )
-            )
-            append_sensitivity_rows(
-                rows,
-                sim_name,
-                trial,
-                "convective_source_fraction",
-                convective_fraction,
-                label,
-                CF_THRESH,
-                P_PRECIP_MIN,
-                P_HEAVY,
-                W_STRONG,
-                convective_fraction,
-            )
-    df = pd.DataFrame(rows)
-    if len(df) == 0:
-        return df
-
-    flags = []
-    science_keys = [
-        "convective_precipitating_high_cloud_mask",
-        "stratiform_precipitating_high_cloud_mask",
-        "nonprecipitating_high_cloud_mask",
-    ]
-    for sim_name in sim_names:
-        for parameter in df.sensitivity_parameter.unique():
-            sub = df[
-                (df.simulation == sim_name)
-                & (df.sensitivity_parameter == parameter)
-                & (df.class_key.isin(science_keys))
-            ]
-            if len(sub) == 0:
-                continue
-            strong = False
-            notes = []
-            for key in science_keys:
-                vals = sub[sub.class_key == key]["within_high_cloud_fraction"].to_numpy(dtype=float)
-                spread = float(np.nanmax(vals) - np.nanmin(vals)) if np.any(np.isfinite(vals)) else np.nan
-                if np.isfinite(spread) and spread > 0.10:
-                    strong = True
-                    notes.append(f"{key} spread {spread:.3f}")
-            dominant = (
-                sub.sort_values("within_high_cloud_fraction")
-                .groupby("threshold_value")
-                .tail(1)[["threshold_value", "class_key"]]
-            )
-            if dominant["class_key"].nunique() > 1:
-                strong = True
-                notes.append("dominant class changes")
-            flags.append(
-                dict(
-                    simulation=sim_name,
-                    sensitivity_parameter=parameter,
-                    interpretation_changes_strongly=bool(strong),
-                    note="; ".join(notes) if notes else "class shares stable across tested values",
-                )
-            )
-    flag_df = pd.DataFrame(flags)
-    if len(flag_df) > 0:
-        save_table(flag_df, "cloud_classification_threshold_sensitivity_flags")
-    return df
-
-
-def plot_sensitivity_diagnostics(fields_by_run, classifications, dss=None):
-    if not should_run_figure(6):
-        return
-    progress("Starting Figure 6: cloud_classification_threshold_sensitivity")
-    if dss is None:
-        print("Skipping Figure 6: source datasets unavailable.")
-        return
-    df = threshold_sensitivity_rows(dss, fields_by_run)
-    if len(df) == 0:
-        print("Skipping Figure 6: threshold sensitivity unavailable.")
-        return
-    save_table(df, "cloud_classification_threshold_sensitivity")
-
-    class_specs = [
-        ("high_cloud_mask", "Total high cloud", "0.15"),
-        ("convective_precipitating_high_cloud_mask", "Convective precipitating", "tab:red"),
-        ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating", "tab:blue"),
-        ("nonprecipitating_high_cloud_mask", "Non-precipitating", "tab:green"),
-        ("unclassified_high_cloud_mask", "Invalid", "0.55"),
-    ]
-    parameter_specs = [
-        (
-            "cldfrac_threshold",
-            "Cloudy-level cldfrac",
-            CF_THRESH,
-        ),
-        (
-            "precipitation_occurrence_threshold",
-            "Precipitation occurrence",
-            P_PRECIP_MIN,
-        ),
-        (
-            "convective_indicator_thresholds",
-            "Joint rain and w indicators",
-            1.0,
-        ),
-        (
-            "convective_source_fraction",
-            "rainc contribution",
-            CONVECTIVE_FRACTION,
-        ),
-    ]
-    fig, ax = plt.subplots(
-        len(sim_names),
-        len(parameter_specs),
-        figsize=(18.5, max(4.2, 3.2 * len(sim_names))),
-        constrained_layout=True,
-        sharey=True,
-        squeeze=False,
-    )
-    for i, sim_name in enumerate(sim_names):
-        for j, (parameter, title, baseline_value) in enumerate(parameter_specs):
-            a = ax[i, j]
-            for class_key, label, color in class_specs:
-                sub = df[
-                    (df.simulation == sim_name)
-                    & (df.sensitivity_parameter == parameter)
-                    & (df.class_key == class_key)
-                ].sort_values("threshold_value")
-                if len(sub) == 0:
-                    continue
-                a.plot(
-                    sub.threshold_value,
-                    100.0 * sub.domain_fraction,
-                    color=color,
-                    marker="o",
-                    lw=1.5,
-                    label=label if i == 0 and j == 0 else None,
-                )
-            a.set_ylim(bottom=0.0)
-            a.grid(alpha=0.22)
-            a.axvline(baseline_value, color="0.4", lw=0.9, ls=":")
-            if parameter == "cldfrac_threshold":
-                a.set_xlabel("cldfrac threshold defining a cloudy model level")
-            elif parameter == "precipitation_occurrence_threshold":
-                a.set_xlabel("rainc + rainnc threshold (mm day$^{-1}$)")
-            elif parameter == "convective_indicator_thresholds":
-                a.set_xticks(
-                    range(len(SENSITIVITY_INDICATOR_SETTINGS)),
-                    [
-                        f"P >= {rain:g}\nwmax >= {updraft:g}"
-                        for rain, updraft in SENSITIVITY_INDICATOR_SETTINGS
-                    ],
-                )
-                a.set_xlabel(
-                    f"P = rainc + rainnc (mm day$^{{-1}}$)\n"
-                    f"wmax = max(w) over cldfrac >= {CF_THRESH:g} levels (m s$^{{-1}}$)"
-                )
-                a.tick_params(axis="x", labelsize=8)
-            else:
-                a.set_xlabel("rainc / (rainc + rainnc) threshold")
-            if j == 0:
-                a.set_ylabel(f"{sim_name}\nTropical area-time (%)")
-            if i == 0:
-                a.set_title(title)
-    ax[0, 0].legend(frameon=False, fontsize=8)
-    fig.suptitle("Tropical area-time occurrence under the tested classification thresholds")
-    save_figure(6, fig, "cloud_classification_threshold_sensitivity")
-    plt.close(fig)
-    progress("Done with figure: cloud_classification_threshold_sensitivity")
-
-
-# -----------------------------------------------------------------------------
-# Figure 7. All-time lat/lon classification validation movies
-# -----------------------------------------------------------------------------
-
-
-def plot_classification_validation_movies(fields_by_run, classifications):
-    if not should_run_figure(7):
-        return
-    progress("Starting Figure 7: cloud_classification_validation_movies")
-    precip_cmap, precip_norm = precip_rate_cmap_norm()
-    updraft_norm = colors.TwoSlopeNorm(vmin=-0.1, vcenter=0.0, vmax=0.4)
-    height_norm = colors.Normalize(
-        vmin=CLOUD_TOP_HEIGHT_MAP_MIN_KM,
-        vmax=CLOUD_TOP_HEIGHT_MAP_MAX_KM,
-    )
-    class_cmap, class_norm = high_cloud_class_cmap_norm(alpha=0.92)
-    class_legend = high_cloud_class_legend_handles()
-    manifest_rows = []
-
-    for i, sim_name in enumerate(sim_names):
-        classif = classifications.get(sim_name)
-        if classif is None:
-            raise RuntimeError(
-                f"{sim_name}: Figure 7 requires the shared classification product"
-            )
-        component_precip = (
-            fields_by_run[i]["convective_precip"]
-            + fields_by_run[i]["grid_scale_precip"]
-        )
-        classification_time = classif["high_cloud_mask"].Time
-        common_times = classification_time.to_index().intersection(
-            component_precip.Time.to_index()
-        )
-        if len(common_times) == 0:
-            raise RuntimeError(
-                f"{sim_name}: classification and precipitation have no common times"
-            )
-
-        fig, axes = plt.subplots(2, 2, figsize=(16.0, 8.8), constrained_layout=False)
-        fig.subplots_adjust(
-            left=0.06,
-            right=0.94,
-            bottom=0.15,
-            top=0.88,
-            wspace=0.24,
-            hspace=0.30,
-        )
-        fig.colorbar(
-            plt.cm.ScalarMappable(norm=precip_norm, cmap=precip_cmap),
-            ax=axes[0, 0],
-            label="rainc + rainnc (mm day$^{-1}$)",
-            fraction=0.046,
-            pad=0.025,
-        )
-        fig.colorbar(
-            plt.cm.ScalarMappable(norm=updraft_norm, cmap="RdBu_r"),
-            ax=axes[0, 1],
-            label=f"max(w) over levels with cldfrac >= {CF_THRESH:g} (m s$^{{-1}}$)",
-            fraction=0.046,
-            pad=0.025,
-        )
-        fig.colorbar(
-            plt.cm.ScalarMappable(norm=height_norm, cmap="magma"),
-            ax=axes[1, 0],
-            label="Cloud-top height (km)",
-            fraction=0.046,
-            pad=0.025,
-        )
-        fig.legend(
-            handles=class_legend,
-            loc="lower center",
-            bbox_to_anchor=(0.5, 0.025),
-            ncol=len(HIGH_CLOUD_CLASS_SPECS),
-            frameon=False,
-            title="High-cloud column class (tint in top row)",
-        )
-
-        def update(frame_index):
-            time_value = common_times[frame_index]
-            for ax in axes.ravel():
-                ax.clear()
-            precip = subset_lat(
-                component_precip.sel(Time=time_value), TROPICAL_LAT_BOUNDS
-            ).load()
-            frame = xr.Dataset(
-                {
-                    key: subset_lat(classif[key].sel(Time=time_value), TROPICAL_LAT_BOUNDS)
-                    for key in (
-                        "high_cloud_mask",
-                        "cloud_top_height",
-                        "column_max_updraft",
-                        "convective_precipitating_high_cloud_mask",
-                        "stratiform_precipitating_high_cloud_mask",
-                        "nonprecipitating_high_cloud_mask",
-                        "unclassified_high_cloud_mask",
-                    )
-                }
-            ).load()
-            high = frame["high_cloud_mask"].astype(float)
-            class_code = class_code_from_masks(
-                high,
-                frame["convective_precipitating_high_cloud_mask"],
-                frame["stratiform_precipitating_high_cloud_mask"],
-                frame["nonprecipitating_high_cloud_mask"],
-                frame["unclassified_high_cloud_mask"],
-            )
-            lon = np.asarray(precip.longitude.values, dtype=float)
-            lat = np.asarray(precip.latitude.values, dtype=float)
-
-            axes[0, 0].pcolormesh(
-                lon,
-                lat,
-                precip.clip(min=0.0),
-                cmap=precip_cmap,
-                norm=precip_norm,
-                shading="auto",
-                rasterized=True,
-            )
-            overlay_class_tint(axes[0, 0], class_code)
-            axes[0, 0].set_title("P = rainc + rainnc; high-cloud class tint")
-
-            axes[0, 1].pcolormesh(
-                lon,
-                lat,
-                frame["column_max_updraft"],
-                cmap="RdBu_r",
-                norm=updraft_norm,
-                shading="auto",
-                rasterized=True,
-            )
-            overlay_class_tint(axes[0, 1], class_code)
-            axes[0, 1].set_title(
-                f"max(w) over cldfrac >= {CF_THRESH:g} levels; high-cloud class tint"
-            )
-
-            cloud_top_height = frame["cloud_top_height"]
-            axes[1, 0].set_facecolor("0.96")
-            axes[1, 0].pcolormesh(
-                lon,
-                lat,
-                cloud_top_height,
-                cmap="magma",
-                norm=height_norm,
-                shading="auto",
-                rasterized=True,
-            )
-            overlay_high_cloud_tint(axes[1, 0], high)
-            axes[1, 0].set_title("Cloud-top height; cyan tint = high-cloud mask")
-
-            class_values = np.ma.masked_where(
-                np.asarray(class_code.values) <= 0,
-                np.asarray(class_code.values),
-            )
-            axes[1, 1].set_facecolor("0.96")
-            axes[1, 1].pcolormesh(
-                lon,
-                lat,
-                class_values,
-                cmap=class_cmap,
-                norm=class_norm,
-                shading="auto",
-                rasterized=True,
-            )
-            axes[1, 1].set_title("High-cloud column class")
-
-            for ax in axes.ravel():
-                ax.set_xlim(float(lon.min()), float(lon.max()))
-                ax.set_ylim(*TROPICAL_LAT_BOUNDS)
-                ax.set_xlabel("Longitude")
-                ax.set_ylabel("Latitude")
-            fig.suptitle(
-                f"{sim_name} | {format_time_value(time_value)}\n"
-                f"{classification_threshold_summary()}"
-            )
-            if frame_index % 25 == 0 or frame_index == len(common_times) - 1:
-                progress(
-                    f"{sim_name}: rendering movie frame {frame_index + 1}/{len(common_times)}"
-                )
-            return []
-
-        movie = animation.FuncAnimation(
-            fig,
-            update,
-            frames=len(common_times),
-            interval=1000.0 / VALIDATION_MOVIE_FPS,
-            blit=False,
-        )
-        safe_sim = sim_name.replace(" ", "_")
-        output_path = os.path.join(
-            save_loc, f"7_cloud_classification_validation_{safe_sim}.mp4"
-        )
-        writer = animation.FFMpegWriter(
-            fps=VALIDATION_MOVIE_FPS,
-            codec="libx264",
-            bitrate=2200,
-            extra_args=[
-                "-vf",
-                "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-                "-pix_fmt",
-                "yuv420p",
-            ],
-            metadata={"title": f"High-cloud classification validation: {sim_name}"},
-        )
-        progress(f"Writing classification validation movie: {output_path}")
-        movie.save(output_path, writer=writer, dpi=VALIDATION_MOVIE_DPI)
-        plt.close(fig)
-        manifest_rows.append(
-            dict(
-                simulation=sim_name,
-                output_file=output_path,
-                frame_count=len(common_times),
-                first_time=format_time_value(common_times[0]),
-                last_time=format_time_value(common_times[-1]),
-                frame_interval_hours=dt,
-                fps=VALIDATION_MOVIE_FPS,
-                precipitation_threshold_mm_day=P_HEAVY,
-                max_w_threshold_m_s=W_STRONG,
-                cldfrac_threshold=CF_THRESH,
-            )
-        )
-
-    save_table(
-        pd.DataFrame(manifest_rows), "cloud_classification_validation_movie_manifest"
-    )
-    progress("Done with Figure 7: cloud_classification_validation_movies")
 
 
 # -----------------------------------------------------------------------------
@@ -3256,89 +2448,45 @@ def test_time_window(ds, sim_name):
         f"{sim_name}: test window uses {TEST_TIME_STEPS} classified times from "
         f"{format_time_value(selected[1])} to {format_time_value(selected[-1])}"
     )
-    return ds.sel(Time=selected), selected
-
-
-def subset_zonal_mean_test_window(zds, selected_times, sim_name):
-    if "Time" not in zds.dims:
-        return zds
-    available = zds.Time.to_index()
-    selected = pd.Index(selected_times)
-    common = selected.intersection(available)
-    if len(common) == 0:
-        warnings.warn(f"{sim_name}: no zonal-mean times overlap the test window")
-        return zds.isel(Time=slice(0, 0))
-    return zds.sel(Time=common)
+    test_ds = subset_latitude(
+        ds.sel(Time=selected), lat_bounds=QUICK_TEST_LAT_BOUNDS
+    ).sel(longitude=slice(*QUICK_TEST_LON_BOUNDS))
+    progress(
+        f"{sim_name}: test domain is {QUICK_TEST_LAT_BOUNDS[0]:g} to "
+        f"{QUICK_TEST_LAT_BOUNDS[1]:g} deg latitude and "
+        f"{QUICK_TEST_LON_BOUNDS[0]:g} to {QUICK_TEST_LON_BOUNDS[1]:g} deg longitude"
+    )
+    return test_ds, selected
 
 
 def load_datasets():
     dss = []
-    dss_zm = []
-    progress("Loading lat-lon and zonal-mean datasets")
+    progress("Loading lat-lon datasets")
     for i, d in enumerate(data_locs):
-        selected_test_times = None
         progress(f"{sim_names[i]}: opening lat-lon dataset")
         ds = load_latlon_dataset(
             os.path.join(root_dir, d),
-            latlon_pattern=latlon_file[i],
-            time_format=time_format,
-            ndays=ndays,
-            end_date=analysis_end_date,
+            latlon_pattern=LATLON_PATTERN,
             chunks=latlon_chunks,
         )
-        ds = standardize_latlon_dataset(ds, needed_vars)
+        ds = standardize_latlon_dataset(ds, latlon_vars)
         if TEST_MODE:
-            ds, selected_test_times = test_time_window(ds, sim_names[i])
+            ds, _selected_test_times = test_time_window(ds, sim_names[i])
         progress(f"{sim_names[i]}: lat-lon dataset ready with {len(ds.data_vars)} variables")
-
-        progress(f"{sim_names[i]}: opening zonal-mean dataset")
-        zds = load_latlon_dataset(
-            os.path.join(root_dir, d),
-            latlon_pattern=zm_latlon_file[i],
-            time_format=time_format,
-            ndays=ndays,
-            end_date=analysis_end_date,
-            chunks=zm_chunks,
-            prefer_pattern=True,
-        )
-        zds = standardize_latlon_dataset(zds, needed_vars)
-        if TEST_MODE:
-            zds = subset_zonal_mean_test_window(
-                zds, selected_test_times, sim_names[i]
-            )
-        progress(f"{sim_names[i]}: zonal-mean dataset ready with {len(zds.data_vars)} variables")
         dss.append(ds)
-        dss_zm.append(zds)
-    return dss, dss_zm
+    return dss
 
 
-def prepare_fields(dss, dss_zm):
+def prepare_fields(dss):
     fields_by_run = []
-    progress("Preparing precipitation, thermodynamic, and TTL fields")
-    for sim_name, ds, zds in zip(sim_names, dss, dss_zm):
+    progress("Preparing precipitation and OLR fields")
+    for sim_name, ds in zip(sim_names, dss):
         progress(f"{sim_name}: preparing fields")
         precip = get_precip_rate(ds)
-        convective_precip = precip_component_rate_from_dataset(
-            ds, "convective", dt_hours=dt
-        )
-        grid_scale_precip = precip_component_rate_from_dataset(
-            ds, "grid_scale", dt_hours=dt
-        )
-        common_time = precip.Time.to_index()
-        common_time = common_time.intersection(convective_precip.Time.to_index())
-        common_time = common_time.intersection(grid_scale_precip.Time.to_index())
-        if len(common_time) == 0:
-            raise RuntimeError(f"{sim_name}: precipitation components have no common times")
         fields = {
-            "precip": precip.sel(Time=common_time),
-            "convective_precip": convective_precip.sel(Time=common_time),
-            "grid_scale_precip": grid_scale_precip.sel(Time=common_time),
+            "precip": precip,
+            "olr": ds["olrtoa"].sel(Time=precip.Time).rename("olr"),
         }
-        for key in ("olr", "pw", "cape", "cin"):
-            da = time_aligned_field(ds, key, fields["precip"], required=False)
-            if da is not None:
-                fields[key] = da
-        fields.update(compute_ttl_diagnostics(zds, fields["precip"]))
         progress(f"{sim_name}: fields ready ({', '.join(sorted(fields))})")
         fields_by_run.append(fields)
     return fields_by_run
@@ -3346,17 +2494,1053 @@ def prepare_fields(dss, dss_zm):
 
 def prepare_classifications(dss, fields_by_run):
     classifications = {}
-    if not should_run_any([1, 2, 3, 4, 5, 6, 7]):
-        return classifications
-    if WRITE_CLASSIFICATION_PRODUCT:
-        invalidate_classification_products()
-    progress("Building high-cloud classification products")
+    progress("Checking high-cloud classification products")
     for sim_name, ds, fields in zip(sim_names, dss, fields_by_run):
         classifications[sim_name] = get_or_build_classification(ds, fields, sim_name)
-    if should_run_any([1, 2, 4, 5, 6, 7]):
-        class_overlap_sanity(classifications)
+    class_overlap_sanity(classifications)
     progress("High-cloud classification stage complete")
     return classifications
+
+
+def layer_mean_from_profile(profile, bounds_km=UTLS_LAYER_BOUNDS_KM):
+    """Linearly integrate a profile over a geometric-height layer."""
+    z_km = np.asarray(profile.z.values, dtype=float) / 1000.0
+    values = np.asarray(profile.values, dtype=float)
+    finite = np.isfinite(z_km) & np.isfinite(values)
+    z_km = z_km[finite]
+    values = values[finite]
+    if z_km.size < 2:
+        return float(values[0]) if values.size == 1 else np.nan
+    lower, upper = map(float, bounds_km)
+    if z_km.min() > lower or z_km.max() < upper:
+        return np.nan
+    inside = (z_km > lower) & (z_km < upper)
+    sample_z = np.concatenate(([lower], z_km[inside], [upper]))
+    sample_values = np.interp(sample_z, z_km, values)
+    return float(np.trapz(sample_values, sample_z) / (upper - lower))
+
+
+def compute_vertical_contribution_profiles(
+    dss,
+    classifications,
+    time_batch=VERTICAL_PROFILE_TIME_BATCH,
+):
+    """Domain-mean cldfrac contributed by columns in each exclusive class."""
+    profiles = {}
+    rows = []
+    summary_rows = []
+    class_keys = [key for key, _label, _color in REGIME_SPECS]
+    class_labels = {key: label for key, label, _color in REGIME_SPECS}
+
+    progress("Computing domain-contribution vertical cloud profiles")
+    for ds, sim_name in zip(dss, sim_names):
+        classif = classifications.get(sim_name)
+        if classif is None:
+            continue
+        cf = standardize_cloud_fraction(ds.cldfrac)
+        cf = subset_lat(cf, TROPICAL_LAT_BOUNDS).sel(
+            z=slice(1000.0 * PROFILE_Z_BOUNDS_KM[0], 1000.0 * PROFILE_Z_BOUNDS_KM[1])
+        )
+        masks = [
+            subset_lat(classif[key].astype(bool), TROPICAL_LAT_BOUNDS)
+            for key in class_keys
+        ]
+        aligned = xr.align(cf, *masks, join="inner")
+        cf_aligned, mask_aligned = aligned[0], aligned[1:]
+        cf_aligned = cf_aligned.transpose("Time", "z", "latitude", "longitude")
+        mask_aligned = [
+            mask.transpose("Time", "latitude", "longitude")
+            for mask in mask_aligned
+        ]
+
+        ntime = cf_aligned.sizes["Time"]
+        time_slices = [
+            slice(start, min(start + time_batch, ntime))
+            for start in range(0, ntime, time_batch)
+        ]
+        numerators = np.zeros((len(class_keys), cf_aligned.sizes["z"]), dtype=float)
+        denominators = np.zeros_like(numerators)
+        latitude_weights = np.cos(
+            np.deg2rad(np.asarray(cf_aligned.latitude.values, dtype=float))
+        )[None, None, :, None]
+        started = time.monotonic()
+        progress(
+            f"{sim_name}: computing vertical cloud profiles in "
+            f"{len(time_slices)} blocks of at most {time_batch} times"
+        )
+
+        for iblock, time_slice in enumerate(time_slices, start=1):
+            block = xr.Dataset(
+                {
+                    "cloud_fraction": cf_aligned.isel(Time=time_slice),
+                    **{
+                        key: mask.isel(Time=time_slice)
+                        for key, mask in zip(class_keys, mask_aligned)
+                    },
+                }
+            ).load()
+            cloud_fraction = np.asarray(block["cloud_fraction"].values)
+            sample_weights = np.broadcast_to(latitude_weights, cloud_fraction.shape)
+
+            # This exactly reproduces cf.where(mask, other=0).weighted(...).mean():
+            # samples outside the class contribute zero to the numerator and
+            # remain in the all-column denominator, while missing cloud fraction
+            # inside the selected class is excluded from both.
+            for iclass, key in enumerate(class_keys):
+                mask = np.asarray(block[key].values, dtype=bool)[:, None, :, :]
+                contribution = np.where(mask, cloud_fraction, 0.0)
+                finite = np.isfinite(contribution)
+                numerators[iclass] += np.sum(
+                    np.where(finite, contribution * sample_weights, 0.0),
+                    axis=(0, 2, 3),
+                    dtype=np.float64,
+                )
+                denominators[iclass] += np.sum(
+                    np.where(finite, sample_weights, 0.0),
+                    axis=(0, 2, 3),
+                    dtype=np.float64,
+                )
+                del contribution, finite, mask
+
+            del block, cloud_fraction, sample_weights
+            elapsed = time.monotonic() - started
+            eta = elapsed / iblock * (len(time_slices) - iblock)
+            progress(
+                f"{sim_name}: vertical-profile block {iblock}/{len(time_slices)} "
+                f"({100.0 * iblock / len(time_slices):.0f}%); "
+                f"elapsed {format_duration(elapsed)}, ETA {format_duration(eta)}"
+            )
+            if iblock % 10 == 0:
+                gc.collect()
+
+        profile = xr.DataArray(
+            np.divide(
+                numerators,
+                denominators,
+                out=np.full_like(numerators, np.nan),
+                where=denominators > 0.0,
+            ),
+            dims=("class_key", "z"),
+            coords={"class_key": class_keys, "z": cf_aligned.z},
+        )
+        profile.name = "domain_mean_cldfrac_contribution"
+        profile.attrs.update(
+            long_name="domain-mean cloud fraction contributed by columns in each high-cloud class",
+            units="1",
+            denominator="all tropical grid-cell/time samples",
+            data_scope="cloud-radiation-on simulations only",
+        )
+        profiles[sim_name] = profile
+
+        for key in class_keys:
+            class_profile = profile.sel(class_key=key)
+            for z_value, value in zip(class_profile.z.values, class_profile.values):
+                rows.append(
+                    dict(
+                        simulation=sim_name,
+                        statistic="absolute_profile",
+                        reference_simulation="none",
+                        class_key=key,
+                        cloud_class=class_labels[key],
+                        height_km=float(z_value) / 1000.0,
+                        domain_mean_cldfrac_contribution=float(value),
+                        domain_mean_cldfrac_contribution_percent=100.0 * float(value),
+                        denominator="all tropical grid-cell/time samples",
+                        data_scope="crf_on only",
+                    )
+                )
+            layer_mean = layer_mean_from_profile(class_profile)
+            summary_rows.append(
+                dict(
+                    simulation=sim_name,
+                    statistic="absolute_layer_mean",
+                    reference_simulation="none",
+                    class_key=key,
+                    cloud_class=class_labels[key],
+                    layer_bottom_km=UTLS_LAYER_BOUNDS_KM[0],
+                    layer_top_km=UTLS_LAYER_BOUNDS_KM[1],
+                    domain_mean_cldfrac_contribution=layer_mean,
+                    domain_mean_cldfrac_contribution_percent=100.0 * layer_mean,
+                    denominator="all tropical grid-cell/time samples and geometric layer depth",
+                    data_scope="crf_on only",
+                )
+            )
+
+    if sim_names and sim_names[0] in profiles:
+        control_name = sim_names[0]
+        control = profiles[control_name]
+        for sim_name in sim_names[1:]:
+            if sim_name not in profiles:
+                continue
+            response = profiles[sim_name] - control
+            for key in class_keys:
+                class_response = response.sel(class_key=key)
+                for z_value, value in zip(class_response.z.values, class_response.values):
+                    rows.append(
+                        dict(
+                            simulation=sim_name,
+                            statistic="difference_from_control",
+                            reference_simulation=control_name,
+                            class_key=key,
+                            cloud_class=class_labels[key],
+                            height_km=float(z_value) / 1000.0,
+                            domain_mean_cldfrac_contribution=float(value),
+                            domain_mean_cldfrac_contribution_percent=100.0 * float(value),
+                            denominator="all tropical grid-cell/time samples",
+                            data_scope="crf_on only",
+                        )
+                    )
+                layer_mean = layer_mean_from_profile(class_response)
+                summary_rows.append(
+                    dict(
+                        simulation=sim_name,
+                        statistic="difference_from_control",
+                        reference_simulation=control_name,
+                        class_key=key,
+                        cloud_class=class_labels[key],
+                        layer_bottom_km=UTLS_LAYER_BOUNDS_KM[0],
+                        layer_top_km=UTLS_LAYER_BOUNDS_KM[1],
+                        domain_mean_cldfrac_contribution=layer_mean,
+                        domain_mean_cldfrac_contribution_percent=100.0 * layer_mean,
+                        denominator="all tropical grid-cell/time samples and geometric layer depth",
+                        data_scope="crf_on only",
+                    )
+                )
+
+    save_table(pd.DataFrame(rows), "high_cloud_vertical_contribution_profiles")
+    save_table(pd.DataFrame(summary_rows), "utls_high_cloud_contribution_summary")
+    progress("Domain-contribution vertical cloud profiles ready")
+    return profiles
+
+
+def plot_vertical_contribution_profiles(profiles):
+    if not should_run_figure(4):
+        return
+    progress("Starting Figure 4: high_cloud_vertical_contribution_profiles")
+    if not profiles:
+        print("Skipping Figure 4: vertical profiles are unavailable.")
+        return
+
+    fig, axes = plt.subplots(
+        2, len(REGIME_SPECS), figsize=(13.2, 8.0), constrained_layout=True,
+        sharey=True, squeeze=False,
+    )
+    control_name = sim_names[0]
+    for j, (key, label, class_color) in enumerate(REGIME_SPECS):
+        ax_absolute = axes[0, j]
+        ax_response = axes[1, j]
+        for sim_name, color in zip(sim_names, cols):
+            if sim_name not in profiles:
+                continue
+            profile = profiles[sim_name].sel(class_key=key)
+            height_km = np.asarray(profile.z.values, dtype=float) / 1000.0
+            ax_absolute.plot(
+                100.0 * profile.values, height_km,
+                color=color, lw=1.8, label=sim_name,
+            )
+            if sim_name != control_name and control_name in profiles:
+                response = profile - profiles[control_name].sel(class_key=key)
+                ax_response.plot(
+                    100.0 * response.values, height_km,
+                    color=color, lw=1.8, label=f"{sim_name} - {control_name}",
+                )
+        for ax in (ax_absolute, ax_response):
+            ax.axhspan(
+                UTLS_LAYER_BOUNDS_KM[0], UTLS_LAYER_BOUNDS_KM[1],
+                color="0.7", alpha=0.16, zorder=0,
+            )
+            ax.set_ylim(*PROFILE_Z_BOUNDS_KM)
+            ax.grid(alpha=0.2)
+        ax_absolute.set_title(label, color=class_color)
+        ax_response.axvline(0.0, color="0.45", lw=0.8)
+        if len(sim_names) == 1:
+            ax_response.text(
+                0.5, 0.5, "Single-simulation test:\nno control difference",
+                transform=ax_response.transAxes, ha="center", va="center", fontsize=8,
+            )
+
+    axes[0, 0].set_ylabel("Height (km)")
+    axes[1, 0].set_ylabel("Height (km)")
+    for ax in axes[0, :]:
+        ax.set_xlabel("Domain contribution (%)")
+    for ax in axes[1, :]:
+        ax.set_xlabel("Simulation minus control (percentage points)")
+    axes[0, -1].legend(frameon=False, fontsize=8)
+    if len(sim_names) > 1:
+        axes[1, -1].legend(frameon=False, fontsize=8)
+    fig.suptitle(
+        "Cloud-radiation-on simulations: vertical cloud amount from each high-cloud column class\n"
+        "Unfiltered tropical means; grey band marks 14-18 km; profiles use the full-domain denominator",
+        fontsize=11,
+    )
+    save_figure(4, fig, "high_cloud_vertical_contribution_profiles")
+    plt.close(fig)
+    progress("Done with figure: high_cloud_vertical_contribution_profiles")
+
+
+# -----------------------------------------------------------------------------
+# Figure 5. Spatial response of each high-cloud class
+# -----------------------------------------------------------------------------
+
+
+def time_mean_class_occurrence_maps(classifications):
+    """Load exact time-mean occurrence maps from the shared class products."""
+    maps = {}
+    zonal_rows = []
+    control_name = sim_names[0]
+    for sim_name in sim_names:
+        classif = classifications.get(sim_name)
+        if classif is None:
+            continue
+        occurrence = xr.Dataset(
+            {
+                key: subset_lat(classif[key].astype(float), TROPICAL_LAT_BOUNDS)
+                for key, _label, _color in SPATIAL_CLASS_SPECS
+            }
+        ).mean("Time", skipna=True).load()
+        maps[sim_name] = occurrence
+        for key, label, _color in SPATIAL_CLASS_SPECS:
+            zonal = occurrence[key].mean("longitude", skipna=True)
+            control_zonal = (
+                maps[control_name][key].mean("longitude", skipna=True)
+                if control_name in maps else None
+            )
+            for latitude, value in zip(zonal.latitude.values, zonal.values):
+                control_value = (
+                    float(control_zonal.sel(latitude=latitude).values)
+                    if control_zonal is not None else np.nan
+                )
+                zonal_rows.append(
+                    dict(
+                        simulation=sim_name,
+                        class_key=key,
+                        cloud_class=label,
+                        latitude=float(latitude),
+                        occurrence_percent=100.0 * float(value),
+                        difference_from_control_percentage_points=(
+                            100.0 * (float(value) - control_value)
+                            if np.isfinite(control_value) else np.nan
+                        ),
+                        temporal_filter="none",
+                        statistic="time-mean zonal-mean grid-column occurrence",
+                    )
+                )
+    save_table(pd.DataFrame(zonal_rows), "high_cloud_class_zonal_response")
+    return maps
+
+
+def control_occurrence_contour_levels(class_key, values_percent):
+    """Return readable, class-specific control-occurrence contour levels."""
+    preferred = {
+        "high_cloud_mask": (20.0, 40.0, 60.0, 80.0),
+        "convective_precipitating_high_cloud_mask": (1.0, 3.0, 5.0, 10.0),
+        "stratiform_precipitating_high_cloud_mask": (5.0, 10.0, 20.0, 30.0),
+        "nonprecipitating_high_cloud_mask": (20.0, 40.0, 60.0, 80.0),
+    }[class_key]
+    finite = np.asarray(values_percent, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return []
+    lo = float(np.nanmin(finite))
+    hi = float(np.nanmax(finite))
+    return [level for level in preferred if lo < level < hi]
+
+
+def plot_class_spatial_response(classifications):
+    """Plot unfiltered spatial occurrence or nudging-minus-control response."""
+    if not should_run_figure(5):
+        return
+    progress("Starting Figure 5: high_cloud_class_spatial_response")
+    occurrence_maps = time_mean_class_occurrence_maps(classifications)
+    if not occurrence_maps:
+        print("Skipping Figure 5: high-cloud occurrence maps are unavailable.")
+        return
+
+    control_name = sim_names[0]
+    control = occurrence_maps[control_name]
+    class_specs = SPATIAL_CLASS_SPECS
+    contrast_names = [name for name in sim_names[1:] if name in occurrence_maps]
+
+    if not contrast_names:
+        fig, axes = plt.subplots(
+            1, len(class_specs), figsize=(17.0, 3.8),
+            constrained_layout=True, squeeze=False, sharey=True,
+        )
+        for column, (key, label, _color) in enumerate(class_specs):
+            ax = axes[0, column]
+            values = 100.0 * control[key]
+            finite = np.asarray(values.values, dtype=float)
+            vmax = max(1.0, float(np.nanpercentile(finite, 99.0)))
+            image = ax.pcolormesh(
+                values.longitude, values.latitude, values,
+                shading="auto", cmap="YlGnBu", vmin=0.0, vmax=vmax,
+            )
+            fig.colorbar(image, ax=ax, label="Occurrence (%)", shrink=0.82)
+            ax.set_title(label)
+            ax.set_xlabel("Longitude")
+        axes[0, 0].set_ylabel("Latitude")
+        fig.suptitle(
+            f"{control_name}: time-mean high-cloud column occurrence "
+            f"({TROPICAL_LAT_BOUNDS[0]:g} to {TROPICAL_LAT_BOUNDS[1]:g} degrees latitude; unfiltered)"
+        )
+    else:
+        fig, axes = plt.subplots(
+            len(contrast_names), len(class_specs),
+            figsize=(18.0, 3.5 * len(contrast_names) + 1.0),
+            constrained_layout=True, squeeze=False, sharex=True, sharey=True,
+        )
+        differences = {
+            (sim_name, key): 100.0 * (occurrence_maps[sim_name][key] - control[key])
+            for sim_name in contrast_names
+            for key, _label, _color in class_specs
+        }
+        for column, (key, label, _color) in enumerate(class_specs):
+            combined = np.concatenate(
+                [
+                    np.ravel(np.asarray(differences[(name, key)].values, dtype=float))
+                    for name in contrast_names
+                ]
+            )
+            finite = np.abs(combined[np.isfinite(combined)])
+            limit = max(
+                0.05,
+                float(np.nanpercentile(finite, 99.0)) if finite.size else 0.05,
+            )
+            norm = colors.TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
+            column_images = []
+            control_percent = 100.0 * control[key]
+            contour_levels = control_occurrence_contour_levels(
+                key, control_percent.values
+            )
+            for row, sim_name in enumerate(contrast_names):
+                ax = axes[row, column]
+                difference = differences[(sim_name, key)]
+                image = ax.pcolormesh(
+                    difference.longitude, difference.latitude, difference,
+                    shading="auto", cmap="RdBu_r", norm=norm,
+                )
+                column_images.append(image)
+                if contour_levels:
+                    contours = ax.contour(
+                        control_percent.longitude,
+                        control_percent.latitude,
+                        control_percent,
+                        levels=contour_levels,
+                        colors="0.25",
+                        linewidths=0.6,
+                    )
+                    if row == 0:
+                        ax.text(
+                            0.01, 0.02,
+                            "control contours: "
+                            + ", ".join(f"{level:g}" for level in contour_levels)
+                            + "%",
+                            transform=ax.transAxes,
+                            ha="left", va="bottom", fontsize=6.5, color="0.2",
+                            bbox=dict(
+                                facecolor="white", edgecolor="none", alpha=0.72,
+                                pad=1.5,
+                            ),
+                        )
+                if row == 0:
+                    ax.set_title(label)
+                if column == 0:
+                    ax.set_ylabel(f"{sim_name} - {control_name}\nLatitude")
+                if row == len(contrast_names) - 1:
+                    ax.set_xlabel("Longitude")
+            fig.colorbar(
+                column_images[-1], ax=axes[:, column], shrink=0.82,
+                label="Occurrence response (percentage points)",
+            )
+        fig.suptitle(
+            "Time-mean high-cloud column-occurrence response "
+            f"({TROPICAL_LAT_BOUNDS[0]:g} to {TROPICAL_LAT_BOUNDS[1]:g} degrees latitude; unfiltered)\n"
+            "Shading: nudged minus control; grey contours: control occurrence (%)"
+        )
+
+    save_figure(5, fig, "high_cloud_class_spatial_response")
+    plt.close(fig)
+    progress("Done with figure: high_cloud_class_spatial_response")
+
+
+# -----------------------------------------------------------------------------
+# Figure 6. Cloud depth and OLR response at matched surface rain rate
+# -----------------------------------------------------------------------------
+
+
+def rain_bin_centres():
+    centres = []
+    for lower, upper in zip(RAIN_RATE_BINS_MM_H[:-1], RAIN_RATE_BINS_MM_H[1:]):
+        centres.append(
+            0.5 * (lower + upper) if np.isfinite(upper) else 1.35 * lower
+        )
+    return np.asarray(centres, dtype=float)
+
+
+def rain_conditioned_block_sums(classifications, fields_by_run):
+    """Accumulate exact area-weighted sums in 10-day time blocks."""
+    rows = []
+    fields_by_name = dict(zip(sim_names, fields_by_run))
+    class_keys = [key for key, _label, _color in RAIN_CONDITIONED_CLASS_SPECS]
+    for sim_name in sim_names:
+        if sim_name not in classifications:
+            continue
+        classif = classifications[sim_name]
+        fields = fields_by_name[sim_name]
+        aligned = xr.align(
+            subset_lat(classif["cloud_top_pressure"], TROPICAL_LAT_BOUNDS),
+            subset_lat(fields["olr"], TROPICAL_LAT_BOUNDS),
+            subset_lat(fields["precip"] / 24.0, TROPICAL_LAT_BOUNDS),
+            *[
+                subset_lat(classif[key].astype(bool), TROPICAL_LAT_BOUNDS)
+                for key in class_keys
+            ],
+            join="inner",
+        )
+        cloud_top_pressure, olr, rain_rate = aligned[:3]
+        masks = dict(zip(class_keys, aligned[3:]))
+        data = xr.Dataset(
+            {
+                "cloud_top_pressure": cloud_top_pressure,
+                "olr": olr,
+                "rain_rate": rain_rate,
+                **masks,
+            }
+        )
+        slices = time_block_slices(
+            rain_rate,
+            block_days=RAIN_CONDITIONED_TIME_BATCH_DAYS,
+        )
+        progress(
+            f"{sim_name}: rain-matched high-cloud properties in {len(slices)} "
+            f"blocks of about {RAIN_CONDITIONED_TIME_BATCH_DAYS:g} days"
+        )
+        latitude_weights = np.cos(
+            np.deg2rad(np.asarray(rain_rate.latitude.values, dtype=float))
+        )[None, :, None]
+        for block_index, time_slice in enumerate(slices):
+            block = data.isel(Time=time_slice).load()
+            rain_values = np.asarray(block["rain_rate"].values, dtype=float)
+            weights = np.broadcast_to(latitude_weights, rain_values.shape)
+            field_values = {
+                "cloud_top_pressure": np.asarray(
+                    block["cloud_top_pressure"].values, dtype=float
+                ),
+                "olr": np.asarray(block["olr"].values, dtype=float),
+            }
+            block_times = block.Time.values
+            for key, label, _color in RAIN_CONDITIONED_CLASS_SPECS:
+                class_mask = np.asarray(block[key].values, dtype=bool)
+                for bin_index, (lower, upper) in enumerate(
+                    zip(RAIN_RATE_BINS_MM_H[:-1], RAIN_RATE_BINS_MM_H[1:])
+                ):
+                    in_bin = (
+                        np.isfinite(rain_values)
+                        & (rain_values >= lower)
+                        & (
+                            (rain_values < upper)
+                            if np.isfinite(upper) else True
+                        )
+                    )
+                    for property_key, values in field_values.items():
+                        valid = class_mask & in_bin & np.isfinite(values)
+                        valid_weights = weights[valid]
+                        rows.append(
+                            dict(
+                                simulation=sim_name,
+                                class_key=key,
+                                cloud_class=label,
+                                property_key=property_key,
+                                block_index=int(block_index),
+                                block_start=format_time_value(block_times[0]),
+                                block_end=format_time_value(block_times[-1]),
+                                rain_bin_index=int(bin_index),
+                                rain_bin_lower_mm_h=float(lower),
+                                rain_bin_upper_mm_h=(
+                                    float(upper) if np.isfinite(upper) else np.inf
+                                ),
+                                rain_bin_centre_mm_h=float(
+                                    rain_bin_centres()[bin_index]
+                                ),
+                                weighted_sum=float(
+                                    np.sum(values[valid] * valid_weights)
+                                ),
+                                area_time_weight=float(np.sum(valid_weights)),
+                                grid_cell_time_count=int(np.count_nonzero(valid)),
+                            )
+                        )
+            if (
+                block_index == 0
+                or (block_index + 1) % 5 == 0
+                or block_index + 1 == len(slices)
+            ):
+                progress(
+                    f"{sim_name}: rain-matched block {block_index + 1}/{len(slices)}"
+                )
+            del block, field_values
+        gc.collect()
+    table = pd.DataFrame(rows)
+    save_table(table, "rain_matched_high_cloud_block_sums")
+    return table
+
+
+def bootstrap_weighted_ratio(block_rows, rng):
+    sums = block_rows.weighted_sum.to_numpy(dtype=float)
+    weights = block_rows.area_time_weight.to_numpy(dtype=float)
+    finite = np.isfinite(sums) & np.isfinite(weights) & (weights > 0.0)
+    sums = sums[finite]
+    weights = weights[finite]
+    if sums.size == 0:
+        return np.nan, np.nan, np.nan, 0
+    value = float(np.sum(sums) / np.sum(weights))
+    boot = np.empty(N_BOOTSTRAP, dtype=float)
+    for iboot in range(N_BOOTSTRAP):
+        index = rng.integers(0, sums.size, sums.size)
+        boot[iboot] = np.sum(sums[index]) / np.sum(weights[index])
+    ci_low, ci_high = np.nanpercentile(boot, CI_PERCENTILES)
+    return value, float(ci_low), float(ci_high), int(sums.size)
+
+
+def bootstrap_paired_weighted_ratio_difference(sim_rows, control_rows, rng):
+    paired = sim_rows.merge(
+        control_rows,
+        on="block_index",
+        suffixes=("_simulation", "_control"),
+    )
+    valid = (
+        np.isfinite(paired.weighted_sum_simulation)
+        & np.isfinite(paired.weighted_sum_control)
+        & np.isfinite(paired.area_time_weight_simulation)
+        & np.isfinite(paired.area_time_weight_control)
+        & (paired.area_time_weight_simulation > 0.0)
+        & (paired.area_time_weight_control > 0.0)
+    )
+    paired = paired.loc[valid]
+    if len(paired) == 0:
+        return np.nan, np.nan, np.nan, 0
+    sim_sum = paired.weighted_sum_simulation.to_numpy(dtype=float)
+    sim_weight = paired.area_time_weight_simulation.to_numpy(dtype=float)
+    control_sum = paired.weighted_sum_control.to_numpy(dtype=float)
+    control_weight = paired.area_time_weight_control.to_numpy(dtype=float)
+    value = float(
+        np.sum(sim_sum) / np.sum(sim_weight)
+        - np.sum(control_sum) / np.sum(control_weight)
+    )
+    boot = np.empty(N_BOOTSTRAP, dtype=float)
+    for iboot in range(N_BOOTSTRAP):
+        index = rng.integers(0, len(paired), len(paired))
+        boot[iboot] = (
+            np.sum(sim_sum[index]) / np.sum(sim_weight[index])
+            - np.sum(control_sum[index]) / np.sum(control_weight[index])
+        )
+    ci_low, ci_high = np.nanpercentile(boot, CI_PERCENTILES)
+    return value, float(ci_low), float(ci_high), int(len(paired))
+
+
+def aggregate_rain_conditioned_response(block_table):
+    rng = np.random.default_rng(BOOTSTRAP_SEED + 61)
+    rows = []
+    group_keys = ["class_key", "cloud_class", "property_key", "rain_bin_index"]
+    for sim_name in sim_names:
+        simulation_table = block_table[block_table.simulation == sim_name]
+        for key_values, group in simulation_table.groupby(group_keys, sort=False):
+            value, ci_low, ci_high, n_blocks = bootstrap_weighted_ratio(group, rng)
+            first = group.iloc[0]
+            rows.append(
+                dict(
+                    statistic="absolute",
+                    simulation=sim_name,
+                    contrast="",
+                    class_key=key_values[0],
+                    cloud_class=key_values[1],
+                    property_key=key_values[2],
+                    rain_bin_index=int(key_values[3]),
+                    rain_bin_lower_mm_h=first.rain_bin_lower_mm_h,
+                    rain_bin_upper_mm_h=first.rain_bin_upper_mm_h,
+                    rain_bin_centre_mm_h=first.rain_bin_centre_mm_h,
+                    value=value,
+                    ci_low=ci_low,
+                    ci_high=ci_high,
+                    n_blocks=n_blocks,
+                )
+            )
+
+    control_name = sim_names[0]
+    for sim_name in sim_names[1:]:
+        for key_values, sim_group in block_table[
+            block_table.simulation == sim_name
+        ].groupby(group_keys, sort=False):
+            control_group = block_table[
+                (block_table.simulation == control_name)
+                & (block_table.class_key == key_values[0])
+                & (block_table.property_key == key_values[2])
+                & (block_table.rain_bin_index == key_values[3])
+            ]
+            value, ci_low, ci_high, n_blocks = (
+                bootstrap_paired_weighted_ratio_difference(
+                    sim_group, control_group, rng
+                )
+            )
+            first = sim_group.iloc[0]
+            rows.append(
+                dict(
+                    statistic="difference_from_control",
+                    simulation=sim_name,
+                    contrast=f"{sim_name} - {control_name}",
+                    class_key=key_values[0],
+                    cloud_class=key_values[1],
+                    property_key=key_values[2],
+                    rain_bin_index=int(key_values[3]),
+                    rain_bin_lower_mm_h=first.rain_bin_lower_mm_h,
+                    rain_bin_upper_mm_h=first.rain_bin_upper_mm_h,
+                    rain_bin_centre_mm_h=first.rain_bin_centre_mm_h,
+                    value=value,
+                    ci_low=ci_low,
+                    ci_high=ci_high,
+                    n_blocks=n_blocks,
+                )
+            )
+    out = pd.DataFrame(rows)
+    out["temporal_filter"] = "none"
+    out["conditioning"] = "surface rain-rate bin"
+    out["interval"] = "95% 10-day block-bootstrap consistency interval"
+    out["block_support"] = np.where(
+        out.statistic == "difference_from_control",
+        "paired 10-day blocks containing class samples in both simulations",
+        "10-day blocks containing class samples",
+    )
+    save_table(out, "rain_matched_high_cloud_response")
+    return out
+
+
+def plot_rain_matched_high_cloud_response(classifications, fields_by_run):
+    if not should_run_figure(6):
+        return
+    progress("Starting Figure 6: rain_matched_high_cloud_structure_response")
+    block_table = rain_conditioned_block_sums(classifications, fields_by_run)
+    response = aggregate_rain_conditioned_response(block_table)
+    if len(response) == 0:
+        print("Skipping Figure 6: rain-matched high-cloud statistics are unavailable.")
+        return
+
+    has_contrasts = len(sim_names) > 1
+    statistic = "difference_from_control" if has_contrasts else "absolute"
+    plotted = response[response.statistic == statistic]
+    property_specs = (
+        (
+            "cloud_top_pressure",
+            "Cloud-top pressure response (hPa)\nnegative = higher cloud top"
+            if has_contrasts else "Cloud-top pressure (hPa)",
+        ),
+        (
+            "olr",
+            "OLR response (W m$^{-2}$)\nnegative = less outgoing longwave radiation"
+            if has_contrasts else "OLR (W m$^{-2}$)",
+        ),
+    )
+    fig, axes = plt.subplots(
+        2, len(RAIN_CONDITIONED_CLASS_SPECS),
+        figsize=(17.2, 7.2), constrained_layout=True,
+        sharex=True, squeeze=False,
+    )
+    line_names = sim_names[1:] if has_contrasts else sim_names
+    line_colors = cols[1:] if has_contrasts else cols
+    required_blocks = 1 if TEST_MODE else MIN_RAIN_CONDITIONED_BLOCKS
+    for column, (class_key, class_label, _class_color) in enumerate(
+        RAIN_CONDITIONED_CLASS_SPECS
+    ):
+        axes[0, column].set_title(class_label)
+        for row, (property_key, ylabel) in enumerate(property_specs):
+            ax = axes[row, column]
+            for line_name, color in zip(line_names, line_colors):
+                values = plotted[
+                    (plotted.class_key == class_key)
+                    & (plotted.property_key == property_key)
+                    & (plotted.simulation == line_name)
+                    & (plotted.n_blocks >= required_blocks)
+                ].sort_values("rain_bin_index")
+                if len(values) == 0:
+                    continue
+                x = values.rain_bin_centre_mm_h.to_numpy(dtype=float)
+                y = values.value.to_numpy(dtype=float)
+                lo = values.ci_low.to_numpy(dtype=float)
+                hi = values.ci_high.to_numpy(dtype=float)
+                label = (
+                    f"{line_name} - {sim_names[0]}" if has_contrasts else line_name
+                )
+                ax.plot(x, y, color=color, lw=1.7, marker="o", ms=3, label=label)
+                ax.fill_between(x, lo, hi, color=color, alpha=0.14, lw=0)
+            if has_contrasts:
+                ax.axhline(0.0, color="0.45", lw=0.8)
+            ax.axvline(
+                P_PRECIP_MIN / 24.0, color="0.35", lw=0.9, ls="--"
+            )
+            ax.set_xscale("symlog", linthresh=0.05, linscale=0.6, base=10)
+            ax.set_xlim(0.0, 11.0)
+            ax.set_xticks([0.025, 0.1, 0.5, 1.0, 5.0, 10.0])
+            ax.set_xticklabels(["0.025", "0.1", "0.5", "1", "5", "8+"])
+            ax.grid(alpha=0.2)
+            if column == 0:
+                ax.set_ylabel(ylabel)
+            if row == 1:
+                ax.set_xlabel("Surface rain rate (mm h$^{-1}$)")
+        axes[0, column].invert_yaxis()
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if not handles:
+        for ax in axes.ravel():
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                break
+    if handles and has_contrasts:
+        axes[0, 0].legend(handles, labels, loc="best", frameon=False, fontsize=8)
+    title_prefix = "Nudging response of" if has_contrasts else "Control values of"
+    fig.suptitle(
+        f"{title_prefix} cloud depth and outgoing longwave radiation at matched surface rain rate\n"
+        f"Unfiltered {TROPICAL_LAT_BOUNDS[0]:g} to {TROPICAL_LAT_BOUNDS[1]:g} degree columns; "
+        f"dashed line: {P_PRECIP_MIN / 24.0:g} mm h$^{{-1}}$ class threshold; "
+        f"shading: 95% 10-day block-bootstrap interval; >= {required_blocks} block(s) required",
+        fontsize=11,
+    )
+    save_figure(6, fig, "rain_matched_high_cloud_structure_response")
+    plt.close(fig)
+    progress("Done with figure: rain_matched_high_cloud_structure_response")
+
+
+def plot_literature_high_cloud_structure(
+    dss, fields_by_run, classifications, vertical_profiles
+):
+    """Unfiltered cloud-top, TTL, vertical-profile, and longwave diagnostics."""
+    if not should_run_figure(2):
+        return
+    progress("Starting Figure 2: literature_high_cloud_structure")
+    class_specs = REGIME_SPECS
+    ctp_bins = np.arange(0.0, P_HIGH_HPA + 20.0, 20.0)
+    ctp_centres = 0.5 * (ctp_bins[:-1] + ctp_bins[1:])
+    rows = []
+
+    fig, axes = plt.subplots(2, 3, figsize=(16.8, 8.2), constrained_layout=True)
+    ctp_distribution_ax = axes[0, 0]
+    ttl_ax = axes[0, 1]
+    mean_ctp_ax = axes[0, 2]
+    olr_ax = axes[1, 0]
+    vertical_profile_ax = axes[1, 1]
+    mean_ctt_ax = axes[1, 2]
+    control_name = sim_names[0]
+    x = np.arange(len(class_specs))
+    width = 0.8 / max(1, len(sim_names))
+    simulation_linestyles = ("-", "--", ":", "-.")
+    for isim, (sim_name, ds, fields) in enumerate(
+        zip(sim_names, dss, fields_by_run)
+    ):
+        classif = classifications[sim_name]
+        statistics = full_class_structure_statistics(
+            ds,
+            fields,
+            classif,
+            sim_name,
+            ctp_bins=ctp_bins,
+        )
+        ttl_fractions = [statistics[key]["ttl_fraction"] for key, *_ in class_specs]
+        olr_means = [statistics[key]["mean_olr"] for key, *_ in class_specs]
+        ctp_means = [
+            statistics[key]["mean_cloud_top_pressure"] for key, *_ in class_specs
+        ]
+        ctt_means = [
+            statistics[key]["mean_cloud_top_temperature"] for key, *_ in class_specs
+        ]
+        olr_tb_means = [
+            statistics[key]["mean_brightness_temperature"] for key, *_ in class_specs
+        ]
+        for key, label, _color in class_specs:
+            class_statistics = statistics[key]
+            ctt_mean = class_statistics["mean_cloud_top_temperature"]
+            olr_tb_mean = class_statistics["mean_brightness_temperature"]
+            rows.append(dict(
+                simulation=sim_name,
+                class_key=key,
+                cloud_class=label,
+                occurrence_fraction=class_statistics["occurrence_fraction"],
+                ttl_reaching_fraction_ctp_le_180_hpa=class_statistics["ttl_fraction"],
+                class_conditioned_olr_w_m2=class_statistics["mean_olr"],
+                mean_cloud_top_pressure_hpa=class_statistics["mean_cloud_top_pressure"],
+                mean_diagnosed_cloud_top_temperature_k=ctt_mean,
+                mean_olr_equivalent_brightness_temperature_k=olr_tb_mean,
+                mean_olr_tb_minus_cloud_top_temperature_k=(
+                    olr_tb_mean - ctt_mean
+                    if np.isfinite(olr_tb_mean) and np.isfinite(ctt_mean)
+                    else np.nan
+                ),
+                response_filter="none",
+                occurrence_denominator="all tropical area-time samples",
+                ttl_share_denominator="area-time occurrence of this cloud class",
+                olr_condition="unfiltered grid columns in which this cloud class occurs",
+                cloud_top_temperature_method=(
+                    "linear interpolation of model isobaric temperature to the "
+                    f"highest cldfrac >= {CF_THRESH:g} layer's pressure"
+                ),
+                temporal_spatial_sampling="full 20S-20N analysis period; time-blocked",
+            ))
+        for key, _label, color in class_specs:
+            ctp_distribution_ax.plot(
+                statistics[key]["ctp_histogram"],
+                ctp_centres,
+                color=color,
+                ls=simulation_linestyles[isim % len(simulation_linestyles)],
+                lw=1.8,
+            )
+        del statistics
+        gc.collect()
+        offset = (isim - (len(sim_names) - 1) / 2.0) * width
+        ttl_ax.bar(
+            x + offset, ttl_fractions, width=width,
+            color=cols[isim], label=sim_name,
+        )
+        olr_ax.bar(
+            x + offset, olr_means, width=width,
+            color=cols[isim], label=sim_name,
+        )
+        mean_ctp_ax.scatter(
+            x + offset, ctp_means, s=30, marker="o",
+            color=cols[isim], label=sim_name, zorder=4,
+        )
+        mean_ctt_ax.scatter(
+            x + offset, ctt_means, s=30, marker="o",
+            color=cols[isim], label=f"{sim_name}: cloud-top T", zorder=4,
+        )
+        mean_ctt_ax.scatter(
+            x + offset, olr_tb_means, s=34, marker="s",
+            facecolor="white", edgecolor=cols[isim], linewidth=1.2,
+            label=f"{sim_name}: OLR-equivalent Tb", zorder=4,
+        )
+        for xpos, ctt_mean, olr_tb_mean in zip(
+            x + offset, ctt_means, olr_tb_means
+        ):
+            if np.isfinite(ctt_mean) and np.isfinite(olr_tb_mean):
+                mean_ctt_ax.plot(
+                    [xpos, xpos], [ctt_mean, olr_tb_mean],
+                    color=cols[isim], lw=0.9, alpha=0.55, zorder=2,
+                )
+
+    core_x = x[0]
+    nonprecip_x = x[2]
+    literature_color = "#7a4e00"
+    mean_ctp_ax.scatter(
+        [core_x, nonprecip_x], [223.3, 281.4],
+        marker="D", s=48, facecolor="white", edgecolor=literature_color,
+        linewidth=1.3, zorder=5,
+        label="MODIS 30S-30N: deep convective 223.3; cirriform 281.4 hPa",
+    )
+    mean_ctt_ax.scatter(
+        [core_x, nonprecip_x], [234.9, 231.0],
+        marker="D", s=48, facecolor="white", edgecolor=literature_color,
+        linewidth=1.3, zorder=5,
+        label="MODIS 30S-30N: deep convective 234.9; cirriform 231.0 K",
+    )
+    olr_ax.scatter(
+        [core_x], [205.0], marker="D", s=48,
+        facecolor="white", edgecolor=literature_color, linewidth=1.3,
+        zorder=5,
+        label="Satellite deep-convection threshold: 205 W m$^{-2}$ (0-20N)",
+    )
+    olr_ax.scatter(
+        [nonprecip_x], [260.0], marker=">", s=55,
+        facecolor="white", edgecolor="#375a7f", linewidth=1.3,
+        zorder=5,
+        label="Thin-cirrus OLR: ~260 W m$^{-2}$ (tropical-ocean model)",
+    )
+
+    if control_name in vertical_profiles:
+        for key, label, color in class_specs:
+            profile = vertical_profiles[control_name].sel(class_key=key)
+            vertical_profile_ax.plot(
+                100.0 * profile, profile.z / 1000.0,
+                color=color, lw=1.8, label=label,
+            )
+        vertical_profile_ax.axhspan(
+            UTLS_LAYER_BOUNDS_KM[0], UTLS_LAYER_BOUNDS_KM[1],
+            color="0.7", alpha=0.16,
+        )
+
+    ctp_distribution_ax.invert_yaxis()
+    ctp_distribution_ax.set(
+        xlabel="Share of class occurrence per 20-hPa bin",
+        ylabel="Cloud-top pressure (hPa)",
+        title="(a) Within-class cloud-top distributions",
+    )
+    class_legend = ctp_distribution_ax.legend(
+        handles=[
+            Line2D([0], [0], color=color, lw=1.8, label=label)
+            for _key, label, color in class_specs
+        ],
+        loc="lower right",
+        frameon=False,
+        fontsize=7,
+    )
+    ctp_distribution_ax.add_artist(class_legend)
+    ctp_distribution_ax.legend(
+        handles=[
+            Line2D(
+                [0], [0], color="0.15",
+                ls=simulation_linestyles[index % len(simulation_linestyles)],
+                lw=1.5, label=sim_name,
+            )
+            for index, sim_name in enumerate(sim_names)
+        ],
+        loc="upper right",
+        frameon=False,
+        fontsize=7,
+    )
+    ttl_ax.set(
+        title="(b) Share of each class reaching the TTL",
+        ylabel="Class occurrence with CTP <= 180 hPa (fraction)",
+        xticks=x,
+        xticklabels=[label for _key, label, _color in class_specs],
+    )
+    mean_ctp_ax.set(
+        title="(c) Mean cloud-top pressure",
+        ylabel="Cloud-top pressure (hPa)",
+        xticks=x,
+        xticklabels=[label for _key, label, _color in class_specs],
+    )
+    mean_ctp_ax.set_ylim(P_HIGH_HPA, 100.0)
+    olr_ax.set(
+        title="(d) Mean OLR where each class occurs",
+        ylabel="Unfiltered class-conditioned OLR (W m$^{-2}$)",
+        xticks=x,
+        xticklabels=[label for _key, label, _color in class_specs],
+    )
+    vertical_profile_ax.set(
+        xlabel="Contribution to domain-mean cloud fraction (%)",
+        ylabel="Height (km)",
+        title=f"(e) Domain cloud amount from each class ({control_name})",
+    )
+    mean_ctt_ax.set(
+        title="(f) Cloud-top and OLR-equivalent temperature",
+        ylabel="Temperature (K)",
+        xticks=x,
+        xticklabels=[label for _key, label, _color in class_specs],
+    )
+    for ax in (ttl_ax, mean_ctp_ax, olr_ax, mean_ctt_ax):
+        ax.tick_params(axis="x", rotation=18)
+        ax.legend(frameon=False, fontsize=8)
+    if control_name in vertical_profiles:
+        vertical_profile_ax.legend(frameon=False, fontsize=8)
+    for ax in axes.ravel():
+        ax.grid(alpha=0.2)
+    fig.suptitle(
+        "Unfiltered high-cloud height and longwave structure (model bars/points: 20S-20N)\n"
+        "Circles: model isobaric temperature interpolated to diagnosed cloud-top pressure; "
+        "squares: PyFLEXTRKR OLR-equivalent brightness temperature"
+    )
+    save_table(pd.DataFrame(rows), "literature_high_cloud_structure_metrics")
+    save_table(
+        pd.DataFrame(LITERATURE_CLOUD_STRUCTURE_VALUES),
+        "high_cloud_structure_literature_values",
+    )
+    save_figure(2, fig, "literature_high_cloud_structure")
+    plt.close(fig)
+    progress("Done with figure: literature_high_cloud_structure")
 
 
 def main(argv=None):
@@ -3373,29 +3557,30 @@ def main(argv=None):
         )
     elif not WRITE_CLASSIFICATION_PRODUCT:
         progress("Classification products will be preserved and reused after version/schema validation")
+    else:
+        progress(
+            "Classification products will be reused when current and rebuilt "
+            "only when missing, stale, incomplete, or on the wrong Time axis"
+        )
     write_classification_method_table()
 
-    dss, dss_zm = load_datasets()
-    fields_by_run = prepare_fields(dss, dss_zm)
+    dss = load_datasets()
+    fields_by_run = prepare_fields(dss)
     classifications = prepare_classifications(dss, fields_by_run)
-
-    plot_class_budget(classifications)
-    plot_residual_diagnostics(fields_by_run, classifications)
-    plot_validation_snapshots(dss, fields_by_run, classifications)
-    process_frame = (
-        build_process_validation_frame(dss, fields_by_run)
-        if should_run_any([4, 5])
-        else pd.DataFrame()
+    vertical_profiles = (
+        compute_vertical_contribution_profiles(dss, classifications)
+        if should_run_figure(2) or should_run_figure(4)
+        else {}
     )
-    if len(process_frame) > 0:
-        save_table(
-            threshold_percentile_table(process_frame),
-            "cloud_classification_threshold_percentile_ranks",
-        )
-    plot_regime_process_validation(process_frame)
-    plot_precip_component_validation(process_frame, classifications)
-    plot_sensitivity_diagnostics(fields_by_run, classifications, dss=dss)
-    plot_classification_validation_movies(fields_by_run, classifications)
+
+    plot_class_budget(classifications, fields_by_run)
+    plot_literature_high_cloud_structure(
+        dss, fields_by_run, classifications, vertical_profiles
+    )
+    plot_validation_snapshots(dss, fields_by_run, classifications)
+    plot_vertical_contribution_profiles(vertical_profiles)
+    plot_class_spatial_response(classifications)
+    plot_rain_matched_high_cloud_response(classifications, fields_by_run)
 
     progress("Refined high-cloud classification diagnostics complete")
 
