@@ -1,25 +1,15 @@
 #!/usr/bin/env python
-# coding: utf-8
+"""Explicit cloud, convective-system, temperature, and wind comparisons.
 
-"""
-Conditional convective/cloud pathway diagnostics for MPAS-A nudging experiments.
-
-This script asks whether precipitation and high-cloud changes in the control,
-u-nudged, and T-nudged experiments are better explained by:
-
-  * local thermodynamic controls such as rain rate, PW, CAPE, CIN and latitude;
-  * direct or balanced UTLS thermal/static-stability changes; or
-  * wind/shear/wave effects, especially in organised equatorial disturbances.
-
-The high-cloud diagnostics deliberately separate convective precipitating convection,
-stratiform precipitating high cloud, and non-precipitating high cloud.  High cloud
-with a high cloud top is not automatically interpreted as deep precipitating convection.
+The filtered predictors are the published Kelvin, easterly-wave, and ER bands
+already produced by equatorial_wave_diagnostics.py. Cloud responses are never
+filtered. The figures report only simulated quantities and experimental
+contrasts: no intraseasonal mode or phase state is inferred.
 """
 
+import json
 import os
 import sys
-import warnings
-from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 for _rel_path in ("..", "../..", "../../.."):
@@ -27,2017 +17,556 @@ for _rel_path in ("..", "../..", "../../.."):
     if _path not in sys.path:
         sys.path.append(_path)
 
-import dask
 import numpy as np
 import pandas as pd
 import xarray as xr
 from matplotlib import pyplot as plt
 
-from diagnostics.diagnostic_helpers import *
+from diagnostics.diagnostic_helpers import (
+    FigureSaver, ZONAL_MEAN_PATTERN, diagnostic_cache_dir,
+    convective_organisation_cache_dir, diagnostic_output_dir,
+    load_latlon_dataset, PRIMARY_TRACK_SOURCE, progress,
+    PYFLEXTRKR_PRODUCT_VERSION,
+    TRACK_POPULATION_LABELS, TRACK_POPULATIONS, table_boolean_mask,
+    standardize_latlon_dataset, subset_latitude,
+)
 from diagnostics.convection.high_cloud_classification import (
-    HighCloudThresholds,
-    cached_classification_is_current as shared_cached_classification_is_current,
-    classification_cache_metadata as shared_classification_cache_metadata,
+    CLASSIFICATION_CACHE_VERSION, HighCloudThresholds,
+    cached_classification_is_current,
 )
-from diagnostics.waves.equatorial_wave_config import (
-    CORE_WAVE_NAMES,
-    WAVE_BOXES as SHARED_WAVE_BOXES,
-)
+from diagnostics.waves.cached_wave_products import load_existing_filtered_wave
+from diagnostics.waves.equatorial_wave_config import CORE_WAVE_NAMES, WAVE_BOXES
 
-try:
-    from waveFilter import kf_filter
-except ModuleNotFoundError:
-    kf_filter = None
-
-
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
 
 save = True
-save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/convective_pathways/")
-
-# Set to [] or None to run all figures. Otherwise list numbered figures.
-#
-# Figure numbers:
-#   1: conditional_highcloud_vs_precip
-#   2: conditional_cloudtop_pressure_vs_precip_pw
-#   3: conditional_precip_pw_by_wave_amplitude_and_phase
-#   4: residual_highcloud_thermo_controls
-#   5: cloud_classification_summary
-#   6: cloud_classification_mean_maps
-#   7: cloud_classification_snapshots
-#   8: conditional_nonprecipitating_highcloud_pw_by_lagged_precip
-#   9: wave_conditioned_cloud_classes_and_cloud_top_pressure
-#  10: wave_phase_binned_cloud_composites (fine signed-phase bins + latitude profiles)
-figures_to_run = []
+save_loc = diagnostic_output_dir(
+    "/home/cwp29/tmp/mpas/crf_on/final/convective_pathways/"
+)
+figures_to_run = [1, 2]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control_new", "u_nudge", "T_nudge"]
-latlon_file = ["latlon.2000-*.nc", "latlon.2000-*.nc", "latlon.2000-*.nc"]
-zm_latlon_file = ["zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc", "zm_latlon.2000-*.nc"]
 sim_names = ["control", "nudged u", "nudged T"]
 cols = ["k", "b", "r"]
-
-ndays = 200
-dt = 6
-analysis_end_date = "2000-11-21"
-time_format = "time"
-obs_per_day = int(round(24 / dt))
+WAVE_NAMES = tuple(CORE_WAVE_NAMES)
 
 TROPICAL_LAT_BOUNDS = (-20.0, 20.0)
-WAVE_FILTER_LAT_BOUNDS = (-10.0, 10.0)
-
-# High-cloud classification thresholds.  Keep these near the top so threshold
-# sensitivity tests do not require editing the classification logic.
+TTL_Z_BOUNDS_M = (14_000.0, 18_000.0)
+TTL_LAT_BOUNDS = (-10.0, 10.0)
 CF_THRESH = 0.05
 P_HIGH_HPA = 440.0
-P_PRECIP_MIN = 1.0
-CONVECTIVE_FRACTION = 0.50
-LAGGED_PRECIP_TIME_STEPS = 1
+P_PRECIP_MIN_MM_DAY = 12.0
 
-# Conditional sampling and binning controls.  These diagnostics use high-time
-# gridded fields, but they stride before materialising values to keep memory
-# predictable.
-MIN_BIN_COUNT = 50
-PRECIP_NBINS = 14
-PW_NBINS = 14
-LATITUDE_BIN_WIDTH = 2.0
-LOW_COUNT_MARKER_Y = 0.03
-
-PLOT_SAMPLE_LIMITS = dict(max_time=96, max_lat=96, max_lon=192)
-RESIDUAL_FIT_SAMPLE_LIMITS = dict(max_time=120, max_lat=120, max_lon=240)
-RESIDUAL_PLOT_SAMPLE_LIMITS = dict(max_time=120, max_lat=120, max_lon=240)
-
-# This diagnostic consumes the shared high-cloud classification written by
-# refined_high_cloud_classification_diagnostics.py. Missing or stale caches are
-# fatal so all analyses use exactly the same physical classes.
-classification_cache_dir = diagnostic_cache_dir("classification_cache", root_dir=root_dir)
-classification_cache_read_dirs = unique_existing_order([classification_cache_dir])
-
-cache_dir = diagnostic_cache_dir("convective_pathways_cache", root_dir=root_dir)
-os.makedirs(cache_dir, exist_ok=True)
-os.makedirs(classification_cache_dir, exist_ok=True)
-
-# Robust variable aliases.  The first available variable in each list is used.
-VAR_ALIASES = {
-    "precip": ["precip", "precip_rate", "pr", "rain_rate"],
-    "rainc": ["rainc"],
-    "rainnc": ["rainnc"],
-    "i_rainc": ["i_rainc"],
-    "i_rainnc": ["i_rainnc"],
-    "olr": ["olr", "olrtoa", "OLR"],
-    "pw": ["pw", "precipw", "prw"],
-    "cape": ["cape", "CAPE"],
-    "cin": ["cin", "CIN"],
-    "theta": ["theta", "potential_temperature"],
-    "pressure": ["pressure", "p"],
-    "zgrid": ["zgrid"],
-    "u_zm": ["uReconstructZonal", "u", "uzonal"],
-    "u_isobaric": ["uzonal_isobaric", "u_isobaric"],
-    "N2": ["N2", "n2", "static_stability"],
-    "dudz": ["dudz", "du_dz", "vertical_shear"],
-}
-
-needed_vars = sorted(
-    set(
-        VAR_ALIASES["rainc"]
-        + VAR_ALIASES["rainnc"]
-        + VAR_ALIASES["i_rainc"]
-        + VAR_ALIASES["i_rainnc"]
-        + VAR_ALIASES["precip"]
-        + VAR_ALIASES["olr"]
-        + VAR_ALIASES["pw"]
-        + VAR_ALIASES["cape"]
-        + VAR_ALIASES["cin"]
-        + VAR_ALIASES["theta"]
-        + VAR_ALIASES["pressure"]
-        + VAR_ALIASES["zgrid"]
-        + VAR_ALIASES["u_zm"]
-        + VAR_ALIASES["u_isobaric"]
-        + VAR_ALIASES["N2"]
-        + VAR_ALIASES["dudz"]
-    )
+classification_cache_dir = diagnostic_cache_dir(
+    "classification_cache", root_dir=root_dir
 )
+organisation_output_dir = convective_organisation_cache_dir(root_dir=root_dir)
+os.makedirs(save_loc, exist_ok=True)
 
-latlon_chunks = {"Time": 8, "latitude": 90, "longitude": 180}
-zm_chunks = {"Time": -1}
-
-dask.config.set({"array.slicing.split_large_chunks": True})
-
-
-# Shared core wave definitions used by the equatorial-wave and lifecycle
-# diagnostics. Wave activity is defined from filtered precipitation.
-WAVE_BOXES = {name: SHARED_WAVE_BOXES[name] for name in CORE_WAVE_NAMES}
-WAVE_BANDS_FOR_FIG3 = list(CORE_WAVE_NAMES)
-WAVE_FILTER_FIELD = "precip"
-WAVE_PHASE_THRESHOLD_STD = 0.5
-# Fine signed-phase bins for Figure 10 wave-phase composites (ported from the
-# Kelvin-only decomposition previously in equatorial_wave_diagnostics.py).
-WAVE_PHASE_COMPOSITE_BINS = np.linspace(-3.0, 3.0, 25)
-WAVE_PHASE_COMPOSITE_MIN_COUNT = 20
-
-CLOUD_CATEGORY_SPECS = [
-    ("high_cloud_mask", "Total high cloud", "0.25"),
-    ("convective_precipitating_high_cloud_mask", "Convective precipitating", "tab:red"),
-    ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating", "tab:blue"),
-    ("nonprecipitating_high_cloud_mask", "Non-precipitating", "tab:green"),
-    ("unclassified_high_cloud_mask", "Invalid/unclassified", "0.55"),
-]
-
-MAP_CATEGORY_SPECS = [
-    ("high_cloud_mask", "Total high cloud"),
-    ("convective_precipitating_high_cloud_mask", "Convective precipitating"),
-    ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating"),
-    ("nonprecipitating_high_cloud_mask", "Non-precipitating"),
-]
-
-
-should_run_figure = partial(figure_should_run, figures_to_run)
-should_run_any = partial(figure_should_run_any, figures_to_run)
-run_all_figures = partial(all_figures_requested, figures_to_run)
-
-
-save_figure = numbered_figure_saver(figsave)
-
-
-# -----------------------------------------------------------------------------
-# General helpers
-# -----------------------------------------------------------------------------
-
-find_var = partial(find_variable, aliases=VAR_ALIASES)
-subset_lat = subset_latitude
-get_precip_rate = partial(
-    precipitation_rate_from_dataset,
-    aliases=VAR_ALIASES,
-    dt_hours=dt,
-)
-time_aligned_field = partial(
-    time_aligned_variable,
-    aliases=VAR_ALIASES,
-    intersect=False,
-)
-
-
-def weighted_lat_mean(da, lat_bounds=WAVE_FILTER_LAT_BOUNDS):
-    x = subset_lat(da, lat_bounds=lat_bounds)
-    if "latitude" not in x.dims:
-        return x
-    return lat_mean(x)
-
-
-classification_thresholds = partial(
-    HighCloudThresholds,
-    cf_thresh=CF_THRESH,
-    high_cloud_top_pressure_hpa=P_HIGH_HPA,
-    surface_precip_min_mm_day=P_PRECIP_MIN,
-    convective_fraction_threshold=CONVECTIVE_FRACTION,
-)
-
-
-classification_cache_metadata = partial(
-    shared_classification_cache_metadata,
-    thresholds=classification_thresholds(),
-)
-
-
-cached_classification_is_current = partial(
-    shared_cached_classification_is_current,
-    thresholds=classification_thresholds(),
-)
-
-
-REQUIRED_CLASSIFICATION_VARS = (
+CLASSIFICATION_VARIABLES = (
     "cloud_top_pressure",
-    "cloud_top_height",
-    "high_cloud_fraction",
     "high_cloud_mask",
-    "precipitating_high_cloud_mask",
     "convective_precipitating_high_cloud_mask",
     "stratiform_precipitating_high_cloud_mask",
     "nonprecipitating_high_cloud_mask",
-    "unclassified_high_cloud_mask",
 )
 
-
-def open_cached_classification(cache_path, sim_name):
-    cached = xr.open_dataset(cache_path, chunks={})
-    if not cached_classification_is_current(cached):
-        cached.close()
-        raise RuntimeError(f"{sim_name}: stale high-cloud classification cache: {cache_path}")
-    missing = [name for name in REQUIRED_CLASSIFICATION_VARS if name not in cached.data_vars]
-    if missing:
-        cached.close()
-        raise RuntimeError(
-            f"{sim_name}: high-cloud classification cache lacks required shared variables "
-            f"{missing}: {cache_path}"
-        )
-    progress(f"{sim_name}: using cached high-cloud classification {cache_path}")
-    return {name: cached[name] for name in cached.data_vars}
-
-
-def load_required_classification(ds, fields, sim_name):
-    cache_filename = f"{sim_name.replace(' ', '_')}_classified_high_cloud.nc"
-    checked_paths = []
-    for read_dir in classification_cache_read_dirs:
-        read_path = os.path.join(read_dir, cache_filename)
-        checked_paths.append(read_path)
-        if os.path.exists(read_path):
-            return open_cached_classification(read_path, sim_name)
-    raise FileNotFoundError(
-        f"{sim_name}: required shared high-cloud classification cache is missing. "
-        f"Run refined_high_cloud_classification_diagnostics.py first. Checked: {checked_paths}"
-    )
-
-
-def print_class_coverage(classifications):
-    progress("Computing high-cloud class tropical coverage")
-    rows = []
-    for sim_name, classif in classifications.items():
-        if classif is None:
-            continue
-        for key in (
-            "high_cloud_mask",
-            "convective_precipitating_high_cloud_mask",
-            "stratiform_precipitating_high_cloud_mask",
-            "nonprecipitating_high_cloud_mask",
-            "unclassified_high_cloud_mask",
-        ):
-            rows.append(
-                dict(
-                    simulation=sim_name,
-                    class_name=key,
-                    tropical_area_time_fraction=weighted_area_time_mean(classif[key], TROPICAL_LAT_BOUNDS),
-                )
-            )
-
-    coverage = pd.DataFrame(rows)
-    if len(coverage) == 0:
-        return coverage
-
-    print("\nHigh-cloud class tropical area/time coverage")
-    print(coverage.to_string(index=False), flush=True)
-    if save:
-        coverage.to_csv(os.path.join(save_loc, "high_cloud_class_coverage.csv"), index=False)
-        progress(f"Wrote {os.path.join(save_loc, 'high_cloud_class_coverage.csv')}")
-
-    for sim_name in coverage.simulation.unique():
-        sub = coverage[coverage.simulation == sim_name].set_index("class_name")
-        high = sub.loc["high_cloud_mask", "tropical_area_time_fraction"]
-        if high <= 0:
-            continue
-        class_fracs = sub.drop(index="high_cloud_mask")["tropical_area_time_fraction"] / high
-        if class_fracs.max() > 0.85:
-            dominant = class_fracs.idxmax()
-            warnings.warn(
-                f"{sim_name}: high-cloud classification is dominated by {dominant} "
-                f"({100.0 * class_fracs.max():.1f}% of high-cloud coverage)."
-            )
-    return coverage
-
-
-def class_overlap_sanity(classifications):
-    progress("Computing high-cloud class overlap/denominator sanity checks")
-    rows = []
-    exclusive_keys = [
+CLOUD_RESPONSES = (
+    (
+        "convective_core",
+        "PyFLEXTRKR convective core",
         "convective_precipitating_high_cloud_mask",
+    ),
+    (
+        "stratiform",
+        "Stratiform precipitating",
         "stratiform_precipitating_high_cloud_mask",
+    ),
+    (
+        "nonprecipitating",
+        "Non-precipitating",
         "nonprecipitating_high_cloud_mask",
-        "unclassified_high_cloud_mask",
-    ]
-    for sim_name, classif in classifications.items():
-        if classif is None:
-            continue
-        high = classif["high_cloud_mask"].astype(bool)
-        high_frac = weighted_area_time_mean(high, TROPICAL_LAT_BOUNDS)
-        rows.append(dict(simulation=sim_name, metric="high_cloud_denominator", value=high_frac))
+    ),
+    ("ttl_top", "TTL-reaching high cloud\n(CTP <= 180 hPa)", None),
+)
 
-        for key in exclusive_keys + ["precipitating_high_cloud_mask"]:
-            mask = classif[key].astype(bool)
-            rows.append(dict(simulation=sim_name, metric=f"{key}_coverage", value=weighted_area_time_mean(mask, TROPICAL_LAT_BOUNDS)))
-            rows.append(dict(simulation=sim_name, metric=f"{key}_within_high_cloud", value=weighted_area_time_mean(mask & high, TROPICAL_LAT_BOUNDS) / high_frac if high_frac > 0 else np.nan))
-
-        for i, key_a in enumerate(exclusive_keys):
-            for key_b in exclusive_keys[i + 1:]:
-                overlap = weighted_area_time_mean(classif[key_a].astype(bool) & classif[key_b].astype(bool), TROPICAL_LAT_BOUNDS)
-                rows.append(dict(simulation=sim_name, metric=f"overlap_{key_a}__{key_b}", value=overlap))
-
-    df = pd.DataFrame(rows)
-    if len(df) > 0:
-        print("\nHigh-cloud class denominator/overlap sanity checks")
-        print(df.to_string(index=False), flush=True)
-        if save:
-            path = os.path.join(save_loc, "high_cloud_classification_sanity.csv")
-            df.to_csv(path, index=False)
-            progress(f"Wrote {path}")
-    return df
-
-
-def zonal_occurrence(da):
-    x = subset_lat(da.astype(float), TROPICAL_LAT_BOUNDS)
-    dims = [dim for dim in ("Time", "longitude") if dim in x.dims]
-    return x.mean(dim=dims, skipna=True)
-
-
-def time_mean_map(da):
-    x = subset_lat(da.astype(float), TROPICAL_LAT_BOUNDS)
-    if "Time" in x.dims:
-        x = x.mean(dim="Time", skipna=True)
-    return x
-
-
-def representative_snapshot_time(classif):
-    high = subset_lat(classif["high_cloud_mask"].astype(float), TROPICAL_LAT_BOUNDS)
-    if "Time" not in high.dims:
-        return None
-    weights = np.cos(np.deg2rad(high.latitude))
-    coverage = high.weighted(weights).mean(dim=("latitude", "longitude"), skipna=True)
-    idx = int(coverage.argmax(dim="Time").values)
-    return high.Time.isel(Time=idx).values
-
-
-compute_ttl_diagnostics = partial(compute_ttl_diagnostics, aliases=VAR_ALIASES)
-
-
-def unique_monotonic_bins(edges, fallback=None):
-    edges = np.asarray(edges, dtype=float)
-    edges = edges[np.isfinite(edges)]
-    edges = np.unique(edges)
-    if edges.size < 3:
-        if fallback is None:
-            raise ValueError("Could not construct enough unique bin edges")
-        return np.asarray(fallback, dtype=float)
-    return edges
-
-
-def fallback_bins_for_key(key, vals, nbins):
-    if key == "precip":
-        vmax = max(80.0, float(np.nanpercentile(vals, 99.5)))
-        core = np.array([0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 80.0])
-        return np.unique(np.concatenate([core[core < vmax], [vmax]]))
-    if key == "pw":
-        return np.linspace(float(np.nanpercentile(vals, 1.0)), float(np.nanpercentile(vals, 99.0)), nbins + 1)
-    return np.linspace(float(np.nanmin(vals)), float(np.nanmax(vals)), nbins + 1)
-
-
-def pooled_weighted_bins(field_dicts, key, nbins, lat_bounds=TROPICAL_LAT_BOUNDS, limits=PLOT_SAMPLE_LIMITS):
-    vals_all = []
-    weights_all = []
-    for fields in field_dicts:
-        if key not in fields:
-            continue
-        vals, weights = sample_matching_arrays(fields[key], lat_bounds=lat_bounds, **limits)
-        vals_all.append(vals[0])
-        weights_all.append(weights)
-    if not vals_all:
-        return None
-    vals = np.concatenate(vals_all)
-    weights = np.concatenate(weights_all)
-    q = np.linspace(0.01, 0.99, nbins + 1)
-    edges = weighted_quantile(vals, q, weights)
-    return unique_monotonic_bins(edges, fallback=fallback_bins_for_key(key, vals, nbins))
-
-
-def pooled_classified_values(field_dicts, classifications, key, lat_bounds=TROPICAL_LAT_BOUNDS, limits=PLOT_SAMPLE_LIMITS):
-    """
-    Pool one predictor only over samples with classified cloud data.
-
-    This keeps the control run on its shorter cloud-fraction record while still
-    using the full available cloud record for the nudged simulations.
-    """
-    vals_all = []
-    weights_all = []
-    for sim_name, fields in zip(sim_names, field_dicts):
-        classif = classifications.get(sim_name)
-        if classif is None or key not in fields:
-            continue
-        vals, weights = sample_matching_arrays(
-            fields[key],
-            classif["high_cloud_mask"].astype(float),
-            lat_bounds=lat_bounds,
-            **limits,
-        )
-        vals_all.append(vals[0])
-        weights_all.append(weights)
-    if not vals_all:
-        return None, None
-    return np.concatenate(vals_all), np.concatenate(weights_all)
-
-
-def pooled_weighted_bins_for_classified(field_dicts, classifications, key, nbins, lat_bounds=TROPICAL_LAT_BOUNDS, limits=PLOT_SAMPLE_LIMITS):
-    vals, weights = pooled_classified_values(field_dicts, classifications, key, lat_bounds=lat_bounds, limits=limits)
-    if vals is None:
-        return None
-    q = np.linspace(0.01, 0.99, nbins + 1)
-    edges = weighted_quantile(vals, q, weights)
-    return unique_monotonic_bins(edges, fallback=fallback_bins_for_key(key, vals, nbins))
-
-
-def pooled_tercile_edges_for_classified(field_dicts, classifications, key, lat_bounds=TROPICAL_LAT_BOUNDS, limits=PLOT_SAMPLE_LIMITS):
-    vals, weights = pooled_classified_values(field_dicts, classifications, key, lat_bounds=lat_bounds, limits=limits)
-    if vals is None:
-        return None
-    q = weighted_quantile(vals, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0], weights)
-    q[0] = np.nanmin(vals)
-    q[-1] = np.nanmax(vals)
-    return unique_monotonic_bins(q)
-
-
-def weighted_binned_mean(x, y, bins, weights=None, min_count=MIN_BIN_COUNT):
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    weights = np.ones_like(x) if weights is None else np.asarray(weights, dtype=float)
-    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(weights) & (weights > 0)
-    x = x[ok]
-    y = y[ok]
-    weights = weights[ok]
-    idx = np.digitize(x, bins) - 1
-    centres = 0.5 * (bins[:-1] + bins[1:])
-    mean = np.full(centres.size, np.nan)
-    count = np.zeros(centres.size, dtype=int)
-    for j in range(centres.size):
-        m = idx == j
-        count[j] = int(np.count_nonzero(m))
-        if count[j] >= min_count and np.sum(weights[m]) > 0:
-            mean[j] = np.sum(weights[m] * y[m]) / np.sum(weights[m])
-    return centres, mean, count
-
-
-def weighted_binned_fraction(x, numerator, bins, denominator=None, weights=None, min_count=MIN_BIN_COUNT):
-    x = np.asarray(x, dtype=float)
-    numerator = np.asarray(numerator, dtype=bool)
-    if denominator is None:
-        denominator = np.ones_like(numerator, dtype=bool)
-    else:
-        denominator = np.asarray(denominator, dtype=bool)
-    weights = np.ones_like(x) if weights is None else np.asarray(weights, dtype=float)
-    ok = np.isfinite(x) & np.isfinite(weights) & (weights > 0) & denominator
-    x = x[ok]
-    numerator = numerator[ok]
-    weights = weights[ok]
-    idx = np.digitize(x, bins) - 1
-    centres = 0.5 * (bins[:-1] + bins[1:])
-    frac = np.full(centres.size, np.nan)
-    count = np.zeros(centres.size, dtype=int)
-    for j in range(centres.size):
-        m = idx == j
-        count[j] = int(np.count_nonzero(m))
-        if count[j] >= min_count and np.sum(weights[m]) > 0:
-            frac[j] = np.sum(weights[m] * numerator[m].astype(float)) / np.sum(weights[m])
-    return centres, frac, count
-
-
-def plot_supported_curve(
-    ax,
-    centres,
-    values,
-    count,
-    color,
-    label=None,
-    linestyle="-",
-    marker="o",
-    min_count=MIN_BIN_COUNT,
-    low_count_marker=True,
-    **kwargs,
-):
-    """Plot only sample-supported bins and mark bins that were present but undersampled."""
-    centres = np.asarray(centres)
-    values = np.asarray(values, dtype=float)
-    count = np.asarray(count, dtype=int)
-    supported = np.isfinite(values) & (count >= min_count)
-    if np.any(supported):
-        ax.plot(
-            centres[supported],
-            values[supported],
-            color=color,
-            ls=linestyle,
-            marker=marker,
-            ms=3,
-            lw=1.6,
-            label=label,
-            **kwargs,
-        )
-    elif label is not None:
-        # Keep the legend honest even if this run has no supported bins.
-        ax.plot([], [], color=color, ls=linestyle, marker=marker, label=label, **kwargs)
-
-    weak = (~supported) & (count > 0)
-    if low_count_marker and np.any(weak):
-        ax.scatter(
-            centres[weak],
-            np.full(np.count_nonzero(weak), LOW_COUNT_MARKER_Y),
-            marker="|",
-            s=22,
-            color=color,
-            alpha=0.35,
-            transform=ax.get_xaxis_transform(),
-            clip_on=False,
-            zorder=2,
-        )
-    return supported
-
-
-def add_low_count_note(ax, min_count=MIN_BIN_COUNT):
-    ax.text(
-        0.99,
-        0.02,
-        f"ticks: n<{min_count}",
-        transform=ax.transAxes,
-        ha="right",
-        va="bottom",
-        fontsize=6,
-        color="0.35",
-    )
-
-
-count_rows_to_frame = partial(
-    count_rows_to_frame,
-    save=save,
-    save_loc=save_loc,
+TRACK_METRICS = (
+    ("event_rate", "MCS event rate", "events per 100 days"),
+    ("lifetime_hours", "Median MCS lifetime", "h"),
+    ("max_area_km2", "Median maximum cold-shield area", "km2"),
 )
 
 
-def write_metadata_table():
-    rows = [dict(threshold=name, value=value) for name, value in classification_cache_metadata().items()]
-    df = pd.DataFrame(rows)
-    if save:
-        path = os.path.join(save_loc, "high_cloud_classification_thresholds.csv")
-        df.to_csv(path, index=False)
-        progress(f"Wrote {path}")
-    return df
+def classification_thresholds():
+    return HighCloudThresholds(
+        cf_thresh=CF_THRESH,
+        high_cloud_top_pressure_hpa=P_HIGH_HPA,
+        surface_precip_min_mm_day=P_PRECIP_MIN_MM_DAY,
+    )
 
 
-def condition_support_table(field_dicts, classifications, condition_key, edges, stem):
-    """Count samples each simulation contributes to each conditioning bin."""
-    rows = []
-    labels = condition_labels(edges, condition_key)
-    for sim_name, fields in zip(sim_names, field_dicts):
-        classif = classifications.get(sim_name)
-        if classif is None or condition_key not in fields:
-            continue
-        vals, weights = sample_matching_arrays(
-            fields[condition_key],
-            classif["high_cloud_mask"].astype(float),
-            lat_bounds=TROPICAL_LAT_BOUNDS,
-            **PLOT_SAMPLE_LIMITS,
+def load_classification(simulation):
+    path = os.path.join(
+        classification_cache_dir,
+        f"{simulation.replace(' ', '_')}_classified_high_cloud.nc",
+    )
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{simulation}: missing shared high-cloud product {path}. Run "
+            "refined_high_cloud_classification_diagnostics.py first."
         )
-        cond = vals[0]
-        for j, label in enumerate(labels):
-            lo, hi = edges[j], edges[j + 1]
-            mask = (cond >= lo) & (cond <= hi if j == len(labels) - 1 else cond < hi)
-            rows.append(
-                dict(
-                    simulation=sim_name,
-                    condition=condition_key,
-                    bin_label=label,
-                    bin_min=lo,
-                    bin_max=hi,
-                    sample_count=int(np.count_nonzero(mask)),
-                    weighted_sample=float(np.sum(weights[mask])),
-                )
+    dataset = xr.open_dataset(path, chunks={})
+    if not cached_classification_is_current(dataset, classification_thresholds()):
+        dataset.close()
+        raise RuntimeError(f"{simulation}: stale high-cloud product {path}")
+    missing = [name for name in CLASSIFICATION_VARIABLES if name not in dataset]
+    if missing:
+        dataset.close()
+        raise RuntimeError(f"{simulation}: high-cloud product lacks {missing}: {path}")
+    progress(f"{simulation}: using {path}")
+    return dataset
+
+
+def response_masks(classification):
+    high = classification.high_cloud_mask.astype(bool)
+    masks = {}
+    for key, _label, variable in CLOUD_RESPONSES:
+        masks[key] = (
+            (high & (classification.cloud_top_pressure <= 180.0)).fillna(False)
+            if variable is None else classification[variable].astype(bool)
+        )
+    return masks
+
+
+def tropical_zonal_occurrence(mask):
+    mask = subset_latitude(mask.astype(float), lat_bounds=TROPICAL_LAT_BOUNDS)
+    weights = xr.DataArray(
+        np.cos(np.deg2rad(mask.latitude.values)),
+        dims=("latitude",),
+        coords={"latitude": mask.latitude},
+    )
+    return mask.weighted(weights).mean("latitude", skipna=True)
+
+
+def standardised_regression_slope(response, predictor):
+    response, predictor = xr.align(response, predictor, join="inner")
+    predictor_sigma = predictor.std(("Time", "longitude"), skipna=True)
+    predictor_standard = predictor / predictor_sigma
+    x_mean = predictor_standard.mean(("Time", "longitude"), skipna=True)
+    y_mean = response.mean(("Time", "longitude"), skipna=True)
+    x_anomaly = predictor_standard - x_mean
+    y_anomaly = response - y_mean
+    denominator = (x_anomaly**2).mean(("Time", "longitude"), skipna=True)
+    slope = (x_anomaly * y_anomaly).mean(
+        ("Time", "longitude"), skipna=True
+    ) / denominator
+    slope_value = slope.compute()
+    sigma_value = predictor_sigma.compute()
+    return float(slope_value.values), float(sigma_value.values)
+
+
+def wave_cloud_regression_table(classifications):
+    rows = []
+    for simulation, classification in zip(sim_names, classifications):
+        responses = {
+            key: tropical_zonal_occurrence(mask).load()
+            for key, mask in response_masks(classification).items()
+        }
+        for wave_name in WAVE_NAMES:
+            predictor = load_existing_filtered_wave(
+                root_dir, simulation, "Precip", wave_name
             )
-    df = pd.DataFrame(rows)
-    if len(df) > 0:
-        print(f"\nCondition-bin support for {stem}")
-        print(df.to_string(index=False), flush=True)
-        if save:
-            path = os.path.join(save_loc, f"{stem}_condition_support.csv")
-            df.to_csv(path, index=False)
-            progress(f"Wrote {path}")
-    return df
-
-
-def common_support_condition_edges(field_dicts, classifications, key, nbins=3):
-    """
-    Prefer edges inside the range sampled by all simulations.
-
-    For N2_TTL this avoids interpreting a nudged-only stability regime as a
-    like-for-like comparison.  If the robust per-run ranges do not overlap, the
-    caller gets pooled occupancy bins and should label the panels accordingly.
-    """
-    if key != "N2_TTL":
-        return pooled_tercile_edges_for_classified(field_dicts, classifications, key), "pooled occupancy", None
-
-    per_run = []
-    for sim_name, fields in zip(sim_names, field_dicts):
-        classif = classifications.get(sim_name)
-        if classif is None or key not in fields:
-            continue
-        vals, weights = sample_matching_arrays(
-            fields[key],
-            classif["high_cloud_mask"].astype(float),
-            lat_bounds=TROPICAL_LAT_BOUNDS,
-            **PLOT_SAMPLE_LIMITS,
-        )
-        q02, q98 = weighted_quantile(vals[0], [0.02, 0.98], weights)
-        per_run.append((sim_name, q02, q98))
-
-    if len(per_run) == len(sim_names):
-        common_lo = max(row[1] for row in per_run)
-        common_hi = min(row[2] for row in per_run)
-        if np.isfinite(common_lo) and np.isfinite(common_hi) and common_hi > common_lo:
-            vals, weights = pooled_classified_values(field_dicts, classifications, key)
-            if vals is not None:
-                in_common = (vals >= common_lo) & (vals <= common_hi)
-                if np.any(in_common):
-                    q = weighted_quantile(vals[in_common], np.linspace(0, 1, nbins + 1), weights[in_common])
-                    q[0], q[-1] = common_lo, common_hi
-                    return unique_monotonic_bins(q), "common-support", (common_lo, common_hi, per_run)
-
-    return pooled_tercile_edges_for_classified(field_dicts, classifications, key), "regime-occupancy", None
-
-
-def condition_labels(edges, name):
-    nbin = max(len(edges) - 1, 0)
-    if nbin == 3:
-        prefixes = ["low", "mid", "high"]
-    else:
-        prefixes = [f"bin {i + 1}" for i in range(nbin)]
-    return [f"{prefix} {name}" for prefix in prefixes]
-
-
-# -----------------------------------------------------------------------------
-# Wave-filter helpers for Figure 3
-# -----------------------------------------------------------------------------
-
-
-wave_label = partial(configured_label, WAVE_BOXES)
-
-
-def active_phase_sign(field_key):
-    """Positive active_index means wave phase favours convection."""
-    return -1.0 if field_key == "olr" else 1.0
-
-
-def wave_cache_path(sim_index, field_key, wave_name):
-    return os.path.join(
-        cache_dir,
-        f"{safe_name(sim_names[sim_index])}_{field_key}_{wave_name}_latmean_{WAVE_FILTER_LAT_BOUNDS[0]:g}_{WAVE_FILTER_LAT_BOUNDS[1]:g}.nc"
-        .replace("-", "m"),
-    )
-
-
-def filter_latmean_wave(fields, sim_index, field_key, wave_name):
-    if kf_filter is None:
-        raise ModuleNotFoundError("waveFilter.kf_filter is unavailable")
-    if field_key not in fields:
-        raise ValueError(f"{field_key} is not available for wave filtering")
-
-    cache_path = wave_cache_path(sim_index, field_key, wave_name)
-    if os.path.exists(cache_path):
-        progress(f"{sim_names[sim_index]} {wave_name}: using cached {field_key} wave filter {cache_path}")
-        with xr.open_dataset(cache_path) as cached:
-            return cached["wave"].load()
-
-    box = WAVE_BOXES[wave_name]
-    k0, k1 = box["k"]
-    p0, p1 = box["period"]
-    h0, h1 = box["depth"]
-    filter_name = box.get("filter_name", wave_name)
-
-    da = weighted_lat_mean(fields[field_key], lat_bounds=WAVE_FILTER_LAT_BOUNDS)
-    da = da.transpose("Time", "longitude")
-    progress(f"{sim_names[sim_index]} {wave_name}: filtering {field_key} over {WAVE_FILTER_LAT_BOUNDS}")
-    obs_time = da.Time.load()
-    lon = da.longitude.load()
-    obs = np.asarray(da.load().values, dtype="f")
-
-    filt_time = np.arange(0, obs.shape[0] + 702)
-    filt_data = np.zeros((len(filt_time), obs.shape[1]), dtype="f")
-    filt_data[: obs.shape[0], :] = obs
-
-    wave_full = kf_filter(filt_data, obs_per_day, p0, p1, k0, k1, h0, h1, filter_name)
-    wave = xr.DataArray(
-        wave_full[: obs.shape[0], :],
-        dims=("Time", "longitude"),
-        coords={"Time": obs_time, "longitude": lon},
-        name="wave",
-        attrs=dict(
-            field=field_key,
-            wave_name=wave_name,
-            filter_name=filter_name,
-            units=fields[field_key].attrs.get("units", ""),
-        ),
-    )
-    tmp_path = cache_path + ".tmp"
-    wave.to_dataset().to_netcdf(tmp_path)
-    os.replace(tmp_path, cache_path)
-    progress(f"{sim_names[sim_index]} {wave_name}: wrote wave cache {cache_path}")
-    return wave
-
-
-def wave_conditioned_cloud_table(fields_by_run, classifications_by_run):
-    rows = []
-    class_specs = [
-        ("convective_precipitating_high_cloud_mask", "Convective precipitating"),
-        ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating"),
-        ("nonprecipitating_high_cloud_mask", "Non-precipitating"),
-    ]
-    condition_specs = [
-        ("suppressed", lambda phase: phase <= -WAVE_PHASE_THRESHOLD_STD),
-        ("neutral", lambda phase: np.abs(phase) < WAVE_PHASE_THRESHOLD_STD),
-        ("active", lambda phase: phase >= WAVE_PHASE_THRESHOLD_STD),
-    ]
-    for wave_name in WAVE_BANDS_FOR_FIG3:
-        for i, (fields, sim_name) in enumerate(zip(fields_by_run, sim_names)):
-            classif = classifications_by_run.get(sim_name)
-            if classif is None:
-                continue
-            field_key = WAVE_FILTER_FIELD if WAVE_FILTER_FIELD in fields else "precip"
-            wave = filter_latmean_wave(fields, i, field_key, wave_name)
-            sigma = float(wave.std(dim=("Time", "longitude"), skipna=True).values)
-            if not np.isfinite(sigma) or sigma <= 0.0:
-                continue
-            phase = active_phase_sign(field_key) * wave / sigma
-            for condition, selector in condition_specs:
-                condition_mask = selector(phase)
-                for class_key, class_label in class_specs:
-                    mask, condition_aligned = xr.align(
-                        classif[class_key].astype(float), condition_mask, join="inner"
+            for response_key, response_label, _variable in CLOUD_RESPONSES:
+                slope, predictor_sigma = standardised_regression_slope(
+                    responses[response_key], predictor
+                )
+                rows.append(
+                    dict(
+                        simulation=simulation,
+                        wave=wave_name,
+                        response_key=response_key,
+                        response_label=response_label.replace("\n", " "),
+                        occurrence_slope_per_predictor_std=slope,
+                        predictor_std_mm_day=predictor_sigma,
+                        predictor=f"{wave_name}-filtered 10S-10N precipitation",
+                        response="unfiltered tropical cloud occurrence",
+                        units="occurrence fraction per predictor standard deviation",
                     )
-                    fraction = weighted_area_time_mean(
-                        mask.where(condition_aligned),
-                        TROPICAL_LAT_BOUNDS,
-                    )
-                    ctp, class_bool, condition_ctp = xr.align(
-                        classif["cloud_top_pressure"],
-                        classif[class_key].astype(bool),
-                        condition_mask,
-                        join="inner",
-                    )
-                    mean_ctp = weighted_area_time_mean(
-                        ctp.where(class_bool & condition_ctp),
-                        TROPICAL_LAT_BOUNDS,
-                    )
-                    rows.append(
-                        dict(
-                            wave=wave_name,
-                            wave_label=wave_label(wave_name),
-                            simulation=sim_name,
-                            condition=condition,
-                            class_key=class_key,
-                            class_label=class_label,
-                            conditional_area_fraction=fraction,
-                            mean_cloud_top_pressure_hpa=mean_ctp,
-                            denominator="tropical area-time within wave condition",
-                        )
-                    )
+                )
     return pd.DataFrame(rows)
 
 
-def plot_wave_conditioned_cloud_diagnostics(table):
-    if len(table) == 0:
-        return
-    table.to_csv(
-        os.path.join(save_loc, "wave_conditioned_cloud_classes_and_cloud_top_pressure.csv"),
+def realised_ttl_temperature_mean(zonal_dataset):
+    theta = zonal_dataset.theta
+    pressure = zonal_dataset.pressure
+    pressure_pa = xr.where(pressure < 2_000.0, pressure * 100.0, pressure)
+    temperature = theta * (pressure_pa / 100_000.0) ** (287.0 / 1004.0)
+    temperature = temperature.where(
+        (temperature.z >= TTL_Z_BOUNDS_M[0])
+        & (temperature.z <= TTL_Z_BOUNDS_M[1]),
+        drop=True,
+    ).sel(latitude=slice(*TTL_LAT_BOUNDS))
+    weights = np.cos(np.deg2rad(temperature.latitude))
+    return float(
+        temperature.weighted(weights).mean(
+            [dim for dim in ("Time", "z", "latitude") if dim in temperature.dims],
+            skipna=True,
+        ).load().values
+    )
+
+
+def realised_temperature_scaling(zonal_datasets):
+    means = np.asarray(
+        [realised_ttl_temperature_mean(dataset) for dataset in zonal_datasets]
+    )
+    delta_u = means[1] - means[0]
+    delta_t = means[2] - means[0]
+    alpha = delta_u / delta_t if np.isfinite(delta_t) and abs(delta_t) > 1e-12 else np.nan
+    table = pd.DataFrame(
+        {
+            "simulation": sim_names,
+            "mean_temperature_14_18km_10S_10N_K": means,
+            "temperature_change_from_control_K": means - means[0],
+            "thermal_scaling_alpha_deltaT_u_over_deltaT_T": alpha,
+        }
+    )
+    table.to_csv(os.path.join(save_loc, "pathway_temperature_scaling.csv"), index=False)
+    return float(alpha)
+
+
+def scaled_contrasts(table, index_columns, value_column, alpha):
+    pivot = table.pivot(
+        index=index_columns, columns="simulation", values=value_column
+    )
+    rows = []
+    for index, values in pivot.iterrows():
+        index = index if isinstance(index, tuple) else (index,)
+        base = dict(zip(index_columns, index))
+        control = values[sim_names[0]]
+        delta_u = values[sim_names[1]] - control
+        delta_t = values[sim_names[2]] - control
+        for contrast_key, contrast_label, value in (
+            ("T_minus_control", "T-nudged - control", delta_t),
+            ("U_minus_control", "U-nudged - control", delta_u),
+            (
+                "U_residual_after_thermal_scaling",
+                "U response after scaled temperature response",
+                delta_u - alpha * delta_t if np.isfinite(alpha) else np.nan,
+            ),
+        ):
+            rows.append(
+                {
+                    **base,
+                    "contrast_key": contrast_key,
+                    "contrast_label": contrast_label,
+                    "response_change": value,
+                    "thermal_scaling_alpha": alpha,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def load_convective_system_tracks():
+    path = os.path.join(
+        organisation_output_dir, "organisation_track_lifetimes.csv"
+    )
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Missing dual-population track product {path}. Run "
+            "convective_organisation_diagnostics.py first."
+        )
+    metadata_path = os.path.join(
+        organisation_output_dir,
+        "organisation_track_persistence_cache_metadata.json",
+    )
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(
+            f"Missing dual-population track metadata {metadata_path}. Rebuild the "
+            "organisation diagnostic."
+        )
+    with open(metadata_path, "r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    expected = {
+        "cloud_classification_cache_version": CLASSIFICATION_CACHE_VERSION,
+        "product_version": PYFLEXTRKR_PRODUCT_VERSION,
+        "primary_track_source": PRIMARY_TRACK_SOURCE,
+    }
+    changed = [
+        key for key, value in expected.items() if metadata.get(key) != value
+    ]
+    if changed:
+        raise RuntimeError(
+            f"Track metadata is stale ({changed}): {metadata_path}. "
+            "Rebuild convective_organisation_diagnostics.py."
+        )
+    tracks = pd.read_csv(path)
+    required = {
+        "simulation", "track_id", "lifetime_hours", "max_area_km2",
+        *TRACK_POPULATIONS,
+    }
+    missing = sorted(required - set(tracks.columns))
+    if missing:
+        raise RuntimeError(f"Dual-population track table lacks {missing}: {path}")
+    return tracks
+
+
+def analysed_duration_days(classification):
+    time = classification.Time.values
+    if len(time) < 2:
+        return np.nan
+    differences = np.diff(time)
+    if np.issubdtype(time.dtype, np.datetime64):
+        step = float(np.nanmedian(differences / np.timedelta64(1, "D")))
+        span = float((time[-1] - time[0]) / np.timedelta64(1, "D"))
+    else:
+        step = float(np.nanmedian(differences))
+        span = float(time[-1] - time[0])
+    return span + step
+
+
+def convective_system_population_table(classifications, tracks):
+    rows = []
+    for population in TRACK_POPULATIONS:
+        population_tracks = tracks[table_boolean_mask(tracks, population)]
+        population_label = TRACK_POPULATION_LABELS[population]
+        for simulation, classification in zip(sim_names, classifications):
+            subset = population_tracks[population_tracks.simulation == simulation]
+            duration = analysed_duration_days(classification)
+            for metric_key, metric_label, units in TRACK_METRICS:
+                display_label = metric_label.replace("MCS", "system")
+                if metric_key == "event_rate":
+                    value = 100.0 * len(subset) / duration if duration > 0.0 else np.nan
+                    denominator = "population events divided by analysed duration"
+                else:
+                    value = float(subset[metric_key].median()) if len(subset) else np.nan
+                    denominator = "median across population events"
+                rows.append(
+                    dict(
+                        track_population=population,
+                        track_population_label=population_label,
+                        simulation=simulation,
+                        metric_key=metric_key,
+                        metric_label=display_label,
+                        units=units,
+                        value=value,
+                        event_count=int(len(subset)),
+                        analysed_duration_days=duration,
+                        denominator=denominator,
+                    )
+                )
+    return pd.DataFrame(rows)
+
+
+def plot_wave_cloud_pathways(regressions, contrasts, alpha):
+    response_keys = [key for key, _label, _variable in CLOUD_RESPONSES]
+    response_labels = [label for _key, label, _variable in CLOUD_RESPONSES]
+    contrast_specs = (
+        ("T_minus_control", "T-nudged - control", "tab:red"),
+        ("U_minus_control", "U-nudged - control", "tab:blue"),
+        (
+            "U_residual_after_thermal_scaling",
+            "U residual after\nthermal scaling",
+            "tab:purple",
+        ),
+    )
+    fig, axes = plt.subplots(
+        len(WAVE_NAMES), 4, figsize=(14.8, 9.2), constrained_layout=True,
+        sharey=True,
+    )
+    x = np.arange(len(response_keys))
+    width = 0.8 / len(sim_names)
+    for row, wave_name in enumerate(WAVE_NAMES):
+        wave_rows = regressions[regressions.wave == wave_name]
+        for simulation_index, (simulation, color) in enumerate(zip(sim_names, cols)):
+            values = wave_rows[wave_rows.simulation == simulation].set_index(
+                "response_key"
+            )
+            axes[row, 0].bar(
+                x + (simulation_index - 1) * width,
+                [100.0 * values.loc[key, "occurrence_slope_per_predictor_std"] for key in response_keys],
+                width=width,
+                color=color,
+                label=simulation,
+            )
+        axes[row, 0].set_ylabel(
+            f"{wave_name}\nOccurrence slope\n(percentage points per +1 std)"
+        )
+        wave_contrasts = contrasts[contrasts.wave == wave_name]
+        for column, (contrast_key, title, color) in enumerate(contrast_specs, start=1):
+            values = wave_contrasts[
+                wave_contrasts.contrast_key == contrast_key
+            ].set_index("response_key")
+            axes[row, column].bar(
+                x,
+                [100.0 * values.loc[key, "response_change"] for key in response_keys],
+                color=color,
+                alpha=0.82,
+            )
+            if row == 0:
+                axes[row, column].set_title(title)
+        for axis in axes[row]:
+            axis.axhline(0.0, color="0.45", lw=0.8)
+            axis.set_xticks(x)
+            axis.set_xticklabels(response_labels, rotation=27, ha="right")
+            axis.grid(axis="y", alpha=0.2)
+    axes[0, 0].set_title("Regression slope by simulation")
+    axes[0, 0].legend(frameon=False, fontsize=7)
+    alpha_text = f"alpha={alpha:.2f}" if np.isfinite(alpha) else "alpha unavailable"
+    fig.suptitle(
+        "Unfiltered high-cloud occurrence regressed on filtered CCEW precipitation\n"
+        "Rows identify the filtered predictor; cloud response is unfiltered | "
+        + alpha_text,
+        fontsize=11,
+    )
+    figsave.save(fig, "ccew_cloud_utls_nudging_contrasts", number=1)
+    plt.close(fig)
+
+
+def plot_convective_system_pathways(population, contrasts, alpha):
+    metric_keys = [key for key, _label, _units in TRACK_METRICS]
+    contrast_specs = (
+        ("T_minus_control", "T-control", "tab:red"),
+        ("U_minus_control", "U-control", "tab:blue"),
+        (
+            "U_residual_after_thermal_scaling",
+            "U residual after\nthermal scaling",
+            "tab:purple",
+        ),
+    )
+    for track_population in TRACK_POPULATIONS:
+        population_rows = population[
+            population.track_population == track_population
+        ]
+        contrast_population = contrasts[
+            contrasts.track_population == track_population
+        ]
+        if len(population_rows) == 0:
+            continue
+        fig, axes = plt.subplots(2, 3, figsize=(13.0, 7.6), constrained_layout=True)
+        for column, metric_key in enumerate(metric_keys):
+            rows = population_rows[population_rows.metric_key == metric_key].set_index("simulation")
+            metadata = population_rows[population_rows.metric_key == metric_key].iloc[0]
+            axes[0, column].bar(np.arange(len(sim_names)), [rows.loc[name, "value"] for name in sim_names], color=cols)
+            axes[0, column].set_xticks(np.arange(len(sim_names)))
+            axes[0, column].set_xticklabels(sim_names, rotation=20, ha="right")
+            axes[0, column].set(title=metadata.metric_label, ylabel=metadata.units)
+            contrast_rows = contrast_population[contrast_population.metric_key == metric_key].set_index("contrast_key")
+            axes[1, column].bar(np.arange(3), [contrast_rows.loc[key, "response_change"] for key, _label, _color in contrast_specs], color=[color for _key, _label, color in contrast_specs])
+            axes[1, column].set_xticks(np.arange(3))
+            axes[1, column].set_xticklabels([label for _key, label, _color in contrast_specs], rotation=20, ha="right")
+            axes[1, column].set_ylabel(f"Change in {metadata.units}")
+            axes[1, column].axhline(0.0, color="0.45", lw=0.8)
+            for row in range(2):
+                axes[row, column].grid(axis="y", alpha=0.2)
+        alpha_text = f"alpha={alpha:.2f}" if np.isfinite(alpha) else "alpha unavailable"
+        fig.suptitle(
+            f"{TRACK_POPULATION_LABELS[track_population]} under UTLS nudging\n"
+            "Top: simulated values; bottom: experimental nudging contrasts | " + alpha_text,
+            fontsize=11,
+        )
+        figsave.save(fig, f"{track_population}_utls_nudging_contrasts", number=2)
+        plt.close(fig)
+
+
+def write_method_table():
+    rows = []
+    for wave_name in WAVE_NAMES:
+        box = WAVE_BOXES[wave_name]
+        rows.append(
+            dict(
+                component="cloud predictor",
+                predictor=wave_name,
+                method=(
+                    f"existing 10S-10N filtered precipitation cache; "
+                    f"k={box['k']}, period={box['period']} days"
+                ),
+                response="unfiltered 20S-20N cloud-class occurrence",
+                statistic="linear occurrence slope per predictor standard deviation",
+                inference="none; descriptive association in the simulated CCEW band",
+                reference=(
+                    "Rios-Berrios et al. (2023), J. Climate"
+                    if wave_name == "Easterly"
+                    else "Wheeler-Kiladis filter convention"
+                ),
+            )
+        )
+    rows.extend(
+        [
+            dict(
+                component="temperature experiment",
+                predictor="not applicable",
+                method="T-nudged minus control",
+                response="cloud-regression slope or convective-system population metric",
+                statistic="experimental difference",
+                inference="temperature-associated response",
+                reference="experiment design",
+            ),
+            dict(
+                component="U residual",
+                predictor="not applicable",
+                method="U-control minus alpha times T-control; alpha from realised 14-18-km temperature changes",
+                response="cloud-regression slope or convective-system population metric",
+                statistic="scaled experimental contrast",
+                inference="response remaining after realised-temperature scaling",
+                reference="experiment design",
+            ),
+        ]
+    )
+    pd.DataFrame(rows).to_csv(
+        os.path.join(save_loc, "convective_pathway_method.csv"), index=False
+    )
+
+
+def main():
+    progress("Loading shared classification and zonal-mean temperature products")
+    classifications = []
+    zonal_datasets = []
+    for data_loc, simulation in zip(data_locs, sim_names):
+        classifications.append(load_classification(simulation))
+        dataset = load_latlon_dataset(
+            os.path.join(root_dir, data_loc),
+            latlon_pattern=ZONAL_MEAN_PATTERN,
+            chunks={"Time": -1},
+        )
+        zonal_datasets.append(
+            standardize_latlon_dataset(dataset, ["theta", "pressure"])
+        )
+
+    alpha = realised_temperature_scaling(zonal_datasets)
+    regressions = wave_cloud_regression_table(classifications)
+    regressions.to_csv(
+        os.path.join(save_loc, "ccew_unfiltered_cloud_occurrence_regressions.csv"),
         index=False,
     )
-    conditions = ["suppressed", "neutral", "active"]
-    classes = list(table.class_key.drop_duplicates())
-    labels = {
-        key: table.loc[table.class_key == key, "class_label"].iloc[0]
-        for key in classes
-    }
-    x = np.arange(len(classes))
-    width = 0.8 / len(sim_names)
-    for wave_name in WAVE_BANDS_FOR_FIG3:
-        wave_table = table[table.wave == wave_name]
-        if len(wave_table) == 0:
-            continue
-        for metric, ylabel, stem, invert in (
-            ("conditional_area_fraction", "Conditional tropical area-time fraction", "class_fraction", False),
-            ("mean_cloud_top_pressure_hpa", "Mean cloud-top pressure (hPa)", "cloud_top_pressure", True),
-        ):
-            fig, axes = plt.subplots(
-                1, len(conditions), figsize=(12.5, 3.8), constrained_layout=True, sharey=True
-            )
-            for c, condition in enumerate(conditions):
-                ax = axes[c]
-                sub = wave_table[wave_table.condition == condition]
-                for i, sim_name in enumerate(sim_names):
-                    values = []
-                    for class_key in classes:
-                        row = sub[(sub.simulation == sim_name) & (sub.class_key == class_key)]
-                        values.append(float(row[metric].iloc[0]) if len(row) else np.nan)
-                    ax.bar(
-                        x + (i - (len(sim_names) - 1) / 2) * width,
-                        values,
-                        width,
-                        color=cols[i],
-                        label=sim_name if c == 0 else None,
-                    )
-                ax.set_title(condition.title())
-                ax.set_xticks(x)
-                ax.set_xticklabels([labels[key] for key in classes], rotation=25, ha="right")
-                ax.grid(axis="y", alpha=0.2)
-                if invert:
-                    ax.invert_yaxis()
-            axes[0].set_ylabel(ylabel)
-            axes[0].legend(frameon=False)
-            fig.suptitle(f"{wave_label(wave_name)}-conditioned high cloud")
-            save_figure(9, fig, f"wave_conditioned_{stem}_{wave_name}")
-            plt.close(fig)
-
-
-WAVE_PHASE_CLASS_SPECS = [
-    ("convective_precipitating_high_cloud_mask", "Convective precipitating"),
-    ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating"),
-    ("nonprecipitating_high_cloud_mask", "Non-precipitating"),
-]
-
-
-def wave_phase_binned_cloud_tables(fields_by_run, classifications_by_run):
-    """Fine signed-phase composites and active-phase latitude profiles.
-
-    Complements the coarse suppressed/neutral/active split of Figure 9 with
-    24 signed-sigma phase bins, plus latitude profiles of each cloud class
-    under the active-wave condition.
-    """
-    phase_rows = []
-    profile_rows = []
-    bins = WAVE_PHASE_COMPOSITE_BINS
-    for i, (fields, sim_name) in enumerate(zip(fields_by_run, sim_names)):
-        classif = classifications_by_run.get(sim_name)
-        if classif is None:
-            continue
-        # Load the tropical subset of each classification field once per
-        # simulation. The classification cache is opened lazily, so every
-        # binned reduction below would otherwise re-read it from disk.
-        class_masks = {
-            key: subset_lat(classif[key].astype(float), TROPICAL_LAT_BOUNDS).load()
-            for key, _ in WAVE_PHASE_CLASS_SPECS
-        }
-        ctp = subset_lat(classif["cloud_top_pressure"], TROPICAL_LAT_BOUNDS).load()
-        field_key = WAVE_FILTER_FIELD if WAVE_FILTER_FIELD in fields else "precip"
-        for wave_name in WAVE_BANDS_FOR_FIG3:
-            wave = filter_latmean_wave(fields, i, field_key, wave_name)
-            sigma = float(wave.std(dim=("Time", "longitude"), skipna=True).values)
-            if not np.isfinite(sigma) or sigma <= 0.0:
-                continue
-            phase = active_phase_sign(field_key) * wave / sigma
-            active = phase >= WAVE_PHASE_THRESHOLD_STD
-            for class_key, class_label in WAVE_PHASE_CLASS_SPECS:
-                mask = class_masks[class_key]
-                metric_series = [
-                    ("class_fraction", weighted_lat_mean(mask, lat_bounds=WAVE_FILTER_LAT_BOUNDS)),
-                    (
-                        "cloud_top_pressure",
-                        weighted_lat_mean(
-                            ctp.where(mask.astype(bool)), lat_bounds=WAVE_FILTER_LAT_BOUNDS
-                        ),
-                    ),
-                ]
-                for metric, y in metric_series:
-                    phase_aligned, y_aligned = xr.align(phase, y, join="inner")
-                    xc, ym, y25, y75, count = binned_mean_1d(
-                        phase_aligned.values,
-                        y_aligned.values,
-                        bins,
-                        min_count=WAVE_PHASE_COMPOSITE_MIN_COUNT,
-                    )
-                    for xx, yy, lo, hi, cnum in zip(xc, ym, y25, y75, count):
-                        phase_rows.append(
-                            dict(
-                                wave=wave_name,
-                                wave_label=wave_label(wave_name),
-                                simulation=sim_name,
-                                class_key=class_key,
-                                class_label=class_label,
-                                metric=metric,
-                                signed_phase_sigma_bin=xx,
-                                mean=yy,
-                                p25=lo,
-                                p75=hi,
-                                count=cnum,
-                            )
-                        )
-                mask_aligned, active_aligned = xr.align(mask, active, join="inner")
-                profile = mask_aligned.where(active_aligned).mean(
-                    dim=("Time", "longitude"), skipna=True
-                )
-                profile = hemispheric_fold(profile, parity="even")
-                for lat, val in zip(profile.latitude.values, profile.values):
-                    profile_rows.append(
-                        dict(
-                            wave=wave_name,
-                            wave_label=wave_label(wave_name),
-                            simulation=sim_name,
-                            class_key=class_key,
-                            class_label=class_label,
-                            latitude=float(lat),
-                            fraction=float(val),
-                        )
-                    )
-    return pd.DataFrame(phase_rows), pd.DataFrame(profile_rows)
-
-
-def plot_wave_phase_binned_composites(phase_table):
-    if len(phase_table) == 0:
-        return
-    waves = [w for w in WAVE_BANDS_FOR_FIG3 if w in set(phase_table.wave)]
-    for metric, ylabel, stem, invert in (
-        ("class_fraction", "Class area fraction", "wave_phase_binned_class_fraction", False),
-        (
-            "cloud_top_pressure",
-            "Mean cloud-top pressure (hPa)",
-            "wave_phase_binned_cloud_top_pressure",
-            True,
-        ),
-    ):
-        sub_metric = phase_table[phase_table.metric == metric]
-        fig, axes = plt.subplots(
-            len(WAVE_PHASE_CLASS_SPECS),
-            len(waves),
-            figsize=(3.6 * len(waves), 2.7 * len(WAVE_PHASE_CLASS_SPECS)),
-            constrained_layout=True,
-            sharex=True,
-            sharey="row",
-            squeeze=False,
-        )
-        for r, (class_key, class_label) in enumerate(WAVE_PHASE_CLASS_SPECS):
-            for c, wave_name in enumerate(waves):
-                ax = axes[r, c]
-                sub = sub_metric[
-                    (sub_metric.class_key == class_key) & (sub_metric.wave == wave_name)
-                ]
-                for i, sim_name in enumerate(sim_names):
-                    s = sub[sub.simulation == sim_name].sort_values("signed_phase_sigma_bin")
-                    if len(s) == 0:
-                        continue
-                    ax.plot(
-                        s.signed_phase_sigma_bin, s["mean"], color=cols[i],
-                        label=sim_name if (r == 0 and c == 0) else None,
-                    )
-                    ax.fill_between(
-                        s.signed_phase_sigma_bin, s.p25, s.p75, color=cols[i], alpha=0.15, lw=0
-                    )
-                ax.axvline(0.0, color="0.7", lw=0.8)
-                for thresh in (-WAVE_PHASE_THRESHOLD_STD, WAVE_PHASE_THRESHOLD_STD):
-                    ax.axvline(thresh, color="0.85", lw=0.8, ls=":")
-                ax.grid(alpha=0.2)
-                if r == 0:
-                    ax.set_title(wave_label(wave_name))
-                if c == 0:
-                    ax.set_ylabel(f"{class_label}\n{ylabel}")
-                if r == len(WAVE_PHASE_CLASS_SPECS) - 1:
-                    ax.set_xlabel("Signed wave anomaly ($\\sigma$)")
-                if invert and c == 0:
-                    ax.invert_yaxis()
-        axes[0, 0].legend(frameon=False)
-        fig.suptitle(f"Wave-phase composites of high-cloud classes ({ylabel.lower()})")
-        save_figure(10, fig, stem)
-        plt.close(fig)
-
-
-def plot_wave_active_latitude_profiles(profile_table):
-    if len(profile_table) == 0:
-        return
-    control_name = sim_names[0]
-    for wave_name in WAVE_BANDS_FOR_FIG3:
-        wave_table = profile_table[profile_table.wave == wave_name]
-        if len(wave_table) == 0:
-            continue
-        fig, axes = plt.subplots(
-            len(WAVE_PHASE_CLASS_SPECS), 2,
-            figsize=(9.0, 2.7 * len(WAVE_PHASE_CLASS_SPECS)),
-            constrained_layout=True,
-            sharex=True,
-            squeeze=False,
-        )
-        for r, (class_key, class_label) in enumerate(WAVE_PHASE_CLASS_SPECS):
-            sub = wave_table[wave_table.class_key == class_key]
-            by_sim = {
-                sim_name: sub[sub.simulation == sim_name].sort_values("latitude")
-                for sim_name in sim_names
-            }
-            ax = axes[r, 0]
-            for i, sim_name in enumerate(sim_names):
-                s = by_sim[sim_name]
-                if len(s):
-                    ax.plot(s.latitude, s.fraction, color=cols[i],
-                            label=sim_name if r == 0 else None)
-            ax.set_ylabel(f"{class_label}\nactive-phase fraction")
-            ax.grid(alpha=0.2)
-
-            ax = axes[r, 1]
-            ctrl = by_sim[control_name]
-            deltas = {}
-            for i, sim_name in enumerate(sim_names[1:], start=1):
-                s = by_sim[sim_name]
-                if len(s) == 0 or len(ctrl) == 0:
-                    continue
-                merged = s.merge(ctrl, on="latitude", suffixes=("", "_control"))
-                delta = merged.fraction - merged.fraction_control
-                deltas[sim_name] = (merged.latitude, delta)
-                ax.plot(merged.latitude, delta, color=cols[i],
-                        label=f"{sim_name} $-$ {control_name}" if r == 0 else None)
-            if len(deltas) == 2:
-                (lat_u, du), (lat_t, dt_) = deltas[sim_names[1]], deltas[sim_names[2]]
-                if len(du) == len(dt_):
-                    ax.plot(lat_u, du.values - dt_.values, color="0.5", ls="--",
-                            label="residual ($\\Delta$u $-$ $\\Delta$T)" if r == 0 else None)
-            ax.axhline(0.0, color="0.7", lw=0.8)
-            ax.set_ylabel("Fraction difference")
-            ax.grid(alpha=0.2)
-        for c in range(2):
-            axes[-1, c].set_xlabel("Latitude (deg)")
-        axes[0, 0].legend(frameon=False, fontsize=8)
-        axes[0, 1].legend(frameon=False, fontsize=8)
-        fig.suptitle(
-            f"High-cloud classes vs latitude during active {wave_label(wave_name)} phases "
-            f"(phase $\\geq$ {WAVE_PHASE_THRESHOLD_STD:g}$\\sigma$)"
-        )
-        save_figure(10, fig, f"wave_active_latitude_profiles_{wave_name}")
-        plt.close(fig)
-
-
-# -----------------------------------------------------------------------------
-# Residual model helpers
-# -----------------------------------------------------------------------------
-
-
-fit_control_relationship = partial(fit_control_relationship, report_backend=True)
-
-
-feature_arrays = residual_feature_arrays
-residual_target_da = residual_target_array
-
-
-model_training_data = partial(
-    residual_model_training_data,
-    lat_bounds=TROPICAL_LAT_BOUNDS,
-    sample_limits=RESIDUAL_FIT_SAMPLE_LIMITS,
-)
-
-
-def residual_sample_data(fields, classif, target_key, feature_keys, bin_keys):
-    target = residual_target_da(classif, target_key)
-    bin_arrays = []
-    for key in bin_keys:
-        if key == "latitude":
-            bin_arrays.append(latitude_field_like(fields["precip"]))
-        else:
-            bin_arrays.append(fields[key])
-    arrays = feature_arrays(fields, feature_keys) + [target] + bin_arrays
-    vals, weights = sample_matching_arrays(
-        *arrays,
-        lat_bounds=TROPICAL_LAT_BOUNDS,
-        **RESIDUAL_PLOT_SAMPLE_LIMITS,
+    cloud_contrasts = scaled_contrasts(
+        regressions,
+        ["wave", "response_key"],
+        "occurrence_slope_per_predictor_std",
+        alpha,
     )
-    n_features = len(feature_keys)
-    X = np.column_stack(vals[:n_features])
-    y = vals[n_features]
-    bins = {key: vals[n_features + 1 + j] for j, key in enumerate(bin_keys)}
-    return X, y, bins, weights
-
-
-# -----------------------------------------------------------------------------
-# Load data
-# -----------------------------------------------------------------------------
-
-
-dss = []
-dss_zm = []
-progress("Loading lat-lon and zonal-mean datasets")
-for i, d in enumerate(data_locs):
-    progress(f"{sim_names[i]}: opening lat-lon dataset")
-    ds = load_latlon_dataset(
-        os.path.join(root_dir, d),
-        latlon_pattern=latlon_file[i],
-            time_format=time_format,
-            ndays=ndays,
-            end_date=analysis_end_date,
-            chunks=latlon_chunks,
-        )
-    ds = standardize_latlon_dataset(ds, needed_vars)
-    progress(f"{sim_names[i]}: lat-lon dataset ready with {len(ds.data_vars)} variables")
-
-    progress(f"{sim_names[i]}: opening zonal-mean dataset")
-    zds = load_latlon_dataset(
-        os.path.join(root_dir, d),
-        latlon_pattern=zm_latlon_file[i],
-        time_format=time_format,
-        ndays=ndays,
-        end_date=analysis_end_date,
-        chunks=zm_chunks,
-        prefer_pattern=True,
+    cloud_contrasts.to_csv(
+        os.path.join(save_loc, "ccew_cloud_pathway_contrasts.csv"), index=False
     )
-    zds = standardize_latlon_dataset(zds, needed_vars)
-    progress(f"{sim_names[i]}: zonal-mean dataset ready with {len(zds.data_vars)} variables")
 
-    print(ds)
-    print(zds)
-    dss.append(ds)
-    dss_zm.append(zds)
+    population = convective_system_population_table(
+        classifications, load_convective_system_tracks()
+    )
+    population.to_csv(
+        os.path.join(save_loc, "convective_system_population_pathway_metrics.csv"), index=False
+    )
+    track_contrasts = scaled_contrasts(
+        population, ["track_population", "metric_key"], "value", alpha
+    )
+    track_contrasts.to_csv(
+        os.path.join(save_loc, "convective_system_population_pathway_contrasts.csv"), index=False
+    )
 
-
-fields_by_run = []
-progress("Preparing precipitation, thermodynamic, and TTL fields")
-for sim_name, ds, zds in zip(sim_names, dss, dss_zm):
-    progress(f"{sim_name}: preparing fields")
-    fields = {"precip": get_precip_rate(ds)}
-    for key in ("olr", "pw", "cape", "cin"):
-        da = time_aligned_field(ds, key, fields["precip"], required=False)
-        if da is not None:
-            fields[key] = da
-
-    ttl_fields = compute_ttl_diagnostics(zds, fields["precip"])
-    fields.update(ttl_fields)
-    progress(f"{sim_name}: fields ready ({', '.join(sorted(fields))})")
-    fields_by_run.append(fields)
+    write_method_table()
+    plot_wave_cloud_pathways(regressions, cloud_contrasts, alpha)
+    plot_convective_system_pathways(population, track_contrasts, alpha)
+    print("\nFinished convective_pathway_diagnostics.py")
 
 
-classifications_by_run = {}
-classification_coverage = pd.DataFrame()
-classification_sanity = pd.DataFrame()
-if should_run_any([1, 2, 4, 5, 6, 7, 8]):
-    progress("Building or reading high-cloud classifications")
-    for sim_name, ds, fields in zip(sim_names, dss, fields_by_run):
-        classifications_by_run[sim_name] = load_required_classification(ds, fields, sim_name)
-    write_metadata_table()
-    classification_coverage = print_class_coverage(classifications_by_run)
-    classification_sanity = class_overlap_sanity(classifications_by_run)
-    progress("High-cloud classification stage complete")
-
-
-# -----------------------------------------------------------------------------
-# Figure 5. Cloud-classification summary and zonal occurrence
-# -----------------------------------------------------------------------------
-# WHAT TO LOOK FOR:
-#   * The bar plot shows tropical area-time occurrence; total high cloud is the
-#     denominator for class-fraction diagnostics.
-#   * The zonal curves show whether a class response is confined to the equator,
-#     flanks, or broad tropical belt.
-#   * Non-precipitating means high cloud with total rainc+rainnc below the shared
-#     precipitation threshold; it is a precipitation regime, not a detailed
-#     microphysical cloud-type claim.
-
-if should_run_figure(5):
-    progress("Starting Figure 5: cloud_classification_summary")
-    if len(classification_coverage) == 0:
-        print("Skipping Figure 5: classification coverage is unavailable.")
-    else:
-        fig, ax = plt.subplots(
-            1, 1 + len(sim_names),
-            figsize=(4.8 + 3.6 * len(sim_names), 4.6),
-            constrained_layout=True,
-            sharey=False,
-        )
-        class_keys = [key for key, _label, _color in CLOUD_CATEGORY_SPECS]
-        class_labels = [label for _key, label, _color in CLOUD_CATEGORY_SPECS]
-        class_colors = [color for _key, _label, color in CLOUD_CATEGORY_SPECS]
-        x = np.arange(len(class_keys))
-        width = 0.8 / len(sim_names)
-        cov = classification_coverage.set_index(["simulation", "class_name"])
-
-        for i, sim_name in enumerate(sim_names):
-            vals = [
-                cov.loc[(sim_name, key), "tropical_area_time_fraction"]
-                if (sim_name, key) in cov.index else np.nan
-                for key in class_keys
-            ]
-            ax[0].bar(
-                x + (i - (len(sim_names) - 1) / 2) * width,
-                vals,
-                width,
-                color=cols[i],
-                label=sim_name,
-            )
-        ax[0].set_xticks(x)
-        ax[0].set_xticklabels(class_labels, rotation=35, ha="right")
-        ax[0].set_ylabel("Tropical area-time fraction")
-        ax[0].set_title("Class coverage\n(total high cloud is denominator)")
-        ax[0].grid(axis="y", alpha=0.2)
-        ax[0].legend(loc="best", fontsize=7)
-
-        for i, sim_name in enumerate(sim_names):
-            a = ax[i + 1]
-            classif = classifications_by_run.get(sim_name)
-            if classif is None:
-                a.text(0.5, 0.5, "not available", transform=a.transAxes, ha="center", va="center")
-                continue
-            for key, label, color in CLOUD_CATEGORY_SPECS:
-                try:
-                    zocc = zonal_occurrence(classif[key])
-                    a.plot(zocc.latitude, zocc, color=color, lw=1.4, label=label if i == 0 else None)
-                except Exception as exc:
-                    print(f"Skipping zonal occurrence {sim_name} {key}: {exc}")
-            a.set_title(sim_name)
-            a.set_xlabel("Latitude")
-            a.set_xlim(*TROPICAL_LAT_BOUNDS)
-            a.grid(alpha=0.2)
-            if i == 0:
-                a.set_ylabel("Occurrence")
-                a.legend(loc="best", fontsize=6)
-        fig.suptitle("High-cloud classification visibility and denominator check")
-        save_figure(5, fig, "cloud_classification_summary")
-        progress("Done with figure: cloud_classification_summary")
-
-
-# -----------------------------------------------------------------------------
-# Figure 6. Time-mean maps of selected cloud classes
-# -----------------------------------------------------------------------------
-# WHAT TO LOOK FOR:
-#   * Spatially coherent class differences help distinguish cloud-type changes
-#     from a few sparsely sampled conditional bins.
-#   * The total high-cloud map is the denominator visibility check for the class
-#     maps and fractions.
-
-if should_run_figure(6):
-    progress("Starting Figure 6: cloud_classification_mean_maps")
-    if not any(classifications_by_run.get(sim_name) is not None for sim_name in sim_names):
-        print("Skipping Figure 6: high-cloud classification is unavailable.")
-    else:
-        fig, ax = plt.subplots(
-            len(sim_names), len(MAP_CATEGORY_SPECS),
-            figsize=(3.4 * len(MAP_CATEGORY_SPECS), 2.8 * len(sim_names)),
-            constrained_layout=True,
-            sharex=True,
-            sharey=True,
-        )
-        if len(sim_names) == 1:
-            ax = ax[None, :]
-        last_im = None
-        levels = np.linspace(0, 0.5, 11)
-        for i, sim_name in enumerate(sim_names):
-            classif = classifications_by_run.get(sim_name)
-            for j, (key, label) in enumerate(MAP_CATEGORY_SPECS):
-                a = ax[i, j]
-                if classif is None:
-                    a.text(0.5, 0.5, "not available", transform=a.transAxes, ha="center", va="center")
-                else:
-                    try:
-                        m = time_mean_map(classif[key])
-                        last_im = a.contourf(
-                            m.longitude,
-                            m.latitude,
-                            m,
-                            levels=levels,
-                            cmap="YlGnBu",
-                            extend="max",
-                        )
-                    except Exception as exc:
-                        a.text(0.5, 0.5, f"skipped\n{exc}", transform=a.transAxes, ha="center", va="center", fontsize=7)
-                if i == 0:
-                    a.set_title(label)
-                if j == 0:
-                    a.set_ylabel(f"{sim_name}\nLatitude")
-                if i == len(sim_names) - 1:
-                    a.set_xlabel("Longitude")
-                a.set_xlim(-180, 180)
-                a.set_ylim(*TROPICAL_LAT_BOUNDS)
-        if last_im is not None:
-            fig.colorbar(last_im, ax=ax.ravel().tolist(), label="Time-mean occurrence")
-        fig.suptitle("Time-mean occurrence maps of high-cloud classes")
-        save_figure(6, fig, "cloud_classification_mean_maps")
-        progress("Done with figure: cloud_classification_mean_maps")
-
-
-# -----------------------------------------------------------------------------
-# Figure 7. Representative class snapshots
-# -----------------------------------------------------------------------------
-# WHAT TO LOOK FOR:
-#   * Snapshots are a sanity check on whether the masks look meteorologically
-#     sensible: convective precipitating convection should be compact, stratiform precipitating
-#     cloud should lie near or downstream of active objects, and non-precipitating
-#     masks should be separated by construction.
-
-if should_run_figure(7):
-    progress("Starting Figure 7: cloud_classification_snapshots")
-    if not any(classifications_by_run.get(sim_name) is not None for sim_name in sim_names):
-        print("Skipping Figure 7: high-cloud classification is unavailable.")
-    else:
-        snapshot_specs = [
-            ("high_cloud_mask", "Total high cloud"),
-            ("convective_precipitating_high_cloud_mask", "Convective precipitating"),
-            ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating"),
-            ("nonprecipitating_high_cloud_mask", "Non-precipitating"),
-        ]
-        fig, ax = plt.subplots(
-            len(sim_names), len(snapshot_specs),
-            figsize=(3.4 * len(snapshot_specs), 2.8 * len(sim_names)),
-            constrained_layout=True,
-            sharex=True,
-            sharey=True,
-        )
-        if len(sim_names) == 1:
-            ax = ax[None, :]
-        for i, sim_name in enumerate(sim_names):
-            classif = classifications_by_run.get(sim_name)
-            if classif is None:
-                for j, (_key, label) in enumerate(snapshot_specs):
-                    a = ax[i, j]
-                    a.text(0.5, 0.5, "not available", transform=a.transAxes, ha="center", va="center")
-                    if i == 0:
-                        a.set_title(label)
-                    if j == 0:
-                        a.set_ylabel(f"{sim_name}\nnot available")
-                    if i == len(sim_names) - 1:
-                        a.set_xlabel("Longitude")
-                    a.set_xlim(-180, 180)
-                    a.set_ylim(*TROPICAL_LAT_BOUNDS)
-                continue
-            snap_time = representative_snapshot_time(classif)
-            for j, (key, label) in enumerate(snapshot_specs):
-                a = ax[i, j]
-                if snap_time is None:
-                    a.text(0.5, 0.5, "no Time dim", transform=a.transAxes, ha="center", va="center")
-                    continue
-                m = subset_lat(classif[key].sel(Time=snap_time).astype(float), TROPICAL_LAT_BOUNDS)
-                a.pcolormesh(m.longitude, m.latitude, m, vmin=0, vmax=1, cmap="Greys", shading="auto")
-                if i == 0:
-                    a.set_title(label)
-                if j == 0:
-                    a.set_ylabel(f"{sim_name}\n{np.datetime_as_string(np.asarray(snap_time), unit='h')}")
-                if i == len(sim_names) - 1:
-                    a.set_xlabel("Longitude")
-                a.set_xlim(-180, 180)
-                a.set_ylim(*TROPICAL_LAT_BOUNDS)
-        fig.suptitle("Representative high-cloud class snapshots (time of max tropical high-cloud coverage)")
-        save_figure(7, fig, "cloud_classification_snapshots")
-        progress("Done with figure: cloud_classification_snapshots")
-
-
-# -----------------------------------------------------------------------------
-# Figure 1. High cloud vs precipitation, conditioned on PW or TTL N2
-# -----------------------------------------------------------------------------
-# Interpretation:
-#   * If u-nudged has more high cloud at fixed precipitation and fixed PW/N2_TTL,
-#     the response is not just due to sampling wetter or more stable columns.
-#   * If T-nudged matches u-nudged at fixed N2_TTL, this supports the
-#     thermal/static-stability pathway.
-#   * If u-nudged remains distinct from T-nudged at fixed N2_TTL, this supports
-#     a wind/shear/wave pathway.
-#   * If the signal is mainly non-precipitating or stratiform precipitating high cloud
-#     rather than convective precipitating convection, do not interpret it as simply deeper
-#     precipitating convection.
-#   * Non-precipitating is not plotted against local precipitation here
-#     because weak local precipitation is part of that category definition.
-#     Non-precipitating and nonprecipitating high cloud are diagnosed in the
-#     classification summary figures and should be interpreted as
-#     occurrence/lifetime/proximity information, not as a local rain-rate
-#     response curve.
-
-if should_run_figure(1):
-    progress("Starting Figure 1: conditional_highcloud_vs_precip")
-    available_condition = "N2_TTL" if all("N2_TTL" in f for f in fields_by_run) else "pw"
-    if not all(available_condition in f for f in fields_by_run):
-        print("Skipping Figure 1: neither N2_TTL nor PW is available in all runs.")
-    else:
-        if available_condition == "N2_TTL":
-            condition_label = r"$N^2_{TTL}$"
-            cond_edges, support_mode, support_bounds = common_support_condition_edges(
-                fields_by_run, classifications_by_run, available_condition
-            )
-        else:
-            condition_label = "PW"
-            cond_edges = pooled_tercile_edges_for_classified(
-                fields_by_run, classifications_by_run, available_condition
-            )
-            support_mode, support_bounds = "pooled occupancy", None
-        precip_bins = pooled_weighted_bins_for_classified(
-            fields_by_run, classifications_by_run, "precip", PRECIP_NBINS
-        )
-        if cond_edges is None or precip_bins is None:
-            print("Skipping Figure 1: could not construct condition or precipitation bins.")
-        else:
-            condition_support = condition_support_table(
-                fields_by_run, classifications_by_run, available_condition, cond_edges,
-                "conditional_highcloud_vs_precip",
-            )
-            if available_condition == "N2_TTL" and support_mode != "common-support":
-                warnings.warn(
-                    "Figure 1 N2_TTL panels are regime-occupancy diagnostics: "
-                    "robust N2_TTL ranges do not overlap across all simulations."
-                )
-
-            response_specs = [
-                ("total high cloud", lambda c: c["high_cloud_fraction"], "High-cloud fraction, cloud top <= 440 hPa"),
-                ("convective precipitating", lambda c: c["convective_precipitating_high_cloud_mask"].astype(float), "Convective-precipitating high-cloud probability"),
-                ("stratiform precipitating", lambda c: c["stratiform_precipitating_high_cloud_mask"].astype(float), "Stratiform precipitating high-cloud probability"),
-            ]
-
-            labels = condition_labels(cond_edges, condition_label)
-            n_condition_bins = len(labels)
-            fig, ax = plt.subplots(
-                len(response_specs), n_condition_bins,
-                figsize=(12.0, 8.0),
-                constrained_layout=True,
-                sharex=True,
-                sharey="row",
-            )
-            if n_condition_bins == 1:
-                ax = ax[:, None]
-            count_rows = []
-
-            for r, (resp_name, resp_getter, ylabel) in enumerate(response_specs):
-                for c, label in enumerate(labels):
-                    lo, hi = cond_edges[c], cond_edges[c + 1]
-                    for i, sim_name in enumerate(sim_names):
-                        classif = classifications_by_run.get(sim_name)
-                        if classif is None:
-                            continue
-                        fields = fields_by_run[i]
-                        vals, weights = sample_matching_arrays(
-                            fields["precip"], resp_getter(classif), fields[available_condition],
-                            lat_bounds=TROPICAL_LAT_BOUNDS,
-                            **PLOT_SAMPLE_LIMITS,
-                        )
-                        pr_v, y_v, cond_v = vals
-                        cond_mask = (cond_v >= lo) & (cond_v <= hi if c == n_condition_bins - 1 else cond_v < hi)
-                        centres, mean, count = weighted_binned_mean(
-                            pr_v[cond_mask], y_v[cond_mask], precip_bins,
-                            weights=weights[cond_mask],
-                            min_count=MIN_BIN_COUNT,
-                        )
-                        plot_supported_curve(
-                            ax[r, c], centres, mean, count, cols[i],
-                            label=sim_name if (r == 0 and c == 0) else None,
-                        )
-                        for centre, n in zip(centres, count):
-                            count_rows.append(
-                                dict(figure=1, simulation=sim_name, response=resp_name,
-                                     condition=label, condition_mode=support_mode,
-                                     precip_bin_center=centre, sample_count=n)
-                            )
-
-                    if r == 0:
-                        title = f"{label}\n{lo:.3g} to {hi:.3g}"
-                        if available_condition == "N2_TTL":
-                            title += f"\n{support_mode}"
-                        ax[r, c].set_title(title)
-                        if available_condition == "N2_TTL" and support_mode != "common-support":
-                            ax[r, c].set_facecolor("#fff8e8")
-                    if c == 0:
-                        ax[r, c].set_ylabel(ylabel)
-                    if r == len(response_specs) - 1:
-                        ax[r, c].set_xlabel(r"Precipitation (mm day$^{-1}$)")
-                    ax[r, c].grid(alpha=0.2)
-                    add_low_count_note(ax[r, c])
-
-            ax[0, 0].legend(loc="best")
-            title = f"High cloud vs precipitation conditioned on {condition_label}"
-            if available_condition == "N2_TTL" and support_bounds is not None:
-                title += f" ({support_mode}: {support_bounds[0]:.3g} to {support_bounds[1]:.3g})"
-            elif available_condition == "N2_TTL":
-                title += " (regime occupancy, not common support)"
-            fig.suptitle(title)
-            save_figure(1, fig, "conditional_highcloud_vs_precip")
-            count_rows_to_frame(count_rows, "conditional_highcloud_vs_precip")
-            progress("Done with figure: conditional_highcloud_vs_precip")
-
-
-# -----------------------------------------------------------------------------
-# Figure 2. Cloud-top pressure vs precipitation, conditioned on PW
-# -----------------------------------------------------------------------------
-# Interpretation:
-#   * Lower cloud-top pressure in u-nudged at fixed precipitation and PW implies altered
-#     vertical cloud expression independent of local rain rate and moisture.
-#   * A difference between convective and stratiform curves distinguishes the
-#     strong-rain/ascent convective pathway from weaker precipitating high cloud.
-#   * If it appears mainly outside convective precipitation, it suggests changes
-#     in stratiform precipitating or non-precipitating cloud lifetime, detrainment, or
-#     upper-level cloud-radiative effects.
-
-if should_run_figure(2):
-    progress("Starting Figure 2: conditional_cloudtop_pressure_vs_precip_pw")
-    if not all("pw" in f for f in fields_by_run):
-        print("Skipping Figure 2: PW is unavailable in at least one run.")
-    elif not any(classifications_by_run.get(sim_name) is not None for sim_name in sim_names):
-        print("Skipping Figure 2: high-cloud classification is unavailable.")
-    else:
-        pw_edges = pooled_tercile_edges_for_classified(fields_by_run, classifications_by_run, "pw")
-        precip_bins = pooled_weighted_bins_for_classified(
-            fields_by_run, classifications_by_run, "precip", PRECIP_NBINS
-        )
-
-        class_specs = [
-            ("all high", "high_cloud_mask", "-", "All high cloud"),
-            ("convective precipitating", "convective_precipitating_high_cloud_mask", "--", "Convective precipitating"),
-            ("stratiform precipitating", "stratiform_precipitating_high_cloud_mask", ":", "Stratiform precipitating"),
-        ]
-
-        labels = condition_labels(pw_edges, "PW")
-        n_condition_bins = len(labels)
-        fig, ax = plt.subplots(2, n_condition_bins, figsize=(12.0, 6.6), constrained_layout=True, sharex=True)
-        if n_condition_bins == 1:
-            ax = ax[:, None]
-        count_rows = []
-
-        for c, label in enumerate(labels):
-            lo, hi = pw_edges[c], pw_edges[c + 1]
-            for i, sim_name in enumerate(sim_names):
-                classif = classifications_by_run.get(sim_name)
-                if classif is None:
-                    continue
-                fields = fields_by_run[i]
-                vals, weights = sample_matching_arrays(
-                    fields["precip"], fields["pw"], classif["cloud_top_pressure"], classif["high_cloud_mask"].astype(float),
-                    classif["convective_precipitating_high_cloud_mask"].astype(float),
-                    classif["stratiform_precipitating_high_cloud_mask"].astype(float),
-                    lat_bounds=TROPICAL_LAT_BOUNDS,
-                    **PLOT_SAMPLE_LIMITS,
-                )
-                pr_v, pw_v, ctp_v, high_v, active_v, generated_v = vals
-                cond_mask = (pw_v >= lo) & (pw_v <= hi if c == n_condition_bins - 1 else pw_v < hi)
-
-                masks = {
-                    "high_cloud_mask": high_v >= 0.5,
-                    "convective_precipitating_high_cloud_mask": active_v >= 0.5,
-                    "stratiform_precipitating_high_cloud_mask": generated_v >= 0.5,
-                }
-                for class_label, mask_key, linestyle, _pretty in class_specs:
-                    valid = cond_mask & masks[mask_key]
-                    centres, mean, count = weighted_binned_mean(
-                        pr_v[valid], ctp_v[valid], precip_bins,
-                        weights=weights[valid],
-                        min_count=MIN_BIN_COUNT,
-                    )
-                    plot_supported_curve(
-                        ax[0, c], centres, mean, count, cols[i], linestyle=linestyle,
-                        label=f"{sim_name}, {class_label}" if c == 0 else None,
-                    )
-                    for centre, n in zip(centres, count):
-                        count_rows.append(
-                            dict(figure=2, panel="cloud_top", simulation=sim_name,
-                                 class_name=class_label, pw_condition=label,
-                                 precip_bin_center=centre, sample_count=n)
-                        )
-
-                high_den = (high_v >= 0.5) & cond_mask
-                for frac_label, numerator, linestyle in [
-                    ("convective fraction", active_v >= 0.5, "--"),
-                    ("stratiform precipitating fraction", generated_v >= 0.5, ":"),
-                ]:
-                    centres, frac, count = weighted_binned_fraction(
-                        pr_v, numerator, precip_bins,
-                        denominator=high_den,
-                        weights=weights,
-                        min_count=MIN_BIN_COUNT,
-                    )
-                    plot_supported_curve(
-                        ax[1, c], centres, frac, count, cols[i], linestyle=linestyle,
-                        label=f"{sim_name}, {frac_label}" if c == 0 else None,
-                    )
-                    for centre, n in zip(centres, count):
-                        count_rows.append(
-                            dict(figure=2, panel="class_fraction", simulation=sim_name,
-                                 class_name=frac_label, denominator="all high cloud in PW/precip bin",
-                                 pw_condition=label,
-                                 precip_bin_center=centre, sample_count=n)
-                        )
-
-            ax[0, c].set_title(f"{label}\n{lo:.3g} to {hi:.3g} kg m$^{{-2}}$")
-            ax[1, c].set_xlabel(r"Precipitation (mm day$^{-1}$)")
-            for rr in (0, 1):
-                ax[rr, c].grid(alpha=0.2)
-                add_low_count_note(ax[rr, c])
-
-        for c in range(n_condition_bins):
-            ax[0, c].invert_yaxis()
-        ax[0, 0].set_ylabel("Mean cloud-top pressure (hPa)")
-        ax[1, 0].set_ylabel("Fraction of high-cloud samples\n(denominator: all high cloud)")
-        ax[0, 0].legend(loc="best", fontsize=7)
-        ax[1, 0].legend(loc="best", fontsize=7)
-        fig.suptitle("Cloud-top pressure and high-cloud class fractions at fixed PW")
-        save_figure(2, fig, "conditional_cloudtop_pressure_vs_precip_pw")
-        count_rows_to_frame(count_rows, "conditional_cloudtop_pressure_vs_precip_pw")
-        progress("Done with figure: conditional_cloudtop_pressure_vs_precip_pw")
-
-
-# -----------------------------------------------------------------------------
-# Figure 8. Non-precipitating high cloud vs PW by lagged precipitation
-# -----------------------------------------------------------------------------
-# Interpretation:
-#   * This avoids plotting non-precipitating cloud against current local precipitation.
-#   * A stronger non-precipitating occurrence after previous-timestep rain suggests
-#     a precipitation-memory or detrainment effect.
-
-if should_run_figure(8):
-    progress("Starting Figure 8: conditional_nonprecipitating_highcloud_pw_by_lagged_precip")
-    if not all("pw" in f for f in fields_by_run):
-        print("Skipping Figure 8: PW is unavailable in at least one run.")
-    elif not any(classifications_by_run.get(sim_name) is not None for sim_name in sim_names):
-        print("Skipping Figure 8: high-cloud classification is unavailable.")
-    else:
-        pw_bins = pooled_weighted_bins_for_classified(
-            fields_by_run, classifications_by_run, "pw", PW_NBINS
-        )
-        target_specs = [
-            ("non-precipitating", "nonprecipitating_high_cloud_mask", "Non-precipitating high-cloud occurrence"),
-        ]
-        lag_specs = [
-            (f"previous P < {P_PRECIP_MIN:g}", "dry_lagged_precip", lambda lag: lag < P_PRECIP_MIN),
-            (f"previous P >= {P_PRECIP_MIN:g}", "wet_lagged_precip", lambda lag: lag >= P_PRECIP_MIN),
-        ]
-        fig, ax = plt.subplots(
-            len(target_specs), len(lag_specs),
-            figsize=(8.8, 5.8),
-            constrained_layout=True,
-            sharex=True,
-            sharey="row",
-        )
-        count_rows = []
-        for r, (target_label, target_key, ylabel) in enumerate(target_specs):
-            for c, (lag_label, lag_id, lag_mask_func) in enumerate(lag_specs):
-                for i, sim_name in enumerate(sim_names):
-                    fields = fields_by_run[i]
-                    classif = classifications_by_run.get(sim_name)
-                    if classif is None:
-                        continue
-                    lagged_precip = fields["precip"].shift(Time=LAGGED_PRECIP_TIME_STEPS)
-                    vals, weights = sample_matching_arrays(
-                        fields["pw"],
-                        lagged_precip,
-                        classif[target_key].astype(float),
-                        lat_bounds=TROPICAL_LAT_BOUNDS,
-                        **PLOT_SAMPLE_LIMITS,
-                    )
-                    pw_v, lag_v, y_v = vals
-                    split = lag_mask_func(lag_v)
-                    centres, mean, count = weighted_binned_mean(
-                        pw_v[split],
-                        y_v[split],
-                        pw_bins,
-                        weights=weights[split],
-                        min_count=MIN_BIN_COUNT,
-                    )
-                    plot_supported_curve(
-                        ax[r, c], centres, mean, count, cols[i],
-                        label=sim_name if (r == 0 and c == 0) else None,
-                    )
-                    for centre, n in zip(centres, count):
-                        count_rows.append(
-                            dict(
-                                figure=8,
-                                simulation=sim_name,
-                                target=target_label,
-                                split=lag_id,
-                                pw_bin_center=centre,
-                                sample_count=n,
-                                denominator="all samples in PW bin and lagged-precip split",
-                            )
-                        )
-                ax[r, c].set_title(lag_label if r == 0 else "")
-                ax[r, c].grid(alpha=0.2)
-                add_low_count_note(ax[r, c])
-                if c == 0:
-                    ax[r, c].set_ylabel(ylabel)
-                if r == len(target_specs) - 1:
-                    ax[r, c].set_xlabel(r"PW (kg m$^{-2}$)")
-        ax[0, 0].legend(loc="best")
-        fig.suptitle(
-            "Non-precipitating high cloud vs PW split by previous-timestep precipitation\n"
-            "Current local precipitation is not used as the conditioning axis"
-        )
-        save_figure(8, fig, "conditional_nonprecipitating_highcloud_pw_by_lagged_precip")
-        count_rows_to_frame(count_rows, "conditional_nonprecipitating_highcloud_pw_by_lagged_precip")
-        progress("Done with figure: conditional_nonprecipitating_highcloud_pw_by_lagged_precip")
-
-
-# -----------------------------------------------------------------------------
-# Figure 3. Precipitation vs PW split by wave amplitude and phase
-# -----------------------------------------------------------------------------
-# Interpretation:
-#   * If u-nudged changes the precipitation-PW curve mainly during strong wave
-#     activity, this supports a wind/wave-mediated organisation mechanism.
-#   * If T-nudged behaves similarly during strong wave activity, the wave
-#     response may be mediated through thermal/static-stability changes.
-#   * If u-nudged changes wave-active convection while T-nudged does not, that
-#     is strong evidence for a wind/shear/wave-filtering pathway.
-
-if should_run_figure(3):
-    progress("Starting Figure 3: conditional_precip_pw_by_wave_amplitude_and_phase")
-    if kf_filter is None:
-        print("Skipping Figure 3: waveFilter.kf_filter is unavailable.")
-    elif not all("pw" in f for f in fields_by_run):
-        print("Skipping Figure 3: PW is unavailable in at least one run.")
-    else:
-        pw_bins = pooled_weighted_bins(fields_by_run, "pw", PW_NBINS)
-        row_specs = [
-            ("weak amplitude", "amplitude", "weak"),
-            ("strong amplitude", "amplitude", "strong"),
-            ("suppressed phase", "phase", "suppressed"),
-            ("neutral phase", "phase", "neutral"),
-            ("active phase", "phase", "active"),
-        ]
-        fig, ax = plt.subplots(
-            len(row_specs), len(WAVE_BANDS_FOR_FIG3),
-            figsize=(5.2 * len(WAVE_BANDS_FOR_FIG3), 10.0),
-            constrained_layout=True,
-            sharex=True,
-            sharey=True,
-        )
-        if len(WAVE_BANDS_FOR_FIG3) == 1:
-            ax = ax[:, None]
-        count_rows = []
-
-        for wj, wave_name in enumerate(WAVE_BANDS_FOR_FIG3):
-            amp_by_run = []
-            active_index_by_run = []
-            for i, fields in enumerate(fields_by_run):
-                field_key = WAVE_FILTER_FIELD if WAVE_FILTER_FIELD in fields else "precip"
-                try:
-                    wave = filter_latmean_wave(fields, i, field_key, wave_name)
-                    std = float(wave.std(dim=("Time", "longitude"), skipna=True).values)
-                    wave_norm = wave / std if std > 0 else xr.zeros_like(wave)
-                    amp = np.abs(wave_norm)
-                    active_index = active_phase_sign(field_key) * wave_norm
-                    active_index.attrs["phase_convention"] = (
-                        "positive means convectively active; for OLR this is negative filtered OLR"
-                    )
-                    amp_by_run.append(amp)
-                    active_index_by_run.append(active_index)
-                except Exception as exc:
-                    print(f"Skipping {sim_names[i]} {wave_name} wave split: {exc}")
-                    amp_by_run.append(None)
-                    active_index_by_run.append(None)
-
-            amp_samples = []
-            amp_weights = []
-            for fields, amp in zip(fields_by_run, amp_by_run):
-                if amp is None:
-                    continue
-                vals, weights = sample_matching_arrays(
-                    amp, fields["pw"], fields["precip"],
-                    lat_bounds=TROPICAL_LAT_BOUNDS,
-                    **PLOT_SAMPLE_LIMITS,
-                )
-                amp_samples.append(vals[0])
-                amp_weights.append(weights)
-            if not amp_samples:
-                continue
-            amp_edges = weighted_quantile(
-                np.concatenate(amp_samples), [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0],
-                np.concatenate(amp_weights),
-            )
-
-            for i, (fields, amp, active_index) in enumerate(zip(fields_by_run, amp_by_run, active_index_by_run)):
-                if amp is None or active_index is None:
-                    continue
-                vals, weights = sample_matching_arrays(
-                    fields["pw"], fields["precip"], amp, active_index,
-                    lat_bounds=TROPICAL_LAT_BOUNDS,
-                    **PLOT_SAMPLE_LIMITS,
-                )
-                pw_v, pr_v, amp_v, phase_v = vals
-                split_masks = [
-                    ("weak", "amplitude", amp_v <= amp_edges[1], 0),
-                    ("strong", "amplitude", amp_v >= amp_edges[2], 1),
-                    ("suppressed", "phase", phase_v <= -WAVE_PHASE_THRESHOLD_STD, 2),
-                    ("neutral", "phase", np.abs(phase_v) < WAVE_PHASE_THRESHOLD_STD, 3),
-                    ("active", "phase", phase_v >= WAVE_PHASE_THRESHOLD_STD, 4),
-                ]
-                for split_label, split_type, mask, row in split_masks:
-                    centres, mean, count = weighted_binned_mean(
-                        pw_v[mask], pr_v[mask], pw_bins,
-                        weights=weights[mask],
-                        min_count=MIN_BIN_COUNT,
-                    )
-                    plot_supported_curve(
-                        ax[row, wj], centres, mean, count, cols[i],
-                        label=sim_names[i] if (wj == 0 and row == 0) else None,
-                    )
-                    for centre, n in zip(centres, count):
-                        count_rows.append(
-                            dict(figure=3, simulation=sim_names[i], wave=wave_name,
-                                 split_type=split_type, split_label=split_label,
-                                 pw_bin_center=centre, sample_count=n)
-                        )
-
-            ax[0, wj].set_title(wave_label(wave_name))
-            for row, (row_label, _split_type, _split_label) in enumerate(row_specs):
-                ax[row, wj].set_xlabel(r"PW (kg m$^{-2}$)")
-                ax[row, wj].grid(alpha=0.2)
-                add_low_count_note(ax[row, wj])
-        for row, (row_label, _split_type, _split_label) in enumerate(row_specs):
-            ax[row, 0].set_ylabel(f"{row_label}\nPrecipitation (mm day$^{{-1}}$)")
-        ax[0, 0].legend(loc="best")
-        fig.suptitle(
-            "Precipitation-PW relationship split by filtered wave amplitude and phase\n"
-            f"Phase threshold: |active-index| >= {WAVE_PHASE_THRESHOLD_STD:g} std; active OLR phase is negative filtered OLR"
-        )
-        save_figure(3, fig, "conditional_precip_pw_by_wave_amplitude")
-        save_figure(3, fig, "conditional_precip_pw_by_wave_amplitude_and_phase")
-        wave_count_df = count_rows_to_frame(count_rows, "conditional_precip_pw_by_wave_amplitude_and_phase")
-        if save and len(wave_count_df) > 0:
-            wave_count_df.to_csv(
-                os.path.join(save_loc, "conditional_precip_pw_by_wave_amplitude_bin_counts.csv"),
-                index=False,
-            )
-        progress("Done with figure: conditional_precip_pw_by_wave_amplitude_and_phase")
-
-
-# -----------------------------------------------------------------------------
-# Figure 9. Wave-conditioned cloud classes and cloud-top pressure
-# -----------------------------------------------------------------------------
-
-if should_run_figure(9):
-    progress("Starting Figure 9: wave_conditioned_cloud_classes_and_cloud_top_pressure")
-    if kf_filter is None:
-        print("Skipping Figure 9: waveFilter.kf_filter is unavailable.")
-    else:
-        wave_cloud_table = wave_conditioned_cloud_table(
-            fields_by_run, classifications_by_run
-        )
-        plot_wave_conditioned_cloud_diagnostics(wave_cloud_table)
-        progress("Done with figure: wave_conditioned_cloud_classes_and_cloud_top_pressure")
-
-
-# -----------------------------------------------------------------------------
-# Figure 10. Fine wave-phase-binned cloud composites and latitude profiles
-# -----------------------------------------------------------------------------
-# Interpretation:
-#   * Smooth signed-phase composites resolve where in the wave cycle each
-#     cloud class responds, beyond the coarse suppressed/neutral/active split
-#     of Figure 9.
-#   * Convective-precipitating fraction rising toward positive phase with an
-#     unchanged non-precipitating curve implies the wave modulates convection
-#     rather than broad cloud cover.
-#   * Latitude profiles under active phases show whether nudged-run changes
-#     are equatorially confined (wave-coupled) or spread across the tropics.
-
-if should_run_figure(10):
-    progress("Starting Figure 10: wave_phase_binned_cloud_composites")
-    if kf_filter is None:
-        print("Skipping Figure 10: waveFilter.kf_filter is unavailable.")
-    else:
-        phase_table, profile_table = wave_phase_binned_cloud_tables(
-            fields_by_run, classifications_by_run
-        )
-        if save and len(phase_table) > 0:
-            phase_table.to_csv(
-                os.path.join(save_loc, "wave_phase_binned_cloud_composites.csv"), index=False
-            )
-        if save and len(profile_table) > 0:
-            profile_table.to_csv(
-                os.path.join(save_loc, "wave_active_cloud_latitude_profiles.csv"), index=False
-            )
-        plot_wave_phase_binned_composites(phase_table)
-        plot_wave_active_latitude_profiles(profile_table)
-        progress("Done with figure: wave_phase_binned_cloud_composites")
-
-
-# -----------------------------------------------------------------------------
-# Figure 4. Residual high cloud after removing local thermodynamic controls
-# -----------------------------------------------------------------------------
-# Interpretation:
-#   * Residuals near zero for both nudged runs mean high-cloud differences are
-#     mostly explained by local rain/PW/CAPE/CIN/latitude.
-#   * If T-nudged residuals resemble u-nudged residuals when binned by N2_TTL,
-#     this supports a thermal/static-stability pathway.
-#   * If u-nudged has a distinct residual at fixed N2_TTL, especially organised
-#     by dudz_TTL, this supports a wind/shear/wave pathway.
-#   * Residuals in convective precipitating convection imply deeper or more vertically
-#     connected precipitating convection; residuals in stratiform precipitating or
-#     non-precipitating cloud imply changes in detrainment, lifetime, or upper-level
-#     cloud-radiative feedback rather than simply deeper convective cores.
-
-if should_run_figure(4):
-    progress("Starting Figure 4: residual_highcloud_thermo_controls")
-    if any(classifications_by_run.get(sim_name) is None for sim_name in sim_names):
-        print("Skipping Figure 4: high-cloud classification is unavailable.")
-    else:
-        feature_keys = available_residual_features(fields_by_run)
-        bin_keys = ["latitude"]
-        if all("N2_TTL" in fields for fields in fields_by_run):
-            bin_keys.append("N2_TTL")
-        if all("dudz_TTL" in fields for fields in fields_by_run):
-            bin_keys.append("dudz_TTL")
-
-        target_specs = [
-            ("total", "Total high cloud"),
-            ("convective", "Convective precipitating"),
-            ("stratiform", "Stratiform precipitating"),
-            ("nonprecipitating", "Non-precipitating"),
-        ]
-
-        residual_samples = {}
-        models = {}
-        for target_key, target_label in target_specs:
-            Xc, yc, wc = model_training_data(
-                fields_by_run[0], classifications_by_run[sim_names[0]], target_key, feature_keys
-            )
-            models[target_key] = fit_control_relationship(Xc, yc, wc, target_label)
-
-            for i, sim_name in enumerate(sim_names):
-                X, y, bins, weights = residual_sample_data(
-                    fields_by_run[i], classifications_by_run[sim_name], target_key, feature_keys, bin_keys
-                )
-                pred = np.clip(models[target_key].predict(X), 0.0, 1.0)
-                residual = y - pred
-                residual_samples[(target_key, sim_name)] = dict(
-                    residual=residual,
-                    bins=bins,
-                    weights=weights,
-                )
-                mean_resid = np.sum(weights * residual) / np.sum(weights)
-                print(f"Mean residual for {sim_name} {target_label}: {mean_resid:.4f}")
-
-        fig, ax = plt.subplots(
-            len(target_specs), len(bin_keys),
-            figsize=(4.2 * len(bin_keys), 8.0),
-            constrained_layout=True,
-            sharey="row",
-        )
-        if len(target_specs) == 1:
-            ax = ax[None, :]
-        if len(bin_keys) == 1:
-            ax = ax[:, None]
-
-        count_rows = []
-        for r, (target_key, target_label) in enumerate(target_specs):
-            for c, bin_key in enumerate(bin_keys):
-                pooled_vals = []
-                pooled_weights = []
-                for sim_name in sim_names:
-                    sample = residual_samples[(target_key, sim_name)]
-                    pooled_vals.append(sample["bins"][bin_key])
-                    pooled_weights.append(sample["weights"])
-                pooled_vals = np.concatenate(pooled_vals)
-                pooled_weights = np.concatenate(pooled_weights)
-                if bin_key == "latitude":
-                    bins = np.arange(TROPICAL_LAT_BOUNDS[0], TROPICAL_LAT_BOUNDS[1] + LATITUDE_BIN_WIDTH, LATITUDE_BIN_WIDTH)
-                    xlabel = "Latitude (deg)"
-                elif bin_key == "N2_TTL":
-                    bins = unique_monotonic_bins(weighted_quantile(pooled_vals, np.linspace(0.02, 0.98, 11), pooled_weights))
-                    xlabel = r"$N^2_{TTL}$ (s$^{-2}$)"
-                else:
-                    bins = unique_monotonic_bins(weighted_quantile(pooled_vals, np.linspace(0.02, 0.98, 11), pooled_weights))
-                    xlabel = r"$du/dz_{TTL}$ (s$^{-1}$)"
-
-                for i, sim_name in enumerate(sim_names):
-                    sample = residual_samples[(target_key, sim_name)]
-                    centres, mean, count = weighted_binned_mean(
-                        sample["bins"][bin_key],
-                        sample["residual"],
-                        bins,
-                        weights=sample["weights"],
-                        min_count=MIN_BIN_COUNT,
-                    )
-                    plot_supported_curve(
-                        ax[r, c], centres, mean, count, cols[i],
-                        label=sim_name if (r == 0 and c == 0) else None,
-                    )
-                    for centre, n in zip(centres, count):
-                        count_rows.append(
-                            dict(figure=4, simulation=sim_name, target=target_label,
-                                 bin_variable=bin_key, bin_center=centre, sample_count=n)
-                        )
-
-                ax[r, c].axhline(0, color="0.6", lw=0.8)
-                ax[r, c].grid(alpha=0.2)
-                add_low_count_note(ax[r, c])
-                if r == 0:
-                    ax[r, c].set_title(f"Residual vs {bin_key}")
-                if c == 0:
-                    ax[r, c].set_ylabel(f"{target_label}\nobserved - control-predicted")
-                if r == len(target_specs) - 1:
-                    ax[r, c].set_xlabel(xlabel)
-
-        ax[0, 0].legend(loc="best")
-        fig.suptitle("High-cloud residuals after removing control local-thermodynamic relationship")
-        save_figure(4, fig, "residual_highcloud_thermo_controls")
-        count_rows_to_frame(count_rows, "residual_highcloud_thermo_controls")
-        progress("Done with figure: residual_highcloud_thermo_controls")
+if __name__ == "__main__":
+    main()

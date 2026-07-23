@@ -2,7 +2,6 @@ import glob
 import hashlib
 import json
 import os
-import numbers
 import warnings
 from datetime import datetime
 
@@ -20,6 +19,13 @@ DEFAULT_SIMULATION_PARENT_DIR = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/c
 DEFAULT_DIAGNOSTIC_OUTPUT_ROOT = "/home/cwp29/tmp/mpas/crf_on"
 DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
 DIAGNOSTIC_FIGURE_ROOT_ENV = "MPAS_DIAGNOSTIC_FIGURE_ROOT"
+DEFAULT_ORGANISATION_TRACKING_MODE = "drift"
+ANALYSIS_START = "2000-05-05 06:00:00"
+ANALYSIS_END = "2000-11-21 00:00:00"
+LATLON_PATTERN = "latlon.2000-*.nc"
+ZONAL_MEAN_PATTERN = "zm_latlon.2000-*.nc"
+QUICK_TEST_LAT_BOUNDS = (-20.0, 20.0)
+QUICK_TEST_LON_BOUNDS = (60.0, 180.0)
 
 
 def simulation_parent_dir(root_dir=None):
@@ -35,6 +41,19 @@ def diagnostic_cache_dir(*parts, root_dir=None):
         os.environ.get("MPAS_DIAGNOSTIC_CACHE_ROOT", simulation_parent_dir(root_dir))
     )
     return os.path.join(base, *parts)
+
+
+def convective_organisation_cache_dir(
+    tracking_mode=DEFAULT_ORGANISATION_TRACKING_MODE,
+    root_dir=None,
+):
+    """Data-side cache for retained convective-system object products."""
+    mode = str(tracking_mode).strip().lower()
+    if mode not in {"standard", "drift"}:
+        raise ValueError(
+            f"tracking_mode must be 'standard' or 'drift', got {mode!r}"
+        )
+    return diagnostic_cache_dir("organisation_cache", mode, root_dir=root_dir)
 
 
 def diagnostic_output_dir(default_save_loc, root_dir=DEFAULT_DIAGNOSTIC_OUTPUT_ROOT):
@@ -60,40 +79,11 @@ def diagnostic_output_dir(default_save_loc, root_dir=DEFAULT_DIAGNOSTIC_OUTPUT_R
     return os.path.join(override_root, rel_path) + os.sep
 
 
-def unique_existing_order(paths):
-    """Deduplicate path lists without changing their priority order."""
-    out = []
-    seen = set()
-    for path in paths:
-        if path is None:
-            continue
-        norm = os.path.abspath(path)
-        if norm in seen:
-            continue
-        seen.add(norm)
-        out.append(path)
-    return out
-
-
 ISOBARIC_DIM_LEVEL_VAR = {
     "nIsoLevelsT": "t_iso_levels",
     "nIsoLevelsU": "u_iso_levels",
     "nIsoLevelsZ": "z_iso_levels",
 }
-
-
-def silence_hdf5_error_stack():
-    """Disable HDF5 C-library error-stack printing, without hiding Python errors."""
-    try:
-        import h5py
-    except Exception:
-        return False
-
-    try:
-        h5py._errors.silence_errors()
-    except Exception:
-        return False
-    return True
 
 
 def standardize_cldfrac_vertical_coordinate(ds):
@@ -135,53 +125,36 @@ def standardize_cldfrac_vertical_coordinate(ds):
 
 def load_latlon_dataset(
     data_dir,
-    latlon_pattern="latlon.2000-*.nc",
-    diag_file="latlon_diag.nc",
-    hist_file="latlon_hist.nc",
-    time_format="int",
-    dt=6,
-    ndays=None,
-    end_date=None,
-    chunks=None,
-    prefer_pattern=False,
+    latlon_pattern,
+    chunks,
+    direct_chunks=False,
 ):
-    diag_path = os.path.join(data_dir, diag_file)
-    hist_path = os.path.join(data_dir, hist_file)
     latlon_files = sorted(glob.glob(os.path.join(data_dir, latlon_pattern)))
-
-    if prefer_pattern and latlon_files:
-        print(data_dir, latlon_pattern)
-        ds = xr.open_mfdataset(latlon_files, combine="by_coords", chunks={}, data_vars="minimal", coords="minimal", compat="override")
-        print(ds)
-    elif os.path.exists(diag_path) and os.path.exists(hist_path):
-        dsd = xr.open_dataset(diag_path, chunks={})
-        dsh = xr.open_dataset(hist_path, chunks={})
-        dsd = dsd.isel(Time=slice(0, None, 2)) if time_format == "int" else dsd.sel(Time=dsh.Time)
-        ds = xr.merge([dsh, dsd], join="exact", compat="override")
-    elif latlon_files:
-        print(data_dir, latlon_pattern)
-        ds = xr.open_mfdataset(latlon_files, combine="by_coords", chunks={}, data_vars="minimal", coords="minimal", compat="override")
-        print(ds)
-    else:
-        raise FileNotFoundError(
-            f"Could not find either {latlon_pattern} or both {diag_file} and {hist_file} in {data_dir}"
-        )
-
-    if ndays is not None:
-        if time_format == "int":
-            ds = ds.isel(Time=slice(-ndays * int(24 / dt), None))
-        else:
-            t_end = pd.to_datetime(end_date) if end_date is not None else pd.to_datetime(ds.Time.max().item())
-            ds = ds.sel(Time=slice(t_end - pd.Timedelta(days=ndays), t_end))
-
-    ds = standardize_cldfrac_vertical_coordinate(ds)
-
-    return ds.chunk(chunks) if chunks is not None else ds
+    if not latlon_files:
+        raise FileNotFoundError(f"No files match {latlon_pattern!r} in {data_dir}")
+    print(data_dir, latlon_pattern)
+    ds = xr.open_mfdataset(
+        latlon_files,
+        combine="by_coords",
+        chunks=chunks if direct_chunks else {},
+        data_vars="minimal",
+        coords="minimal",
+        compat="override",
+    )
+    if not np.issubdtype(ds.Time.dtype, np.datetime64):
+        raise TypeError(f"Expected decoded datetime Time coordinate, got {ds.Time.dtype}")
+    expected_time = pd.date_range(
+        start=ANALYSIS_START,
+        end=ANALYSIS_END,
+        freq="6h",
+    )
+    ds = ds.sel(Time=expected_time)
+    if not ds.Time.to_index().equals(expected_time):
+        raise ValueError("Input does not have the expected complete 6-hourly Time axis")
+    return ds if direct_chunks else ds.chunk(chunks)
 
 
-def get_time_values(ds, dt=6):
-    if issubclass(ds.Time.values.dtype.type, numbers.Integral):
-        return ds.Time.values * dt / 24.0
+def get_time_values(ds):
     return ds.Time.values
 
 
@@ -232,10 +205,8 @@ def total_precip_accum(ds):
     )
 
 
-def precip_rate_from_accum(accum, dt=6):
+def precip_rate_from_accum(accum):
     """Convert accumulated precipitation to a precipitation rate in mm day-1."""
-    if issubclass(accum.Time.values.dtype.type, numbers.Integral):
-        return accum.diff("Time") / (dt / 24.0)
     dt_days = accum.Time.diff("Time") / np.timedelta64(1, "D")
     return accum.diff("Time") / dt_days
 
@@ -407,10 +378,6 @@ def isobaric_vertical_velocity_from_zm(zds, pressure_levels_hpa=None, hemispheri
     return hemispheric_fold(da, parity=hemispheric_parity)
 
 
-def height_from_zm_latlon(zds):
-    return zds["z"]
-
-
 def model_lat_field(da):
     lev_dim = vertical_dim(da)
     if lev_dim != "z":
@@ -431,7 +398,7 @@ def lat_height_mesh(field, zmid, lat):
 def N2_latheight(zds, g=9.80665):
     """Time-mean static stability on model height levels as (z, latitude)."""
     theta = model_lat_field(zds.theta.mean(dim="Time"))
-    z = height_from_zm_latlon(zds).values
+    z = zds.z.values
     dtheta_dz = np.gradient(theta.values, z, axis=0)
     n2 = xr.DataArray(
         g / theta.values * dtheta_dz,
@@ -443,57 +410,40 @@ def N2_latheight(zds, g=9.80665):
     return hemispheric_fold(n2, parity="even")
 
 
-def _pressure_axis_values(ds, name, dim):
-    if name not in ds.variables:
-        raise ValueError(f"Dataset has dimension {dim!r} but no in-file pressure variable {name!r}")
-    axis = ds[name]
-    if dim not in axis.dims:
-        raise ValueError(f"Pressure variable {name!r} is not defined on dimension {dim!r}; dims are {axis.dims!r}")
-    values = np.asarray(axis.values, dtype=np.float64)
-    values = np.squeeze(values)
-    if values.ndim != 1:
-        raise ValueError(f"Pressure variable {name!r} must be one-dimensional; shape is {axis.shape!r}")
-    if values.size != ds.sizes[dim]:
-        raise ValueError(
-            f"Pressure variable {name!r} has {values.size} levels, "
-            f"but dimension {dim!r} has {ds.sizes[dim]}"
-        )
-    return values
-
-
 def pressure_values_from_dataset(ds):
-    """Return the verified in-file pressure coordinate in hPa, if present."""
-    axes = []
+    """Return the fixed 22-level pressure coordinate, checking exact agreement."""
     if "pres" in ds.dims:
-        axes.append(("pres", "pres", _pressure_axis_values(ds, "pres", "pres")))
-        for level_var in ISOBARIC_DIM_LEVEL_VAR.values():
-            if level_var in ds.variables and "pres" in ds[level_var].dims:
-                axes.append(("pres", level_var, _pressure_axis_values(ds, level_var, "pres")))
+        return np.asarray(ds.pres.values, dtype=float)
 
+    axes = []
     for dim, level_var in ISOBARIC_DIM_LEVEL_VAR.items():
         if dim in ds.dims:
-            axes.append((dim, level_var, _pressure_axis_values(ds, level_var, dim)))
+            values = np.asarray(ds[level_var].values, dtype=float)
+            if values.shape != (ds.sizes[dim],):
+                raise ValueError(f"{level_var} must be one-dimensional on {dim}")
+            axes.append(values)
 
     if not axes:
         return None
 
-    ref_dim, ref_name, ref_values = axes[0]
-    for dim, name, values in axes[1:]:
-        if ref_values.shape != values.shape or not np.allclose(ref_values, values, rtol=1e-8, atol=1e-10):
-            raise ValueError(
-                "In-file isobaric pressure axes disagree: "
-                f"{ref_name!r} on {ref_dim!r} differs from {name!r} on {dim!r}"
-            )
-    return ref_values
+    if any(not np.array_equal(axes[0], values) for values in axes[1:]):
+        raise ValueError("In-file isobaric pressure axes disagree")
+    return axes[0]
 
 
 def standardize_latlon_dataset(ds, needed_vars=None):
     if needed_vars is not None:
+        missing = [name for name in needed_vars if name not in ds.data_vars]
+        if missing:
+            raise KeyError(f"Required variables are missing: {missing}")
+        source = ds
+        selected = ds[list(needed_vars)]
         level_vars = [
-            v for v in ISOBARIC_DIM_LEVEL_VAR.values()
-            if v in ds.variables and v not in needed_vars
+            level_var
+            for dim, level_var in ISOBARIC_DIM_LEVEL_VAR.items()
+            if dim in selected.dims and level_var not in needed_vars
         ]
-        ds = ds[[v for v in needed_vars if v in ds.data_vars] + level_vars]
+        ds = source[list(needed_vars) + level_vars]
     file_pres_values = pressure_values_from_dataset(ds)
     rename_map = {}
     for dim in ISOBARIC_DIM_LEVEL_VAR:
@@ -508,7 +458,7 @@ def standardize_latlon_dataset(ds, needed_vars=None):
             raise ValueError(f"Unexpected pressure axis length: {ds.sizes['pres']} (expected {len(file_pres_values)})")
         ds = ds.assign_coords(pres=("pres", file_pres_values))
         ds["pres"].attrs.update(units="hPa", positive="down", axis="Z")
-    return ds
+    return standardize_cldfrac_vertical_coordinate(ds)
 
 
 def lat_mean(da, lat_dim="latitude"):
@@ -593,10 +543,6 @@ def plot_rhw_latpres(a, lats, pres, rhbar, vbar, wbar, tbar, rd=287.0, g=9.80665
 def isobaric_lat_mean(da, hemispheric_parity=None):
     out = da.mean(dim="Time").transpose("pres", "latitude")
     return hemispheric_fold(out, parity=hemispheric_parity)
-
-
-def interp_like_control(field, control_field):
-    return control_field.interp(pres=field.pres, latitude=field.latitude)
 
 
 def set_latheight_labels(ax, xlabel=True, ylabel=True):
@@ -715,7 +661,7 @@ PRECIP_RATE_COLORS = [
 PRECIP_RATE_LEVELS = np.linspace(0.01, 25.0, len(PRECIP_RATE_COLORS))
 
 HIGH_CLOUD_CLASS_SPECS = (
-    (1, "Convective precipitating", "tab:red"),
+    (1, "PyFLEXTRKR convective core", "tab:red"),
     (2, "Stratiform precipitating", "tab:blue"),
     (3, "Non-precipitating", "tab:green"),
     (4, "Invalid/unclassified", "0.70"),
@@ -749,10 +695,6 @@ def high_cloud_class_legend_handles():
         Patch(facecolor=color, label=label)
         for _code, label, color in HIGH_CLOUD_CLASS_SPECS
     ]
-
-
-def make_diff_norm(levels):
-    return colors.BoundaryNorm(levels, plt.get_cmap("bwr").N)
 
 
 def difference_cmap(levels, cmap="bwr"):
@@ -905,8 +847,20 @@ def all_figures_requested(figures_to_run):
 
 
 class FigureSaver:
-    def __init__(self, save_loc, enabled=True, start=1, dpi=300, figures_to_run=None):
-        self.save_loc = diagnostic_output_dir(save_loc)
+    """Save numbered figures beneath a date-stamped output directory."""
+
+    def __init__(
+        self,
+        save_loc,
+        enabled=True,
+        start=1,
+        dpi=300,
+        figures_to_run=None,
+        date_stamp=None,
+    ):
+        self.target_dir = diagnostic_output_dir(save_loc)
+        self.date_stamp = date_stamp or datetime.now().strftime("%Y-%m-%d")
+        self.save_loc = os.path.join(self.target_dir, self.date_stamp)
         self.enabled = enabled
         self.index = start
         self.dpi = dpi
@@ -919,9 +873,11 @@ class FigureSaver:
             self.index += 1
         fname = f"{number:02d}_{stem}.png"
         if self.enabled and figure_should_run(self.figures_to_run, number):
-            fig.savefig(os.path.join(self.save_loc, fname), dpi=self.dpi if dpi is None else dpi)
-            print(f"Done with figure file: {fname}", flush=True)
-        return fname
+            output_path = os.path.join(self.save_loc, fname)
+            fig.savefig(output_path, dpi=self.dpi if dpi is None else dpi)
+            print(f"Done with figure file: {output_path}", flush=True)
+            return output_path
+        return os.path.join(self.save_loc, fname)
 
 
 def numbered_figure_saver(figure_saver):
@@ -1070,6 +1026,157 @@ def pressure_layer_weights(pressure):
     )
 
 
+def bounded_pressure_integral(field, pressure_pa, top_pressure_pa,
+                              bottom_pressure_pa, dim="pres"):
+    """Integrate a pressure-level field between spatially varying bounds.
+
+    The pressure coordinate must be one-dimensional.  Values at partial layer
+    endpoints are linearly interpolated, and bounds outside the supplied
+    pressure range are clipped.  The returned integral retains the pressure
+    units supplied by ``pressure_pa`` (normally Pa).
+    """
+    if dim not in field.dims:
+        raise ValueError(f"{dim!r} is not a dimension of {field.dims!r}")
+
+    pressure = np.asarray(
+        pressure_pa.values if isinstance(pressure_pa, xr.DataArray) else pressure_pa,
+        dtype=float,
+    )
+    if pressure.ndim != 1 or pressure.size != field.sizes[dim]:
+        raise ValueError("pressure_pa must be one-dimensional and match the pressure dimension")
+    if not np.all(np.isfinite(pressure)) or np.any(pressure <= 0.0):
+        raise ValueError("pressure_pa must contain finite positive values")
+
+    order = np.argsort(pressure)
+    pressure = pressure[order]
+    if np.any(np.diff(pressure) <= 0.0):
+        raise ValueError("pressure_pa must contain unique levels")
+    field = field.isel({dim: order})
+
+    top = (
+        top_pressure_pa
+        if isinstance(top_pressure_pa, xr.DataArray)
+        else xr.DataArray(float(top_pressure_pa))
+    )
+    bottom = (
+        bottom_pressure_pa
+        if isinstance(bottom_pressure_pa, xr.DataArray)
+        else xr.DataArray(float(bottom_pressure_pa))
+    )
+    top, bottom = xr.broadcast(top, bottom)
+    result = xr.zeros_like(top + bottom, dtype=float)
+    for index in range(pressure.size - 1):
+        p0 = float(pressure[index])
+        p1 = float(pressure[index + 1])
+        lo = xr.where(top > p0, top, p0)
+        hi = xr.where(bottom < p1, bottom, p1)
+        width = (hi - lo).clip(min=0.0)
+
+        f0 = field.isel({dim: index}, drop=True)
+        f1 = field.isel({dim: index + 1}, drop=True)
+        slope = (f1 - f0) / (p1 - p0)
+        flo = f0 + slope * (lo - p0)
+        fhi = f0 + slope * (hi - p0)
+        contribution = 0.5 * (flo + fhi) * width
+        result = result + contribution.where(width > 0.0, 0.0)
+
+    result.name = getattr(field, "name", None)
+    result.attrs.update(getattr(field, "attrs", {}))
+    return result
+
+
+def interpolate_isobaric_to_pressure(field, target_pressure_hpa, dim="pres"):
+    """Linearly interpolate a fixed-isobaric field to a varying pressure."""
+    if dim not in field.dims:
+        raise ValueError(f"{dim!r} is not a dimension of {field.dims!r}")
+    pressure = np.asarray(field[dim].values, dtype=float)
+    if pressure.ndim != 1 or np.any(~np.isfinite(pressure)):
+        raise ValueError("The isobaric coordinate must be one-dimensional and finite")
+
+    order = np.argsort(pressure)
+    pressure = pressure[order]
+    field = field.isel({dim: order})
+    target = target_pressure_hpa
+    out = xr.full_like(target, np.nan, dtype=float)
+    for index in range(pressure.size - 1):
+        p0 = float(pressure[index])
+        p1 = float(pressure[index + 1])
+        fraction = (target - p0) / (p1 - p0)
+        value = (
+            field.isel({dim: index}, drop=True)
+            + fraction
+            * (
+                field.isel({dim: index + 1}, drop=True)
+                - field.isel({dim: index}, drop=True)
+            )
+        )
+        out = xr.where((target >= p0) & (target <= p1), value, out)
+    out.name = getattr(field, "name", None)
+    out.attrs.update(getattr(field, "attrs", {}))
+    return out
+
+
+def spherical_flux_divergence(zonal_flux, meridional_flux,
+                              radius=6_371_000.0,
+                              latitude="latitude", longitude="longitude"):
+    """Return horizontal divergence of a vector flux on a regular lat-lon grid."""
+    for dim in (latitude, longitude):
+        if dim not in zonal_flux.dims or dim not in meridional_flux.dims:
+            raise ValueError(f"Both fluxes must contain {dim!r}")
+
+    lon = np.asarray(zonal_flux[longitude].values, dtype=float)
+    if lon.size < 3:
+        raise ValueError("At least three longitude points are required")
+    lon_step = np.deg2rad(np.diff(lon))
+    median_lon_step = float(np.median(lon_step))
+    if not np.allclose(lon_step, median_lon_step, rtol=5e-5, atol=1e-12):
+        raise ValueError("Longitude must be regularly spaced")
+
+    coslat = np.cos(np.deg2rad(zonal_flux[latitude]))
+    d_zonal_dlambda = (
+        zonal_flux.roll({longitude: -1}, roll_coords=False)
+        - zonal_flux.roll({longitude: 1}, roll_coords=False)
+    ) / (2.0 * median_lon_step)
+    d_meridional_cos_dphi = (
+        meridional_flux * coslat
+    ).differentiate(latitude, edge_order=2) * (180.0 / np.pi)
+
+    divergence = (d_zonal_dlambda + d_meridional_cos_dphi) / (radius * coslat)
+    divergence.name = "horizontal_flux_divergence"
+    divergence.attrs.update(
+        long_name="spherical horizontal flux divergence",
+        earth_radius_m=float(radius),
+    )
+    return divergence
+
+
+def spherical_horizontal_advection(scalar, zonal_wind, meridional_wind,
+                                    radius=6_371_000.0,
+                                    latitude="latitude", longitude="longitude"):
+    """Return ``u/(a cos(phi))*d/dlambda + v/a*d/dphi`` for a scalar."""
+    lon = np.asarray(scalar[longitude].values, dtype=float)
+    if lon.size < 3:
+        raise ValueError("At least three longitude points are required")
+    lon_step = np.deg2rad(np.diff(lon))
+    median_lon_step = float(np.median(lon_step))
+    if not np.allclose(lon_step, median_lon_step, rtol=5e-5, atol=1e-12):
+        raise ValueError("Longitude must be regularly spaced")
+
+    coslat = np.cos(np.deg2rad(scalar[latitude]))
+    dscalar_dlambda = (
+        scalar.roll({longitude: -1}, roll_coords=False)
+        - scalar.roll({longitude: 1}, roll_coords=False)
+    ) / (2.0 * median_lon_step)
+    dscalar_dphi = scalar.differentiate(latitude, edge_order=2) * (180.0 / np.pi)
+    out = (
+        zonal_wind * dscalar_dlambda / (radius * coslat)
+        + meridional_wind * dscalar_dphi / radius
+    )
+    out.name = "horizontal_advection"
+    out.attrs["earth_radius_m"] = float(radius)
+    return out
+
+
 def latitude_weights(latitude_or_field):
     """Return non-negative cosine-latitude weights on the latitude dimension."""
     latitude = (
@@ -1092,33 +1199,27 @@ def latitude_weights(latitude_or_field):
     )
 
 
-def time_step_days(da, dt_hours=6, numeric_step_values=True):
-    """Return a robust positive median Time increment in days."""
+def time_step_days(da):
+    """Return the median decoded-datetime Time increment in days."""
     if "Time" not in da.dims or da.sizes["Time"] < 2:
-        return dt_hours / 24.0
+        return 0.25
     values = da.Time.values
-    if np.issubdtype(values.dtype, np.number):
-        if not numeric_step_values:
-            return dt_hours / 24.0
-        deltas = np.diff(np.asarray(values, dtype=float)) * dt_hours / 24.0
-    elif np.issubdtype(values.dtype, np.datetime64):
-        deltas = np.diff(values) / np.timedelta64(1, "D")
-    else:
-        timestamps = pd.to_datetime(values)
-        deltas = np.asarray(np.diff(timestamps) / pd.Timedelta(days=1), dtype=float)
+    if not np.issubdtype(values.dtype, np.datetime64):
+        raise TypeError(f"Expected decoded datetime Time coordinate, got {values.dtype}")
+    deltas = np.diff(values) / np.timedelta64(1, "D")
     deltas = np.asarray(deltas, dtype=float)
     deltas = deltas[np.isfinite(deltas) & (deltas > 0)]
-    return float(np.median(deltas)) if deltas.size else dt_hours / 24.0
+    if not deltas.size:
+        raise ValueError("Time coordinate has no positive increments")
+    return float(np.median(deltas))
 
 
 def time_block_slices(
     da,
     block_days,
-    dt_hours=6,
     complete=False,
     min_blocks=0,
     require_time=False,
-    numeric_step_values=True,
 ):
     """Construct time-block slices for resampling or bounded calculations."""
     if "Time" not in da.dims:
@@ -1130,11 +1231,7 @@ def time_block_slices(
         int(
             round(
                 block_days
-                / time_step_days(
-                    da,
-                    dt_hours=dt_hours,
-                    numeric_step_values=numeric_step_values,
-                )
+                / time_step_days(da)
             )
         ),
     )
@@ -1187,17 +1284,6 @@ def configured_label(mapping, name):
     return mapping.get(name, {}).get("label", name)
 
 
-def find_variable(ds, key, required=False, aliases=None):
-    """Find a data variable by its canonical key and optional alias mapping."""
-    names = (aliases or {}).get(key, [key])
-    for name in names:
-        if name in ds.data_vars:
-            return name
-    if required:
-        raise KeyError(f"Could not find variable for {key!r}; tried {names}")
-    return None
-
-
 def subset_latitude(da, lat_bounds=None):
     """Subset a latitude dimension while tolerating fields without latitude."""
     if lat_bounds is None or "latitude" not in da.dims:
@@ -1229,78 +1315,42 @@ def weighted_area_time_mean(da, lat_bounds=None):
     return float(field.weighted(weights).mean(dim=dims, skipna=True).values)
 
 
-def select_common_time(da, reference):
-    """Select the intersection of two Time coordinates when both are present."""
-    if "Time" not in da.dims or "Time" not in reference.dims:
-        return da
-    common_time = da.Time.to_index().intersection(reference.Time.to_index())
-    return da.sel(Time=common_time)
-
-
 def time_aligned_variable(
     ds,
-    key,
+    name,
     reference,
-    required=False,
-    aliases=None,
-    intersect=True,
 ):
-    """Load a finite variable by alias and align it to a reference time axis."""
-    name = find_variable(ds, key, required=required, aliases=aliases)
-    if name is None:
-        return None
-    out = finite_or_nan(ds[name])
+    """Load a required variable and select the reference timestamps exactly."""
+    out = ds[name]
     if "Time" in out.dims and "Time" in reference.dims:
-        out = (
-            select_common_time(out, reference)
-            if intersect
-            else out.sel(Time=reference.Time)
-        )
-    out.name = key
+        out = out.sel(Time=reference.Time)
     return out
 
 
-def precipitation_rate_from_dataset(ds, aliases=None, dt_hours=6):
-    """Return a direct or accumulated total precipitation rate in mm/day."""
-    direct = find_variable(ds, "precip", aliases=aliases)
-    if direct is not None:
-        precip = finite_or_nan(ds[direct])
-        precip.name = "precip"
-        precip.attrs.setdefault("units", "mm day-1")
-        return precip
-
-    names = {
-        key: find_variable(ds, key, required=True, aliases=aliases)
-        for key in ("rainc", "rainnc", "i_rainc", "i_rainnc")
-    }
-    accumulated = (
-        ds[names["rainnc"]]
-        + ds[names["i_rainnc"]] * 100.0
-        + ds[names["rainc"]]
-        + ds[names["i_rainc"]] * 100.0
-    )
-    precip = finite_or_nan(precip_rate_from_accum(accumulated, dt=dt_hours))
+def precipitation_rate_from_dataset(ds):
+    """Return total precipitation rate from the four MPAS accumulators."""
+    precip = precip_rate_from_accum(total_precip_accum(ds))
     precip.name = "precip"
     precip.attrs["units"] = "mm day-1"
     return precip
 
 
-def time_days_from_coord(time_coord, dt_hours=6):
-    """Convert a datetime or integer time coordinate to elapsed days."""
+def time_days_from_coord(time_coord):
+    """Convert a decoded datetime coordinate to elapsed days."""
     values = np.asarray(time_coord.values)
-    if np.issubdtype(values.dtype, np.datetime64):
-        return (values - values[0]) / np.timedelta64(1, "D")
-    return values.astype(float) * dt_hours / 24.0
+    if not np.issubdtype(values.dtype, np.datetime64):
+        raise TypeError(f"Expected decoded datetime Time coordinate, got {values.dtype}")
+    return (values - values[0]) / np.timedelta64(1, "D")
 
 
-def median_time_step_days(da, dt_hours=6):
+def median_time_step_days(da):
     """Return the median Time increment in days."""
     values = np.asarray(da.Time.values)
     if values.size < 2:
-        return dt_hours / 24.0
-    if np.issubdtype(values.dtype, np.datetime64):
-        return float(np.median(np.diff(values) / np.timedelta64(1, "D")))
-    return float(np.median(np.diff(values))) * dt_hours / 24.0
+        return 0.25
+    if not np.issubdtype(values.dtype, np.datetime64):
+        raise TypeError(f"Expected decoded datetime Time coordinate, got {values.dtype}")
+    return float(np.median(np.diff(values) / np.timedelta64(1, "D")))
 
 
 def weighted_tropical_mean(da, lat_bounds):
@@ -1466,65 +1516,27 @@ def stride_indexers(
     return indexers
 
 
-def compute_ttl_diagnostics(zonal_dataset, precip_reference, aliases):
-    """Return optional 14--18 km static-stability and shear diagnostics."""
-    output = {}
-    if "z" not in zonal_dataset.coords:
-        return output
-    z_coord = zonal_dataset["z"]
-    z_values = np.asarray(z_coord.values, dtype=float)
-    z_km = z_values / 1000.0 if np.nanmax(np.abs(z_values)) > 100.0 else z_values
+def compute_ttl_diagnostics(zonal_dataset, precip_reference):
+    """Derive 14--18 km static stability and shear from the fixed zm schema."""
+    z_coord = zonal_dataset.z
     ttl_mask = xr.DataArray(
-        (z_km >= 14.0) & (z_km <= 18.0),
+        (z_coord >= 14_000.0) & (z_coord <= 18_000.0),
         dims=("z",),
         coords={"z": z_coord},
     )
-
-    n2_name = find_variable(zonal_dataset, "N2", aliases=aliases)
-    if n2_name is not None:
-        n2 = finite_or_nan(zonal_dataset[n2_name])
-        if vertical_dim(n2) != "z":
-            n2 = n2.rename({vertical_dim(n2): "z"})
-        output["N2_TTL"] = n2.where(ttl_mask, drop=True).mean(dim="z", skipna=True)
-    else:
-        theta_name = find_variable(zonal_dataset, "theta", aliases=aliases)
-        if theta_name is not None:
-            theta = finite_or_nan(zonal_dataset[theta_name])
-            if vertical_dim(theta) != "z":
-                theta = theta.rename({vertical_dim(theta): "z"})
-            try:
-                output["N2_TTL"] = (
-                    9.80665 / theta * theta.differentiate("z")
-                ).where(ttl_mask, drop=True).mean(dim="z", skipna=True)
-            except Exception as exc:
-                warnings.warn(f"Could not compute N2_TTL from theta: {exc}")
-
-    shear_name = find_variable(zonal_dataset, "dudz", aliases=aliases)
-    if shear_name is not None:
-        shear = finite_or_nan(zonal_dataset[shear_name])
-        if vertical_dim(shear) != "z":
-            shear = shear.rename({vertical_dim(shear): "z"})
-        output["dudz_TTL"] = shear.where(ttl_mask, drop=True).mean(dim="z", skipna=True)
-    else:
-        wind_name = find_variable(zonal_dataset, "u_zm", aliases=aliases)
-        if wind_name is not None:
-            wind = finite_or_nan(zonal_dataset[wind_name])
-            if vertical_dim(wind) != "z":
-                wind = wind.rename({vertical_dim(wind): "z"})
-            try:
-                output["dudz_TTL"] = wind.differentiate("z").where(
-                    ttl_mask, drop=True
-                ).mean(dim="z", skipna=True)
-            except Exception as exc:
-                warnings.warn(f"Could not compute dudz_TTL from uReconstructZonal: {exc}")
-
-    aligned = {}
-    for key, array in output.items():
-        if "Time" in array.dims:
-            array = array.sel(Time=precip_reference.Time)
-        array.name = key
-        aligned[key] = array
-    return aligned
+    theta = zonal_dataset.theta
+    wind = zonal_dataset.uReconstructZonal
+    output = {
+        "N2_TTL": (9.80665 / theta * theta.differentiate("z"))
+        .where(ttl_mask, drop=True)
+        .mean(dim="z", skipna=True),
+        "dudz_TTL": wind.differentiate("z")
+        .where(ttl_mask, drop=True)
+        .mean(dim="z", skipna=True),
+    }
+    for name, array in output.items():
+        output[name] = array.sel(Time=precip_reference.Time).rename(name)
+    return output
 
 
 def residual_feature_arrays(fields, feature_keys):
@@ -1573,64 +1585,9 @@ def residual_model_training_data(
     return np.column_stack(values[:-1]), values[-1], weights
 
 
-def available_residual_features(fields_by_run):
-    """Return predictors available for every simulation in a residual model."""
-    feature_keys = ["precip_log"]
-    for key in ("pw", "cape", "cin"):
-        if all(key in fields for fields in fields_by_run):
-            feature_keys.append(key)
-        else:
-            warnings.warn(
-                f"Residual model omits {key.upper()} because it is unavailable "
-                "in at least one run."
-            )
-    feature_keys.append("latitude")
-    return feature_keys
-
-
-class SimpleRidgeRegressor:
-    """Small weighted ridge fallback with linear, squared, and pair terms."""
-
-    def __init__(self, alpha=1.0):
-        self.alpha = alpha
-        self.mean_ = None
-        self.scale_ = None
-        self.beta_ = None
-
-    def _design(self, X, fit=False):
-        X = np.asarray(X, dtype=float)
-        if fit:
-            self.mean_ = np.nanmean(X, axis=0)
-            self.scale_ = np.nanstd(X, axis=0)
-            self.scale_[self.scale_ == 0] = 1.0
-        normalized = (X - self.mean_) / self.scale_
-        columns = [np.ones(normalized.shape[0]), normalized, normalized ** 2]
-        pairs = [
-            normalized[:, i] * normalized[:, j]
-            for i in range(normalized.shape[1])
-            for j in range(i + 1, normalized.shape[1])
-        ]
-        if pairs:
-            columns.append(np.column_stack(pairs))
-        return np.column_stack(columns)
-
-    def fit(self, X, y, sample_weight=None):
-        design = self._design(X, fit=True)
-        y = np.asarray(y, dtype=float)
-        weights = np.ones_like(y) if sample_weight is None else np.asarray(sample_weight, dtype=float)
-        sqrt_weights = np.sqrt(np.maximum(weights, 0.0))
-        weighted_design = design * sqrt_weights[:, None]
-        weighted_y = y * sqrt_weights
-        penalty = self.alpha * np.eye(design.shape[1])
-        penalty[0, 0] = 0.0
-        self.beta_ = np.linalg.solve(
-            weighted_design.T @ weighted_design + penalty,
-            weighted_design.T @ weighted_y,
-        )
-        return self
-
-    def predict(self, X):
-        return self._design(X, fit=False) @ self.beta_
+def available_residual_features():
+    """Return the fixed residual-model predictor set."""
+    return ["precip_log", "pw", "cape", "cin", "latitude"]
 
 
 def fit_control_relationship(
@@ -1641,7 +1598,7 @@ def fit_control_relationship(
     logger=print,
     report_backend=False,
 ):
-    """Fit the shared control high-cloud model with a ridge fallback."""
+    """Fit the shared control high-cloud model."""
     valid = (
         np.all(np.isfinite(X), axis=1)
         & np.isfinite(y)
@@ -1652,24 +1609,20 @@ def fit_control_relationship(
     y = y[valid]
     weights = weights[valid]
     logger(f"Fitting control high-cloud model for {target_label}: {X.shape[0]} samples")
-    try:
-        from sklearn.ensemble import HistGradientBoostingRegressor
+    from sklearn.ensemble import HistGradientBoostingRegressor
 
-        model = HistGradientBoostingRegressor(
-            max_iter=160,
-            learning_rate=0.04,
-            max_leaf_nodes=31,
-            l2_regularization=0.01,
-            min_samples_leaf=40,
-            random_state=0,
-        )
-        model.fit(X, y, sample_weight=weights)
-        if report_backend:
-            logger(f"  used HistGradientBoostingRegressor for {target_label}")
-        return model
-    except Exception as exc:
-        logger(f"  falling back to weighted ridge for {target_label}: {exc}")
-        return SimpleRidgeRegressor(alpha=1.0).fit(X, y, sample_weight=weights)
+    model = HistGradientBoostingRegressor(
+        max_iter=160,
+        learning_rate=0.04,
+        max_leaf_nodes=31,
+        l2_regularization=0.01,
+        min_samples_leaf=40,
+        random_state=0,
+    )
+    model.fit(X, y, sample_weight=weights)
+    if report_backend:
+        logger(f"  used HistGradientBoostingRegressor for {target_label}")
+    return model
 
 
 def symmetric_percentile_levels_for_fields(
@@ -1707,16 +1660,6 @@ def accumulated_precipitation_components(ds):
     convective = ds["rainc"].astype(np.float32) + ds["i_rainc"].astype(np.float32) * hundred
     resolved = ds["rainnc"].astype(np.float32) + ds["i_rainnc"].astype(np.float32) * hundred
     return (convective + resolved).astype(np.float32), convective, resolved
-
-
-def precipitation_rate(accumulated, dt_hours=6):
-    """Convert accumulated precipitation to a float32 rate in mm/day."""
-    if issubclass(accumulated.Time.dtype.type, numbers.Integral):
-        rate = accumulated.diff("Time") / np.float32(dt_hours / 24.0)
-    else:
-        dt_days = accumulated.Time.diff("Time") / np.timedelta64(1, "D")
-        rate = accumulated.diff("Time") / dt_days
-    return rate.astype(np.float32)
 
 
 def domain_fields(field, tropical_lat_bounds=DEFAULT_TROPICAL_LAT_BOUNDS):
@@ -1814,18 +1757,37 @@ def duration_domain_histograms(
 # -----------------------------------------------------------------------------
 
 
-PYFLEXTRKR_PRODUCT_VERSION = "mpas-organised-convective-envelope-pyflextrkr-v9"
+PYFLEXTRKR_PRODUCT_VERSION = "mpas-dual-population-pyflextrkr-v11"
 PYFLEXTRKR_METADATA_FILENAME = "pyflextrkr_product_metadata.json"
 PYFLEXTRKR_TRACK_MANIFEST_FILENAME = "organised_track_manifest.csv"
 PRIMARY_TRACK_SOURCE = "organised_convective_system_mask"
 PRIMARY_ANALYSIS_ROLE = "primary_persistence_and_composites"
 TRACKED_SOURCES = (PRIMARY_TRACK_SOURCE,)
-MIN_ORGANISED_TRACK_OBSERVATIONS = 4
-MIN_ORGANISED_TRACK_DURATION_HOURS = 24.0
-ORGANISED_TRACK_ACCEPTANCE_CRITERIA = "duration_and_embedded_classifier_core"
-ORGANISED_TRACK_EMBEDDED_CORE_REQUIREMENT = "any_positive_area_during_track"
-ORGANISED_TRACK_OBJECT_GEOMETRY = "pyflextrkr_olr_to_tb_detect_and_spread"
-ORGANISED_ENVELOPE_MIN_RAW_AREA_KM2 = 5000.0
+MIN_ORGANISED_TRACK_OBSERVATIONS = 2
+MIN_ORGANISED_TRACK_DURATION_HOURS = 6.0
+ORGANISED_TRACK_ACCEPTANCE_CRITERIA = "feng_2021_50km_15th_percentile_pf_criteria"
+ORGANISED_TRACK_EMBEDDED_CORE_REQUIREMENT = "not_an_acceptance_criterion"
+PERSISTENT_DCS_ACCEPTANCE_CRITERIA = (
+    "feng_mcs_or_pyflextrkr_241K_cold_cloud_track_at_least_2_consecutive_"
+    "6h_scenes_with_225K_core_in_at_least_1_scene"
+)
+TRACK_POPULATIONS = ("persistent_dcs", "feng_mcs")
+TRACK_POPULATION_LABELS = {
+    "persistent_dcs": "Persistent deep-convective systems",
+    "feng_mcs": "Feng-defined MCSs",
+}
+ORGANISED_TRACK_OBJECT_GEOMETRY = "shared_pyflextrkr_tb225_core_spread_to_tb241_cold_shield"
+ORGANISED_ENVELOPE_MIN_RAW_AREA_KM2 = 0.0
+FENG_MCS_COLD_SHIELD_MIN_AREA_KM2 = 60000.0
+FENG_MCS_PF_MIN_RAIN_MM_H = 0.5
+FENG_MCS_PF_MIN_MAJOR_AXIS_KM = 100.0
+FENG_MCS_PF_AREA_INTERCEPT_KM2 = 14675.3
+FENG_MCS_PF_AREA_SLOPE_KM2_PER_H = 350.918
+FENG_MCS_PF_MEAN_RAIN_INTERCEPT_MM_H = 1.77764
+FENG_MCS_PF_MEAN_RAIN_SLOPE_MM_H_PER_H = 0.0169073
+FENG_MCS_PF_SKEW_INTERCEPT = 0.203418
+FENG_MCS_PF_SKEW_SLOPE_PER_H = 0.0117695
+FENG_MCS_CRITERIA_PERCENTILE = 15
 
 
 def epoch_seconds(time_values):
@@ -1876,11 +1838,21 @@ def product_fingerprint(metadata):
         "track_min_area_km2", "min_track_observations",
         "min_track_duration_hours", "track_acceptance_criteria",
         "embedded_convective_core_requirement", "object_geometry",
+        "persistent_dcs_acceptance_criteria", "track_populations",
+        "tracking_mode", "pyflextrkr_advection_median_filter_length",
+        "pyflextrkr_advection_max_movement_mps",
         "envelope_min_raw_area_km2", "pyflextrkr_tb_core_k",
         "pyflextrkr_tb_cold_k", "pyflextrkr_tb_warm_k",
         "pyflextrkr_tb_cloud_k", "pyflextrkr_tb_smoothing_cells",
         "pyflextrkr_min_cold_core_pixels", "pyflextrkr_warm_anvil_expansion",
         "track_manifest_sha256", "pyflextrkr_nmaxlinks",
+        "feng_mcs_cold_shield_min_area_km2", "feng_mcs_pf_min_rain_mm_h",
+        "feng_mcs_pf_min_major_axis_km", "feng_mcs_pf_area_intercept_km2",
+        "feng_mcs_pf_area_slope_km2_per_h",
+        "feng_mcs_pf_mean_rain_intercept_mm_h",
+        "feng_mcs_pf_mean_rain_slope_mm_h_per_h",
+        "feng_mcs_pf_skew_intercept", "feng_mcs_pf_skew_slope_per_h",
+        "feng_mcs_criteria_percentile",
     )
     payload = {key: metadata.get(key) for key in keys}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -1909,6 +1881,31 @@ def manifest_accepted_mask(manifest):
     if invalid.any():
         raise ValueError("organised-track manifest contains invalid accepted values")
     return normalized.isin({"true", "1"})
+
+
+def table_boolean_mask(table, column):
+    """Read a CSV-safe boolean column without treating strings as truthy."""
+    if column not in table:
+        raise KeyError(f"table is missing required boolean column {column!r}")
+    values = table[column]
+    if values.dtype.kind == "b":
+        return values.astype(bool)
+    normalized = values.astype(str).str.strip().str.lower()
+    invalid = ~normalized.isin({"true", "false", "1", "0"})
+    if invalid.any():
+        raise ValueError(f"table contains invalid {column!r} boolean values")
+    return normalized.isin({"true", "1"})
+
+
+def manifest_population_mask(manifest, population):
+    """Return membership in one of the two retained PyFLEXTRKR populations."""
+    if population not in TRACK_POPULATIONS:
+        raise ValueError(
+            f"unknown track population {population!r}; expected {TRACK_POPULATIONS}"
+        )
+    if population == "feng_mcs" and "feng_mcs" not in manifest:
+        return manifest_accepted_mask(manifest)
+    return table_boolean_mask(manifest, population)
 
 
 def read_product_metadata(work_path):
