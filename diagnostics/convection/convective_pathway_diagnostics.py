@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Explicit cloud, convective-system, temperature, and wind comparisons.
+"""Explicit cloud, LPT-envelope, temperature, and wind comparisons.
 
 The filtered predictors are the published Kelvin, easterly-wave, and ER bands
 already produced by equatorial_wave_diagnostics.py. Cloud responses are never
@@ -7,7 +7,6 @@ filtered. The figures report only simulated quantities and experimental
 contrasts: no intraseasonal mode or phase state is inferred.
 """
 
-import json
 import os
 import sys
 
@@ -24,11 +23,14 @@ from matplotlib import pyplot as plt
 
 from diagnostics.diagnostic_helpers import (
     FigureSaver, ZONAL_MEAN_PATTERN, diagnostic_cache_dir,
-    convective_organisation_cache_dir, diagnostic_output_dir,
-    load_latlon_dataset, PRIMARY_TRACK_SOURCE, progress,
-    PYFLEXTRKR_PRODUCT_VERSION,
-    TRACK_POPULATION_LABELS, TRACK_POPULATIONS, table_boolean_mask,
+    diagnostic_output_dir, load_latlon_dataset, progress,
     standardize_latlon_dataset, subset_latitude,
+)
+from diagnostics.convection.lpt_precipitation_envelope_diagnostics import (
+    PRODUCT_VERSION as LPT_PRODUCT_VERSION,
+    lpt_output_root,
+    read_standard_event_tables,
+    require_publication_products,
 )
 from diagnostics.convection.high_cloud_classification import (
     CLASSIFICATION_CACHE_VERSION, HighCloudThresholds,
@@ -61,7 +63,7 @@ P_PRECIP_MIN_MM_DAY = 12.0
 classification_cache_dir = diagnostic_cache_dir(
     "classification_cache", root_dir=root_dir
 )
-organisation_output_dir = convective_organisation_cache_dir(root_dir=root_dir)
+lpt_tracking_output_dir = lpt_output_root()
 os.makedirs(save_loc, exist_ok=True)
 
 CLASSIFICATION_VARIABLES = (
@@ -75,7 +77,7 @@ CLASSIFICATION_VARIABLES = (
 CLOUD_RESPONSES = (
     (
         "convective_core",
-        "PyFLEXTRKR convective core",
+        "Active deep convection",
         "convective_precipitating_high_cloud_mask",
     ),
     (
@@ -92,10 +94,18 @@ CLOUD_RESPONSES = (
 )
 
 TRACK_METRICS = (
-    ("event_rate", "MCS event rate", "events per 100 days"),
-    ("lifetime_hours", "Median MCS lifetime", "h"),
-    ("max_area_km2", "Median maximum cold-shield area", "km2"),
+    ("event_rate", "Tropical LPT event rate", "events per 100 days"),
+    ("duration_hours", "Median envelope duration", "h"),
+    ("maximum_area_km2", "Median maximum envelope area", "km2"),
 )
+LPT_TRACK_POPULATION = "lpt_precipitation_envelope"
+LPT_TRACK_POPULATION_LABEL = "Large-scale precipitation envelopes"
+LPT_TRACK_POPULATIONS = (LPT_TRACK_POPULATION,)
+LPT_TO_PATHWAY_SIMULATION = {
+    "control": "control",
+    "nudged-u": "nudged u",
+    "nudged-T": "nudged T",
+}
 
 
 def classification_thresholds():
@@ -267,47 +277,28 @@ def scaled_contrasts(table, index_columns, value_column, alpha):
     return pd.DataFrame(rows)
 
 
-def load_convective_system_tracks():
-    path = os.path.join(
-        organisation_output_dir, "organisation_track_lifetimes.csv"
-    )
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Missing dual-population track product {path}. Run "
-            "convective_organisation_diagnostics.py first."
-        )
-    metadata_path = os.path.join(
-        organisation_output_dir,
-        "organisation_track_persistence_cache_metadata.json",
-    )
-    if not os.path.exists(metadata_path):
-        raise FileNotFoundError(
-            f"Missing dual-population track metadata {metadata_path}. Rebuild the "
-            "organisation diagnostic."
-        )
-    with open(metadata_path, "r", encoding="utf-8") as handle:
-        metadata = json.load(handle)
-    expected = {
-        "cloud_classification_cache_version": CLASSIFICATION_CACHE_VERSION,
-        "product_version": PYFLEXTRKR_PRODUCT_VERSION,
-        "primary_track_source": PRIMARY_TRACK_SOURCE,
-    }
-    changed = [
-        key for key, value in expected.items() if metadata.get(key) != value
-    ]
-    if changed:
-        raise RuntimeError(
-            f"Track metadata is stale ({changed}): {metadata_path}. "
-            "Rebuild convective_organisation_diagnostics.py."
-        )
-    tracks = pd.read_csv(path)
+def load_lpt_events(output_directory=None):
+    """Load the primary tropical LPT sample through the stable project schema."""
+
+    publication = require_publication_products(output_directory)
+    tracks, _lifecycle = read_standard_event_tables(publication / "primary")
     required = {
-        "simulation", "track_id", "lifetime_hours", "max_area_km2",
-        *TRACK_POPULATIONS,
+        "simulation", "event_id", "duration_hours", "maximum_area_km2",
+        "primary_tropical_sample", "reference_in_record_subset",
     }
     missing = sorted(required - set(tracks.columns))
     if missing:
-        raise RuntimeError(f"Dual-population track table lacks {missing}: {path}")
+        raise RuntimeError(
+            "Standard LPT event table lacks required pathway fields: "
+            f"{missing}. Rebuild {LPT_PRODUCT_VERSION}."
+        )
+    tracks = tracks[
+        tracks.primary_tropical_sample.astype(bool)
+        & tracks.reference_in_record_subset.astype(bool)
+    ].copy()
+    tracks["simulation"] = tracks.simulation.map(LPT_TO_PATHWAY_SIMULATION)
+    if tracks.simulation.isna().any():
+        raise RuntimeError("Standard LPT event table contains an unknown simulation")
     return tracks
 
 
@@ -325,36 +316,32 @@ def analysed_duration_days(classification):
     return span + step
 
 
-def convective_system_population_table(classifications, tracks):
+def lpt_envelope_population_table(classifications, tracks):
     rows = []
-    for population in TRACK_POPULATIONS:
-        population_tracks = tracks[table_boolean_mask(tracks, population)]
-        population_label = TRACK_POPULATION_LABELS[population]
-        for simulation, classification in zip(sim_names, classifications):
-            subset = population_tracks[population_tracks.simulation == simulation]
-            duration = analysed_duration_days(classification)
-            for metric_key, metric_label, units in TRACK_METRICS:
-                display_label = metric_label.replace("MCS", "system")
-                if metric_key == "event_rate":
-                    value = 100.0 * len(subset) / duration if duration > 0.0 else np.nan
-                    denominator = "population events divided by analysed duration"
-                else:
-                    value = float(subset[metric_key].median()) if len(subset) else np.nan
-                    denominator = "median across population events"
-                rows.append(
-                    dict(
-                        track_population=population,
-                        track_population_label=population_label,
-                        simulation=simulation,
-                        metric_key=metric_key,
-                        metric_label=display_label,
-                        units=units,
-                        value=value,
-                        event_count=int(len(subset)),
-                        analysed_duration_days=duration,
-                        denominator=denominator,
-                    )
+    for simulation, classification in zip(sim_names, classifications):
+        subset = tracks[tracks.simulation == simulation]
+        duration = analysed_duration_days(classification)
+        for metric_key, metric_label, units in TRACK_METRICS:
+            if metric_key == "event_rate":
+                value = 100.0 * len(subset) / duration if duration > 0.0 else np.nan
+                denominator = "tropical LPT events divided by analysed duration"
+            else:
+                value = float(subset[metric_key].median()) if len(subset) else np.nan
+                denominator = "median across LPT events; each event weighted equally"
+            rows.append(
+                dict(
+                    track_population=LPT_TRACK_POPULATION,
+                    track_population_label=LPT_TRACK_POPULATION_LABEL,
+                    simulation=simulation,
+                    metric_key=metric_key,
+                    metric_label=metric_label,
+                    units=units,
+                    value=value,
+                    event_count=int(len(subset)),
+                    analysed_duration_days=duration,
+                    denominator=denominator,
                 )
+            )
     return pd.DataFrame(rows)
 
 
@@ -423,7 +410,7 @@ def plot_wave_cloud_pathways(regressions, contrasts, alpha):
     plt.close(fig)
 
 
-def plot_convective_system_pathways(population, contrasts, alpha):
+def plot_lpt_envelope_pathways(population, contrasts, alpha):
     metric_keys = [key for key, _label, _units in TRACK_METRICS]
     contrast_specs = (
         ("T_minus_control", "T-control", "tab:red"),
@@ -434,7 +421,7 @@ def plot_convective_system_pathways(population, contrasts, alpha):
             "tab:purple",
         ),
     )
-    for track_population in TRACK_POPULATIONS:
+    for track_population in LPT_TRACK_POPULATIONS:
         population_rows = population[
             population.track_population == track_population
         ]
@@ -461,11 +448,11 @@ def plot_convective_system_pathways(population, contrasts, alpha):
                 axes[row, column].grid(axis="y", alpha=0.2)
         alpha_text = f"alpha={alpha:.2f}" if np.isfinite(alpha) else "alpha unavailable"
         fig.suptitle(
-            f"{TRACK_POPULATION_LABELS[track_population]} under UTLS nudging\n"
+            f"{LPT_TRACK_POPULATION_LABEL} under UTLS nudging\n"
             "Top: simulated values; bottom: experimental nudging contrasts | " + alpha_text,
             fontsize=11,
         )
-        figsave.save(fig, f"{track_population}_utls_nudging_contrasts", number=2)
+        figsave.save(fig, "lpt_envelope_utls_nudging_contrasts", number=2)
         plt.close(fig)
 
 
@@ -497,7 +484,7 @@ def write_method_table():
                 component="temperature experiment",
                 predictor="not applicable",
                 method="T-nudged minus control",
-                response="cloud-regression slope or convective-system population metric",
+                response="cloud-regression slope or LPT-envelope population metric",
                 statistic="experimental difference",
                 inference="temperature-associated response",
                 reference="experiment design",
@@ -506,7 +493,7 @@ def write_method_table():
                 component="U residual",
                 predictor="not applicable",
                 method="U-control minus alpha times T-control; alpha from realised 14-18-km temperature changes",
-                response="cloud-regression slope or convective-system population metric",
+                response="cloud-regression slope or LPT-envelope population metric",
                 statistic="scaled experimental contrast",
                 inference="response remaining after realised-temperature scaling",
                 reference="experiment design",
@@ -549,22 +536,24 @@ def main():
         os.path.join(save_loc, "ccew_cloud_pathway_contrasts.csv"), index=False
     )
 
-    population = convective_system_population_table(
-        classifications, load_convective_system_tracks()
+    population = lpt_envelope_population_table(
+        classifications, load_lpt_events(lpt_tracking_output_dir)
     )
     population.to_csv(
-        os.path.join(save_loc, "convective_system_population_pathway_metrics.csv"), index=False
+        os.path.join(save_loc, "lpt_envelope_population_pathway_metrics.csv"),
+        index=False,
     )
     track_contrasts = scaled_contrasts(
         population, ["track_population", "metric_key"], "value", alpha
     )
     track_contrasts.to_csv(
-        os.path.join(save_loc, "convective_system_population_pathway_contrasts.csv"), index=False
+        os.path.join(save_loc, "lpt_envelope_population_pathway_contrasts.csv"),
+        index=False,
     )
 
     write_method_table()
     plot_wave_cloud_pathways(regressions, cloud_contrasts, alpha)
-    plot_convective_system_pathways(population, track_contrasts, alpha)
+    plot_lpt_envelope_pathways(population, track_contrasts, alpha)
     print("\nFinished convective_pathway_diagnostics.py")
 
 

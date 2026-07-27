@@ -36,8 +36,8 @@ from diagnostics.convection.pyflextrkr_cloud_identification import (
 
 
 # Dropping redundant derived display masks does not change any science mask.
-# Keep this semantic version stable so downstream PyFLEXTRKR track products,
-# which depend only on the unchanged native scene masks, remain reusable.
+# Keep this semantic version stable so downstream LPT-envelope pathway and
+# lifecycle products can reject stale classification inputs.
 CLASSIFICATION_CACHE_VERSION = "high-cloud-pyflextrkr-rain-baseline-v11"
 
 
@@ -352,7 +352,7 @@ def classification_dataset(classif, thresholds=None, extra_attrs=None):
             "attribution is applied in this baseline. Native core-bearing "
             "241-K cold- and 261-K warm-shield masks are retained only as "
             "PyFLEXTRKR scene context. They do not define additional cloud "
-            "classes or alter Feng MCS acceptance."
+            "classes or alter LPT precipitation-envelope selection."
         ),
         method_references=(
             "Rossow and Schiffer 1999, BAMS, doi:10.1175/1520-0477(1999)080<2261:AIUCFI>2.0.CO;2; "

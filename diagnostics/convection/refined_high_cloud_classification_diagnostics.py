@@ -4,10 +4,11 @@
 """
 Refined high-cloud classification diagnostics for MPAS-A nudging experiments.
 
-This script owns the shared high-cloud/PyFLEXTRKR scene product. Its primary
+This script owns the shared high-cloud classification, including the
+instantaneous PyFLEXTRKR-derived cold-core scene masks. Its primary
 figures report class occurrence/composition, cloud-top-pressure distributions,
-TTL-reaching frequency, domain-contribution vertical cloud profiles,
-class-conditioned OLR, spatial occurrence responses, and rain-matched cloud
+TTL-reaching frequency, tropical-mean vertical cloud profiles,
+class-conditioned OLR distributions, spatial occurrence responses, and rain-matched cloud
 depth/OLR responses. Core/cold-shield/warm-shield scene regions and vertical
 slices provide the validation view behind ``--qc``.
 """
@@ -135,13 +136,13 @@ dask.config.set({"array.slicing.split_large_chunks": True})
 
 latlon_vars = [
     "rainc", "rainnc", "i_rainc", "i_rainnc",
-    "olrtoa", "cldfrac", "pressure", "t_isobaric", "zgrid",
+    "olrtoa", "cldfrac", "pressure", "zgrid",
 ]
 
 BUDGET_SPECS = [
     ("high_cloud_mask", "Total high cloud", "0.25"),
-    ("convective_precipitating_high_cloud_mask", "PyFLEXTRKR convective core", "tab:red"),
-    ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating", "tab:blue"),
+    ("convective_precipitating_high_cloud_mask", "Deep convection", "tab:red"),
+    ("stratiform_precipitating_high_cloud_mask", "Stratiform", "tab:blue"),
     ("nonprecipitating_high_cloud_mask", "Non-precipitating", "tab:green"),
 ]
 
@@ -149,14 +150,14 @@ SPATIAL_CLASS_SPECS = BUDGET_SPECS
 RAIN_CONDITIONED_CLASS_SPECS = BUDGET_SPECS
 
 REGIME_SPECS = [
-    ("convective_precipitating_high_cloud_mask", "PyFLEXTRKR convective core", "tab:red"),
-    ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating", "tab:blue"),
+    ("convective_precipitating_high_cloud_mask", "Deep convection", "tab:red"),
+    ("stratiform_precipitating_high_cloud_mask", "Stratiform", "tab:blue"),
     ("nonprecipitating_high_cloud_mask", "Non-precipitating", "tab:green"),
 ]
 
 PRECIPITATING_COMPOSITION_SPECS = [
-    ("rainy_pyflextrkr_core_mask", "Rainy PyFLEXTRKR core", "tab:red"),
-    ("stratiform_precipitating_high_cloud_mask", "Stratiform precipitating", "tab:blue"),
+    ("rainy_pyflextrkr_core_mask", "Deep convection", "tab:red"),
+    ("stratiform_precipitating_high_cloud_mask", "Stratiform", "tab:blue"),
 ]
 
 CIRRUS_COMPARISON_SPECS = [
@@ -301,29 +302,9 @@ LITERATURE_CLOUD_STRUCTURE_VALUES = [
     ),
     dict(
         metric="mean_cloud_top_pressure",
-        cloud_type="deep convective",
+        cloud_type="Deep convection",
         value=223.3,
         units="hPa",
-        definition="MODIS ISCCP deep-convective high-cloud optical class",
-        region="30S-30N",
-        reference="Hong et al. (2007), Journal of Applied Meteorology and Climatology",
-        doi="10.1175/2007JAMC1583.1",
-    ),
-    dict(
-        metric="mean_cloud_top_temperature",
-        cloud_type="cirriform",
-        value=231.0,
-        units="K",
-        definition="MODIS ISCCP cirriform high-cloud optical classes",
-        region="30S-30N",
-        reference="Hong et al. (2007), Journal of Applied Meteorology and Climatology",
-        doi="10.1175/2007JAMC1583.1",
-    ),
-    dict(
-        metric="mean_cloud_top_temperature",
-        cloud_type="deep convective",
-        value=234.9,
-        units="K",
         definition="MODIS ISCCP deep-convective high-cloud optical class",
         region="30S-30N",
         reference="Hong et al. (2007), Journal of Applied Meteorology and Climatology",
@@ -746,43 +727,12 @@ def get_cloud_fraction(ds):
     return ds.cldfrac
 
 
-def diagnosed_cloud_top_temperature(ds, classif):
-    """Interpolate model isobaric temperature to diagnosed cloud-top pressure."""
-    if "t_isobaric" not in ds:
-        raise KeyError("t_isobaric is required for cloud-top temperature")
-    temperature = ds["t_isobaric"]
-    if "pres" not in temperature.dims:
-        raise ValueError(
-            "t_isobaric must have a 'pres' dimension after lat-lon standardisation"
-        )
-    temperature, cloud_top_pressure = xr.align(
-        temperature,
-        classif["cloud_top_pressure"],
-        join="inner",
-    )
-    # xarray requires a monotonic interpolation coordinate.  The source files
-    # currently store pressure from the top downward, but sorting makes this
-    # robust to either ordering.
-    temperature = temperature.sortby("pres")
-    out = temperature.interp(pres=cloud_top_pressure)
-    out.name = "diagnosed_cloud_top_temperature"
-    out.attrs.update(
-        units="K",
-        long_name="model isobaric temperature at diagnosed cloud-top pressure",
-        method=(
-            "linear interpolation of t_isobaric to the pressure of the highest "
-            f"model layer with cloud fraction at or above {CF_THRESH:g}"
-        ),
-    )
-    return out
-
-
 def full_class_structure_statistics(
-    ds,
     fields,
     classif,
     sim_name,
     ctp_bins=None,
+    olr_bins=None,
     time_batch=CLOUD_STRUCTURE_TIME_BATCH,
 ):
     """Accumulate exact tropical class statistics in memory-bounded time blocks."""
@@ -790,25 +740,18 @@ def full_class_structure_statistics(
     aligned = xr.align(
         subset_lat(classif["cloud_top_pressure"], TROPICAL_LAT_BOUNDS),
         subset_lat(fields["olr"], TROPICAL_LAT_BOUNDS),
-        subset_lat(classif["brightness_temperature"], TROPICAL_LAT_BOUNDS),
         *[
             subset_lat(classif[key].astype(bool), TROPICAL_LAT_BOUNDS)
             for key in class_keys
         ],
         join="inner",
     )
-    cloud_top_pressure, olr, brightness_temperature = aligned[:3]
-    class_masks = dict(zip(class_keys, aligned[3:]))
-    tropical_ds = subset_lat(ds, TROPICAL_LAT_BOUNDS).sel(
-        latitude=cloud_top_pressure.latitude,
-        longitude=cloud_top_pressure.longitude,
-    )
+    cloud_top_pressure, olr = aligned[:2]
+    class_masks = dict(zip(class_keys, aligned[2:]))
 
     field_names = (
         "cloud_top_pressure",
         "olr",
-        "brightness_temperature",
-        "cloud_top_temperature",
     )
     accumulators = {
         key: {
@@ -819,6 +762,10 @@ def full_class_structure_statistics(
             "ctp_histogram": (
                 np.zeros(len(ctp_bins) - 1, dtype=float)
                 if ctp_bins is not None else None
+            ),
+            "olr_histogram": (
+                np.zeros(len(olr_bins) - 1, dtype=float)
+                if olr_bins is not None else None
             ),
         }
         for key in class_keys
@@ -844,16 +791,10 @@ def full_class_structure_statistics(
 
     for iblock, time_slice in enumerate(time_slices, start=1):
         block_reference = cloud_top_pressure.isel(Time=time_slice)
-        block_ds = tropical_ds.sel(Time=block_reference.Time)
-        cloud_top_temperature = diagnosed_cloud_top_temperature(
-            block_ds,
-            {"cloud_top_pressure": block_reference},
-        ).load()
         block = xr.Dataset(
             {
                 "cloud_top_pressure": block_reference,
                 "olr": olr.isel(Time=time_slice),
-                "brightness_temperature": brightness_temperature.isel(Time=time_slice),
                 **{
                     key: class_masks[key].isel(Time=time_slice)
                     for key in class_keys
@@ -865,12 +806,6 @@ def full_class_structure_statistics(
                 block["cloud_top_pressure"].values, dtype=float
             ),
             "olr": np.asarray(block["olr"].values, dtype=float),
-            "brightness_temperature": np.asarray(
-                block["brightness_temperature"].values, dtype=float
-            ),
-            "cloud_top_temperature": np.asarray(
-                cloud_top_temperature.values, dtype=float
-            ),
         }
         sample_weights = np.broadcast_to(
             latitude_weights, block_values["cloud_top_pressure"].shape
@@ -905,8 +840,16 @@ def full_class_structure_statistics(
                     weights=sample_weights[valid],
                 )
                 accumulator["ctp_histogram"] += histogram
+            if olr_bins is not None:
+                valid = mask_values & np.isfinite(block_values["olr"])
+                histogram, _ = np.histogram(
+                    block_values["olr"][valid],
+                    bins=olr_bins,
+                    weights=sample_weights[valid],
+                )
+                accumulator["olr_histogram"] += histogram
 
-        del block, block_values, cloud_top_temperature
+        del block, block_values
         elapsed = time.monotonic() - started
         eta = elapsed / iblock * (len(time_slices) - iblock)
         progress(
@@ -935,12 +878,13 @@ def full_class_structure_statistics(
                 accumulator[f"{field_name}_sum"] / weight
                 if weight > 0.0 else np.nan
             )
-        histogram = accumulator["ctp_histogram"]
-        if histogram is not None:
-            result["ctp_histogram"] = (
-                histogram / histogram.sum()
-                if histogram.sum() > 0.0 else histogram
-            )
+        for histogram_name in ("ctp_histogram", "olr_histogram"):
+            histogram = accumulator[histogram_name]
+            if histogram is not None:
+                result[histogram_name] = (
+                    histogram / histogram.sum()
+                    if histogram.sum() > 0.0 else histogram
+                )
         statistics[key] = result
     progress(f"{sim_name}: full-period cloud-structure statistics ready")
     return statistics
@@ -1682,7 +1626,10 @@ def plot_class_budget(classifications, fields_by_run):
     occurrence_ax.scatter(
         [35.0], [occurrence_y[0]], marker="D", s=52,
         facecolor="white", edgecolor="#7a4e00", linewidth=1.4, zorder=7,
-        label="CIRS all UT cloud: ~35% (30S-30N; CTP < 440 hPa)",
+        label=(
+            "AIRS/IASI upper-tropospheric cloud: ~35% "
+            "(Stubenrauch et al., 2023; 30°S–30°N)"
+        ),
     )
     occurrence_ax.annotate(
         "35", (35.0, occurrence_y[0]), xytext=(0, 8),
@@ -1692,7 +1639,10 @@ def plot_class_budget(classifications, fields_by_run):
     occurrence_ax.scatter(
         [22.7], [occurrence_y[0]], marker="v", s=54,
         facecolor="white", edgecolor="#375a7f", linewidth=1.3, zorder=7,
-        label="MODIS daytime high ice cloud: 22.7% (30S-30N)",
+        label=(
+            "MODIS daytime high ice cloud: 22.7% "
+            "(Hong et al., 2007; 30°S–30°N)"
+        ),
     )
     occurrence_ax.annotate(
         "22.7", (22.7, occurrence_y[0]), xytext=(0, -10),
@@ -1707,7 +1657,10 @@ def plot_class_budget(classifications, fields_by_run):
         [nonprecip_occurrence_y, nonprecip_occurrence_y],
         color="#7a4e00", lw=4.0, alpha=0.85, solid_capstyle="round",
         zorder=7,
-        label="CALIOP cirrus occurrence: 38-44% (15S-15N)",
+        label=(
+            "CALIOP cirrus occurrence: 38–44% "
+            "(Martins et al., 2011; 15°S–15°N)"
+        ),
     )
     occurrence_ax.scatter(
         [38.4, 43.5], [nonprecip_occurrence_y, nonprecip_occurrence_y],
@@ -1716,7 +1669,10 @@ def plot_class_budget(classifications, fields_by_run):
     precip_ax.scatter(
         [27.0, 73.0], precip_y, marker="D", s=52,
         facecolor="white", edgecolor="#7a4e00", linewidth=1.4, zorder=7,
-        label="TRMM PR raining area: 27% convective / 73% stratiform (20S-20N)",
+        label=(
+            "TRMM PR raining area: 27% convective / 73% stratiform "
+            "(Schumacher and Houze, 2003; 20°S–20°N)"
+        ),
     )
     for value, y_value in zip((27.0, 73.0), precip_y):
         precip_ax.annotate(
@@ -1727,7 +1683,10 @@ def plot_class_budget(classifications, fields_by_run):
     cirrus_comparison_ax.scatter(
         [80.0], [cirrus_comparison_y[0]], marker=">", s=60,
         facecolor="white", edgecolor="#7a4e00", linewidth=1.4, zorder=7,
-        label="MODIS high-cloud optical classes: cirriform >80% (30S-30N)",
+        label=(
+            "MODIS high-cloud optical classes: cirriform >80% "
+            "(Hong et al., 2007; 30°S–30°N)"
+        ),
     )
     cirrus_comparison_ax.annotate(
         ">80", (80.0, cirrus_comparison_y[0]), xytext=(0, 8),
@@ -1738,8 +1697,8 @@ def plot_class_budget(classifications, fields_by_run):
     occurrence_ax.set_yticks(occurrence_y)
     occurrence_ax.set_yticklabels(occurrence_labels)
     occurrence_ax.invert_yaxis()
-    occurrence_ax.set_xlabel("Tropical area-time (%)")
-    occurrence_ax.set_title("(a) Domain occurrence")
+    occurrence_ax.set_xlabel("Frequency of occurrence (%)")
+    occurrence_ax.set_title("(a) Tropical occurrence")
     occurrence_ax.grid(axis="x", alpha=0.22)
     occurrence_ax.legend(frameon=False, fontsize=7)
     occurrence_ax.margins(x=0.14)
@@ -1748,7 +1707,7 @@ def plot_class_budget(classifications, fields_by_run):
     composition_ax.set_yticklabels(composition_labels)
     composition_ax.invert_yaxis()
     composition_ax.set_xlabel("Share of all diagnosed high cloud (%)")
-    composition_ax.set_title("(b) High-cloud composition")
+    composition_ax.set_title("(b) High-cloud class fractions")
     composition_ax.grid(axis="x", alpha=0.22)
     composition_ax.legend(frameon=False, fontsize=7)
     composition_ax.margins(x=0.14)
@@ -1758,7 +1717,7 @@ def plot_class_budget(classifications, fields_by_run):
     precip_ax.invert_yaxis()
     precip_ax.set_xlim(0.0, 108.0)
     precip_ax.set_xlabel("Share of precipitating high-cloud area (%)")
-    precip_ax.set_title("(c) Rainy-core/stratiform validation")
+    precip_ax.set_title("(c) Precipitating high-cloud fractions")
     precip_ax.grid(axis="x", alpha=0.22)
     precip_ax.legend(frameon=False, fontsize=7)
 
@@ -1767,8 +1726,8 @@ def plot_class_budget(classifications, fields_by_run):
         difference_ax.set_yticklabels(occurrence_labels)
         difference_ax.invert_yaxis()
         difference_ax.axvline(0.0, color="0.45", lw=0.8)
-        difference_ax.set_xlabel("Simulation minus control (percentage points)")
-        difference_ax.set_title("(d) Domain-occurrence response")
+        difference_ax.set_xlabel("Difference (%)")
+        difference_ax.set_title("(d) Occurrence difference")
         difference_ax.grid(axis="x", alpha=0.22)
         difference_ax.legend(frameon=False, fontsize=8)
     else:
@@ -1785,7 +1744,7 @@ def plot_class_budget(classifications, fields_by_run):
     cirrus_comparison_ax.invert_yaxis()
     cirrus_comparison_ax.set_xlim(0.0, 108.0)
     cirrus_comparison_ax.set_xlabel("Share of all diagnosed high cloud (%)")
-    cirrus_comparison_ax.set_title("(e) Cirrus comparison")
+    cirrus_comparison_ax.set_title("(e) Cirrus-classification comparison")
     cirrus_comparison_ax.grid(axis="x", alpha=0.22)
     cirrus_comparison_ax.legend(frameon=False, fontsize=7)
 
@@ -1794,7 +1753,7 @@ def plot_class_budget(classifications, fields_by_run):
     shield_association_ax.invert_yaxis()
     shield_association_ax.set_xlim(0.0, 108.0)
     shield_association_ax.set_xlabel("Share of non-precipitating high cloud (%)")
-    shield_association_ax.set_title("(f) Non-precipitating shield association")
+    shield_association_ax.set_title("(f) Convective-shield association")
     shield_association_ax.grid(axis="x", alpha=0.22)
     if len(shield_association_df) > 0:
         shield_association_ax.legend(frameon=False, fontsize=7)
@@ -1807,9 +1766,10 @@ def plot_class_budget(classifications, fields_by_run):
 
     fig.suptitle(
         "Cloud-radiation-on high-cloud occurrence and composition\n"
-        "Model bars use 20S-20N. Panel (b) uses all high cloud; panel (c) uses only "
-        f"high-cloud columns with rain >= {P_PRECIP_MIN / 24.0:g} mm h$^{{-1}}$. "
-        "Literature symbols use the denominators stated in their legends.",
+        "Frequency of occurrence is the fraction of 20°S–20°N grid-cell/time samples; "
+        "error bars are 95% intervals from resampling 10-day blocks.\n"
+        f"Panel (c): rain ≥ {P_PRECIP_MIN / 24.0:g} mm h$^{{-1}}$; "
+        "literature denominators are stated in the legends.",
         fontsize=11,
     )
     save_figure(1, fig, "high_cloud_class_budget")
@@ -1970,10 +1930,12 @@ def add_rain_ticks(ax, x, precip_values):
 def classification_threshold_summary():
     return (
         f"High cloud: cldfrac >= {CF_THRESH:g}, CTP <= {P_HIGH_HPA:g} hPa\n"
-        "Core: PyFLEXTRKR Tb < 225 K; "
-        f"stratiform: other high cloud with rain >= {P_PRECIP_MIN / 24.0:g} mm h-1; "
-        "non-precipitating: leftover\n"
-        "Cold-core, cold-shield-shell, and warm-shield-shell regions are shown for PyFLEXTRKR validation and do not alter the three cloud classes"
+        "Deep convection: PyFLEXTRKR Tb < 225 K; "
+        f"Stratiform: other high cloud with rain >= {P_PRECIP_MIN / 24.0:g} mm h-1; "
+        "Non-precipitating: remaining high cloud\n"
+        "Cold-core, cold-shield-shell, and warm-shield-shell regions document "
+        "the instantaneous scene classification and do not alter the three "
+        "cloud classes or LPT envelope selection"
     )
 
 
@@ -2525,14 +2487,14 @@ def compute_vertical_contribution_profiles(
     classifications,
     time_batch=VERTICAL_PROFILE_TIME_BATCH,
 ):
-    """Domain-mean cldfrac contributed by columns in each exclusive class."""
+    """Tropical mean of cloud fraction after selecting each column class."""
     profiles = {}
     rows = []
     summary_rows = []
     class_keys = [key for key, _label, _color in REGIME_SPECS]
     class_labels = {key: label for key, label, _color in REGIME_SPECS}
 
-    progress("Computing domain-contribution vertical cloud profiles")
+    progress("Computing tropical-mean vertical cloud profiles by column class")
     for ds, sim_name in zip(dss, sim_names):
         classif = classifications.get(sim_name)
         if classif is None:
@@ -2709,7 +2671,7 @@ def compute_vertical_contribution_profiles(
 
     save_table(pd.DataFrame(rows), "high_cloud_vertical_contribution_profiles")
     save_table(pd.DataFrame(summary_rows), "utls_high_cloud_contribution_summary")
-    progress("Domain-contribution vertical cloud profiles ready")
+    progress("Tropical-mean vertical cloud profiles ready")
     return profiles
 
 
@@ -2762,15 +2724,16 @@ def plot_vertical_contribution_profiles(profiles):
     axes[0, 0].set_ylabel("Height (km)")
     axes[1, 0].set_ylabel("Height (km)")
     for ax in axes[0, :]:
-        ax.set_xlabel("Domain contribution (%)")
+        ax.set_xlabel("Tropical-mean cloud fraction (%)")
     for ax in axes[1, :]:
-        ax.set_xlabel("Simulation minus control (percentage points)")
+        ax.set_xlabel("Difference (%)")
     axes[0, -1].legend(frameon=False, fontsize=8)
     if len(sim_names) > 1:
         axes[1, -1].legend(frameon=False, fontsize=8)
     fig.suptitle(
-        "Cloud-radiation-on simulations: vertical cloud amount from each high-cloud column class\n"
-        "Unfiltered tropical means; grey band marks 14-18 km; profiles use the full-domain denominator",
+        "Vertical cloud-fraction contribution by high-cloud class\n"
+        "Class masks are zero outside identified columns; grey band marks the "
+        "14–18 km UTLS layer",
         fontsize=11,
     )
     save_figure(4, fig, "high_cloud_vertical_contribution_profiles")
@@ -2846,6 +2809,38 @@ def control_occurrence_contour_levels(class_key, values_percent):
     return [level for level in preferred if lo < level < hi]
 
 
+def add_zonal_mean_inset(ax, field_percent, difference=False):
+    """Add a compact longitude-mean profile using the map's latitude axis."""
+    zonal = field_percent.mean("longitude", skipna=True)
+    values = np.asarray(zonal.values, dtype=float)
+    finite = values[np.isfinite(values)]
+    inset = ax.inset_axes([0.80, 0.08, 0.19, 0.84])
+    inset.set_facecolor((1.0, 1.0, 1.0, 0.84))
+    inset.plot(values, zonal.latitude.values, color="0.10", lw=1.25)
+    if difference:
+        limit = max(
+            0.02,
+            1.08 * float(np.nanmax(np.abs(finite))) if finite.size else 0.02,
+        )
+        inset.set_xlim(-limit, limit)
+        inset.axvline(0.0, color="0.55", lw=0.6)
+    else:
+        upper = max(
+            0.1,
+            1.08 * float(np.nanmax(finite)) if finite.size else 0.1,
+        )
+        inset.set_xlim(0.0, upper)
+    inset.set_ylim(float(zonal.latitude.min()), float(zonal.latitude.max()))
+    inset.set_title("Zonal mean", fontsize=6, pad=2)
+    inset.set_xlabel("%", fontsize=6, labelpad=0)
+    inset.tick_params(
+        axis="x", labelsize=5.5, length=2, pad=1, labelrotation=25
+    )
+    inset.tick_params(axis="y", left=False, labelleft=False)
+    inset.grid(axis="x", alpha=0.15)
+    return inset
+
+
 def plot_class_spatial_response(classifications):
     """Plot unfiltered spatial occurrence or nudging-minus-control response."""
     if not should_run_figure(5):
@@ -2875,13 +2870,14 @@ def plot_class_spatial_response(classifications):
                 values.longitude, values.latitude, values,
                 shading="auto", cmap="YlGnBu", vmin=0.0, vmax=vmax,
             )
+            add_zonal_mean_inset(ax, values, difference=False)
             fig.colorbar(image, ax=ax, label="Occurrence (%)", shrink=0.82)
             ax.set_title(label)
             ax.set_xlabel("Longitude")
         axes[0, 0].set_ylabel("Latitude")
         fig.suptitle(
-            f"{control_name}: time-mean high-cloud column occurrence "
-            f"({TROPICAL_LAT_BOUNDS[0]:g} to {TROPICAL_LAT_BOUNDS[1]:g} degrees latitude; unfiltered)"
+            f"{control_name}: time-mean high-cloud frequency of occurrence "
+            f"({abs(TROPICAL_LAT_BOUNDS[0]):g}°S–{TROPICAL_LAT_BOUNDS[1]:g}°N; unfiltered)"
         )
     else:
         fig, axes = plt.subplots(
@@ -2919,6 +2915,7 @@ def plot_class_spatial_response(classifications):
                     difference.longitude, difference.latitude, difference,
                     shading="auto", cmap="RdBu_r", norm=norm,
                 )
+                add_zonal_mean_inset(ax, difference, difference=True)
                 column_images.append(image)
                 if contour_levels:
                     contours = ax.contour(
@@ -2950,12 +2947,13 @@ def plot_class_spatial_response(classifications):
                     ax.set_xlabel("Longitude")
             fig.colorbar(
                 column_images[-1], ax=axes[:, column], shrink=0.82,
-                label="Occurrence response (percentage points)",
+                label="Difference (%)",
             )
         fig.suptitle(
-            "Time-mean high-cloud column-occurrence response "
-            f"({TROPICAL_LAT_BOUNDS[0]:g} to {TROPICAL_LAT_BOUNDS[1]:g} degrees latitude; unfiltered)\n"
-            "Shading: nudged minus control; grey contours: control occurrence (%)"
+            "Difference in time-mean high-cloud frequency of occurrence "
+            f"({abs(TROPICAL_LAT_BOUNDS[0]):g}°S–{TROPICAL_LAT_BOUNDS[1]:g}°N; unfiltered)\n"
+            "Shading: nudged minus control; grey contours: control occurrence; "
+            "insets: longitude averages (%)"
         )
 
     save_figure(5, fig, "high_cloud_class_spatial_response")
@@ -3162,6 +3160,8 @@ def aggregate_rain_conditioned_response(block_table):
                     ci_low=ci_low,
                     ci_high=ci_high,
                     n_blocks=n_blocks,
+                    sample_count=int(group.grid_cell_time_count.sum()),
+                    control_sample_count=np.nan,
                 )
             )
 
@@ -3198,6 +3198,10 @@ def aggregate_rain_conditioned_response(block_table):
                     ci_low=ci_low,
                     ci_high=ci_high,
                     n_blocks=n_blocks,
+                    sample_count=int(sim_group.grid_cell_time_count.sum()),
+                    control_sample_count=int(
+                        control_group.grid_cell_time_count.sum()
+                    ),
                 )
             )
     out = pd.DataFrame(rows)
@@ -3211,6 +3215,18 @@ def aggregate_rain_conditioned_response(block_table):
     )
     save_table(out, "rain_matched_high_cloud_response")
     return out
+
+
+def compact_count(value):
+    """Format a sample count compactly enough to annotate every rain bin."""
+    if not np.isfinite(value):
+        return "–"
+    value = int(value)
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}m"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(value)
 
 
 def plot_rain_matched_high_cloud_response(classifications, fields_by_run):
@@ -3252,7 +3268,9 @@ def plot_rain_matched_high_cloud_response(classifications, fields_by_run):
         axes[0, column].set_title(class_label)
         for row, (property_key, ylabel) in enumerate(property_specs):
             ax = axes[row, column]
-            for line_name, color in zip(line_names, line_colors):
+            for line_index, (line_name, color) in enumerate(
+                zip(line_names, line_colors)
+            ):
                 values = plotted[
                     (plotted.class_key == class_key)
                     & (plotted.property_key == property_key)
@@ -3270,6 +3288,31 @@ def plot_rain_matched_high_cloud_response(classifications, fields_by_run):
                 )
                 ax.plot(x, y, color=color, lw=1.7, marker="o", ms=3, label=label)
                 ax.fill_between(x, lo, hi, color=color, alpha=0.14, lw=0)
+                if row == 0:
+                    for _, point in values.iterrows():
+                        count_label = compact_count(point.sample_count)
+                        if has_contrasts:
+                            count_label += "/" + compact_count(
+                                point.control_sample_count
+                            )
+                        ax.text(
+                            float(point.rain_bin_centre_mm_h),
+                            0.985 - 0.065 * line_index,
+                            count_label,
+                            transform=ax.get_xaxis_transform(),
+                            ha="center",
+                            va="top",
+                            rotation=90,
+                            fontsize=4.8,
+                            color=color,
+                            alpha=0.76,
+                            bbox=dict(
+                                facecolor="white",
+                                edgecolor="none",
+                                alpha=0.42,
+                                pad=0.2,
+                            ),
+                        )
             if has_contrasts:
                 ax.axhline(0.0, color="0.45", lw=0.8)
             ax.axvline(
@@ -3296,10 +3339,14 @@ def plot_rain_matched_high_cloud_response(classifications, fields_by_run):
         axes[0, 0].legend(handles, labels, loc="best", frameon=False, fontsize=8)
     title_prefix = "Nudging response of" if has_contrasts else "Control values of"
     fig.suptitle(
-        f"{title_prefix} cloud depth and outgoing longwave radiation at matched surface rain rate\n"
-        f"Unfiltered {TROPICAL_LAT_BOUNDS[0]:g} to {TROPICAL_LAT_BOUNDS[1]:g} degree columns; "
-        f"dashed line: {P_PRECIP_MIN / 24.0:g} mm h$^{{-1}}$ class threshold; "
-        f"shading: 95% 10-day block-bootstrap interval; >= {required_blocks} block(s) required",
+        f"{title_prefix} cloud-top pressure and OLR conditioned on surface precipitation rate "
+        f"({abs(TROPICAL_LAT_BOUNDS[0]):g}°S–{TROPICAL_LAT_BOUNDS[1]:g}°N)\n"
+        f"Dashed line: {P_PRECIP_MIN / 24.0:g} mm h$^{{-1}}$ threshold "
+        "(applied only outside deep-convection cores); "
+        "small numbers: grid-cell/time samples"
+        + (" (nudged/control); " if has_contrasts else "; ")
+        + "shading: 95% interval from 10-day block resampling; "
+        f">= {required_blocks} block(s) required",
         fontsize=11,
     )
     save_figure(6, fig, "rain_matched_high_cloud_structure_response")
@@ -3307,55 +3354,32 @@ def plot_rain_matched_high_cloud_response(classifications, fields_by_run):
     progress("Done with figure: rain_matched_high_cloud_structure_response")
 
 
-def plot_literature_high_cloud_structure(
-    dss, fields_by_run, classifications, vertical_profiles
-):
-    """Unfiltered cloud-top, TTL, vertical-profile, and longwave diagnostics."""
+def plot_literature_high_cloud_structure(fields_by_run, classifications):
+    """Class-specific cloud-top-pressure and OLR distributions."""
     if not should_run_figure(2):
         return
     progress("Starting Figure 2: literature_high_cloud_structure")
     class_specs = REGIME_SPECS
     ctp_bins = np.arange(0.0, P_HIGH_HPA + 20.0, 20.0)
     ctp_centres = 0.5 * (ctp_bins[:-1] + ctp_bins[1:])
+    olr_bins = np.arange(80.0, 330.0, 10.0)
+    olr_centres = 0.5 * (olr_bins[:-1] + olr_bins[1:])
     rows = []
 
     fig, axes = plt.subplots(2, 3, figsize=(16.8, 8.2), constrained_layout=True)
-    ctp_distribution_ax = axes[0, 0]
-    ttl_ax = axes[0, 1]
-    mean_ctp_ax = axes[0, 2]
-    olr_ax = axes[1, 0]
-    vertical_profile_ax = axes[1, 1]
-    mean_ctt_ax = axes[1, 2]
-    control_name = sim_names[0]
-    x = np.arange(len(class_specs))
-    width = 0.8 / max(1, len(sim_names))
-    simulation_linestyles = ("-", "--", ":", "-.")
-    for isim, (sim_name, ds, fields) in enumerate(
-        zip(sim_names, dss, fields_by_run)
-    ):
+    ctp_axes = axes[0, :]
+    olr_axes = axes[1, :]
+    for isim, (sim_name, fields) in enumerate(zip(sim_names, fields_by_run)):
         classif = classifications[sim_name]
         statistics = full_class_structure_statistics(
-            ds,
             fields,
             classif,
             sim_name,
             ctp_bins=ctp_bins,
+            olr_bins=olr_bins,
         )
-        ttl_fractions = [statistics[key]["ttl_fraction"] for key, *_ in class_specs]
-        olr_means = [statistics[key]["mean_olr"] for key, *_ in class_specs]
-        ctp_means = [
-            statistics[key]["mean_cloud_top_pressure"] for key, *_ in class_specs
-        ]
-        ctt_means = [
-            statistics[key]["mean_cloud_top_temperature"] for key, *_ in class_specs
-        ]
-        olr_tb_means = [
-            statistics[key]["mean_brightness_temperature"] for key, *_ in class_specs
-        ]
-        for key, label, _color in class_specs:
+        for column, (key, label, _color) in enumerate(class_specs):
             class_statistics = statistics[key]
-            ctt_mean = class_statistics["mean_cloud_top_temperature"]
-            olr_tb_mean = class_statistics["mean_brightness_temperature"]
             rows.append(dict(
                 simulation=sim_name,
                 class_key=key,
@@ -3364,174 +3388,131 @@ def plot_literature_high_cloud_structure(
                 ttl_reaching_fraction_ctp_le_180_hpa=class_statistics["ttl_fraction"],
                 class_conditioned_olr_w_m2=class_statistics["mean_olr"],
                 mean_cloud_top_pressure_hpa=class_statistics["mean_cloud_top_pressure"],
-                mean_diagnosed_cloud_top_temperature_k=ctt_mean,
-                mean_olr_equivalent_brightness_temperature_k=olr_tb_mean,
-                mean_olr_tb_minus_cloud_top_temperature_k=(
-                    olr_tb_mean - ctt_mean
-                    if np.isfinite(olr_tb_mean) and np.isfinite(ctt_mean)
-                    else np.nan
-                ),
                 response_filter="none",
                 occurrence_denominator="all tropical area-time samples",
                 ttl_share_denominator="area-time occurrence of this cloud class",
                 olr_condition="unfiltered grid columns in which this cloud class occurs",
-                cloud_top_temperature_method=(
-                    "linear interpolation of model isobaric temperature to the "
-                    f"highest cldfrac >= {CF_THRESH:g} layer's pressure"
-                ),
                 temporal_spatial_sampling="full 20S-20N analysis period; time-blocked",
             ))
-        for key, _label, color in class_specs:
-            ctp_distribution_ax.plot(
-                statistics[key]["ctp_histogram"],
+            ctp_mean = class_statistics["mean_cloud_top_pressure"]
+            olr_mean = class_statistics["mean_olr"]
+            ctp_axes[column].plot(
+                100.0 * class_statistics["ctp_histogram"],
                 ctp_centres,
-                color=color,
-                ls=simulation_linestyles[isim % len(simulation_linestyles)],
+                color=cols[isim],
                 lw=1.8,
+                label=f"{sim_name}; mean {ctp_mean:.0f} hPa",
+            )
+            ctp_axes[column].axhline(
+                ctp_mean, color=cols[isim], lw=0.9, ls="--", alpha=0.8
+            )
+            olr_axes[column].plot(
+                olr_centres,
+                100.0 * class_statistics["olr_histogram"],
+                color=cols[isim],
+                lw=1.8,
+                label=f"{sim_name}; mean {olr_mean:.0f} W m$^{{-2}}$",
+            )
+            olr_axes[column].axvline(
+                olr_mean, color=cols[isim], lw=0.9, ls="--", alpha=0.8
+            )
+            ttl_text = (
+                f"{sim_name}: {100.0 * class_statistics['ttl_fraction']:.1f}%"
+            )
+            ctp_axes[column].text(
+                0.98,
+                0.98 - 0.065 * isim,
+                ttl_text,
+                transform=ctp_axes[column].transAxes,
+                ha="right",
+                va="top",
+                fontsize=7,
+                color=cols[isim],
             )
         del statistics
         gc.collect()
-        offset = (isim - (len(sim_names) - 1) / 2.0) * width
-        ttl_ax.bar(
-            x + offset, ttl_fractions, width=width,
-            color=cols[isim], label=sim_name,
-        )
-        olr_ax.bar(
-            x + offset, olr_means, width=width,
-            color=cols[isim], label=sim_name,
-        )
-        mean_ctp_ax.scatter(
-            x + offset, ctp_means, s=30, marker="o",
-            color=cols[isim], label=sim_name, zorder=4,
-        )
-        mean_ctt_ax.scatter(
-            x + offset, ctt_means, s=30, marker="o",
-            color=cols[isim], label=f"{sim_name}: cloud-top T", zorder=4,
-        )
-        mean_ctt_ax.scatter(
-            x + offset, olr_tb_means, s=34, marker="s",
-            facecolor="white", edgecolor=cols[isim], linewidth=1.2,
-            label=f"{sim_name}: OLR-equivalent Tb", zorder=4,
-        )
-        for xpos, ctt_mean, olr_tb_mean in zip(
-            x + offset, ctt_means, olr_tb_means
-        ):
-            if np.isfinite(ctt_mean) and np.isfinite(olr_tb_mean):
-                mean_ctt_ax.plot(
-                    [xpos, xpos], [ctt_mean, olr_tb_mean],
-                    color=cols[isim], lw=0.9, alpha=0.55, zorder=2,
-                )
 
-    core_x = x[0]
-    nonprecip_x = x[2]
     literature_color = "#7a4e00"
-    mean_ctp_ax.scatter(
-        [core_x, nonprecip_x], [223.3, 281.4],
-        marker="D", s=48, facecolor="white", edgecolor=literature_color,
-        linewidth=1.3, zorder=5,
-        label="MODIS 30S-30N: deep convective 223.3; cirriform 281.4 hPa",
-    )
-    mean_ctt_ax.scatter(
-        [core_x, nonprecip_x], [234.9, 231.0],
-        marker="D", s=48, facecolor="white", edgecolor=literature_color,
-        linewidth=1.3, zorder=5,
-        label="MODIS 30S-30N: deep convective 234.9; cirriform 231.0 K",
-    )
-    olr_ax.scatter(
-        [core_x], [205.0], marker="D", s=48,
-        facecolor="white", edgecolor=literature_color, linewidth=1.3,
-        zorder=5,
-        label="Satellite deep-convection threshold: 205 W m$^{-2}$ (0-20N)",
-    )
-    olr_ax.scatter(
-        [nonprecip_x], [260.0], marker=">", s=55,
-        facecolor="white", edgecolor="#375a7f", linewidth=1.3,
-        zorder=5,
-        label="Thin-cirrus OLR: ~260 W m$^{-2}$ (tropical-ocean model)",
-    )
-
-    if control_name in vertical_profiles:
-        for key, label, color in class_specs:
-            profile = vertical_profiles[control_name].sel(class_key=key)
-            vertical_profile_ax.plot(
-                100.0 * profile, profile.z / 1000.0,
-                color=color, lw=1.8, label=label,
-            )
-        vertical_profile_ax.axhspan(
-            UTLS_LAYER_BOUNDS_KM[0], UTLS_LAYER_BOUNDS_KM[1],
-            color="0.7", alpha=0.16,
+    ctp_literature = {
+        0: (
+            223.3,
+            "MODIS deep-convective mean, 223 hPa (Hong et al., 2007)",
+        ),
+        2: (
+            281.4,
+            "MODIS cirriform mean, 281 hPa (Hong et al., 2007)",
+        ),
+    }
+    olr_literature = {
+        0: (
+            205.0,
+            "Deep-convection threshold, 205 W m$^{-2}$ (Gu et al., 2002)",
+        ),
+        2: (
+            260.0,
+            "Thin-cirrus value, ~260 W m$^{-2}$ (Seiki et al., 2015)",
+        ),
+    }
+    panel_letters = ("a", "b", "c", "d", "e", "f")
+    for column, (_key, label, _color) in enumerate(class_specs):
+        ctp_ax = ctp_axes[column]
+        olr_ax = olr_axes[column]
+        ctp_ax.axhspan(
+            ctp_bins[0], 180.0, color="#8da0cb", alpha=0.10, zorder=0
         )
-
-    ctp_distribution_ax.invert_yaxis()
-    ctp_distribution_ax.set(
-        xlabel="Share of class occurrence per 20-hPa bin",
-        ylabel="Cloud-top pressure (hPa)",
-        title="(a) Within-class cloud-top distributions",
-    )
-    class_legend = ctp_distribution_ax.legend(
-        handles=[
-            Line2D([0], [0], color=color, lw=1.8, label=label)
-            for _key, label, color in class_specs
-        ],
-        loc="lower right",
-        frameon=False,
-        fontsize=7,
-    )
-    ctp_distribution_ax.add_artist(class_legend)
-    ctp_distribution_ax.legend(
-        handles=[
-            Line2D(
-                [0], [0], color="0.15",
-                ls=simulation_linestyles[index % len(simulation_linestyles)],
-                lw=1.5, label=sim_name,
+        ctp_ax.set_ylim(P_HIGH_HPA, ctp_bins[0])
+        ctp_ax.set_xlabel("Relative frequency per 20 hPa bin (%)")
+        ctp_ax.set_title(
+            f"({panel_letters[column]}) {label}: cloud-top pressure"
+        )
+        if column == 0:
+            ctp_ax.set_ylabel("Cloud-top pressure (hPa)")
+        if column in ctp_literature:
+            value, citation = ctp_literature[column]
+            ctp_ax.axhline(
+                value,
+                color=literature_color,
+                lw=1.3,
+                ls="-.",
+                label=citation,
             )
-            for index, sim_name in enumerate(sim_names)
-        ],
-        loc="upper right",
-        frameon=False,
-        fontsize=7,
-    )
-    ttl_ax.set(
-        title="(b) Share of each class reaching the TTL",
-        ylabel="Class occurrence with CTP <= 180 hPa (fraction)",
-        xticks=x,
-        xticklabels=[label for _key, label, _color in class_specs],
-    )
-    mean_ctp_ax.set(
-        title="(c) Mean cloud-top pressure",
-        ylabel="Cloud-top pressure (hPa)",
-        xticks=x,
-        xticklabels=[label for _key, label, _color in class_specs],
-    )
-    mean_ctp_ax.set_ylim(P_HIGH_HPA, 100.0)
-    olr_ax.set(
-        title="(d) Mean OLR where each class occurs",
-        ylabel="Unfiltered class-conditioned OLR (W m$^{-2}$)",
-        xticks=x,
-        xticklabels=[label for _key, label, _color in class_specs],
-    )
-    vertical_profile_ax.set(
-        xlabel="Contribution to domain-mean cloud fraction (%)",
-        ylabel="Height (km)",
-        title=f"(e) Domain cloud amount from each class ({control_name})",
-    )
-    mean_ctt_ax.set(
-        title="(f) Cloud-top and OLR-equivalent temperature",
-        ylabel="Temperature (K)",
-        xticks=x,
-        xticklabels=[label for _key, label, _color in class_specs],
-    )
-    for ax in (ttl_ax, mean_ctp_ax, olr_ax, mean_ctt_ax):
-        ax.tick_params(axis="x", rotation=18)
-        ax.legend(frameon=False, fontsize=8)
-    if control_name in vertical_profiles:
-        vertical_profile_ax.legend(frameon=False, fontsize=8)
-    for ax in axes.ravel():
-        ax.grid(alpha=0.2)
+        ctp_ax.text(
+            0.02,
+            0.98,
+            "shading: CTP ≤ 180 hPa\nnumbers: frequency within shaded range",
+            transform=ctp_ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=6.5,
+            color="0.28",
+        )
+        ctp_ax.legend(frameon=False, fontsize=7, loc="best")
+
+        olr_ax.set_xlabel("Outgoing longwave radiation (W m$^{-2}$)")
+        olr_ax.set_title(
+            f"({panel_letters[column + 3]}) {label}: OLR"
+        )
+        if column == 0:
+            olr_ax.set_ylabel("Relative frequency per 10 W m$^{-2}$ bin (%)")
+        if column in olr_literature:
+            value, citation = olr_literature[column]
+            olr_ax.axvline(
+                value,
+                color=literature_color if column == 0 else "#375a7f",
+                lw=1.3,
+                ls="-.",
+                label=citation,
+            )
+        olr_ax.legend(frameon=False, fontsize=7, loc="best")
+        ctp_ax.grid(alpha=0.2)
+        olr_ax.grid(alpha=0.2)
+
     fig.suptitle(
-        "Unfiltered high-cloud height and longwave structure (model bars/points: 20S-20N)\n"
-        "Circles: model isobaric temperature interpolated to diagnosed cloud-top pressure; "
-        "squares: PyFLEXTRKR OLR-equivalent brightness temperature"
+        "Cloud-top height and outgoing longwave radiation for each high-cloud class "
+        "(unfiltered, 20°S–20°N)\n"
+        "Dashed model lines mark distribution means; literature lines use related, "
+        "but not identical, observational or model cloud definitions",
+        fontsize=11,
     )
     save_table(pd.DataFrame(rows), "literature_high_cloud_structure_metrics")
     save_table(
@@ -3569,14 +3550,12 @@ def main(argv=None):
     classifications = prepare_classifications(dss, fields_by_run)
     vertical_profiles = (
         compute_vertical_contribution_profiles(dss, classifications)
-        if should_run_figure(2) or should_run_figure(4)
+        if should_run_figure(4)
         else {}
     )
 
     plot_class_budget(classifications, fields_by_run)
-    plot_literature_high_cloud_structure(
-        dss, fields_by_run, classifications, vertical_profiles
-    )
+    plot_literature_high_cloud_structure(fields_by_run, classifications)
     plot_validation_snapshots(dss, fields_by_run, classifications)
     plot_vertical_contribution_profiles(vertical_profiles)
     plot_class_spatial_response(classifications)
