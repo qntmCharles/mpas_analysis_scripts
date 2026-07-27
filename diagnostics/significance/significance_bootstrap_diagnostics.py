@@ -42,8 +42,8 @@ except ModuleNotFoundError:
 from diagnostics.diagnostic_helpers import (
     ANALYSIS_END, ANALYSIS_START, FigureSaver, LATLON_PATTERN,
     ZONAL_MEAN_PATTERN, add_symmetric_colorbar,
-    configured_label, convective_organisation_cache_dir,
-    diagnostic_cache_dir, diagnostic_output_dir, difference_cmap, env_flag,
+    configured_label, diagnostic_cache_dir, diagnostic_output_dir,
+    difference_cmap, env_flag,
     figure_should_run, finite_or_nan, hemispheric_fold, jsonable_value,
     latitude_weights, load_latlon_dataset, precip_rate_from_accum,
     pressure_layer_weights, read_json_file, safe_name,
@@ -61,10 +61,11 @@ from diagnostics.waves.equatorial_wave_config import (
     WAVE_BOXES as SHARED_WAVE_BOXES,
     WAVE_LATITUDE_PROJECTION as SHARED_WAVE_LATITUDE_PROJECTION,
 )
-from diagnostics.diagnostic_helpers import (
-    PRIMARY_TRACK_SOURCE as PYFLEXTRKR_PRIMARY_TRACK_SOURCE,
-    PYFLEXTRKR_PRODUCT_VERSION, TRACK_POPULATION_LABELS, TRACK_POPULATIONS,
-    table_boolean_mask,
+from diagnostics.convection.lpt_precipitation_envelope_diagnostics import (
+    PRODUCT_VERSION as LPT_PRODUCT_VERSION,
+    publication_output_directory,
+    read_standard_event_tables,
+    require_publication_products,
 )
 
 try:
@@ -85,7 +86,7 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/significance
 #   2: precipitation scalar/PDF block-consistency diagnostics
 #   3: cloud profile/cloud-type block-consistency diagnostics
 #   4: CCEW wave-box variance block-consistency diagnostics
-#   5: persistent-DCS and Feng-MCS event-bootstrap diagnostics
+#   5: LPT precipitation-envelope event-bootstrap diagnostics
 #   6: basic convection PDF block-consistency diagnostics
 #   7: vertical wave-power profile block-consistency diagnostics
 #   8: wave-amplitude lag-correlation block-consistency diagnostics
@@ -171,24 +172,23 @@ WAVE_LAG_TARGET_FIELDS = ["Precip", "OLR", "PW"]
 WAVE_LAG_MAX_DAYS = 8.0
 WAVE_LAG_BLOCK_DAYS = 30.0
 
-ORGANISATION_OUTPUT_DIR = convective_organisation_cache_dir(root_dir=root_dir)
-ORGANISATION_TRACKS_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_track_lifetimes.csv")
-ORGANISATION_TRACK_METADATA_FILE = os.path.join(ORGANISATION_OUTPUT_DIR, "organisation_track_persistence_cache_metadata.json")
+ORGANISATION_OUTPUT_DIR = publication_output_directory()
+ORGANISATION_TRACKS_FILE = str(ORGANISATION_OUTPUT_DIR / "primary")
 ORGANISATION_TRACK_METRIC_SPECS = [
-    ("lifetime_hours", "h"),
-    ("max_area_km2", "km2"),
-    ("max_pf_area_km2", "km2"),
-    ("max_pf_major_axis_km", "km"),
-    ("mean_pf_rain_mm_h", "mm h-1"),
-    ("mean_pf_rain_skewness", ""),
-    ("max_area_convective_precipitating_high_cloud_mask_km2", "km2"),
-    ("max_area_stratiform_precipitating_high_cloud_mask_km2", "km2"),
-    ("max_area_nonprecipitating_high_cloud_mask_km2", "km2"),
-    ("mean_frac_convective_precipitating_high_cloud_mask", "fraction"),
-    ("max_translation_speed_kmh", "km h-1"),
+    ("duration_hours", "h"),
+    ("maximum_area_km2", "km2"),
+    ("event_integrated_precipitation", "km2 mm"),
+    ("zonal_speed_m_s", "m s-1"),
+    ("total_zonal_displacement_km", "km"),
 ]
-# Rows come from the two retained PyFLEXTRKR track populations. This script only
-# performs event-equal bootstraps; it never creates another object product.
+# Rows come from the definitive 15-mm/day tropical LPT population. Complete
+# events are resampled as indivisible units; track steps are never samples.
+LPT_TRACK_SOURCE = "lpt_precipitation_envelope"
+LPT_TRACK_POPULATION = "primary_tropical_lpt"
+ANALYSIS_TRACK_POPULATIONS = (LPT_TRACK_POPULATION,)
+TRACK_POPULATION_LABELS = {
+    LPT_TRACK_POPULATION: "Large-scale tropical precipitation envelopes",
+}
 
 # Shared coarse-grid precipitation-regime cloud thresholds.
 CF_THRESH = 0.05
@@ -1652,87 +1652,50 @@ def run_conditional_precipitation_states(precip_by_run):
 
 
 # -----------------------------------------------------------------------------
-# Dual-population convective-system event properties from the organisation script
+# LPT precipitation-envelope event properties
 # -----------------------------------------------------------------------------
 
 ORGANISATION_SOURCE_ORDER = [
-    PYFLEXTRKR_PRIMARY_TRACK_SOURCE,
+    LPT_TRACK_SOURCE,
 ]
-ORGANISATION_PRIMARY_TRACK_SOURCE = PYFLEXTRKR_PRIMARY_TRACK_SOURCE
-ORGANISATION_TRACK_CACHE_VERSION = "pyflextrkr_dual_population_tracks_v15"
+ORGANISATION_PRIMARY_TRACK_SOURCE = LPT_TRACK_SOURCE
+ORGANISATION_TRACK_CACHE_VERSION = LPT_PRODUCT_VERSION
 
 
-def require_current_organisation_metadata(path, label):
-    if not os.path.exists(path):
-        raise RuntimeError(
-            f"{label} metadata is missing: {path}. "
-            "Run convective_organisation_diagnostics.py with the new shared high-cloud classification first."
-        )
-    with open(path, "r", encoding="utf-8") as handle:
-        metadata = json.load(handle)
-    cached_version = metadata.get("cloud_classification_cache_version")
-    if cached_version != CLASSIFICATION_CACHE_VERSION:
-        raise RuntimeError(
-            f"{label} metadata was built with high-cloud classification version "
-            f"{cached_version!r}, expected {CLASSIFICATION_CACHE_VERSION!r}. "
-            "Run convective_organisation_diagnostics.py before this bootstrap script."
-        )
-    return metadata
-
-
-def load_organisation_tracks():
-    if not os.path.exists(ORGANISATION_TRACKS_FILE):
-        raise FileNotFoundError(
-            "Required convective-organisation PyFLEXTRKR track product is missing: "
-            f"{ORGANISATION_TRACKS_FILE}. Run convective_organisation_diagnostics.py first."
-        )
-
-    metadata = require_current_organisation_metadata(
-        ORGANISATION_TRACK_METADATA_FILE, "organisation track"
-    )
-    if metadata.get("cache_version") != ORGANISATION_TRACK_CACHE_VERSION:
-        raise RuntimeError(
-            "Organisation track metadata does not describe the current "
-            f"PyFLEXTRKR product ({metadata.get('cache_version')!r} != "
-            f"{ORGANISATION_TRACK_CACHE_VERSION!r}). Run "
-            "convective_organisation_diagnostics.py first."
-        )
-    if metadata.get("primary_track_source") != ORGANISATION_PRIMARY_TRACK_SOURCE:
-        raise RuntimeError(
-            "Organisation track metadata does not use the shared organised "
-            f"convective-system source {ORGANISATION_PRIMARY_TRACK_SOURCE!r}."
-        )
-    if metadata.get("product_version") != PYFLEXTRKR_PRODUCT_VERSION:
-        raise RuntimeError(
-            "Organisation track metadata does not describe the current "
-            f"PyFLEXTRKR product version {PYFLEXTRKR_PRODUCT_VERSION!r}."
-        )
-    df = pd.read_csv(ORGANISATION_TRACKS_FILE)
+def load_lpt_envelope_events():
+    publication = require_publication_products()
+    df, _lifecycle = read_standard_event_tables(publication / "primary")
     required = {
-        "source", "source_label", "simulation", "track_id",
-        "starts_as_split", "ends_as_merge",
-        *TRACK_POPULATIONS,
+        "simulation", "event_id", "primary_tropical_sample",
+        "reference_in_record_subset",
         *[metric for metric, _ in ORGANISATION_TRACK_METRIC_SPECS],
     }
     missing = sorted(required - set(df.columns))
     if missing:
-        raise ValueError(f"organisation track table is missing columns: {missing}")
+        raise ValueError(f"LPT event table is missing columns: {missing}")
 
-    df = df[df["simulation"].isin(sim_names)].copy()
-    for col in ["starts_as_split", "ends_as_merge"]:
-        if df[col].dtype != bool:
-            raise TypeError(f"organisation track column {col} must be boolean")
-    for population in TRACK_POPULATIONS:
-        df[population] = table_boolean_mask(df, population)
-    df["complete_lifecycle"] = (
-        ~df["starts_as_split"] & ~df["ends_as_merge"]
-    ).astype(float)
+    df = df[
+        df.primary_tropical_sample.astype(bool)
+        & df.reference_in_record_subset.astype(bool)
+    ].copy()
+    df["simulation"] = df.simulation.map(
+        {
+            "control": "control",
+            "nudged-u": "nudged u",
+            "nudged-T": "nudged T",
+        }
+    )
+    if df.simulation.isna().any():
+        raise ValueError("LPT event table contains an unknown simulation")
+    df["source"] = LPT_TRACK_SOURCE
+    df["source_label"] = TRACK_POPULATION_LABELS[LPT_TRACK_POPULATION]
+    df[LPT_TRACK_POPULATION] = True
     for col in [metric for metric, _ in ORGANISATION_TRACK_METRIC_SPECS]:
         df[col] = pd.to_numeric(df[col], errors="raise")
     return df
 
 
-def organisation_source_label(df, source):
+def lpt_source_label(df, source):
     sub = df[df["source"] == source]
     if len(sub) == 0 or "source_label" not in sub.columns:
         return source
@@ -1740,40 +1703,41 @@ def organisation_source_label(df, source):
     return str(vals[0]) if len(vals) else source
 
 
-def ordered_organisation_sources(df):
+def ordered_lpt_sources(df):
     present = set(df["source"].dropna().unique())
-    unexpected = present - {ORGANISATION_PRIMARY_TRACK_SOURCE}
+    unexpected = present - {LPT_TRACK_SOURCE}
     if unexpected:
         raise RuntimeError(
-            "Organisation tables contain sources outside the current shared "
-            f"PyFLEXTRKR product: {sorted(unexpected)}"
+            f"LPT event tables contain unexpected sources: {sorted(unexpected)}"
         )
     ordered = [source for source in ORGANISATION_SOURCE_ORDER if source in present]
     return ordered
 
 
-def organisation_source_role(source):
-    if source == ORGANISATION_PRIMARY_TRACK_SOURCE:
-        return "organised_convective_systems"
+def lpt_source_role(source):
+    if source == LPT_TRACK_SOURCE:
+        return "large_scale_precipitation_envelopes"
     raise RuntimeError(
-        "Organisation tables contain a source outside the current shared "
-        f"PyFLEXTRKR product: {source!r}"
+        f"LPT event tables contain an unexpected source: {source!r}"
     )
 
 
-def plot_organisation_bootstrap_summary(org_df, org_source_labels):
+def plot_lpt_envelope_bootstrap_summary(org_df, org_source_labels):
     if not should_run_figure(5) or len(org_df) == 0:
         return
 
     display_metrics = [
-        ("lifetime_hours", "MCS lifetime (h)"),
-        ("max_area_km2", "Maximum cold-shield area (km2)"),
-        ("max_pf_area_km2", "Maximum PF area (km2)"),
-        ("mean_pf_rain_mm_h", "Mean PF rain rate (mm h-1)"),
-        ("mean_pf_rain_skewness", "PF rain-rate skewness"),
+        ("duration_hours", "Envelope duration (h)"),
+        ("maximum_area_km2", "Maximum envelope area (km2)"),
+        (
+            "event_integrated_precipitation",
+            "Event-integrated precipitation (km2 mm)",
+        ),
+        ("zonal_speed_m_s", "Mean zonal propagation speed (m s-1)"),
+        ("total_zonal_displacement_km", "Net zonal displacement (km)"),
     ]
     plot_df = org_df[
-        (org_df["category"] == "convective_system_event_properties")
+        (org_df["category"] == "lpt_envelope_event_properties")
         & (org_df["metric"].isin([metric for metric, _ in display_metrics]))
     ].copy()
     if len(plot_df) == 0:
@@ -1841,47 +1805,50 @@ def plot_organisation_bootstrap_summary(org_df, org_source_labels):
         ax.grid(axis="x", alpha=0.18)
         ax.set_xlabel(f"{label} response")
     axes.ravel()[0].legend(frameon=False, fontsize=8, loc="best")
-    fig.suptitle("Event-equal convective-system responses; filled points exclude zero")
-    figsave.save(fig, "organisation_bootstrap_summary", number=5)
+    fig.suptitle(
+        "LPT precipitation-envelope responses with each event weighted equally; "
+        "filled points exclude zero"
+    )
+    figsave.save(fig, "lpt_envelope_bootstrap_summary", number=5)
     plt.close(fig)
 
 
-def run_convective_organisation_bootstrap():
+def run_lpt_envelope_bootstrap():
     try:
-        tracks = load_organisation_tracks()
+        tracks = load_lpt_envelope_events()
         cache_signature = base_bootstrap_cache_signature(
-            "convective_system_event_properties",
+            "lpt_envelope_event_properties",
             extra=dict(
                 organisation_tracks_file=ORGANISATION_TRACKS_FILE,
                 track_metric_specs=jsonable_value(ORGANISATION_TRACK_METRIC_SPECS),
                 primary_track_source=ORGANISATION_PRIMARY_TRACK_SOURCE,
                 organisation_track_cache_version=ORGANISATION_TRACK_CACHE_VERSION,
                 cloud_classification_cache_version=CLASSIFICATION_CACHE_VERSION,
-                track_populations=list(TRACK_POPULATIONS),
+                track_populations=list(ANALYSIS_TRACK_POPULATIONS),
                 weighting="tracks are resampled equally within each population",
             ),
         )
         cached_rows = load_cached_table(
-            "organisation_bootstrap_metrics", cache_signature
+            "lpt_envelope_bootstrap_metrics", cache_signature
         )
         if cached_rows is not None:
             append_cached_scalar_rows(cached_rows)
-            save_table(cached_rows, "organisation_bootstrap_metrics.csv")
+            save_table(cached_rows, "lpt_envelope_bootstrap_metrics.csv")
             source_labels = (
                 cached_rows.dropna(subset=["diagnostic", "source_label"])
                 .drop_duplicates("diagnostic")
                 .set_index("diagnostic")["source_label"]
                 .to_dict()
             )
-            plot_organisation_bootstrap_summary(cached_rows, source_labels)
-            record_implemented("cached dual-population event bootstrap")
+            plot_lpt_envelope_bootstrap_summary(cached_rows, source_labels)
+            record_implemented("cached LPT-envelope event bootstrap")
             return
 
         source_labels = {}
         row_start = len(scalar_metric_rows)
         skipped = 0
-        for source in ordered_organisation_sources(tracks):
-            for population in TRACK_POPULATIONS:
+        for source in ordered_lpt_sources(tracks):
+            for population in ANALYSIS_TRACK_POPULATIONS:
                 diagnostic = f"{source}:{population}"
                 population_label = TRACK_POPULATION_LABELS[population]
                 source_labels[diagnostic] = population_label
@@ -1905,31 +1872,33 @@ def run_convective_organisation_bootstrap():
                     append_bootstrap_metric_rows(
                         scalar_metric_rows,
                         values_by_run,
-                        "convective_system_event_properties",
+                        "lpt_envelope_event_properties",
                         diagnostic,
                         metric,
                         units=units,
                         extra={
                             "source_label": population_label,
                             "track_population": population,
-                            "organisation_role": organisation_source_role(source),
+                            "organisation_role": lpt_source_role(source),
                             "weighting": "tracks resampled equally within population",
                         },
                     )
 
         result = pd.DataFrame(scalar_metric_rows[row_start:])
         if len(result) == 0:
-            record_skip("dual-population event bootstrap (too few events)")
+            record_skip("LPT-envelope event bootstrap (too few events)")
             return
-        save_table(result, "organisation_bootstrap_metrics.csv")
-        plot_organisation_bootstrap_summary(result, source_labels)
-        write_cached_table("organisation_bootstrap_metrics", result, cache_signature)
-        message = "event-equal bootstrap of persistent-DCS and Feng-MCS properties"
+        save_table(result, "lpt_envelope_bootstrap_metrics.csv")
+        plot_lpt_envelope_bootstrap_summary(result, source_labels)
+        write_cached_table("lpt_envelope_bootstrap_metrics", result, cache_signature)
+        message = (
+            "bootstrap of tropical LPT-envelope properties with equal event weights"
+        )
         if skipped:
             message += f" ({skipped} metric/run combinations skipped for small samples)"
         record_implemented(message)
     except Exception as exc:
-        record_failure("dual-population event bootstrap", exc)
+        record_failure("LPT-envelope event bootstrap", exc)
         raise
 
 
@@ -2673,13 +2642,17 @@ def print_mechanism_cues(metrics_df, matched_df):
             print("  Robust wave-box changes are present; compare U-control and T-control rows in wave_box_variance_bootstrap_metrics.csv for wind-mediated organisation.")
         org_robust = metrics_df[
             (metrics_df["category"].isin([
-                "convective_system_event_properties",
+                "lpt_envelope_event_properties",
             ]))
             & (metrics_df["comparison"].isin(["u_minus_control", "T_minus_control"]))
             & (metrics_df.get("robust", False) == True)
         ]
         if len(org_robust) > 0:
-            print("  Robust convective-system property changes are present; use organisation_bootstrap_metrics.csv to compare event-equal persistent-DCS and Feng-MCS responses.")
+            print(
+                "  Robust LPT-envelope property changes are present; use "
+                "lpt_envelope_bootstrap_metrics.csv to compare equally "
+                "weighted tracked systems."
+            )
         thermal_robust = metrics_df[
             (metrics_df["category"] == "mean_state_pathway")
             & (metrics_df["diagnostic"].isin(["temperature", "static_stability_N2", "lapse_rate", "cloud_fraction"]))
@@ -2727,7 +2700,7 @@ def print_final_summary(metrics_df, matched_df):
     print_mechanism_cues(metrics_df, matched_df)
 
     print("\nAnswering the headline question:")
-    print("  Use bootstrap_scalar_metrics.csv for scalar robustness, basic_convection_pdf_bootstrap_response.csv for PR/OLR/PW/CAPE distribution changes, wavenumber_variance_fraction_bootstrap_response.csv for planetary-scale organisation/noise checks, organisation_bootstrap_metrics.csv for persistent-DCS and Feng-MCS event properties, the lat-height figures for coherent structures rather than isolated gridpoints, wave_box_variance_bootstrap_metrics.csv plus vertical_wave_power_profile_bootstrap_metrics.csv and wave_lag_correlation_bootstrap_metrics.csv for organised wave-mediated changes, and matched_pattern_bootstrap_metrics.csv for thermal-pattern attribution.")
+    print("  Use bootstrap_scalar_metrics.csv for scalar robustness, basic_convection_pdf_bootstrap_response.csv for PR/OLR/PW/CAPE distribution changes, wavenumber_variance_fraction_bootstrap_response.csv for planetary-scale organisation/noise checks, lpt_envelope_bootstrap_metrics.csv for LPT-envelope properties, the lat-height figures for coherent structures rather than isolated gridpoints, wave_box_variance_bootstrap_metrics.csv plus vertical_wave_power_profile_bootstrap_metrics.csv and wave_lag_correlation_bootstrap_metrics.csv for organised wave-mediated changes, and matched_pattern_bootstrap_metrics.csv for thermal-pattern attribution.")
     print("  Robust U-control changes in zonal wind or CCEW variance that are absent from T-control point toward a wind-driven pathway; robust shared temperature/N2/cloud-depth structures with high matched-pattern correlation point toward a temperature-driven pathway.")
 
 
@@ -2742,7 +2715,7 @@ run_basic_convection_pdf_bootstrap()
 run_wavenumber_variance_bootstrap()
 run_cloud_response(precip_by_run)
 run_conditional_precipitation_states(precip_by_run)
-run_convective_organisation_bootstrap()
+run_lpt_envelope_bootstrap()
 run_wave_pathway()
 run_vertical_wave_power_profile_bootstrap()
 run_wave_lag_correlation_bootstrap()

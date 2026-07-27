@@ -1,5 +1,4 @@
 import glob
-import hashlib
 import json
 import os
 import warnings
@@ -19,7 +18,6 @@ DEFAULT_SIMULATION_PARENT_DIR = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/c
 DEFAULT_DIAGNOSTIC_OUTPUT_ROOT = "/home/cwp29/tmp/mpas/crf_on"
 DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
 DIAGNOSTIC_FIGURE_ROOT_ENV = "MPAS_DIAGNOSTIC_FIGURE_ROOT"
-DEFAULT_ORGANISATION_TRACKING_MODE = "drift"
 ANALYSIS_START = "2000-05-05 06:00:00"
 ANALYSIS_END = "2000-11-21 00:00:00"
 LATLON_PATTERN = "latlon.2000-*.nc"
@@ -41,19 +39,6 @@ def diagnostic_cache_dir(*parts, root_dir=None):
         os.environ.get("MPAS_DIAGNOSTIC_CACHE_ROOT", simulation_parent_dir(root_dir))
     )
     return os.path.join(base, *parts)
-
-
-def convective_organisation_cache_dir(
-    tracking_mode=DEFAULT_ORGANISATION_TRACKING_MODE,
-    root_dir=None,
-):
-    """Data-side cache for retained convective-system object products."""
-    mode = str(tracking_mode).strip().lower()
-    if mode not in {"standard", "drift"}:
-        raise ValueError(
-            f"tracking_mode must be 'standard' or 'drift', got {mode!r}"
-        )
-    return diagnostic_cache_dir("organisation_cache", mode, root_dir=root_dir)
 
 
 def diagnostic_output_dir(default_save_loc, root_dir=DEFAULT_DIAGNOSTIC_OUTPUT_ROOT):
@@ -661,8 +646,8 @@ PRECIP_RATE_COLORS = [
 PRECIP_RATE_LEVELS = np.linspace(0.01, 25.0, len(PRECIP_RATE_COLORS))
 
 HIGH_CLOUD_CLASS_SPECS = (
-    (1, "PyFLEXTRKR convective core", "tab:red"),
-    (2, "Stratiform precipitating", "tab:blue"),
+    (1, "Deep convection", "tab:red"),
+    (2, "Stratiform", "tab:blue"),
     (3, "Non-precipitating", "tab:green"),
     (4, "Invalid/unclassified", "0.70"),
 )
@@ -1750,180 +1735,3 @@ def duration_domain_histograms(
                 tropical_counts += np.histogram(run_lengths[tropical_ended], bins=edges)[0]
             run_lengths[ended] = 0
     return (global_counts, edges), (tropical_counts, edges)
-
-
-# -----------------------------------------------------------------------------
-# Shared producer/consumer contract for MPAS PyFLEXTRKR products
-# -----------------------------------------------------------------------------
-
-
-PYFLEXTRKR_PRODUCT_VERSION = "mpas-dual-population-pyflextrkr-v11"
-PYFLEXTRKR_METADATA_FILENAME = "pyflextrkr_product_metadata.json"
-PYFLEXTRKR_TRACK_MANIFEST_FILENAME = "organised_track_manifest.csv"
-PRIMARY_TRACK_SOURCE = "organised_convective_system_mask"
-PRIMARY_ANALYSIS_ROLE = "primary_persistence_and_composites"
-TRACKED_SOURCES = (PRIMARY_TRACK_SOURCE,)
-MIN_ORGANISED_TRACK_OBSERVATIONS = 2
-MIN_ORGANISED_TRACK_DURATION_HOURS = 6.0
-ORGANISED_TRACK_ACCEPTANCE_CRITERIA = "feng_2021_50km_15th_percentile_pf_criteria"
-ORGANISED_TRACK_EMBEDDED_CORE_REQUIREMENT = "not_an_acceptance_criterion"
-PERSISTENT_DCS_ACCEPTANCE_CRITERIA = (
-    "feng_mcs_or_pyflextrkr_241K_cold_cloud_track_at_least_2_consecutive_"
-    "6h_scenes_with_225K_core_in_at_least_1_scene"
-)
-TRACK_POPULATIONS = ("persistent_dcs", "feng_mcs")
-TRACK_POPULATION_LABELS = {
-    "persistent_dcs": "Persistent deep-convective systems",
-    "feng_mcs": "Feng-defined MCSs",
-}
-ORGANISED_TRACK_OBJECT_GEOMETRY = "shared_pyflextrkr_tb225_core_spread_to_tb241_cold_shield"
-ORGANISED_ENVELOPE_MIN_RAW_AREA_KM2 = 0.0
-FENG_MCS_COLD_SHIELD_MIN_AREA_KM2 = 60000.0
-FENG_MCS_PF_MIN_RAIN_MM_H = 0.5
-FENG_MCS_PF_MIN_MAJOR_AXIS_KM = 100.0
-FENG_MCS_PF_AREA_INTERCEPT_KM2 = 14675.3
-FENG_MCS_PF_AREA_SLOPE_KM2_PER_H = 350.918
-FENG_MCS_PF_MEAN_RAIN_INTERCEPT_MM_H = 1.77764
-FENG_MCS_PF_MEAN_RAIN_SLOPE_MM_H_PER_H = 0.0169073
-FENG_MCS_PF_SKEW_INTERCEPT = 0.203418
-FENG_MCS_PF_SKEW_SLOPE_PER_H = 0.0117695
-FENG_MCS_CRITERIA_PERCENTILE = 15
-
-
-def epoch_seconds(time_values):
-    stamps = pd.to_datetime(np.asarray(time_values))
-    return np.asarray(
-        (stamps - pd.Timestamp("1970-01-01")) / pd.Timedelta(seconds=1),
-        dtype=np.int64,
-    )
-
-
-def sha256_file(path, block_size=1024 * 1024):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while True:
-            block = handle.read(block_size)
-            if not block:
-                break
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def sha256_label_sequence(labels_by_time):
-    digest = hashlib.sha256()
-    for labels in labels_by_time:
-        values = np.ascontiguousarray(labels, dtype=np.int32)
-        digest.update(np.asarray(values.shape, dtype=np.int64).tobytes())
-        digest.update(values.tobytes())
-    return digest.hexdigest()
-
-
-def time_signature(time_values):
-    seconds = epoch_seconds(time_values)
-    digest = hashlib.sha256(np.ascontiguousarray(seconds).tobytes()).hexdigest()
-    return {
-        "time_count": int(seconds.size),
-        "first_basetime": int(seconds[0]) if seconds.size else None,
-        "last_basetime": int(seconds[-1]) if seconds.size else None,
-        "basetimes_sha256": digest,
-    }
-
-
-def product_fingerprint(metadata):
-    keys = (
-        "product_version", "source", "simulation", "analysis_role",
-        "classification_cache_version", "time_count", "first_basetime",
-        "last_basetime", "basetimes_sha256", "cloudid_labels_sha256",
-        "tracknumbers_sha256", "track_min_overlap_fraction",
-        "track_min_area_km2", "min_track_observations",
-        "min_track_duration_hours", "track_acceptance_criteria",
-        "embedded_convective_core_requirement", "object_geometry",
-        "persistent_dcs_acceptance_criteria", "track_populations",
-        "tracking_mode", "pyflextrkr_advection_median_filter_length",
-        "pyflextrkr_advection_max_movement_mps",
-        "envelope_min_raw_area_km2", "pyflextrkr_tb_core_k",
-        "pyflextrkr_tb_cold_k", "pyflextrkr_tb_warm_k",
-        "pyflextrkr_tb_cloud_k", "pyflextrkr_tb_smoothing_cells",
-        "pyflextrkr_min_cold_core_pixels", "pyflextrkr_warm_anvil_expansion",
-        "track_manifest_sha256", "pyflextrkr_nmaxlinks",
-        "feng_mcs_cold_shield_min_area_km2", "feng_mcs_pf_min_rain_mm_h",
-        "feng_mcs_pf_min_major_axis_km", "feng_mcs_pf_area_intercept_km2",
-        "feng_mcs_pf_area_slope_km2_per_h",
-        "feng_mcs_pf_mean_rain_intercept_mm_h",
-        "feng_mcs_pf_mean_rain_slope_mm_h_per_h",
-        "feng_mcs_pf_skew_intercept", "feng_mcs_pf_skew_slope_per_h",
-        "feng_mcs_criteria_percentile",
-    )
-    payload = {key: metadata.get(key) for key in keys}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def metadata_path(work_path):
-    return os.path.join(work_path, PYFLEXTRKR_METADATA_FILENAME)
-
-
-def track_manifest_path(work_path):
-    return os.path.join(work_path, PYFLEXTRKR_TRACK_MANIFEST_FILENAME)
-
-
-def read_track_manifest(work_path):
-    path = track_manifest_path(work_path)
-    return pd.read_csv(path) if os.path.exists(path) else None
-
-
-def manifest_accepted_mask(manifest):
-    values = manifest["accepted"]
-    if values.dtype.kind == "b":
-        return values.astype(bool)
-    normalized = values.astype(str).str.strip().str.lower()
-    invalid = ~normalized.isin({"true", "false", "1", "0"})
-    if invalid.any():
-        raise ValueError("organised-track manifest contains invalid accepted values")
-    return normalized.isin({"true", "1"})
-
-
-def table_boolean_mask(table, column):
-    """Read a CSV-safe boolean column without treating strings as truthy."""
-    if column not in table:
-        raise KeyError(f"table is missing required boolean column {column!r}")
-    values = table[column]
-    if values.dtype.kind == "b":
-        return values.astype(bool)
-    normalized = values.astype(str).str.strip().str.lower()
-    invalid = ~normalized.isin({"true", "false", "1", "0"})
-    if invalid.any():
-        raise ValueError(f"table contains invalid {column!r} boolean values")
-    return normalized.isin({"true", "1"})
-
-
-def manifest_population_mask(manifest, population):
-    """Return membership in one of the two retained PyFLEXTRKR populations."""
-    if population not in TRACK_POPULATIONS:
-        raise ValueError(
-            f"unknown track population {population!r}; expected {TRACK_POPULATIONS}"
-        )
-    if population == "feng_mcs" and "feng_mcs" not in manifest:
-        return manifest_accepted_mask(manifest)
-    return table_boolean_mask(manifest, population)
-
-
-def read_product_metadata(work_path):
-    path = metadata_path(work_path)
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def write_product_metadata(work_path, metadata):
-    os.makedirs(work_path, exist_ok=True)
-    payload = dict(metadata)
-    payload["product_fingerprint"] = product_fingerprint(payload)
-    path = metadata_path(work_path)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.replace(tmp_path, path)
-    return payload

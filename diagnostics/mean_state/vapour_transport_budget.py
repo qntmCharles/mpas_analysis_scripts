@@ -18,8 +18,8 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import shutil
 import sys
-import tempfile
 import warnings
 from pathlib import Path
 
@@ -61,7 +61,7 @@ LV = 2.5e6
 SECONDS_PER_DAY = 86_400.0
 EARTH_RADIUS_M = 6_371_000.0
 FIXED_TOP_PA = 20_000.0
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 MAX_TROPOPAUSE_SURFACE_JUMP_M = 2_000.0
 PLOT_LATITUDE_BOUNDS = (-40.0, 40.0)
 TEST_LATITUDE_BOUNDS = (-42.0, 42.0)
@@ -111,10 +111,10 @@ STATE_CHUNKS = {
     "latitude": 120,
     "longitude": 240,
 }
-DASK_NUM_WORKERS = 2
-LATITUDE_BATCH_SIZE = 30
+DASK_NUM_WORKERS = 1
+LATITUDE_BATCH_SIZE = 20
 LATITUDE_HALO_POINTS = 2
-TIME_BATCH_SIZE = 48
+TIME_BATCH_SIZE = 24
 TIME_HALO_POINTS = 2
 
 
@@ -1438,6 +1438,11 @@ def _latitude_batches(ds, batch_size=LATITUDE_BATCH_SIZE):
         )
         core_latitude = ds.latitude.isel(latitude=slice(start, stop))
         subset = ds.isel(latitude=slice(halo_start, halo_stop))
+        # Slicing across the archive's 120-row chunks can leave a two-row
+        # fragment. Dask's second-order latitude derivative requires every
+        # chunk to contain at least three rows. Each bounded slab is small, so
+        # making latitude a single chunk is both safe and deterministic.
+        subset = subset.chunk({"latitude": -1})
         yield start, stop, core_latitude, subset
 
 
@@ -1601,15 +1606,48 @@ def build_simulation_caches_on_disk(
     number_of_batches = (
         ds.sizes["latitude"] + latitude_batch_size - 1
     ) // latitude_batch_size
-    with tempfile.TemporaryDirectory(
-        prefix=f".{safe_simulation}_vapour_parts_",
-        dir=working_root,
-    ) as temporary_dir:
+    temporary_dir = os.path.join(
+        working_root,
+        f".{safe_simulation}_vapour_parts_schema{SCHEMA_VERSION}",
+    )
+    os.makedirs(temporary_dir, exist_ok=True)
+    completed = False
+    try:
         for number, (
             _start, _stop, core_latitude, subset,
         ) in enumerate(
             _latitude_batches(ds, batch_size=latitude_batch_size), start=1
         ):
+            product_part = os.path.join(
+                temporary_dir, f"products_{number:03d}.nc"
+            )
+            state_part = os.path.join(
+                temporary_dir, f"state_{number:03d}.nc"
+            )
+            product_ready = (
+                need_products
+                and cache_is_current(
+                    product_part, simulation, "mean_products"
+                )
+            )
+            state_ready = (
+                need_state
+                and cache_is_current(
+                    state_part, simulation, "native_mean_state"
+                )
+            )
+            if (not need_products or product_ready) and (
+                not need_state or state_ready
+            ):
+                progress(
+                    f"{simulation}: reusing completed latitude batch "
+                    f"{number}/{number_of_batches}"
+                )
+                if need_products:
+                    product_parts.append(product_part)
+                if need_state:
+                    state_parts.append(state_part)
+                continue
             progress(
                 f"{simulation}: latitude batch {number}/{number_of_batches} "
                 f"({float(core_latitude.min()):.2f} to "
@@ -1619,20 +1657,20 @@ def build_simulation_caches_on_disk(
                 subset, simulation, time_batch_size=time_batch_size
             )
             if need_products:
-                product_part = os.path.join(
-                    temporary_dir, f"products_{number:03d}.nc"
-                )
-                netcdf_safe_dataset(
-                    products.sel(latitude=core_latitude)
-                ).to_netcdf(product_part)
+                if not product_ready:
+                    write_dataset_cache(
+                        products.sel(latitude=core_latitude),
+                        product_part,
+                        f"latitude-batch {number} product",
+                    )
                 product_parts.append(product_part)
             if need_state:
-                state_part = os.path.join(
-                    temporary_dir, f"state_{number:03d}.nc"
-                )
-                netcdf_safe_dataset(
-                    state.sel(latitude=core_latitude)
-                ).to_netcdf(state_part)
+                if not state_ready:
+                    write_dataset_cache(
+                        state.sel(latitude=core_latitude),
+                        state_part,
+                        f"latitude-batch {number} state",
+                    )
                 state_parts.append(state_part)
             del products, state, subset
             gc.collect()
@@ -1688,7 +1726,11 @@ def build_simulation_caches_on_disk(
             finally:
                 for dataset in opened_states:
                     dataset.close()
-    return result_products
+        completed = True
+        return result_products
+    finally:
+        if completed:
+            shutil.rmtree(temporary_dir)
 
 
 def prepare_simulation(data_loc, simulation, force=False, test=False,

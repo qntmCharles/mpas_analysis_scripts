@@ -44,7 +44,7 @@ DEFAULT_SCRIPT_ORDER = [
     "mean_state/matched_pattern_response.py",
     "mean_state/jet_variability_diagnostics.py",
     "convection/refined_high_cloud_classification_diagnostics.py",
-    "convection/convective_organisation_diagnostics.py",
+    "convection/lpt_precipitation_envelope_diagnostics.py",
     "waves/equatorial_wave_diagnostics.py",
     "convection/convective_pathway_diagnostics.py",
     "convection/convective_lifecycle_composite_diagnostics.py",
@@ -53,7 +53,7 @@ DEFAULT_SCRIPT_ORDER = [
 
 QC_CAPABLE_SCRIPTS = {
     "convection/refined_high_cloud_classification_diagnostics.py",
-    "convection/convective_organisation_diagnostics.py",
+    "convection/lpt_precipitation_envelope_diagnostics.py",
 }
 
 def parse_args() -> argparse.Namespace:
@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Request validation figures from selected diagnostics that support "
             "--qc (currently refined high-cloud classification and convective "
-            "organisation)."
+            "LPT precipitation-envelope tracking)."
         ),
     )
     parser.add_argument(
