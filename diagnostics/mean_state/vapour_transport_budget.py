@@ -33,7 +33,10 @@ import dask
 import numpy as np
 import pandas as pd
 import xarray as xr
+from matplotlib import colors as mpl_colors
 from matplotlib import pyplot as plt
+from matplotlib import ticker as mpl_ticker
+from tropopause import tropopause_profile
 
 from diagnostics.diagnostic_helpers import (
     ANALYSIS_END,
@@ -43,12 +46,16 @@ from diagnostics.diagnostic_helpers import (
     diagnostic_cache_dir,
     diagnostic_output_dir,
     finite_or_nan,
+    hemispheric_fold,
     lat_mean,
     load_latlon_dataset,
+    native_layer_interfaces,
+    native_midlevel_height,
     netcdf_safe_dataset,
     progress,
     spherical_flux_divergence,
     spherical_horizontal_advection,
+    simulation_colour,
     standardize_latlon_dataset,
     total_precip_accum,
 )
@@ -62,6 +69,7 @@ SECONDS_PER_DAY = 86_400.0
 EARTH_RADIUS_M = 6_371_000.0
 FIXED_TOP_PA = 20_000.0
 SCHEMA_VERSION = 15
+EXECUTION_LAYOUT_VERSION = 2
 MAX_TROPOPAUSE_SURFACE_JUMP_M = 2_000.0
 PLOT_LATITUDE_BOUNDS = (-40.0, 40.0)
 TEST_LATITUDE_BOUNDS = (-42.0, 42.0)
@@ -82,13 +90,13 @@ COMPONENT_NAMES = (
 ROOT_DIR = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on"
 DATA_LOCS = ("control_new", "u_nudge", "T_nudge")
 SIM_NAMES = ("control", "nudged u", "nudged T")
-SIM_COLORS = ("k", "b", "r")
-COMPARISON_COLORS = ("b", "r")
+SIM_COLORS = tuple(simulation_colour(name) for name in SIM_NAMES)
+COMPARISON_COLORS = SIM_COLORS[1:]
 SAVE_LOC = diagnostic_output_dir(
     "/home/cwp29/tmp/mpas/crf_on/final/vapour_transport_budget/"
 )
-CACHE_ROOT = diagnostic_cache_dir("vapour_transport_budget_cache", root_dir=ROOT_DIR)
-DATA_LOC = diagnostic_cache_dir("vapour_transport_budget_data", root_dir=ROOT_DIR)
+CACHE_ROOT = diagnostic_cache_dir("vapour_transport_budget_cache")
+DATA_LOC = diagnostic_cache_dir("vapour_transport_budget_data")
 
 NEEDED_VARS = (
     "theta", "pressure", "zgrid", "rho", "qv", "w",
@@ -112,7 +120,7 @@ STATE_CHUNKS = {
     "longitude": 240,
 }
 DASK_NUM_WORKERS = 1
-LATITUDE_BATCH_SIZE = 20
+LATITUDE_BATCH_SIZE = 120
 LATITUDE_HALO_POINTS = 2
 TIME_BATCH_SIZE = 24
 TIME_HALO_POINTS = 2
@@ -222,59 +230,181 @@ def _cold_point_block(temperature, pressure, height):
     )
 
 
-def native_midlevel_height(ds, template):
-    lower, upper = native_layer_interfaces(ds, template)
-    return 0.5 * (lower + upper)
+def _wmo_tropopause_pressure_profile(temperature, pressure, height):
+    """Return the WMO tropopause using the shared mean-state diagnostic."""
+    temperature = np.asarray(temperature, dtype=float)
+    pressure = np.asarray(pressure, dtype=float)
+    height = np.asarray(height, dtype=float)
+    valid = (
+        np.isfinite(temperature)
+        & np.isfinite(pressure)
+        & np.isfinite(height)
+    )
+    if valid.sum() < 4:
+        return np.nan
+    temperature = temperature[valid]
+    pressure = pressure[valid]
+    height = height[valid]
+    order = np.argsort(height)
+    temperature = temperature[order]
+    pressure = pressure[order]
+    height = height[order]
+    if np.any(np.diff(height) <= 0.0):
+        return np.nan
+    _temperature, tropopause_pressure, _height, _flag = tropopause_profile(
+        temperature, pressure, height
+    )
+    return tropopause_pressure
 
 
-def native_layer_interfaces(ds, template):
-    """Return geometrically ordered native-layer interfaces.
+def wmo_tropopause_pressure_from_mean_profile(product):
+    """Match the hemispherically folded WMO diagnostic in mean_state."""
+    temperature = hemispheric_fold(
+        product.native_temperature_zonal_mean, parity="even"
+    )
+    pressure_profile = hemispheric_fold(
+        product.native_pressure_zonal_mean, parity="even"
+    )
+    height = hemispheric_fold(
+        product.native_midlevel_height_zonal_mean, parity="even"
+    )
+    pressure = xr.apply_ufunc(
+        _wmo_tropopause_pressure_profile,
+        temperature,
+        pressure_profile,
+        height,
+        input_core_dims=[
+            ["nVertLevels"], ["nVertLevels"], ["nVertLevels"]
+        ],
+        output_core_dims=[[]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[float],
+    )
+    pressure.name = "wmo_tropopause_pressure"
+    pressure.attrs.update(
+        units="Pa",
+        diagnostic=(
+            "WMO lapse-rate tropopause diagnosed with the shared "
+            "tropopause_profile routine from hemispherically folded, "
+            "time-mean, zonal-mean native-level profiles"
+        ),
+    )
+    return pressure
 
-    MPAS stores vapour as a dry-air mixing ratio and ``rho`` as dry-air
-    density at cell centres.  The corresponding native layer water mass is
-    therefore ``rho * qv * dz``; no dry-to-moist mixing-ratio conversion is
-    required for this height-coordinate integral.
-    """
-    level_coord = template["nVertLevels"]
-    first = ds.zgrid.isel(nVertLevelsP1=slice(0, -1)).rename(
-        {"nVertLevelsP1": "nVertLevels"}
-    ).assign_coords(nVertLevels=level_coord)
-    second = ds.zgrid.isel(nVertLevelsP1=slice(1, None)).rename(
-        {"nVertLevelsP1": "nVertLevels"}
-    ).assign_coords(nVertLevels=level_coord)
-    lower = xr.where(first <= second, first, second)
-    upper = xr.where(first <= second, second, first)
-    return lower, upper
 
-
-def _interpolate_native_block(field, coordinate, target):
-    """NumPy kernel for native-profile interpolation with the level axis last."""
-    field = np.asarray(field, dtype=float)
+def _native_interpolation_weights_block(coordinate, target):
+    """Find one native-level bracket and fraction for every target column."""
     coordinate = np.asarray(coordinate, dtype=float)
     target = np.asarray(target, dtype=float)
-    nlevel = field.shape[-1]
+    nlevel = coordinate.shape[-1]
+    if nlevel < 2:
+        raise ValueError("native interpolation requires at least two levels")
     shape = np.broadcast_shapes(
-        field.shape[:-1], coordinate.shape[:-1], target.shape
+        coordinate.shape[:-1], target.shape
     )
-    field = np.broadcast_to(field, shape + (nlevel,))
     coordinate = np.broadcast_to(coordinate, shape + (nlevel,))
     target = np.broadcast_to(target, shape)
-    result = np.full(shape, np.nan, dtype=float)
-    for index in range(nlevel - 1):
-        x0 = coordinate[..., index]
-        x1 = coordinate[..., index + 1]
-        f0 = field[..., index]
-        f1 = field[..., index + 1]
-        lower = np.minimum(x0, x1)
-        upper = np.maximum(x0, x1)
-        valid = (
-            np.isfinite(target) & np.isfinite(x0) & np.isfinite(x1)
-            & np.isfinite(f0) & np.isfinite(f1)
-            & (target >= lower) & (target <= upper) & (x1 != x0)
-        )
-        with np.errstate(divide="ignore", invalid="ignore"):
-            value = f0 + (target - x0) * (f1 - f0) / (x1 - x0)
-        result = np.where(valid, value, result)
+
+    x0 = coordinate[..., :-1]
+    x1 = coordinate[..., 1:]
+    lower = np.minimum(x0, x1)
+    upper = np.maximum(x0, x1)
+    within = (
+        np.isfinite(target)[..., None]
+        & np.isfinite(x0) & np.isfinite(x1)
+        & (target[..., None] >= lower)
+        & (target[..., None] <= upper)
+        & (x1 != x0)
+    )
+    valid = np.any(within, axis=-1)
+    lower_index = np.argmax(within, axis=-1).astype(np.int16)
+    safe_index = np.where(valid, lower_index, 0)
+    selected_x0 = np.take_along_axis(
+        x0, safe_index[..., None], axis=-1
+    )[..., 0]
+    selected_x1 = np.take_along_axis(
+        x1, safe_index[..., None], axis=-1
+    )[..., 0]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fraction = (target - selected_x0) / (selected_x1 - selected_x0)
+    return (
+        np.where(valid, lower_index, -1).astype(np.int16),
+        np.where(valid, fraction, np.nan),
+    )
+
+
+def _apply_native_interpolation_block(field, lower_index, fraction):
+    """Apply precomputed native interpolation weights to one field."""
+    field = np.asarray(field, dtype=float)
+    lower_index = np.asarray(lower_index)
+    fraction = np.asarray(fraction, dtype=float)
+    nlevel = field.shape[-1]
+    shape = np.broadcast_shapes(
+        field.shape[:-1], lower_index.shape, fraction.shape
+    )
+    field = np.broadcast_to(field, shape + (nlevel,))
+    lower_index = np.broadcast_to(lower_index, shape)
+    fraction = np.broadcast_to(fraction, shape)
+    safe_index = np.clip(lower_index, 0, nlevel - 2)
+    f0 = np.take_along_axis(
+        field, safe_index[..., None], axis=-1
+    )[..., 0]
+    f1 = np.take_along_axis(
+        field, (safe_index + 1)[..., None], axis=-1
+    )[..., 0]
+    result = f0 + fraction * (f1 - f0)
+    return np.where(
+        (lower_index >= 0) & np.isfinite(fraction)
+        & np.isfinite(f0) & np.isfinite(f1),
+        result,
+        np.nan,
+    )
+
+
+def native_interpolation_weights(coordinate, target, dim="nVertLevels"):
+    """Return reusable lower-level indices and fractions for a target surface."""
+    if dim not in coordinate.dims:
+        raise ValueError(f"{dim!r} must be present in coordinate")
+    target = (
+        target
+        if isinstance(target, xr.DataArray)
+        else xr.DataArray(float(target))
+    )
+    lower_index, fraction = xr.apply_ufunc(
+        _native_interpolation_weights_block,
+        coordinate,
+        target,
+        input_core_dims=[[dim], []],
+        output_core_dims=[[], []],
+        dask="parallelized",
+        vectorize=False,
+        output_dtypes=[np.int16, float],
+        dask_gufunc_kwargs={"allow_rechunk": True},
+    )
+    return lower_index, fraction
+
+
+def interpolate_native_with_weights(
+    field, lower_index, fraction, dim="nVertLevels",
+):
+    """Interpolate a native field using a previously diagnosed bracket."""
+    if dim not in field.dims:
+        raise ValueError(f"{dim!r} must be present in field")
+    result = xr.apply_ufunc(
+        _apply_native_interpolation_block,
+        field,
+        lower_index,
+        fraction,
+        input_core_dims=[[dim], [], []],
+        output_core_dims=[[]],
+        dask="parallelized",
+        vectorize=False,
+        output_dtypes=[float],
+        dask_gufunc_kwargs={"allow_rechunk": True},
+    )
+    result.name = getattr(field, "name", None)
+    result.attrs.update(getattr(field, "attrs", {}))
     return result
 
 
@@ -285,22 +415,12 @@ def interpolate_native_profile(field, coordinate, target, dim="nVertLevels"):
     if field.sizes[dim] != coordinate.sizes[dim]:
         raise ValueError("field and coordinate must have the same vertical size")
 
-    target = target if isinstance(target, xr.DataArray) else xr.DataArray(float(target))
-    result = xr.apply_ufunc(
-        _interpolate_native_block,
-        field,
-        coordinate,
-        target,
-        input_core_dims=[[dim], [dim], []],
-        output_core_dims=[[]],
-        dask="parallelized",
-        vectorize=False,
-        output_dtypes=[float],
-        dask_gufunc_kwargs={"allow_rechunk": True},
+    lower_index, fraction = native_interpolation_weights(
+        coordinate, target, dim=dim
     )
-    result.name = getattr(field, "name", None)
-    result.attrs.update(getattr(field, "attrs", {}))
-    return result
+    return interpolate_native_with_weights(
+        field, lower_index, fraction, dim=dim
+    )
 
 
 def native_height_at_pressure(ds, target_pressure_pa):
@@ -328,15 +448,22 @@ def native_bounded_height_integral(field, ds, top_height,
     """
     if dim not in field.dims:
         raise ValueError(f"{dim!r} is not a dimension of {field.dims!r}")
+    overlap = native_layer_overlap(field, ds, top_height, dim=dim)
+    contribution = (field * overlap).where(overlap > 0.0, 0.0)
+    result = contribution.sum(dim, skipna=False).where(np.isfinite(top_height))
+    result.name = getattr(field, "name", None)
+    return result
+
+
+def native_layer_overlap(field, ds, top_height, dim="nVertLevels"):
+    """Return native-layer geometric thickness below a varying top surface."""
+    if dim not in field.dims:
+        raise ValueError(f"{dim!r} is not a dimension of {field.dims!r}")
     lower, upper = native_layer_interfaces(ds, field)
     thickness = upper - lower
     clipped_top = xr.where(top_height < upper, top_height, upper)
     overlap = (clipped_top - lower).clip(min=0.0)
-    overlap = xr.where(overlap < thickness, overlap, thickness)
-    contribution = xr.where(overlap > 0.0, field * overlap, 0.0)
-    result = contribution.sum(dim, skipna=False).where(np.isfinite(top_height))
-    result.name = getattr(field, "name", None)
-    return result
+    return xr.where(overlap < thickness, overlap, thickness)
 
 
 def diagnose_tropopauses(ds):
@@ -472,32 +599,62 @@ def moving_surface_continuity(height, time_step=1):
     )
 
 
-def instantaneous_budget(ds, tropopauses):
-    native_mixing_ratio = finite_or_nan(ds.qv)
-    native_u = finite_or_nan(ds.uReconstructZonal)
-    native_v = finite_or_nan(ds.uReconstructMeridional)
-    vapour_density = finite_or_nan(ds.rho) * native_mixing_ratio
+def _core_latitude_subset(obj, core_latitude):
+    if core_latitude is None:
+        return obj
+    return obj.sel(latitude=core_latitude)
 
-    top_pressure, top_height, top_temperature = boundary_arrays(ds, tropopauses)
 
-    column = native_bounded_height_integral(vapour_density, ds, top_height)
-    ivt_u = native_bounded_height_integral(
-        vapour_density * native_u, ds, top_height
+def instantaneous_budget(ds, tropopauses, core_latitude=None):
+    """Construct instantaneous terms, loading native halos only when required."""
+    top_pressure_halo, top_height_halo, top_temperature_halo = boundary_arrays(
+        ds, tropopauses
     )
-    ivt_v = native_bounded_height_integral(
-        vapour_density * native_v, ds, top_height
+    core_ds = _core_latitude_subset(ds, core_latitude)
+    top_pressure = _core_latitude_subset(top_pressure_halo, core_latitude)
+    top_height = _core_latitude_subset(top_height_halo, core_latitude)
+    top_temperature = _core_latitude_subset(
+        top_temperature_halo, core_latitude
     )
 
-    native_height = native_midlevel_height(ds, native_mixing_ratio)
-    vapour_density_top = interpolate_native_profile(
-        vapour_density, native_height, top_height
+    native_mixing_ratio = finite_or_nan(core_ds.qv)
+    native_u = finite_or_nan(core_ds.uReconstructZonal)
+    native_v = finite_or_nan(core_ds.uReconstructMeridional)
+    vapour_density = finite_or_nan(core_ds.rho) * native_mixing_ratio
+
+    native_height = native_midlevel_height(core_ds, native_mixing_ratio)
+    layer_overlap = native_layer_overlap(
+        vapour_density, core_ds, top_height
     )
-    native_u_top = interpolate_native_profile(native_u, native_height, top_height)
-    native_v_top = interpolate_native_profile(native_v, native_height, top_height)
-    native_w_top = interpolate_native_profile(
-        finite_or_nan(ds.w),
-        finite_or_nan(ds.zgrid),
-        top_height,
+    column = (vapour_density * layer_overlap).sum(
+        "nVertLevels", skipna=False
+    ).where(np.isfinite(top_height))
+    ivt_u = (vapour_density * native_u * layer_overlap).sum(
+        "nVertLevels", skipna=False
+    ).where(np.isfinite(top_height))
+    ivt_v = (vapour_density * native_v * layer_overlap).sum(
+        "nVertLevels", skipna=False
+    ).where(np.isfinite(top_height))
+
+    native_lower_index, native_fraction = native_interpolation_weights(
+        native_height, top_height
+    )
+    vapour_density_top = interpolate_native_with_weights(
+        vapour_density, native_lower_index, native_fraction
+    )
+    native_u_top = interpolate_native_with_weights(
+        native_u, native_lower_index, native_fraction
+    )
+    native_v_top = interpolate_native_with_weights(
+        native_v, native_lower_index, native_fraction
+    )
+    w_lower_index, w_fraction = native_interpolation_weights(
+        finite_or_nan(core_ds.zgrid), top_height, dim="nVertLevelsP1"
+    )
+    native_w_top = interpolate_native_with_weights(
+        finite_or_nan(core_ds.w),
+        w_lower_index,
+        w_fraction,
         dim="nVertLevelsP1",
     )
 
@@ -506,18 +663,28 @@ def instantaneous_budget(ds, tropopauses):
     height_horizontal_motion = []
     continuity_masks = []
     continuity_masks_24h = []
+    derivative_height = top_height_halo
+    if derivative_height.chunks is not None:
+        derivative_height = derivative_height.chunk({"latitude": -1})
     for boundary in BOUNDARIES:
-        height = top_height.sel(boundary=boundary, drop=True)
+        height_halo = derivative_height.sel(boundary=boundary, drop=True)
+        height = _core_latitude_subset(height_halo, core_latitude)
         local = time_tendency(height, step=1)
         local24 = time_tendency(height, step=2)
         horizontal = spherical_horizontal_advection(
-            height,
+            height_halo,
             native_u_top.sel(boundary=boundary, drop=True),
             native_v_top.sel(boundary=boundary, drop=True),
         )
         if boundary in MOVING_BOUNDARIES:
-            continuity = moving_surface_continuity(height, time_step=1)
-            continuity24 = moving_surface_continuity(height, time_step=2)
+            continuity = _core_latitude_subset(
+                moving_surface_continuity(height_halo, time_step=1),
+                core_latitude,
+            )
+            continuity24 = _core_latitude_subset(
+                moving_surface_continuity(height_halo, time_step=2),
+                core_latitude,
+            )
         else:
             # The fixed-pressure surface has no branch ambiguity.  Its common
             # validity is set only by the centred time-difference support.
@@ -564,7 +731,9 @@ def instantaneous_budget(ds, tropopauses):
         + (vapour_density_top * height_horizontal_motion).where(continuity24)
     )
 
-    lower_interface, upper_interface = native_layer_interfaces(ds, vapour_density)
+    lower_interface, upper_interface = native_layer_interfaces(
+        core_ds, vapour_density
+    )
     full_column = (
         vapour_density * (upper_interface - lower_interface)
     ).sum("nVertLevels", skipna=False)
@@ -612,19 +781,26 @@ def derive_products(ds, simulation):
         - accumulated_precipitation.isel(Time=0)
     ) / elapsed_seconds
 
-    layer_coord = ds.qv.nVertLevels
-    lower_interface = ds.zgrid.isel(nVertLevelsP1=slice(0, -1)).rename(
+    condensate_endpoints = ds.isel(Time=[0, -1])
+    layer_coord = condensate_endpoints.qv.nVertLevels
+    lower_interface = condensate_endpoints.zgrid.isel(
+        nVertLevelsP1=slice(0, -1)
+    ).rename(
         {"nVertLevelsP1": "nVertLevels"}
     ).assign_coords(nVertLevels=layer_coord)
-    upper_interface = ds.zgrid.isel(nVertLevelsP1=slice(1, None)).rename(
+    upper_interface = condensate_endpoints.zgrid.isel(
+        nVertLevelsP1=slice(1, None)
+    ).rename(
         {"nVertLevelsP1": "nVertLevels"}
     ).assign_coords(nVertLevels=layer_coord)
     layer_thickness = np.abs(upper_interface - lower_interface)
     condensate_mixing_ratio = sum(
-        finite_or_nan(ds[name]) for name in ("qc", "qr", "qi", "qs", "qg")
+        finite_or_nan(condensate_endpoints[name])
+        for name in ("qc", "qr", "qi", "qs", "qg")
     )
     condensate_column = (
-        finite_or_nan(ds.rho) * condensate_mixing_ratio * layer_thickness
+        finite_or_nan(condensate_endpoints.rho)
+        * condensate_mixing_ratio * layer_thickness
     ).sum("nVertLevels", skipna=True)
     condensate_storage = (
         condensate_column.isel(Time=-1) - condensate_column.isel(Time=0)
@@ -677,11 +853,11 @@ def derive_products(ds, simulation):
         native_temperature
     ).mean("longitude", skipna=True)
     native_specific_humidity_zonal = trapezoidal_time_mean(
-        native_specific_humidity
-    ).mean("longitude", skipna=True)
+        native_specific_humidity.mean("longitude", skipna=True)
+    )
     native_relative_humidity_zonal = trapezoidal_time_mean(
-        native_relative_humidity
-    ).mean("longitude", skipna=True)
+        native_relative_humidity.mean("longitude", skipna=True)
+    )
     native_pressure_zonal = trapezoidal_time_mean(
         finite_or_nan(ds.pressure)
     ).mean("longitude", skipna=True)
@@ -753,9 +929,6 @@ def derive_products(ds, simulation):
                     "precipw_integration_bias": native_precipw_bias,
                     "relative_precipw_error": relative_precipw_error,
                     "budget_closure_fraction": budget_closure_fraction,
-                    "condensate_column_mean": trapezoidal_time_mean(
-                        condensate_column
-                    ),
                     "fixed_mean_flow_ivt_u": mean_flow_u,
                     "fixed_mean_flow_ivt_v": mean_flow_v,
                     "fixed_transient_ivt_u": transient_u,
@@ -783,7 +956,6 @@ def derive_products(ds, simulation):
     for name in (
         "column_vapour_mean", "full_column_vapour_mean",
         "archived_precipw_mean", "precipw_integration_bias",
-        "condensate_column_mean",
     ):
         products[name].attrs["units"] = "kg m-2"
     for name in (
@@ -886,11 +1058,14 @@ def write_dataset_cache(dataset, path, description):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temporary = path + ".tmp"
     progress(f"writing {description} cache {path}")
-    netcdf_safe_dataset(dataset).to_netcdf(temporary)
+    pending_write = netcdf_safe_dataset(dataset).to_netcdf(
+        temporary, compute=False
+    )
+    bounded_compute(pending_write)
     os.replace(temporary, path)
 
 
-def write_final_data_products(attribution, products, alpha, data_loc=DATA_LOC):
+def write_final_data_products(attribution, products, data_loc=DATA_LOC):
     """Write retained data products beside the simulations, not the figures."""
     os.makedirs(data_loc, exist_ok=True)
     attribution_path = os.path.join(
@@ -902,7 +1077,7 @@ def write_final_data_products(attribution, products, alpha, data_loc=DATA_LOC):
     write_dataset_cache(
         attribution, attribution_path, "vapour-transport attribution"
     )
-    summary_table(products, attribution, alpha).to_csv(
+    summary_table(products, attribution).to_csv(
         summary_path, index=False
     )
     progress(f"writing vapour-budget summary {summary_path}")
@@ -1013,10 +1188,14 @@ def _add_weighted_statistic(statistics, name, field, weights):
 
 def _time_batch_statistics(
     subset, global_weights, core_start, core_stop, halo_start,
+    core_latitude=None,
 ):
     """Sufficient statistics for exact reconstruction of all time means."""
     tropopauses = diagnose_tropopauses(subset)
-    instantaneous = instantaneous_budget(subset, tropopauses)
+    instantaneous = instantaneous_budget(
+        subset, tropopauses, core_latitude=core_latitude
+    )
+    analysis_subset = _core_latitude_subset(subset, core_latitude)
 
     local_start = core_start - halo_start
     local_stop = local_start + (core_stop - core_start)
@@ -1029,37 +1208,19 @@ def _time_batch_statistics(
         0.0,
     )
 
-    layer_coord = subset.qv.nVertLevels
-    lower_interface = subset.zgrid.isel(
-        nVertLevelsP1=slice(0, -1)
-    ).rename({"nVertLevelsP1": "nVertLevels"}).assign_coords(
-        nVertLevels=layer_coord
+    mixing_ratio = finite_or_nan(analysis_subset.qv)
+    density = finite_or_nan(analysis_subset.rho)
+    zonal_wind = finite_or_nan(analysis_subset.uReconstructZonal)
+    meridional_wind = finite_or_nan(
+        analysis_subset.uReconstructMeridional
     )
-    upper_interface = subset.zgrid.isel(
-        nVertLevelsP1=slice(1, None)
-    ).rename({"nVertLevelsP1": "nVertLevels"}).assign_coords(
-        nVertLevels=layer_coord
-    )
-    layer_thickness = np.abs(upper_interface - lower_interface)
-    condensate_mixing_ratio = sum(
-        finite_or_nan(subset[name]) for name in ("qc", "qr", "qi", "qs", "qg")
-    )
-    condensate_column = (
-        finite_or_nan(subset.rho)
-        * condensate_mixing_ratio
-        * layer_thickness
-    ).sum("nVertLevels", skipna=True)
-
-    mixing_ratio = finite_or_nan(subset.qv)
-    density = finite_or_nan(subset.rho)
-    zonal_wind = finite_or_nan(subset.uReconstructZonal)
-    meridional_wind = finite_or_nan(subset.uReconstructMeridional)
     temperature = finite_or_nan(
-        subset.theta * (subset.pressure / P0_PA) ** (RD / CP)
+        analysis_subset.theta
+        * (analysis_subset.pressure / P0_PA) ** (RD / CP)
     )
     specific_humidity = mixing_ratio_to_specific_humidity(mixing_ratio)
     relative_humidity = specific_humidity / saturation_specific_humidity(
-        temperature, finite_or_nan(subset.pressure)
+        temperature, finite_or_nan(analysis_subset.pressure)
     )
 
     statistics = xr.Dataset()
@@ -1082,26 +1243,31 @@ def _time_batch_statistics(
             instantaneous.top_horizontal_motion_component
         ),
         "full_column_vapour": instantaneous.full_column_vapour,
-        "evaporation": finite_or_nan(subset.lh) / LV,
-        "archived_precipw": finite_or_nan(subset.precipw),
-        "condensate_column": condensate_column,
+        "evaporation": finite_or_nan(analysis_subset.lh) / LV,
+        "archived_precipw": finite_or_nan(analysis_subset.precipw),
         "mixing_ratio": mixing_ratio,
         "density": density,
-        "pressure": finite_or_nan(subset.pressure),
+        "pressure": finite_or_nan(analysis_subset.pressure),
         "temperature": temperature,
         "zonal_wind": zonal_wind,
         "meridional_wind": meridional_wind,
         "vapour_density": density * mixing_ratio,
         "zonal_vapour_flux": density * mixing_ratio * zonal_wind,
         "meridional_vapour_flux": density * mixing_ratio * meridional_wind,
-        "specific_humidity": specific_humidity,
-        "relative_humidity": relative_humidity,
+        "specific_humidity_zonal": specific_humidity.mean(
+            "longitude", skipna=True
+        ),
+        "relative_humidity_zonal": relative_humidity.mean(
+            "longitude", skipna=True
+        ),
     }
     for name, field in sources.items():
         _add_weighted_statistic(statistics, name, field, weights)
 
     statistics["cold_point_valid_count"] = np.isfinite(
-        tropopauses.cold_point_pressure.isel(Time=core_slice)
+        _core_latitude_subset(
+            tropopauses.cold_point_pressure, core_latitude
+        ).isel(Time=core_slice)
     ).sum("Time")
     statistics["top_flux_valid_count"] = (
         instantaneous.top_flux_surface_valid.isel(Time=core_slice)
@@ -1112,12 +1278,31 @@ def _time_batch_statistics(
     return statistics
 
 
-def _endpoint_statistics(ds):
+def _accumulate_statistics_in_place(total, increment):
+    """Add one computed time block without allocating a third full dataset."""
+    if set(total.data_vars) != set(increment.data_vars):
+        raise ValueError("time-batch statistic variables do not match")
+    for name in total.data_vars:
+        left = total[name]
+        right = increment[name]
+        if left.dims != right.dims or left.shape != right.shape:
+            raise ValueError(
+                f"time-batch statistic {name!r} has inconsistent geometry"
+            )
+        np.add(left.data, right.data, out=left.data)
+    return total
+
+
+def _endpoint_statistics(ds, core_latitude=None):
     """Only the exact first/last fields required by interval tendencies."""
     endpoints = ds.isel(Time=[0, -1])
     tropopauses = diagnose_tropopauses(endpoints)
     _, top_height, _ = boundary_arrays(endpoints, tropopauses)
-    vapour_density = finite_or_nan(endpoints.rho) * finite_or_nan(endpoints.qv)
+    endpoints = _core_latitude_subset(endpoints, core_latitude)
+    top_height = _core_latitude_subset(top_height, core_latitude)
+    vapour_density = (
+        finite_or_nan(endpoints.rho) * finite_or_nan(endpoints.qv)
+    )
     column_vapour = native_bounded_height_integral(
         vapour_density, endpoints, top_height
     )
@@ -1147,7 +1332,7 @@ def _endpoint_statistics(ds):
             "column_vapour_endpoint": column_vapour,
             "condensate_column_endpoint": condensate_column,
             "precipitation_accum_endpoint": total_precip_accum(endpoints),
-            "zgrid": finite_or_nan(ds.zgrid),
+            "zgrid": finite_or_nan(endpoints.zgrid),
         }
     )
 
@@ -1173,7 +1358,6 @@ def _set_product_metadata(products, ds, simulation, elapsed_seconds):
     for name in (
         "column_vapour_mean", "full_column_vapour_mean",
         "archived_precipw_mean", "precipw_integration_bias",
-        "condensate_column_mean",
     ):
         products[name].attrs["units"] = "kg m-2"
     for name in ("relative_precipw_error", "budget_closure_fraction"):
@@ -1262,9 +1446,11 @@ def _products_and_state_from_statistics(
         endpoints.condensate_column_endpoint.isel(Time=-1)
         - endpoints.condensate_column_endpoint.isel(Time=0)
     ) / elapsed_seconds
-    convergence = -spherical_flux_divergence(
-        means["ivt_u"], means["ivt_v"]
-    )
+    # Horizontal convergence is deliberately finalised only after all
+    # archive-aligned latitude cores have been concatenated. Computing it here
+    # would either use one-sided derivatives at every internal tile edge or
+    # require loading all native 3-D fields in the derivative halos.
+    convergence = xr.zeros_like(storage)
     residual = storage - (
         means["evaporation"] - precipitation
         + convergence + means["top_influx"]
@@ -1378,7 +1564,6 @@ def _products_and_state_from_statistics(
                     "precipw_integration_bias": precipw_bias,
                     "relative_precipw_error": relative_precipw_error,
                     "budget_closure_fraction": closure_fraction,
-                    "condensate_column_mean": means["condensate_column"],
                     "fixed_mean_flow_ivt_u": mean_flow_u,
                     "fixed_mean_flow_ivt_v": mean_flow_v,
                     "fixed_transient_ivt_u": (
@@ -1395,14 +1580,10 @@ def _products_and_state_from_statistics(
                         means["temperature"].mean("longitude", skipna=True)
                     ),
                     "native_specific_humidity_zonal_mean": (
-                        means["specific_humidity"].mean(
-                            "longitude", skipna=True
-                        )
+                        means["specific_humidity_zonal"]
                     ),
                     "native_relative_humidity_zonal_mean": (
-                        means["relative_humidity"].mean(
-                            "longitude", skipna=True
-                        )
+                        means["relative_humidity_zonal"]
                     ),
                     "native_pressure_zonal_mean": (
                         means["pressure"].mean("longitude", skipna=True)
@@ -1419,10 +1600,45 @@ def _products_and_state_from_statistics(
         ],
         compat="override",
     )
-    return (
-        _set_product_metadata(products, ds, simulation, elapsed_seconds),
-        state,
+    products = _set_product_metadata(
+        products, ds, simulation, elapsed_seconds
     )
+    products.attrs["horizontal_budget_finalized"] = 0
+    return products, state
+
+
+def _finalize_horizontal_budget(products):
+    """Diagnose convergence and closure once on the complete latitude grid."""
+    if products.chunks is not None:
+        products = products.chunk({"latitude": -1})
+    convergence = -spherical_flux_divergence(
+        products.ivt_u_mean, products.ivt_v_mean
+    ) * SECONDS_PER_DAY
+    residual = products.storage - (
+        products.evaporation - products.precipitation
+        + convergence + products.top_influx
+    )
+    conventional_residual = products.storage - (
+        products.evaporation - products.precipitation + convergence
+    )
+    closure_scale = (
+        np.abs(products.storage) + np.abs(products.evaporation)
+        + np.abs(products.precipitation) + np.abs(convergence)
+        + np.abs(products.top_influx)
+    )
+    products["moisture_convergence"] = convergence
+    products["residual"] = residual
+    products["conventional_residual"] = conventional_residual
+    products["budget_closure_fraction"] = xr.where(
+        closure_scale > 0.0, np.abs(residual) / closure_scale, np.nan
+    )
+    for name in (
+        "moisture_convergence", "residual", "conventional_residual"
+    ):
+        products[name].attrs["units"] = "mm day-1"
+    products.budget_closure_fraction.attrs["units"] = "1"
+    products.attrs["horizontal_budget_finalized"] = 1
+    return products
 
 
 def _latitude_batches(ds, batch_size=LATITUDE_BATCH_SIZE):
@@ -1438,11 +1654,10 @@ def _latitude_batches(ds, batch_size=LATITUDE_BATCH_SIZE):
         )
         core_latitude = ds.latitude.isel(latitude=slice(start, stop))
         subset = ds.isel(latitude=slice(halo_start, halo_stop))
-        # Slicing across the archive's 120-row chunks can leave a two-row
-        # fragment. Dask's second-order latitude derivative requires every
-        # chunk to contain at least three rows. Each bounded slab is small, so
-        # making latitude a single chunk is both safe and deterministic.
-        subset = subset.chunk({"latitude": -1})
+        # Preserve the archive's native 120-row chunks for all 3-D fields.
+        # Only the diagnosed 2-D boundary height is rechunked before taking
+        # latitude derivatives, so halo rows do not force every native field
+        # to read an entire neighbouring storage chunk.
         yield start, stop, core_latitude, subset
 
 
@@ -1472,7 +1687,7 @@ def _combine_product_latitude_batches(batches):
 
 
 def compute_latitude_slab_in_time_batches(
-    ds, simulation, time_batch_size=TIME_BATCH_SIZE,
+    ds, simulation, time_batch_size=TIME_BATCH_SIZE, core_latitude=None,
 ):
     """Compute one spatial slab with a bounded graph for each time block."""
     global_weights = trapezoidal_time_weights(ds.Time)
@@ -1497,17 +1712,20 @@ def compute_latitude_slab_in_time_batches(
             core_start,
             core_stop,
             halo_start,
+            core_latitude=core_latitude,
         )
         computed = bounded_compute(lazy_statistics)[0]
         statistics = (
             computed
             if statistics is None
-            else statistics + computed
+            else _accumulate_statistics_in_place(statistics, computed)
         )
         del lazy_statistics, computed, subset
         gc.collect()
 
-    endpoints = bounded_compute(_endpoint_statistics(ds))[0]
+    endpoints = bounded_compute(
+        _endpoint_statistics(ds, core_latitude=core_latitude)
+    )[0]
     products, state = _products_and_state_from_statistics(
         statistics, endpoints, ds, simulation
     )
@@ -1543,7 +1761,10 @@ def compute_simulation_in_latitude_batches(
         )
         computed_products, computed_state = (
             compute_latitude_slab_in_time_batches(
-                subset, simulation, time_batch_size=time_batch_size
+                subset,
+                simulation,
+                time_batch_size=time_batch_size,
+                core_latitude=core_latitude,
             )
         )
         if need_products:
@@ -1558,7 +1779,9 @@ def compute_simulation_in_latitude_batches(
         gc.collect()
 
     products = (
-        _combine_product_latitude_batches(product_batches)
+        _finalize_horizontal_budget(
+            _combine_product_latitude_batches(product_batches)
+        )
         if need_products else None
     )
     state = (
@@ -1576,14 +1799,14 @@ def compute_simulation_in_latitude_batches(
         products.attrs["memory_strategy"] = (
             f"{batch_size}-point latitude batches with "
             f"{LATITUDE_HALO_POINTS}-point derivative halos; "
-            f"{TIME_BATCH_SIZE}-sample time batches with "
+            f"{time_batch_size}-sample time batches with "
             f"{TIME_HALO_POINTS}-sample tendency halos"
         )
     if state is not None:
         state.attrs["memory_strategy"] = (
             f"{batch_size}-point latitude batches with "
             f"{LATITUDE_HALO_POINTS}-point derivative halos; "
-            f"{TIME_BATCH_SIZE}-sample time batches with "
+            f"{time_batch_size}-sample time batches with "
             f"{TIME_HALO_POINTS}-sample tendency halos"
         )
     return products, state
@@ -1608,7 +1831,11 @@ def build_simulation_caches_on_disk(
     ) // latitude_batch_size
     temporary_dir = os.path.join(
         working_root,
-        f".{safe_simulation}_vapour_parts_schema{SCHEMA_VERSION}",
+        (
+            f".{safe_simulation}_vapour_parts_schema{SCHEMA_VERSION}"
+            f"_layout{EXECUTION_LAYOUT_VERSION}"
+            f"_lat{latitude_batch_size}_time{time_batch_size}"
+        ),
     )
     os.makedirs(temporary_dir, exist_ok=True)
     completed = False
@@ -1654,7 +1881,10 @@ def build_simulation_caches_on_disk(
                 f"{float(core_latitude.max()):.2f} degrees)"
             )
             products, state = compute_latitude_slab_in_time_batches(
-                subset, simulation, time_batch_size=time_batch_size
+                subset,
+                simulation,
+                time_batch_size=time_batch_size,
+                core_latitude=core_latitude,
             )
             if need_products:
                 if not product_ready:
@@ -1684,6 +1914,9 @@ def build_simulation_caches_on_disk(
             try:
                 combined_products = _combine_product_latitude_batches(
                     opened_products
+                )
+                combined_products = _finalize_horizontal_budget(
+                    combined_products
                 )
                 combined_products.attrs["memory_strategy"] = (
                     f"disk-backed {latitude_batch_size}-point latitude "
@@ -2038,21 +2271,8 @@ def tropical_mean(da, bounds=(-10.0, 10.0)):
     return subset.weighted(weights).mean(dims, skipna=True)
 
 
-def realised_ttl_scaling(products):
-    values = []
-    for product in products:
-        temperature = product.native_temperature_zonal_mean
-        height = product.native_midlevel_height
-        masked = temperature.where((height >= 14_000.0) & (height <= 18_000.0))
-        values.append(float(tropical_mean(masked).mean("nVertLevels", skipna=True)))
-    delta_u = values[1] - values[0]
-    delta_t = values[2] - values[0]
-    alpha = delta_u / delta_t if np.isfinite(delta_t) and abs(delta_t) > 1e-12 else np.nan
-    return alpha, values
-
-
-def scaled_budget_responses(products, alpha):
-    """Return u, T, and temperature-scaled residual maps for every budget term."""
+def direct_budget_responses(products):
+    """Return direct experiment-minus-control budget responses."""
     terms = (
         "storage", "evaporation", "precipitation", "moisture_convergence",
         "top_influx", "condensate_storage", "residual",
@@ -2072,10 +2292,14 @@ def scaled_budget_responses(products, alpha):
             delta_t = t_experiment - control
             term_arrays.append(
                 xr.concat(
-                    [delta_u, delta_t, delta_u - alpha * delta_t],
+                    [delta_u, delta_t, delta_u - delta_t],
                     dim=xr.IndexVariable(
                         "response",
-                        ["u_nudge_change", "T_nudge_change", "temperature_scaled_residual"],
+                        [
+                            "u_nudge_change",
+                            "T_nudge_change",
+                            "u_nudge_minus_T_nudge",
+                        ],
                     ),
                 )
             )
@@ -2088,12 +2312,14 @@ def scaled_budget_responses(products, alpha):
     out.name = "budget_term_response"
     out.attrs.update(
         units="mm day-1",
-        temperature_scaling_alpha=float(alpha),
+        response_definition=(
+            "direct experiment differences; no scalar thermal scaling"
+        ),
     )
     return out
 
 
-def summary_table(products, attribution, alpha):
+def summary_table(products, attribution):
     rows = []
     terms = (
         "storage", "evaporation", "precipitation", "moisture_convergence",
@@ -2115,51 +2341,64 @@ def summary_table(products, attribution, alpha):
                     }
                 )
 
-    scaled_budget = scaled_budget_responses(products, alpha)
+    budget_responses = direct_budget_responses(products)
+    response_labels = {
+        "u_nudge_change": "u_nudge_minus_control",
+        "T_nudge_change": "T_nudge_minus_control",
+        "u_nudge_minus_T_nudge": "u_nudge_minus_T_nudge",
+    }
     for boundary in BOUNDARIES:
-        for term in terms:
-            scaled_field = scaled_budget.sel(
-                boundary=boundary,
-                budget_term=term,
-                response="temperature_scaled_residual",
-            )
-            rows.append(
-                {
-                    "simulation": "temperature_scaled_attribution",
-                    "boundary": boundary,
-                    "term": f"{term}_scaled_residual",
-                    "global_mean_mm_day": float(
-                        lat_mean(scaled_field.mean("longitude"))
-                    ),
-                    "tropical_mean_mm_day": float(tropical_mean(scaled_field)),
-                }
-            )
+        for response, label in response_labels.items():
+            for term in terms:
+                response_field = budget_responses.sel(
+                    boundary=boundary,
+                    budget_term=term,
+                    response=response,
+                )
+                rows.append(
+                    {
+                        "simulation": label,
+                        "boundary": boundary,
+                        "term": f"{term}_response",
+                        "global_mean_mm_day": float(
+                            lat_mean(response_field.mean("longitude"))
+                        ),
+                        "tropical_mean_mm_day": float(
+                            tropical_mean(response_field)
+                        ),
+                    }
+                )
         for component in COMPONENT_NAMES:
-            u_value = float(
-                tropical_mean(
-                    attribution.convergence_change.sel(
-                        comparison=COMPARISON_NAMES[0], boundary=boundary,
-                        component=component,
+            values = {
+                comparison: float(
+                    tropical_mean(
+                        attribution.convergence_change.sel(
+                            comparison=comparison,
+                            boundary=boundary,
+                            component=component,
+                        )
                     )
                 )
-            )
-            t_value = float(
-                tropical_mean(
-                    attribution.convergence_change.sel(
-                        comparison=COMPARISON_NAMES[1], boundary=boundary,
-                        component=component,
-                    )
+                for comparison in COMPARISON_NAMES[:2]
+            }
+            for comparison, value in (
+                (COMPARISON_NAMES[0], values[COMPARISON_NAMES[0]]),
+                (COMPARISON_NAMES[1], values[COMPARISON_NAMES[1]]),
+                (
+                    "u_nudge_minus_T_nudge",
+                    values[COMPARISON_NAMES[0]]
+                    - values[COMPARISON_NAMES[1]],
+                ),
+            ):
+                rows.append(
+                    {
+                        "simulation": comparison,
+                        "boundary": boundary,
+                        "term": f"convergence_{component}",
+                        "global_mean_mm_day": np.nan,
+                        "tropical_mean_mm_day": value,
+                    }
                 )
-            )
-            rows.append(
-                {
-                    "simulation": "temperature_scaled_attribution",
-                    "boundary": boundary,
-                    "term": f"convergence_{component}",
-                    "global_mean_mm_day": np.nan,
-                    "tropical_mean_mm_day": u_value - alpha * t_value,
-                }
-            )
     return pd.DataFrame(rows)
 
 
@@ -2244,105 +2483,220 @@ def map_field(ax, field, title, symmetric=True, vmin=None, vmax=None):
     ax.set_title(title, fontsize=9)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
+    ax.axhline(0.0, color="0.2", lw=0.75, ls="--", alpha=0.85)
     return image
 
 
 def plot_tropopause_overview(products, figsave):
-    fig, axes = plt.subplots(
-        1, 2, figsize=(11, 4.8), constrained_layout=True,
-        sharex=True, sharey=True,
-    )
+    fig = plt.figure(figsize=(15, 5.8), constrained_layout=True)
+    grid = fig.add_gridspec(2, 3, height_ratios=(1.0, 0.10))
+    axes = [
+        fig.add_subplot(grid[0, column], sharey=None if column == 0 else None)
+        for column in range(3)
+    ]
+    for axis in axes[1:]:
+        axis.sharey(axes[0])
+    legend_axis = fig.add_subplot(grid[1, :])
+    legend_axis.axis("off")
+
     latitude_bounds = slice(*PLOT_LATITUDE_BOUNDS)
     control = products[0]
-    relative_humidity = (
-        100.0 * control.native_relative_humidity_zonal_mean
-    ).clip(0.0, 100.0).sel(latitude=latitude_bounds).transpose(
-        "nVertLevels", "latitude"
-    )
     background_pressure = (
         control.native_pressure_zonal_mean / 100.0
     ).sel(latitude=latitude_bounds).transpose("nVertLevels", "latitude")
+    fields = (
+        control.native_temperature_zonal_mean.sel(
+            latitude=latitude_bounds
+        ).transpose("nVertLevels", "latitude"),
+        (
+            1.0e6 * control.native_specific_humidity_zonal_mean
+        ).sel(latitude=latitude_bounds).transpose(
+            "nVertLevels", "latitude"
+        ),
+        (
+            100.0 * control.native_relative_humidity_zonal_mean
+        ).clip(0.0, 100.0).sel(latitude=latitude_bounds).transpose(
+            "nVertLevels", "latitude"
+        ),
+    )
     latitude_2d = np.broadcast_to(
-        relative_humidity.latitude.values[None, :], relative_humidity.shape
+        background_pressure.latitude.values[None, :],
+        background_pressure.shape,
     )
     latitude_limits = (
-        max(PLOT_LATITUDE_BOUNDS[0], float(relative_humidity.latitude.min())),
-        min(PLOT_LATITUDE_BOUNDS[1], float(relative_humidity.latitude.max())),
+        max(
+            PLOT_LATITUDE_BOUNDS[0],
+            float(background_pressure.latitude.min()),
+        ),
+        min(
+            PLOT_LATITUDE_BOUNDS[1],
+            float(background_pressure.latitude.max()),
+        ),
     )
-    humidity_levels = np.arange(0.0, 105.0, 5.0)
-    images = []
-    for ax, boundary, panel_label in zip(axes, BOUNDARIES, ("(a)", "(b)")):
+    specifications = (
+        {
+            "title": "(a) Control temperature",
+            "label": "Temperature (K)",
+            "levels": np.arange(190.0, 257.5, 2.5),
+            "cmap": "coolwarm",
+            "extend": "both",
+            "norm": None,
+        },
+        {
+            "title": "(b) Control specific humidity",
+            "label": "Specific humidity (mg kg$^{-1}$)",
+            "levels": np.asarray(
+                (1.0, 2.0, 5.0, 10.0, 20.0, 50.0,
+                 100.0, 200.0, 500.0, 1_000.0)
+            ),
+            "cmap": "YlGnBu",
+            "extend": "both",
+            "norm": mpl_colors.LogNorm(vmin=1.0, vmax=1_000.0),
+        },
+        {
+            "title": "(c) Control relative humidity",
+            "label": "Relative humidity (%)",
+            "levels": np.arange(0.0, 105.0, 5.0),
+            "cmap": "BrBG",
+            "extend": "neither",
+            "norm": None,
+        },
+    )
+    for ax, field, specification in zip(axes, fields, specifications):
         image = ax.contourf(
-            latitude_2d, background_pressure, relative_humidity,
-            levels=humidity_levels, cmap="YlGnBu",
+            latitude_2d,
+            background_pressure,
+            field,
+            levels=specification["levels"],
+            cmap=specification["cmap"],
+            norm=specification["norm"],
+            extend=specification["extend"],
         )
-        images.append(image)
-        ax.contour(
-            latitude_2d, background_pressure, relative_humidity,
-            levels=(20.0, 50.0, 80.0), colors="0.35",
-            linewidths=0.45, alpha=0.55,
+        fig.colorbar(
+            image,
+            ax=ax,
+            label=specification["label"],
+            extend=specification["extend"],
+            pad=0.02,
+            shrink=0.76,
+            aspect=25,
         )
-        if boundary == "fixed_200hpa":
-            ax.axhline(
-                FIXED_TOP_PA / 100.0, color="k", lw=1.6,
-                label="fixed boundary",
+        ax.axhline(
+            FIXED_TOP_PA / 100.0,
+            color="0.25",
+            lw=1.4,
+            ls=":",
+            label="fixed 200 hPa",
+        )
+        for simulation, color, product in zip(
+            SIM_NAMES, SIM_COLORS, products
+        ):
+            cold_pressure = (
+                product.boundary_pressure_mean.sel(
+                    boundary="cold_point", drop=True
+                ).mean("longitude", skipna=True)
+                .sel(latitude=latitude_bounds) / 100.0
             )
-        else:
-            for simulation, color, product in zip(
-                SIM_NAMES, SIM_COLORS, products
-            ):
-                tropopause_pressure = product.boundary_pressure_mean.sel(
-                    boundary=boundary
-                ).mean(
-                    "longitude", skipna=True
-                ).sel(latitude=latitude_bounds) / 100.0
-                ax.plot(
-                    tropopause_pressure.latitude, tropopause_pressure,
-                    color=color, lw=1.6, label=simulation,
-                )
-        ax.set_title(f"{panel_label} {BOUNDARY_LABELS[boundary]}")
+            wmo_pressure = (
+                wmo_tropopause_pressure_from_mean_profile(product)
+                .sel(latitude=latitude_bounds) / 100.0
+            )
+            ax.plot(
+                cold_pressure.latitude,
+                cold_pressure,
+                color=color,
+                lw=1.5,
+                ls="-",
+                label=f"{simulation}: cold point",
+            )
+            ax.plot(
+                wmo_pressure.latitude,
+                wmo_pressure,
+                color=color,
+                lw=1.35,
+                ls="--",
+                label=f"{simulation}: WMO (mean profile)",
+            )
+        ax.set_title(specification["title"])
         ax.set_yscale("log")
-        ax.set_ylim(400.0, 40.0)
-        ax.set_yticks((400.0, 300.0, 200.0, 100.0, 70.0, 50.0, 40.0))
-        ax.set_yticklabels(("400", "300", "200", "100", "70", "50", "40"))
-        ax.legend(loc="lower left", fontsize=8, frameon=False)
-    for ax in axes:
+        ax.set_ylim(400.0, 30.0)
+        ax.set_yticks(
+            (400.0, 300.0, 200.0, 100.0, 70.0, 50.0, 40.0, 30.0)
+        )
+        ax.set_yticklabels(
+            ("400", "300", "200", "100", "70", "50", "40", "30")
+        )
         ax.set_xlabel("Latitude")
         ax.set_xlim(*latitude_limits)
         ax.grid(alpha=0.2)
     axes[0].set_ylabel("Pressure (hPa)")
-    fig.colorbar(
-        images[0], ax=list(axes), label="Control relative humidity (%)",
-        shrink=0.92,
+    for ax in axes[1:]:
+        ax.tick_params(labelleft=False)
+    handles, labels = axes[0].get_legend_handles_labels()
+    legend_axis.legend(
+        handles,
+        labels,
+        loc="center",
+        ncol=4,
+        fontsize=8,
+        frameon=False,
     )
     fig.suptitle(
-        "Zonal-mean upper-tropospheric structure and analysis upper boundary"
+        "Zonal-mean upper-tropospheric structure and tropopause definitions"
     )
     figsave.save(fig, "tropopause_definitions", number=1)
     plt.close(fig)
 
 
-def plot_budget_changes(products, figsave, boundary, number):
-    fig, axes = plt.subplots(
-        4, 6, figsize=(18, 12), constrained_layout=True,
-        sharey=True,
-        gridspec_kw={"width_ratios": (3.6, 1.0, 3.6, 1.0, 3.6, 1.0)},
-    )
-    comparison_labels = ("nudged u - control", "nudged T - control")
-    for column, (term, sign, symbol, description) in enumerate(BUDGET_PLOT_TERMS):
-        block_row, block_column = divmod(column, 3)
-        first_row = 2 * block_row
-        map_column = 2 * block_column
-        fields = [
+def budget_change_fields(products, boundary):
+    """Return the two experiment-minus-control maps for every budget term."""
+    return {
+        term: [
             plot_latitude_subset(
                 _budget_field(experiment, term, boundary, sign)
                 - _budget_field(products[0], term, boundary, sign)
             )
             for experiment in products[1:]
         ]
-        vmax = _symmetric_limit(fields)
-        images = []
-        map_axes = []
+        for term, sign, _symbol, _description in BUDGET_PLOT_TERMS
+    }
+
+
+def budget_change_colour_limit(products, boundaries=BOUNDARIES):
+    """Use one robust colour scale across terms, comparisons, and boundaries."""
+    fields = []
+    for boundary in boundaries:
+        for term_fields in budget_change_fields(products, boundary).values():
+            fields.extend(term_fields)
+    return _symmetric_limit(fields)
+
+
+def plot_budget_changes(
+    products, figsave, boundary, number, shared_vmax=None,
+):
+    fig, axes = plt.subplots(
+        4, 6, figsize=(18, 12), constrained_layout=True,
+        sharey=True,
+        gridspec_kw={"width_ratios": (3.6, 1.0, 3.6, 1.0, 3.6, 1.0)},
+    )
+    comparison_labels = ("nudged u - control", "nudged T - control")
+    change_fields = budget_change_fields(products, boundary)
+    all_fields = [
+        field for fields in change_fields.values() for field in fields
+    ]
+    if shared_vmax is None:
+        shared_vmax = _symmetric_limit(all_fields)
+    map_axes = []
+    shared_image = None
+    for column, (term, sign, symbol, description) in enumerate(BUDGET_PLOT_TERMS):
+        block_row, block_column = divmod(column, 3)
+        first_row = 2 * block_row
+        map_column = 2 * block_column
+        fields = change_fields[term]
+        profile_limit = _symmetric_limit(
+            [field.mean("longitude", skipna=True) for field in fields],
+            percentile=100.0,
+        )
         for row, (label, color, field) in enumerate(
             zip(comparison_labels, COMPARISON_COLORS, fields)
         ):
@@ -2353,9 +2707,10 @@ def plot_budget_changes(products, figsave, boundary, number):
             image = map_field(
                 map_axis, field,
                 f"{symbol}\n{description}" if row == 0 else "",
-                symmetric=True, vmax=vmax,
+                symmetric=True, vmax=shared_vmax,
             )
-            images.append(image)
+            if shared_image is None:
+                shared_image = image
             defined_fraction = float(np.isfinite(field).mean())
             if defined_fraction < 0.9995:
                 map_axis.text(
@@ -2373,6 +2728,9 @@ def plot_budget_changes(products, figsave, boundary, number):
                 zonal_mean, zonal_mean.latitude, color=color, lw=1.4,
             )
             profile_axis.axvline(0.0, color="0.35", lw=0.7)
+            profile_axis.axhline(
+                0.0, color="0.2", lw=0.75, ls="--", alpha=0.85
+            )
             profile_axis.grid(True, axis="x", alpha=0.25)
             profile_axis.set_title("Longitude mean" if row == 0 else "", fontsize=8)
             profile_axis.tick_params(labelleft=False)
@@ -2390,19 +2748,21 @@ def plot_budget_changes(products, figsave, boundary, number):
                 profile_axis.tick_params(labelbottom=False)
             else:
                 profile_axis.set_xlabel("mm day$^{-1}$")
-        profile_limit = _symmetric_limit(
-            [field.mean("longitude", skipna=True) for field in fields],
-            percentile=100.0,
-        )
         for row in range(2):
             axes[first_row + row, map_column + 1].set_xlim(
                 -profile_limit, profile_limit
             )
-        fig.colorbar(
-            images[0], ax=map_axes, orientation="horizontal",
-            location="bottom", shrink=0.82, pad=0.03,
-            extend=_colorbar_extend(images[0]), label="mm day$^{-1}$",
-        )
+    fig.colorbar(
+        shared_image,
+        ax=map_axes,
+        orientation="horizontal",
+        location="bottom",
+        shrink=0.56,
+        aspect=42,
+        pad=0.025,
+        extend=_colorbar_extend(shared_image),
+        label="Budget-term change (mm day$^{-1}$)",
+    )
     fig.suptitle(
         r"$\partial W/\partial t = E - P - \nabla_h\!\cdot\mathbf{IVT} "
         r"+ F_t + R$"
@@ -2423,54 +2783,132 @@ def plot_attribution(attribution, figsave):
         ("geometry", r"$C_{rem}$", "geometry + interaction remainder"),
         ("total", r"$\Delta C$", "actual total change"),
     )
-    fig = plt.figure(figsize=(15, 10.5), constrained_layout=True)
-    outer = fig.add_gridspec(2, 4)
+    fig, axes = plt.subplots(
+        4,
+        8,
+        figsize=(20, 11.5),
+        constrained_layout=True,
+        sharey=True,
+        gridspec_kw={
+            "width_ratios": (3.6, 1.0, 3.6, 1.0, 3.6, 1.0, 3.6, 1.0)
+        },
+    )
     comparison_labels = ("nudged u - control", "nudged T - control")
-    for column, (component, symbol, description) in enumerate(component_specs):
-        block_row, block_column = divmod(column, 4)
-        inner = outer[block_row, block_column].subgridspec(
-            3, 1, height_ratios=(1.0, 1.0, 0.07), hspace=0.08
-        )
-        fields = [
+    component_fields = {
+        component: [
             plot_latitude_subset(
                 attribution.convergence_change.sel(
-                    comparison=comparison, boundary="cold_point",
+                    comparison=comparison,
+                    boundary="cold_point",
                     component=component,
                 )
             )
             for comparison in COMPARISON_NAMES
         ]
-        vmax = _symmetric_limit(fields)
-        images = []
-        for row, (comparison_label, field) in enumerate(
-            zip(comparison_labels, fields)
+        for component, _symbol, _description in component_specs
+    }
+    shared_vmax = _symmetric_limit(
+        [
+            field
+            for fields in component_fields.values()
+            for field in fields
+        ]
+    )
+    map_axes = []
+    shared_image = None
+    for column, (component, symbol, description) in enumerate(component_specs):
+        block_row, block_column = divmod(column, 4)
+        first_row = 2 * block_row
+        map_column = 2 * block_column
+        fields = component_fields[component]
+        profile_limit = _symmetric_limit(
+            [field.mean("longitude", skipna=True) for field in fields],
+            percentile=100.0,
+        )
+        for row, (comparison_label, color, field) in enumerate(
+            zip(comparison_labels, COMPARISON_COLORS, fields)
         ):
-            axis = fig.add_subplot(inner[row, 0])
+            figure_row = first_row + row
+            axis = axes[figure_row, map_column]
+            profile_axis = axes[figure_row, map_column + 1]
+            map_axes.append(axis)
             image = map_field(
                 axis, field,
                 f"{symbol}\n{description}" if row == 0 else "",
-                symmetric=True, vmax=vmax,
+                symmetric=True, vmax=shared_vmax,
             )
-            images.append(image)
-            axis.set_ylabel(f"{comparison_label}\nLatitude")
+            if shared_image is None:
+                shared_image = image
+            axis.text(
+                0.02, 0.96, comparison_label,
+                transform=axis.transAxes, va="top", ha="left", fontsize=7,
+                bbox={
+                    "facecolor": "white", "alpha": 0.72,
+                    "edgecolor": "none",
+                },
+            )
+            zonal_mean = field.mean("longitude", skipna=True)
+            profile_axis.plot(
+                zonal_mean,
+                zonal_mean.latitude,
+                color=color,
+                lw=1.4,
+            )
+            profile_axis.axvline(0.0, color="0.35", lw=0.7)
+            profile_axis.axhline(
+                0.0, color="0.2", lw=0.75, ls="--", alpha=0.85
+            )
+            profile_axis.grid(True, axis="x", alpha=0.25)
+            profile_axis.xaxis.set_major_locator(
+                mpl_ticker.MaxNLocator(nbins=3)
+            )
+            profile_axis.xaxis.set_major_formatter(
+                mpl_ticker.FuncFormatter(
+                    lambda value, _position: f"{value:.1g}"
+                )
+            )
+            profile_axis.set_title(
+                "Longitude mean" if row == 0 else "", fontsize=8
+            )
+            profile_axis.tick_params(labelleft=False)
+            axis.set_ylabel("Latitude" if block_column == 0 else "")
+            if block_column != 0:
+                axis.tick_params(labelleft=False)
             if row == 0:
                 axis.tick_params(labelbottom=False)
                 axis.set_xlabel("")
-        colorbar_axis = fig.add_subplot(inner[2, 0])
-        fig.colorbar(
-            images[0], cax=colorbar_axis, orientation="horizontal",
-            extend=_colorbar_extend(images[0]),
-            label="mm day$^{-1}$",
-        )
-    blank_axis = fig.add_subplot(outer[1, 3])
-    blank_axis.axis("off")
+                profile_axis.tick_params(labelbottom=False)
+            else:
+                axis.set_xlabel("Longitude")
+                profile_axis.set_xlabel("mm day$^{-1}$")
+        for row in range(2):
+            axes[first_row + row, map_column + 1].set_xlim(
+                -profile_limit, profile_limit
+            )
+    for row in (2, 3):
+        for column in (6, 7):
+            axes[row, column].set_visible(False)
+    fig.colorbar(
+        shared_image,
+        ax=map_axes,
+        orientation="horizontal",
+        location="bottom",
+        shrink=0.46,
+        aspect=34,
+        pad=0.025,
+        extend=_colorbar_extend(shared_image),
+        label=(
+            r"$C_i$ (attributed component) or $\Delta C$ (diagnosed total) "
+            r"(mm day$^{-1}$)"
+        ),
+    )
     fig.suptitle(
         r"Attribution of the cold-point-column moisture-convergence change" "\n"
         r"$\Delta C=C_T+C_{RH}+C_{\mathbf{u}}+C_\rho+C^\prime+C_{rem}$; "
         r"$C=-\nabla_h\!\cdot\mathbf{IVT}$",
         fontsize=12,
     )
-    figsave.save(fig, "cold_point_convergence_attribution", number=5)
+    figsave.save(fig, "cold_point_convergence_attribution", number=4)
     plt.close(fig)
 
 
@@ -2494,6 +2932,8 @@ def plot_native_tropical_profiles(products, figsave):
                 np.isfinite(profile) & np.isfinite(pressure)
                 & (pressure >= 30.0) & (pressure <= 300.0)
             )
+            if variable == "native_specific_humidity_zonal_mean":
+                valid_layer = valid_layer & (profile > 0.0)
             ax.plot(
                 profile.where(valid_layer, drop=True),
                 pressure.where(valid_layer, drop=True),
@@ -2502,44 +2942,55 @@ def plot_native_tropical_profiles(products, figsave):
             ax.set_xlabel(label)
             ax.grid(alpha=0.2)
 
-    for boundary, linestyle in (("fixed_200hpa", ":"), ("cold_point", "--")):
-        pressures = [
-            float(
-                tropical_mean(
-                    product.boundary_pressure_mean.sel(
-                        boundary=boundary, drop=True
-                    )
+    for ax in axes:
+        ax.axhline(
+            FIXED_TOP_PA / 100.0,
+            color="0.25",
+            ls=":",
+            lw=1.0,
+            label="fixed 200 hPa boundary" if ax is axes[-1] else None,
+        )
+    for simulation, color, product in zip(SIM_NAMES, SIM_COLORS, products):
+        cold_point_pressure = float(
+            tropical_mean(
+                product.boundary_pressure_mean.sel(
+                    boundary="cold_point", drop=True
                 )
-            ) / 100.0
-            for product in products
-        ]
-        for ax in axes:
-            if boundary == "cold_point":
-                ax.axhspan(
-                    min(pressures), max(pressures), color="0.5", alpha=0.10
-                )
-            reference_label = (
-                "fixed 200 hPa boundary"
-                if boundary == "fixed_200hpa"
-                else "control cold-point $p_t$"
             )
+        ) / 100.0
+        for ax in axes:
             ax.axhline(
-                pressures[0], color="0.25", ls=linestyle, lw=0.9,
-                label=reference_label if ax is axes[-1] else None,
+                cold_point_pressure,
+                color=color,
+                ls="--",
+                lw=1.15,
+                label=(
+                    f"{simulation}: cold-point $p_t$"
+                    if ax is axes[-1] else None
+                ),
             )
     for ax in axes:
         ax.set_yscale("log")
         ax.set_ylim(300.0, 30.0)
         ax.set_yticks((300.0, 200.0, 100.0, 70.0, 50.0, 30.0))
         ax.set_yticklabels(("300", "200", "100", "70", "50", "30"))
+    axes[0].set_xscale("log")
     axes[-1].set_xlim(0.0, 100.0)
     axes[0].set_ylabel("Native-level mean pressure (hPa)")
-    axes[-1].legend(fontsize=7, frameon=False)
+    handles, labels = axes[-1].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="outside lower center",
+        ncol=4,
+        fontsize=7,
+        frameon=False,
+    )
     fig.suptitle(
         r"10$^\circ$S-10$^\circ$N native-level moisture and thermal structure; "
-        r"the band spans cold-point $p_t$ across simulations"
+        r"lines show each simulation's mean cold-point $p_t$"
     )
-    figsave.save(fig, "native_tropical_moisture_profiles", number=6)
+    figsave.save(fig, "native_tropical_moisture_profiles", number=5)
     plt.close(fig)
 
 
@@ -2570,7 +3021,7 @@ def plot_tropical_summary(products, figsave):
         r"10$^\circ$S-10$^\circ$N mean signed budget contributions: "
         r"$\partial_tW=E-P-\nabla_h\!\cdot\mathbf{IVT}+F_t+R$"
     )
-    figsave.save(fig, "tropical_budget_summary", number=7)
+    figsave.save(fig, "tropical_budget_summary", number=6)
     plt.close(fig)
 
 
@@ -2607,6 +3058,9 @@ def plot_top_exchange_components(products, figsave):
                 zonal_mean.latitude, zonal_mean, color=color, label=simulation,
             )
         axes[column].axhline(0.0, color="0.3", lw=0.7)
+        axes[column].axvline(
+            0.0, color="0.2", lw=0.75, ls="--", alpha=0.85
+        )
         axes[column].set_title(title, fontsize=9)
         axes[column].set_xlabel("Latitude")
         axes[column].set_xlim(*latitude_limits)
@@ -2614,73 +3068,116 @@ def plot_top_exchange_components(products, figsave):
     axes[0].set_ylabel("mm day$^{-1}$")
     axes[-1].legend(fontsize=7, frameon=False)
     fig.suptitle(
-        "Zonal-mean native-level vapour flux relative to the cold-point "
-        "tropopause; positive is downward"
+        "Zonal-mean native-level vapour flux through the moving cold-point "
+        "tropopause (kinematic decomposition after Wei 1987); "
+        "positive is downward"
     )
-    figsave.save(fig, "cross_tropopause_flux_components", number=8)
+    figsave.save(fig, "cross_tropopause_flux_components", number=7)
     plt.close(fig)
 
 
-def plot_ivt_overview(products, figsave):
-    fig, axes = plt.subplots(3, len(BOUNDARIES), figsize=(10, 10), constrained_layout=True)
+def plot_ivt_component_overview(
+    products, figsave, component, number, stem
+):
+    if component == "zonal":
+        component_symbol = r"IVT_u"
+        component_description = "Zonal IVT"
+        positive_description = "eastward"
+        negative_description = "westward"
+
+        def component_field(u, v):
+            return u
+    elif component == "poleward":
+        component_symbol = r"IVT_{\rm pole}"
+        component_description = "Poleward IVT"
+        positive_description = "poleward"
+        negative_description = "equatorward"
+
+        def component_field(u, v):
+            hemisphere = xr.where(v.latitude >= 0.0, 1.0, -1.0)
+            return hemisphere * v
+    else:
+        raise ValueError(f"unsupported IVT component: {component}")
+
+    fig, axes = plt.subplots(
+        3, 2 * len(BOUNDARIES),
+        figsize=(16, 10),
+        constrained_layout=True,
+        sharey=True,
+        gridspec_kw={"width_ratios": (3.6, 1.0, 3.6, 1.0)},
+    )
     row_labels = ("control", "nudged u - control", "nudged T - control")
     stride_lat = max(products[0].sizes["latitude"] // 24, 1)
     stride_lon = max(products[0].sizes["longitude"] // 36, 1)
     for row, row_label in enumerate(row_labels):
         vector_fields = []
         colour_fields = []
+        control_zonal_fields = []
         for boundary in BOUNDARIES:
+            control_u = plot_latitude_subset(
+                products[0].ivt_u_mean.sel(boundary=boundary)
+            )
+            control_v = plot_latitude_subset(
+                products[0].ivt_v_mean.sel(boundary=boundary)
+            )
             if row == 0:
-                u = plot_latitude_subset(
-                    products[0].ivt_u_mean.sel(boundary=boundary)
-                )
-                v = plot_latitude_subset(
-                    products[0].ivt_v_mean.sel(boundary=boundary)
-                )
-                colour_field = np.hypot(u, v)
+                u = control_u
+                v = control_v
             else:
-                u = plot_latitude_subset(
+                experiment_u = plot_latitude_subset(
                     products[row].ivt_u_mean.sel(boundary=boundary)
-                    - products[0].ivt_u_mean.sel(boundary=boundary)
                 )
-                v = plot_latitude_subset(
+                experiment_v = plot_latitude_subset(
                     products[row].ivt_v_mean.sel(boundary=boundary)
-                    - products[0].ivt_v_mean.sel(boundary=boundary)
                 )
-                colour_field = np.sign(
-                    u * products[0].ivt_u_mean.sel(boundary=boundary)
-                    + v * products[0].ivt_v_mean.sel(boundary=boundary)
-                ) * np.hypot(u, v)
+                u = experiment_u - control_u
+                v = experiment_v - control_v
+            colour_field = component_field(u, v)
             vector_fields.append((u, v))
             colour_fields.append(colour_field)
+            control_zonal_fields.append(
+                component_field(control_u, control_v)
+            )
 
         row_vmax = _symmetric_limit(colour_fields)
         row_images = []
-        for column, (boundary, (u, v), colour_field) in enumerate(
-            zip(BOUNDARIES, vector_fields, colour_fields)
+        map_axes = []
+        for column, (
+            boundary, (u, v), colour_field, control_zonal
+        ) in enumerate(
+            zip(
+                BOUNDARIES, vector_fields, colour_fields,
+                control_zonal_fields,
+            )
         ):
-            if row == 0:
-                image = map_field(
-                    axes[row, column], colour_field,
-                    f"{row_label}: {boundary}", symmetric=False,
-                    vmin=0.0, vmax=row_vmax,
-                )
-            else:
-                image = map_field(
-                    axes[row, column], colour_field,
-                    f"{row_label}: {boundary}", symmetric=True,
-                    vmax=row_vmax,
-                )
+            map_axis = axes[row, 2 * column]
+            profile_axis = axes[row, 2 * column + 1]
+            map_axes.append(map_axis)
+            image = map_field(
+                map_axis, colour_field,
+                f"{row_label}: {BOUNDARY_LABELS[boundary]}",
+                symmetric=True,
+                vmax=row_vmax,
+            )
             row_images.append(image)
             defined_fraction = float(np.isfinite(colour_field).mean())
             if defined_fraction < 0.9995:
-                axes[row, column].text(
+                map_axis.text(
                     0.02, 0.03, f"defined: {100.0 * defined_fraction:.1f}%",
-                    transform=axes[row, column].transAxes,
+                    transform=map_axis.transAxes,
                     fontsize=7, color="0.2",
                     bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
                 )
-            axes[row, column].quiver(
+            map_axis.contour(
+                control_zonal.longitude,
+                control_zonal.latitude,
+                control_zonal,
+                levels=[0.0],
+                colors="0.2",
+                linewidths=1.0,
+                linestyles="--",
+            )
+            map_axis.quiver(
                 u.longitude.isel(longitude=slice(None, None, stride_lon)),
                 u.latitude.isel(latitude=slice(None, None, stride_lat)),
                 u.isel(latitude=slice(None, None, stride_lat),
@@ -2689,14 +3186,72 @@ def plot_ivt_overview(products, figsave):
                        longitude=slice(None, None, stride_lon)),
                 color="k", alpha=0.65, scale=None,
             )
+            zonal_mean = colour_field.mean("longitude", skipna=True)
+            profile_axis.plot(
+                zonal_mean,
+                zonal_mean.latitude,
+                color=SIM_COLORS[row],
+                lw=1.7,
+            )
+            profile_axis.axvline(
+                0.0, color="0.35", lw=0.8, ls="--", alpha=0.9
+            )
+            profile_axis.axhline(
+                0.0, color="0.2", lw=0.75, ls="--", alpha=0.85
+            )
+            profile_axis.set_xlim(-row_vmax, row_vmax)
+            profile_axis.set_title("Zonal mean", fontsize=9)
+            profile_axis.set_xlabel(
+                rf"${component_symbol}$"
+                if row == 0
+                else rf"$\Delta {component_symbol}$"
+            )
+            if column > 0:
+                profile_axis.tick_params(labelleft=False)
         fig.colorbar(
-            row_images[0], ax=list(axes[row, :]), shrink=0.86,
+            row_images[0],
+            ax=list(axes[row, :]),
+            shrink=0.58,
+            aspect=36,
+            pad=0.025,
             extend=_colorbar_extend(row_images[0]),
-            label="kg m$^{-1}$ s$^{-1}$",
+            label=(
+                rf"{component_description}, ${component_symbol}$ "
+                r"(kg m$^{-1}$ s$^{-1}$)"
+                if row == 0
+                else rf"{component_description} change, "
+                rf"$\Delta {component_symbol}$ "
+                r"(kg m$^{-1}$ s$^{-1}$)"
+            ),
         )
-    fig.suptitle("Mean IVT and experiment-minus-control IVT; kg m$^{-1}$ s$^{-1}$")
-    figsave.save(fig, "ivt_vectors_and_magnitude", number=9)
+    fig.suptitle(
+        rf"Vertically integrated vapour transport: shading is signed "
+        rf"${component_symbol}$ or $\Delta {component_symbol}$ "
+        f"(red {positive_description}, blue {negative_description}); "
+        r"arrows are "
+        r"$\mathbf{IVT}$ or $\Delta\mathbf{IVT}$; dashed contours mark "
+        rf"control ${component_symbol}=0$"
+    )
+    figsave.save(fig, stem, number=number)
     plt.close(fig)
+
+
+def plot_ivt_overview(products, figsave):
+    plot_ivt_component_overview(
+        products, figsave,
+        component="zonal",
+        number=8,
+        stem="ivt_vectors_and_magnitude",
+    )
+
+
+def plot_poleward_ivt_overview(products, figsave):
+    plot_ivt_component_overview(
+        products, figsave,
+        component="poleward",
+        number=9,
+        stem="ivt_vectors_and_poleward_transport",
+    )
 
 
 def parse_args():
@@ -2721,35 +3276,35 @@ def main():
     attribution = compute_cached_transport_attribution(
         products, test=args.test
     )
-    alpha, ttl_temperatures = realised_ttl_scaling(products)
-    attribution["budget_term_response"] = scaled_budget_responses(
-        products, alpha
-    )
-    progress(
-        "realised TTL temperatures: "
-        + ", ".join(f"{name}={value:.3f} K" for name, value in zip(SIM_NAMES, ttl_temperatures))
-        + f"; alpha={alpha:.3f}"
-    )
+    attribution["budget_term_response"] = direct_budget_responses(products)
 
     os.makedirs(SAVE_LOC, exist_ok=True)
-    attribution.attrs.update(
-        temperature_scaling_alpha=float(alpha),
-        temperature_scaling_definition="14-18 km, 10S-10N realised mean temperature",
+    attribution.attrs["response_comparison"] = (
+        "direct experiment-minus-control and u-nudged-minus-T-nudged "
+        "differences; no scalar thermal-residual attribution"
     )
     if not args.no_save:
-        write_final_data_products(attribution, products, alpha)
+        write_final_data_products(attribution, products)
 
     figsave = FigureSaver(
         SAVE_LOC, enabled=not args.no_save, figures_to_run=args.figures
     )
     plot_tropopause_overview(products, figsave)
-    plot_budget_changes(products, figsave, "fixed_200hpa", 2)
-    plot_budget_changes(products, figsave, "cold_point", 3)
+    shared_budget_vmax = budget_change_colour_limit(products)
+    plot_budget_changes(
+        products, figsave, "fixed_200hpa", 2,
+        shared_vmax=shared_budget_vmax,
+    )
+    plot_budget_changes(
+        products, figsave, "cold_point", 3,
+        shared_vmax=shared_budget_vmax,
+    )
     plot_attribution(attribution, figsave)
     plot_native_tropical_profiles(products, figsave)
     plot_tropical_summary(products, figsave)
     plot_top_exchange_components(products, figsave)
     plot_ivt_overview(products, figsave)
+    plot_poleward_ivt_overview(products, figsave)
 
 
 if __name__ == "__main__":

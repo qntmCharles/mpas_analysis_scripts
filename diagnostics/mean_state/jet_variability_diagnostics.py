@@ -40,7 +40,7 @@ from diagnostics.diagnostic_helpers import (
     difference_cmap, figure_should_run, figure_should_run_any,
     latitude_weights, load_latlon_dataset, model_lat_field,
     pressure_layer_weights, safe_name, set_latheight_labels, set_latpres_axis,
-    standardize_latlon_dataset, subset_between, symmetric_levels,
+    simulation_colour, standardize_latlon_dataset, subset_between, symmetric_levels,
     symmetric_percentile_levels_for_fields, time_step_days,
 )
 
@@ -81,7 +81,7 @@ should_run_any = partial(figure_should_run_any, figures_to_run)
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control_new", "u_nudge", "T_nudge"]
 sim_names = ["control", "nudged u", "nudged T"]
-cols = ["k", "b", "r"]
+cols = [simulation_colour(name) for name in sim_names]
 
 
 fixed_pressure_level = 250.0
@@ -1066,13 +1066,13 @@ if should_run_figure(6) and jet_structure_fields:
             list(jet_structure_fields.values()),
             percentile=99.0,
             ndiv=16,
-            fallback=25.0,
+            zero_field_scale=25.0,
         )
         diff_levels = symmetric_percentile_levels_for_fields(
             [field for i, field in diff_fields.items() if i != 0],
             percentile=99.0,
             ndiv=12,
-            fallback=3.0,
+            zero_field_scale=3.0,
         )
 
         ncols = len(dss_zm)

@@ -38,7 +38,8 @@ from diagnostics.diagnostic_helpers import (
     positive_levels, precip_rate_from_accum, region_symmetric_levels,
     relative_frequency_from_histogram, safe_nanpercentile,
     set_latheight_labels, set_latpres_axis,
-    split_scales_warranted, standardize_latlon_dataset, symmetric_levels,
+    simulation_colour, split_scales_warranted, standardize_latlon_dataset,
+    symmetric_levels,
     tropopause_on_latitudes, tropopause_region_masks,
     vertical_velocity_from_zm,
 )
@@ -120,15 +121,29 @@ def isobaric_eddy_kinetic_energy(ds):
 
 
 def positive_contour_levels(fields, n=21, fallback=1.0):
-    vmax = np.nanmax([np.nanmax(field.values) for field in fields])
-    if not np.isfinite(vmax) or vmax <= 0:
+    values = np.concatenate(
+        [np.asarray(field.values, dtype=float).ravel() for field in fields]
+    )
+    values = values[np.isfinite(values)]
+    if not values.size:
+        raise ValueError("Cannot plot non-finite positive fields")
+    vmax = np.max(values)
+    if vmax < 0.0:
+        raise ValueError("Positive-field plot contains only negative values")
+    if vmax == 0.0:
         vmax = fallback
     return positive_levels(vmax, n=n)
 
 
 def symmetric_contour_levels(fields, ndiv=11, fallback=1.0):
-    vmax = np.nanmax([np.nanmax(np.abs(field.values)) for field in fields])
-    if not np.isfinite(vmax) or vmax <= 0:
+    values = np.concatenate(
+        [np.asarray(field.values, dtype=float).ravel() for field in fields]
+    )
+    values = values[np.isfinite(values)]
+    if not values.size:
+        raise ValueError("Cannot plot non-finite difference fields")
+    vmax = np.max(np.abs(values))
+    if vmax == 0.0:
         vmax = fallback
     return symmetric_levels(vmax, ndiv=ndiv)
 
@@ -189,7 +204,9 @@ def scalar_constituent_latheight(ds, spec, zmid=None):
 
 def positive_percentile_levels(fields, percentile=99.5, n=21, fallback=1.0):
     vmax = np.nanmax([
-        safe_nanpercentile(field.values, percentile, default=fallback)
+        safe_nanpercentile(
+            field.values, percentile, zero_value=fallback
+        )
         for field in fields
     ])
     if not np.isfinite(vmax) or vmax <= 0:
@@ -198,15 +215,26 @@ def positive_percentile_levels(fields, percentile=99.5, n=21, fallback=1.0):
 
 
 def positive_log_levels(fields, percentile=99.5, n=21, vmin=1.0e-4, fallback=1.0):
-    vals = np.concatenate([
+    finite = np.concatenate([
         np.asarray(field.values, dtype=float).ravel()
         for field in fields
     ])
-    vals = vals[np.isfinite(vals) & (vals > 0.0)]
-    vmax = np.nanpercentile(vals, percentile) if vals.size else fallback
-    if not np.isfinite(vmax) or vmax <= vmin:
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        raise ValueError("Cannot plot a non-finite logarithmic field")
+    vals = finite[finite > 0.0]
+    if not vals.size:
+        if np.any(finite < 0.0):
+            raise ValueError(
+                "Logarithmic positive-field plot contains only non-positive "
+                "values"
+            )
         vmax = fallback
-    if not np.isfinite(vmax) or vmax <= vmin:
+    else:
+        vmax = np.nanpercentile(vals, percentile)
+    if not np.isfinite(vmax):
+        raise ValueError("Calculated logarithmic contour scale is non-finite")
+    if vmax <= vmin:
         vmax = vmin * 10.0
     return np.geomspace(vmin, vmax, n)
 
@@ -241,7 +269,9 @@ def scalar_raw_values(field, spec):
 
 def symmetric_percentile_levels(fields, percentile=99.0, ndiv=10, fallback=1.0):
     vmax = np.nanmax([
-        safe_nanpercentile(np.abs(field.values), percentile, default=fallback)
+        safe_nanpercentile(
+            np.abs(field.values), percentile, zero_value=fallback
+        )
         for field in fields
     ])
     if not np.isfinite(vmax) or vmax <= 0:
@@ -256,7 +286,10 @@ def field_for_level_limits(field, spec):
 
     limited = field.where(field.z >= min_height, drop=True)
     if limited.sizes.get("z", 0) == 0:
-        return field
+        raise ValueError(
+            f"{spec['label']}: no vertical levels satisfy minimum height "
+            f"{min_height} m"
+        )
     return limited
 
 
@@ -287,11 +320,11 @@ def tropopause_split_diff_context(diff_entries, spec, percentile=None, ndiv=10):
     fallback = spec.get("diff_fallback", 1.0)
     tropo_levels = region_symmetric_levels(
         [(entry[0], level_mask(masks[i][0], entry[1])) for i, entry in diff_entries.items()],
-        ndiv=ndiv, fallback=fallback, percentile=percentile,
+        ndiv=ndiv, zero_field_scale=fallback, percentile=percentile,
     )
     strat_levels = region_symmetric_levels(
         [(entry[0], level_mask(masks[i][1], entry[1])) for i, entry in diff_entries.items()],
-        ndiv=ndiv, fallback=fallback, percentile=percentile,
+        ndiv=ndiv, zero_field_scale=fallback, percentile=percentile,
     )
     split = (
         spec.get("diff_split_tropopause", False)
@@ -305,13 +338,15 @@ def latlon_contour_levels(fields, symmetric=False, n=21, fallback=1.0):
     if symmetric:
         return symmetric_contour_levels(fields, ndiv=n-1, fallback=fallback)
 
-    values = [np.asarray(field.values, dtype=float) for field in fields]
-    vmin = np.nanmin([np.nanmin(value) for value in values])
-    vmax = np.nanmax([np.nanmax(value) for value in values])
-
-    if not np.isfinite(vmin) or not np.isfinite(vmax):
-        vmin, vmax = 0.0, fallback
-    elif np.isclose(vmin, vmax):
+    values = np.concatenate(
+        [np.asarray(field.values, dtype=float).ravel() for field in fields]
+    )
+    values = values[np.isfinite(values)]
+    if not values.size:
+        raise ValueError("Cannot plot a non-finite latitude-longitude field")
+    vmin = np.min(values)
+    vmax = np.max(values)
+    if np.isclose(vmin, vmax):
         half_width = abs(vmin) * 0.01 if vmin else fallback
         vmin -= half_width
         vmax += half_width
@@ -453,7 +488,7 @@ root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
 data_locs = ['control_new', 'u_nudge', 'T_nudge']
 sim_names = ['control', 'nudged u', 'nudged T']
 
-cols = ['k', 'b', 'r']
+cols = [simulation_colour(name) for name in sim_names]
 
 
 
