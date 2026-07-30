@@ -32,12 +32,8 @@ for _rel_path in ("..", "../..", "../../.."):
 import numpy as np
 import pandas as pd
 import xarray as xr
+import dask
 from matplotlib import pyplot as plt
-
-try:
-    import dask
-except ModuleNotFoundError:
-    dask = None
 
 from diagnostics.diagnostic_helpers import (
     ANALYSIS_END, ANALYSIS_START, FigureSaver, LATLON_PATTERN,
@@ -46,8 +42,9 @@ from diagnostics.diagnostic_helpers import (
     difference_cmap, env_flag,
     figure_should_run, finite_or_nan, hemispheric_fold, jsonable_value,
     latitude_weights, load_latlon_dataset, precip_rate_from_accum,
-    pressure_layer_weights, read_json_file, safe_name,
-    standardize_latlon_dataset, subset_between,
+    native_midlevel_height, pressure_layer_weights, pressure_to_pa,
+    read_json_file, safe_name,
+    simulation_colour, standardize_latlon_dataset, subset_between,
     subset_latitude, symmetric_levels, time_block_slices, time_step_days,
     total_precip_accum, vertical_dim, vertical_velocity_at_pressure,
     vertical_velocity_from_zm, write_json_file,
@@ -58,20 +55,21 @@ from diagnostics.convection.high_cloud_classification import (
     cached_classification_is_current as shared_cached_classification_is_current,
 )
 from diagnostics.waves.equatorial_wave_config import (
+    SHORT_LAG_FILTERS,
+    SHORT_PERIOD_CRITICAL_LEVEL_FILTERS,
+    VERTICAL_STRUCTURE_FILTERS,
     WAVE_BOXES as SHARED_WAVE_BOXES,
+    WAVE_CONFIG_VERSION,
     WAVE_LATITUDE_PROJECTION as SHARED_WAVE_LATITUDE_PROJECTION,
 )
-from diagnostics.convection.lpt_precipitation_envelope_diagnostics import (
-    PRODUCT_VERSION as LPT_PRODUCT_VERSION,
+from diagnostics.convection.lpo_tracking import (
+    PRODUCT_VERSION as LPO_TRACKING_PRODUCT_VERSION,
     publication_output_directory,
     read_standard_event_tables,
     require_publication_products,
 )
-
-try:
-    from waveFilter import kf_filter
-except ModuleNotFoundError:
-    kf_filter = None
+from diagnostics.waves.wave_metrics import METRICS_VERSION
+from waveFilter import kf_filter
 
 
 # -----------------------------------------------------------------------------
@@ -86,7 +84,7 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/significance
 #   2: precipitation scalar/PDF block-consistency diagnostics
 #   3: cloud profile/cloud-type block-consistency diagnostics
 #   4: CCEW wave-box variance block-consistency diagnostics
-#   5: LPT precipitation-envelope event-bootstrap diagnostics
+#   5: LPO precipitation-envelope event-bootstrap diagnostics
 #   6: basic convection PDF block-consistency diagnostics
 #   7: vertical wave-power profile block-consistency diagnostics
 #   8: wave-amplitude lag-correlation block-consistency diagnostics
@@ -100,7 +98,7 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/significance
 #     meaningful regions over isolated cells that pass the chunk-consistency rule.
 #   * Compare chunk-consistent U-control and T-control responses with the U-T contrast:
 #     shared thermal/static-stability/cloud-depth structures favour a
-#     temperature-driven pathway, while U-only wind/wave residuals favour a
+#     temperature-driven pathway, while U-only wind/wave differences favour a
 #     wind-driven pathway.
 figures_to_run = [2, 3, 4, 5]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
@@ -108,7 +106,7 @@ figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control_new", "u_nudge", "T_nudge"]
 sim_names = ["control", "nudged u", "nudged T"]
-cols = ["k", "b", "r"]
+cols = [simulation_colour(name) for name in sim_names]
 
 dt = 6
 obs_per_day = int(round(24 / dt))
@@ -121,7 +119,7 @@ FORCE_RECOMPUTE_BOOTSTRAP_CACHE = (
     FORCE_RECOMPUTE_BOOTSTRAP_CACHE
     or env_flag("FORCE_RECOMPUTE_BOOTSTRAP_CACHE")
 )
-BOOTSTRAP_CACHE_DIR = diagnostic_cache_dir("significance_bootstrap_cache", root_dir=root_dir)
+BOOTSTRAP_CACHE_DIR = diagnostic_cache_dir("significance_bootstrap_cache")
 
 BOOTSTRAP_BLOCK_DAYS = 10.0
 CLOUD_TYPE_BLOCK_DAYS = 5.0
@@ -159,7 +157,14 @@ WAVENUMBER_FIELDS = ["Precip", "OLR", "PW"]
 WAVENUMBER_LAT_BOUNDS = (-10.0, 10.0)
 WAVENUMBER_MAX_K = 15
 
-WAVE_PROFILE_WAVES = ["Kelvin", "ER", "Easterly"]
+# The main wave analysis includes the slow eastward-intraseasonal band in its
+# vertical profiles. This script deliberately limits ordinary short-block
+# resampling to filters for which a 10-day block is meaningful.
+WAVE_PROFILE_WAVES = tuple(
+    name
+    for name in VERTICAL_STRUCTURE_FILTERS
+    if name in SHORT_PERIOD_CRITICAL_LEVEL_FILTERS
+)
 WAVE_PROFILE_FIELDS = [
     dict(name="u", prefix="u", units="m s-1"),
     dict(name="T", prefix="T", units="K"),
@@ -167,7 +172,7 @@ WAVE_PROFILE_FIELDS = [
 ]
 WAVE_PROFILE_LEVELS_HPA = [100, 150, 200, 250, 300, 500, 700, 850]
 
-WAVE_LAG_WAVES = ["Kelvin", "ER", "Easterly"]
+WAVE_LAG_WAVES = tuple(SHORT_LAG_FILTERS)
 WAVE_LAG_TARGET_FIELDS = ["Precip", "OLR", "PW"]
 WAVE_LAG_MAX_DAYS = 8.0
 WAVE_LAG_BLOCK_DAYS = 30.0
@@ -181,22 +186,22 @@ ORGANISATION_TRACK_METRIC_SPECS = [
     ("zonal_speed_m_s", "m s-1"),
     ("total_zonal_displacement_km", "km"),
 ]
-# Rows come from the definitive 15-mm/day tropical LPT population. Complete
+# Rows come from the definitive 12-mm/day tropical LPO population. Complete
 # events are resampled as indivisible units; track steps are never samples.
-LPT_TRACK_SOURCE = "lpt_precipitation_envelope"
-LPT_TRACK_POPULATION = "primary_tropical_lpt"
-ANALYSIS_TRACK_POPULATIONS = (LPT_TRACK_POPULATION,)
+LPO_TRACK_SOURCE = "lpo_precipitation_envelope"
+LPO_TRACK_POPULATION = "primary_tropical_lpo"
+ANALYSIS_TRACK_POPULATIONS = (LPO_TRACK_POPULATION,)
 TRACK_POPULATION_LABELS = {
-    LPT_TRACK_POPULATION: "Large-scale tropical precipitation envelopes",
+    LPO_TRACK_POPULATION: "Large-scale tropical precipitation envelopes",
 }
 
 # Shared coarse-grid precipitation-regime cloud thresholds.
 CF_THRESH = 0.05
 P_HIGH_HPA = 440.0
 P_PRECIP_MIN = 12.0  # 0.5 mm h-1 PF threshold (Feng et al. 2021)
-CLOUD_CLASSIFICATION_CACHE_DIRS = [
-    diagnostic_cache_dir("classification_cache", root_dir=root_dir),
-]
+CLOUD_CLASSIFICATION_CACHE_DIR = diagnostic_cache_dir(
+    "classification_cache"
+)
 
 RD = 287.0
 CP = 1004.0
@@ -215,21 +220,21 @@ LATHEIGHT_DOMAINS = {
     "Tropics_upper_troposphere_12_18km": dict(lat_bounds=TROPICAL_LAT_BOUNDS, z_bounds=UPPER_TROPOSPHERE_Z_BOUNDS_M),
 }
 
-MATCHED_PATTERN_DOMAINS = {
-    "TTL_70_200hPa_30S30N": dict(lat_bounds=(-30.0, 30.0), p_bounds=(70.0, 200.0)),
-    "UTLS_50_300hPa_40S40N": dict(lat_bounds=(-40.0, 40.0), p_bounds=(50.0, 300.0)),
-    "DeepTropics_70_200hPa_10S10N": dict(lat_bounds=(-10.0, 10.0), p_bounds=(70.0, 200.0)),
-}
-
 WAVE_BOXES = {
     name: SHARED_WAVE_BOXES[name]
-    for name in ("Kelvin", "EIG", "IG_antisym", "Easterly", "ER")
+    for name in SHORT_PERIOD_CRITICAL_LEVEL_FILTERS
 }
 WAVE_LATITUDE_PROJECTION = {
     name: SHARED_WAVE_LATITUDE_PROJECTION[name]
     for name in WAVE_BOXES
 }
 WAVE_FIELDS = ["Precip", "OLR", "PW"]
+WAVE_RESPONSE_METRIC_OUTPUT = os.path.join(
+    diagnostic_output_dir(
+        "/home/cwp29/tmp/mpas/crf_on/final/waves/"
+    ),
+    "wave_response_efficiency_metrics.csv",
+)
 
 latlon_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw", "olrtoa", "cape",
@@ -248,8 +253,7 @@ zonal_mean_vars = [
 latlon_chunks = {"Time": 8, "latitude": 90, "longitude": 180}
 zm_chunks = {"Time": 8}
 
-if dask is not None:
-    dask.config.set({"array.slicing.split_large_chunks": True})
+dask.config.set({"array.slicing.split_large_chunks": True})
 
 
 # -----------------------------------------------------------------------------
@@ -257,7 +261,6 @@ if dask is not None:
 # -----------------------------------------------------------------------------
 
 implemented: list[str] = []
-skipped_unavailable: list[str] = []
 failed: list[str] = []
 todo_diagnostics: list[str] = []
 scalar_metric_rows: list[dict] = []
@@ -269,11 +272,6 @@ should_run_figure = partial(figure_should_run, figures_to_run)
 def record_implemented(message):
     print(f"Implemented: {message}")
     implemented.append(message)
-
-
-def record_skip(message):
-    print(f"Skipping: {message}")
-    skipped_unavailable.append(message)
 
 
 def record_failure(message, exc):
@@ -305,7 +303,7 @@ def bootstrap_cache_path(filename):
 
 def base_bootstrap_cache_signature(family, extra=None):
     signature = dict(
-        cache_version="significance_bootstrap_v1",
+        cache_version="significance_bootstrap_v3-strict-input-contract",
         family=family,
         root_dir=root_dir,
         data_locs=list(data_locs),
@@ -324,6 +322,7 @@ def base_bootstrap_cache_signature(family, extra=None):
         ci_percentiles=jsonable_value(CI_PERCENTILES),
         robust_sign_threshold=float(ROBUST_SIGN_THRESHOLD),
         comparisons=jsonable_value(COMPARISONS),
+        wave_config_version=WAVE_CONFIG_VERSION,
     )
     if extra:
         signature.update(jsonable_value(extra))
@@ -388,8 +387,15 @@ def cached_diff_dataset_filename(cache_name, comp_name):
 def load_cached_diff_datasets(cache_name, signature):
     if not bootstrap_cache_matches(cache_name, signature):
         return None
-    metadata = read_cache_metadata(bootstrap_cache_path(f"{cache_name}.metadata.json")) or {}
-    comp_names = metadata.get("comparison_names", [name for name, *_ in COMPARISONS])
+    metadata = read_cache_metadata(
+        bootstrap_cache_path(f"{cache_name}.metadata.json")
+    )
+    if metadata is None or "comparison_names" not in metadata:
+        return None
+    comp_names = metadata["comparison_names"]
+    expected_names = [name for name, *_ in COMPARISONS]
+    if comp_names != expected_names:
+        return None
     out = {}
     for comp_name in comp_names:
         path = bootstrap_cache_path(cached_diff_dataset_filename(cache_name, comp_name))
@@ -696,35 +702,52 @@ def rename_vertical_to_z(da):
 
 
 def assign_midlevel_height_from_zgrid(da, source_ds):
-    out = rename_vertical_to_z(da)
-    if "z" in out.coords:
-        zvals = np.asarray(out.z.values, dtype=float)
-        if zvals.size == out.sizes["z"] and np.nanmax(np.abs(zvals)) > 100.0:
-            return out
-
-    if "zgrid" not in source_ds.data_vars:
-        raise ValueError("zgrid is required to assign geometric height to model-level field")
-
-    zgrid = finite_or_nan(source_ds.zgrid)
-    mean_dims = [dim for dim in ("latitude", "longitude") if dim in zgrid.dims]
-    zgrid_mean = zgrid.mean(dim=mean_dims, skipna=True).load()
-    zmid = 0.5 * (
-        zgrid_mean.isel(nVertLevelsP1=slice(0, -1)).values
-        + zgrid_mean.isel(nVertLevelsP1=slice(1, None)).values
-    )
-    if out.sizes["z"] != zmid.size:
-        raise ValueError(
-            f"model-level field has {out.sizes['z']} levels but zgrid implies {zmid.size}"
+    zdim = vertical_dim(da)
+    height = native_midlevel_height(source_ds, da)
+    reduce_dims = [dim for dim in height.dims if dim != zdim]
+    height = height.mean(reduce_dims, skipna=True) if reduce_dims else height
+    if height.sizes[zdim] != da.sizes[zdim]:
+        raise RuntimeError(
+            "Native midpoint-height coordinate does not match the field "
+            f"levels: {height.sizes[zdim]} versus {da.sizes[zdim]}"
         )
-    return out.assign_coords(z=("z", zmid))
+    out = da.assign_coords({zdim: np.asarray(height.values, dtype=float)})
+    out = out.rename({zdim: "z"})
+    out.z.attrs.update(units="m", long_name="native MPAS mid-level height")
+    return out
+
+
+def require_zonal_mean_height(da):
+    """Require the fixed physical-height coordinate in zonal-mean products."""
+
+    out = rename_vertical_to_z(da)
+    if "z" not in out.coords:
+        raise RuntimeError(
+            "Zonal-mean field lacks the required physical 'z' coordinate"
+        )
+    height = np.asarray(out.z.values, dtype=float)
+    if (
+        height.ndim != 1
+        or height.size != out.sizes["z"]
+        or not np.all(np.isfinite(height))
+        or not np.all(np.diff(height) > 0)
+    ):
+        raise RuntimeError(
+            "Zonal-mean 'z' coordinate must be finite, one-dimensional, "
+            "and strictly increasing"
+        )
+    out.z.attrs["units"] = "m"
+    return out
 
 
 def zm_temperature(zds):
     missing = [name for name in ("theta", "pressure") if name not in zds.data_vars]
     if missing:
         raise ValueError(f"Missing variables for temperature: {missing}")
-    theta = rename_vertical_to_z(finite_or_nan(zds.theta))
-    pressure = rename_vertical_to_z(finite_or_nan(zds.pressure))
+    theta = require_zonal_mean_height(finite_or_nan(zds.theta))
+    pressure = require_zonal_mean_height(
+        pressure_to_pa(finite_or_nan(zds.pressure))
+    )
     out = theta * (pressure / P0_PA) ** (RD / CP)
     out.name = "temperature"
     out.attrs["units"] = "K"
@@ -734,12 +757,8 @@ def zm_temperature(zds):
 def zm_static_stability(zds):
     if "theta" not in zds.data_vars:
         raise ValueError("Missing theta for static stability")
-    theta = rename_vertical_to_z(finite_or_nan(zds.theta))
-    if "z" not in theta.coords:
-        raise ValueError("theta has no geometric z coordinate")
-    z = np.asarray(theta.z.values, dtype=float)
-    coord_to_m = 1.0 if np.nanmax(np.abs(z)) > 100.0 else 1000.0
-    dtheta_dz_m = theta.differentiate("z") / coord_to_m
+    theta = require_zonal_mean_height(finite_or_nan(zds.theta))
+    dtheta_dz_m = theta.differentiate("z")
     out = G / theta * dtheta_dz_m
     out.name = "N2"
     out.attrs["units"] = "s-2"
@@ -748,9 +767,7 @@ def zm_static_stability(zds):
 
 def zm_lapse_rate(zds):
     temp = zm_temperature(zds)
-    z = np.asarray(temp.z.values, dtype=float)
-    per_km = 1000.0 if np.nanmax(np.abs(z)) > 100.0 else 1.0
-    out = -temp.differentiate("z") * per_km
+    out = -temp.differentiate("z") * 1000.0
     out.name = "lapse_rate"
     out.attrs["units"] = "K km-1"
     return out
@@ -767,31 +784,31 @@ def water_vapour_field(ds, zds):
 
 
 def cloud_fraction_time_field(ds, zds):
-    return zds.cldfrac.rename("cloud_fraction")
+    return require_zonal_mean_height(zds.cldfrac).rename("cloud_fraction")
 
 
 LATHEIGHT_FIELD_SPECS = [
-    dict(name="temperature", label="Temperature", units="K", diff_fallback=2.0,
+    dict(name="temperature", label="Temperature", units="K", zero_difference_scale=2.0,
          getter=lambda ds, zds: zm_temperature(zds), parity="even"),
-    dict(name="zonal_wind", label="Zonal wind", units="m s-1", diff_fallback=5.0,
+    dict(name="zonal_wind", label="Zonal wind", units="m s-1", zero_difference_scale=5.0,
          getter=lambda ds, zds: zds.uReconstructZonal.rename("zonal_wind"), parity="even"),
-    dict(name="static_stability_N2", label="Static stability N2", units="1e-4 s-2", diff_fallback=1.0,
+    dict(name="static_stability_N2", label="Static stability N2", units="1e-4 s-2", zero_difference_scale=1.0,
          getter=lambda ds, zds: zm_static_stability(zds) * 1.0e4, parity="even"),
-    dict(name="lapse_rate", label="Lapse rate", units="K km-1", diff_fallback=0.5,
+    dict(name="lapse_rate", label="Lapse rate", units="K km-1", zero_difference_scale=0.5,
          getter=lambda ds, zds: zm_lapse_rate(zds), parity="even"),
-    dict(name="relative_humidity", label="Relative humidity", units="%", diff_fallback=10.0,
+    dict(name="relative_humidity", label="Relative humidity", units="%", zero_difference_scale=10.0,
          getter=lambda ds, zds: zds.relhum.rename("relative_humidity"), parity="even"),
-    dict(name="water_vapour", label="Water vapour", units="g kg-1", diff_fallback=1.0,
+    dict(name="water_vapour", label="Water vapour", units="g kg-1", zero_difference_scale=1.0,
          getter=water_vapour_field, parity="even"),
-    dict(name="vertical_velocity", label="Vertical velocity", units="m s-1", diff_fallback=0.01,
+    dict(name="vertical_velocity", label="Vertical velocity", units="m s-1", zero_difference_scale=0.01,
          getter=lambda ds, zds: zm_vertical_velocity(zds), parity="even"),
-    dict(name="cloud_fraction", label="Cloud fraction", units="fraction", diff_fallback=0.05,
+    dict(name="cloud_fraction", label="Cloud fraction", units="fraction", zero_difference_scale=0.05,
          getter=cloud_fraction_time_field, parity="even"),
 ]
 
 
 def block_latheight_field(da, parity="even", block_days=BOOTSTRAP_BLOCK_DAYS):
-    x = rename_vertical_to_z(finite_or_nan(da))
+    x = require_zonal_mean_height(finite_or_nan(da))
     blocks = []
     for slc in block_slices(x, block_days=block_days):
         xb = x.isel(Time=slc)
@@ -813,32 +830,45 @@ def latheight_domain_values(blocks, lat_bounds, z_bounds):
     return np.asarray(weighted_mean_dims(x, ["z", "latitude"]).values, dtype=float)
 
 
-def symmetric_field_levels(fields, fallback=1.0, percentile=99.0, ndiv=16):
+def symmetric_field_levels(
+    fields, zero_difference_scale=1.0, percentile=99.0, ndiv=16
+):
     vals = []
     for field in fields:
         arr = np.asarray(field, dtype=float).ravel()
         arr = arr[np.isfinite(arr)]
         if arr.size:
             vals.append(np.nanpercentile(np.abs(arr), percentile))
-    vmax = max(vals) if vals else fallback
-    if not np.isfinite(vmax) or vmax <= 0:
-        vmax = fallback
+    if not vals:
+        raise RuntimeError("Cannot determine plot levels from non-finite fields")
+    vmax = max(vals)
+    if not np.isfinite(vmax):
+        raise RuntimeError("Cannot determine plot levels from invalid fields")
+    if vmax == 0.0:
+        vmax = zero_difference_scale
     return symmetric_levels(vmax, ndiv=ndiv)
 
 
 def plot_latheight_bootstrap(spec, diff_by_comparison):
     if not should_run_figure(1):
         return
+    missing = [
+        name for name, *_ in COMPARISONS if name not in diff_by_comparison
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Lat-height bootstrap plot lacks comparisons {missing}"
+        )
     comp_items = [
         (name, label, diff_by_comparison[name])
         for name, _, _, label in COMPARISONS
-        if name in diff_by_comparison
     ]
-    if not comp_items:
-        return
 
     fields = [item[2].mean_response.values for item in comp_items]
-    levels = symmetric_field_levels(fields, fallback=spec["diff_fallback"])
+    levels = symmetric_field_levels(
+        fields,
+        zero_difference_scale=spec["zero_difference_scale"],
+    )
     fig, axes = plt.subplots(
         1, len(comp_items), figsize=(3.6 * len(comp_items), 3.4),
         constrained_layout=True, sharex=True, sharey=True
@@ -936,10 +966,7 @@ def run_mean_state_pathway():
             write_cached_diff_datasets(f"mean_state_{spec['name']}_diffs", diff_by_comp, cache_signature)
             record_implemented(f"mean-state lat-height bootstrap for {spec['name']}")
         except Exception as exc:
-            if "unavailable" in str(exc) or "Missing" in str(exc) or "None of" in str(exc):
-                record_skip(f"mean-state {spec['name']} ({exc})")
-            else:
-                record_failure(f"mean-state {spec['name']}", exc)
+            record_failure(f"mean-state {spec['name']}", exc)
 
 
 # -----------------------------------------------------------------------------
@@ -1019,7 +1046,7 @@ def plot_precip_pdf_differences(pdf_diffs):
         ax.plot(
             x[plot_mask],
             y[plot_mask],
-            color=colors_by_comp.get(comp_name, "k"),
+            color=colors_by_comp[comp_name],
             lw=1.4,
             label=label,
         )
@@ -1027,7 +1054,7 @@ def plot_precip_pdf_differences(pdf_diffs):
             x[plot_mask],
             ds.ci_low.values[plot_mask],
             ds.ci_high.values[plot_mask],
-            color=colors_by_comp.get(comp_name, "k"),
+            color=colors_by_comp[comp_name],
             alpha=0.12,
         )
     ax.axhline(0.0, color="0.6", lw=0.8)
@@ -1144,7 +1171,7 @@ def plot_basic_convection_pdf_differences(pdf_diffs_by_field):
             label = next(label for name, _, _, label in COMPARISONS if name == comp_name)
             x = ds.pdf_bin.values
             y = ds.mean_response.values
-            color = colors_by_comp.get(comp_name, "k")
+            color = colors_by_comp[comp_name]
             ax.plot(x, y, color=color, lw=1.25, label=label)
             ax.fill_between(x, ds.ci_low.values, ds.ci_high.values, color=color, alpha=0.12)
         ax.axhline(0.0, color="0.6", lw=0.8)
@@ -1186,14 +1213,13 @@ def run_basic_convection_pdf_bootstrap():
         pdf_diffs_by_field = {}
         rng = np.random.default_rng(BOOTSTRAP_SEED + 222)
         for spec in BASIC_CONVECTION_PDF_SPECS:
-            try:
-                blocks_by_run = {
-                    i: field_pdf_block_values(get_surface_convection_field(dss[i], spec["name"]), spec["bins"])
-                    for i in range(len(dss))
-                }
-            except Exception as exc:
-                record_skip(f"basic convection PDF {spec['name']} ({exc})")
-                continue
+            blocks_by_run = {
+                i: field_pdf_block_values(
+                    get_surface_convection_field(dss[i], spec["name"]),
+                    spec["bins"],
+                )
+                for i in range(len(dss))
+            }
 
             diffs = {}
             for comp_name, run_idx, ref_idx, comp_label in COMPARISONS:
@@ -1288,11 +1314,17 @@ def plot_wavenumber_bootstrap_differences(diff_by_direction_field):
     for ri, direction in enumerate(directions):
         for ci, field in enumerate(fields):
             ax = axes[ri, ci]
-            diffs = diff_by_direction_field.get((direction, field), {})
+            key = (direction, field)
+            if key not in diff_by_direction_field:
+                raise RuntimeError(
+                    f"Missing wavenumber bootstrap response for {direction} "
+                    f"{field}"
+                )
+            diffs = diff_by_direction_field[key]
             for comp_name, ds in diffs.items():
                 label = next(label for name, _, _, label in COMPARISONS if name == comp_name)
                 k = ds.wavenumber.values
-                color = colors_by_comp.get(comp_name, "k")
+                color = colors_by_comp[comp_name]
                 ax.plot(k, ds.mean_response.values, color=color, marker="o", ms=3, lw=1.1, label=label)
                 ax.fill_between(k, ds.ci_low.values, ds.ci_high.values, color=color, alpha=0.12)
             ax.axhline(0.0, color="0.6", lw=0.8)
@@ -1329,11 +1361,10 @@ def run_wavenumber_variance_bootstrap():
         diffs_by_direction_field = {}
         rng = np.random.default_rng(BOOTSTRAP_SEED + 333)
         for field_name in WAVENUMBER_FIELDS:
-            try:
-                field_by_run = {i: get_surface_convection_field(dss[i], field_name) for i in range(len(dss))}
-            except Exception as exc:
-                record_skip(f"wavenumber variance {field_name} ({exc})")
-                continue
+            field_by_run = {
+                i: get_surface_convection_field(dss[i], field_name)
+                for i in range(len(dss))
+            }
             for direction in ("zonal", "meridional"):
                 blocks_by_run = {
                     i: block_wavenumber_fraction_values(field_by_run[i], direction)
@@ -1375,14 +1406,8 @@ def run_wavenumber_variance_bootstrap():
 
 def get_cloud_fraction(ds):
     if "cldfrac" not in ds.data_vars:
-        return None
-    cf = rename_vertical_to_z(finite_or_nan(ds.cldfrac))
-    if "z" not in cf.coords:
-        return None
-    zvals = np.asarray(cf.z.values, dtype=float)
-    if np.nanmax(np.abs(zvals)) < 100.0:
-        cf = cf.assign_coords(z=cf.z * 1000.0)
-    return cf
+        raise RuntimeError("cldfrac is required for cloud-profile diagnostics")
+    return require_zonal_mean_height(finite_or_nan(ds.cldfrac))
 
 
 def cloud_profile_blocks(cf):
@@ -1397,15 +1422,20 @@ def cloud_profile_blocks(cf):
 
 
 def plot_cloud_profile_diffs(profile_diffs):
-    if not should_run_figure(3) or not profile_diffs:
+    if not should_run_figure(3):
         return
+    missing = [name for name, *_ in COMPARISONS if name not in profile_diffs]
+    if missing:
+        raise RuntimeError(
+            f"Cloud-profile bootstrap plot lacks comparisons {missing}"
+        )
     fig, ax = plt.subplots(1, 1, figsize=(4.2, 4.4), constrained_layout=True)
     colors_by_comp = {"u_minus_control": "b", "T_minus_control": "r", "u_minus_T": "0.2"}
     for comp_name, ds in profile_diffs.items():
         label = next(label for name, _, _, label in COMPARISONS if name == comp_name)
         z_km = z_values_m(ds.mean_response) / 1000.0
-        ax.plot(ds.mean_response, z_km, color=colors_by_comp.get(comp_name, "k"), lw=1.5, label=label)
-        ax.fill_betweenx(z_km, ds.ci_low, ds.ci_high, color=colors_by_comp.get(comp_name, "k"), alpha=0.13)
+        ax.plot(ds.mean_response, z_km, color=colors_by_comp[comp_name], lw=1.5, label=label)
+        ax.fill_betweenx(z_km, ds.ci_low, ds.ci_high, color=colors_by_comp[comp_name], alpha=0.13)
     ax.axvline(0.0, color="0.6", lw=0.8)
     ax.set_ylim(0.0, 25.0)
     ax.set_xlabel("Cloud-fraction response")
@@ -1440,40 +1470,48 @@ REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS = (
 
 def cloud_masks_from_cache(sim_name, precip_ref):
     filename = f"{sim_name.replace(' ', '_')}_classified_high_cloud.nc"
-    checked = []
-    for cache_dir in CLOUD_CLASSIFICATION_CACHE_DIRS:
-        path = os.path.join(cache_dir, filename)
-        checked.append(path)
-        if not os.path.exists(path):
-            continue
-        cached = xr.open_dataset(path, chunks={})
-        if not cached_classification_is_current(cached):
-            cached.close()
-            raise RuntimeError(f"{sim_name}: stale high-cloud classification cache: {path}")
-        missing = [
-            key for key in REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS
-            if key not in cached.data_vars
-        ]
-        if missing:
-            cached.close()
-            raise RuntimeError(
-                f"{sim_name}: high-cloud classification cache lacks required shared variables {missing}: {path}"
-            )
-        out = {}
-        for key in REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS:
-            da = cached[key]
-            if "Time" in da.dims and "Time" in precip_ref.dims:
-                common = da.Time.to_index().intersection(precip_ref.Time.to_index())
-                da = da.sel(Time=common)
-            if key.endswith("_mask"):
-                da = da.fillna(False).astype(bool)
-            out[key] = da
-        print(f"Using cached high-cloud classification for {sim_name}: {path}")
-        return out
-    raise FileNotFoundError(
-        f"{sim_name}: required shared high-cloud classification cache is missing. "
-        f"Run refined_high_cloud_classification_diagnostics.py first. Checked: {checked}"
-    )
+    path = os.path.join(CLOUD_CLASSIFICATION_CACHE_DIR, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{sim_name}: required shared high-cloud classification cache "
+            f"is missing: {path}. Run "
+            "refined_high_cloud_classification_diagnostics.py first."
+        )
+    cached = xr.open_dataset(path, chunks={})
+    if not cached_classification_is_current(cached):
+        cached.close()
+        raise RuntimeError(
+            f"{sim_name}: stale high-cloud classification cache: {path}"
+        )
+    missing = [
+        key for key in REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS
+        if key not in cached.data_vars
+    ]
+    if missing:
+        cached.close()
+        raise RuntimeError(
+            f"{sim_name}: high-cloud classification cache lacks required "
+            f"shared variables {missing}: {path}"
+        )
+    out = {}
+    expected_time = precip_ref.Time.to_index()
+    for key in REQUIRED_HIGH_CLOUD_CLASSIFICATION_VARS:
+        da = cached[key]
+        if "Time" in da.dims:
+            actual_time = da.Time.to_index()
+            missing_time = expected_time.difference(actual_time)
+            if len(missing_time):
+                cached.close()
+                raise RuntimeError(
+                    f"{sim_name}: classification lacks {len(missing_time)} "
+                    f"required precipitation times for {key}: {path}"
+                )
+            da = da.sel(Time=expected_time)
+        if key.endswith("_mask"):
+            da = da.fillna(False).astype(bool)
+        out[key] = da
+    print(f"Using cached high-cloud classification for {sim_name}: {path}")
+    return out
 
 
 def block_area_fraction_values(da):
@@ -1512,10 +1550,7 @@ def run_cloud_response(precip_by_run):
     try:
         cf_by_run = {}
         for i in range(len(dss)):
-            cf = get_cloud_fraction(dss_zm[i])
-            if cf is None:
-                raise ValueError(f"cldfrac unavailable for {sim_names[i]}")
-            cf_by_run[i] = cf
+            cf_by_run[i] = get_cloud_fraction(dss_zm[i])
 
         profile_by_run = {i: cloud_profile_blocks(cf_by_run[i]) for i in range(len(dss))}
         rng = np.random.default_rng(BOOTSTRAP_SEED + 303)
@@ -1530,8 +1565,9 @@ def run_cloud_response(precip_by_run):
         record_failure("cloud fraction profile/depth bootstrap", exc)
 
     if not precip_by_run:
-        record_skip("cloud-type bootstrap (precipitation unavailable for classification)")
-        return
+        raise RuntimeError(
+            "Cloud-type bootstrap requires precipitation for every simulation"
+        )
 
     try:
         class_by_run = {}
@@ -1591,8 +1627,10 @@ def conditional_area_mean_blocks(target, condition):
 
 def run_conditional_precipitation_states(precip_by_run):
     if not precip_by_run:
-        record_skip("strong/weak precipitation conditional bootstrap (precipitation unavailable)")
-        return
+        raise RuntimeError(
+            "Strong/weak precipitation diagnostics require precipitation for "
+            "every simulation"
+        )
     try:
         cache_signature = base_bootstrap_cache_signature(
             "conditional_precipitation_states",
@@ -1614,11 +1652,6 @@ def run_conditional_precipitation_states(precip_by_run):
             "OLR": {i: aligned_field(dss[i], "OLR", precip_by_run[i]) for i in range(len(dss))},
             "PW": {i: aligned_field(dss[i], "PW", precip_by_run[i]) for i in range(len(dss))},
         }
-        for target_name, by_run in list(targets.items()):
-            if any(by_run[i] is None for i in range(len(dss))):
-                record_skip(f"conditional {target_name} on precipitation states (variable unavailable)")
-                targets.pop(target_name)
-
         for state_name, condition_func in (
             ("strong_precip_ge_5mmday", lambda pr: pr >= PRECIP_STRONG_THRESHOLD),
             ("weak_precip_le_1mmday", lambda pr: pr <= PRECIP_WEAK_THRESHOLD),
@@ -1652,17 +1685,17 @@ def run_conditional_precipitation_states(precip_by_run):
 
 
 # -----------------------------------------------------------------------------
-# LPT precipitation-envelope event properties
+# LPO precipitation-envelope event properties
 # -----------------------------------------------------------------------------
 
 ORGANISATION_SOURCE_ORDER = [
-    LPT_TRACK_SOURCE,
+    LPO_TRACK_SOURCE,
 ]
-ORGANISATION_PRIMARY_TRACK_SOURCE = LPT_TRACK_SOURCE
-ORGANISATION_TRACK_CACHE_VERSION = LPT_PRODUCT_VERSION
+ORGANISATION_PRIMARY_TRACK_SOURCE = LPO_TRACK_SOURCE
+ORGANISATION_TRACK_CACHE_VERSION = LPO_TRACKING_PRODUCT_VERSION
 
 
-def load_lpt_envelope_events():
+def load_lpo_envelope_events():
     publication = require_publication_products()
     df, _lifecycle = read_standard_event_tables(publication / "primary")
     required = {
@@ -1672,7 +1705,7 @@ def load_lpt_envelope_events():
     }
     missing = sorted(required - set(df.columns))
     if missing:
-        raise ValueError(f"LPT event table is missing columns: {missing}")
+        raise ValueError(f"LPO event table is missing columns: {missing}")
 
     df = df[
         df.primary_tropical_sample.astype(bool)
@@ -1686,16 +1719,16 @@ def load_lpt_envelope_events():
         }
     )
     if df.simulation.isna().any():
-        raise ValueError("LPT event table contains an unknown simulation")
-    df["source"] = LPT_TRACK_SOURCE
-    df["source_label"] = TRACK_POPULATION_LABELS[LPT_TRACK_POPULATION]
-    df[LPT_TRACK_POPULATION] = True
+        raise ValueError("LPO event table contains an unknown simulation")
+    df["source"] = LPO_TRACK_SOURCE
+    df["source_label"] = TRACK_POPULATION_LABELS[LPO_TRACK_POPULATION]
+    df[LPO_TRACK_POPULATION] = True
     for col in [metric for metric, _ in ORGANISATION_TRACK_METRIC_SPECS]:
         df[col] = pd.to_numeric(df[col], errors="raise")
     return df
 
 
-def lpt_source_label(df, source):
+def lpo_source_label(df, source):
     sub = df[df["source"] == source]
     if len(sub) == 0 or "source_label" not in sub.columns:
         return source
@@ -1703,26 +1736,26 @@ def lpt_source_label(df, source):
     return str(vals[0]) if len(vals) else source
 
 
-def ordered_lpt_sources(df):
+def ordered_lpo_sources(df):
     present = set(df["source"].dropna().unique())
-    unexpected = present - {LPT_TRACK_SOURCE}
+    unexpected = present - {LPO_TRACK_SOURCE}
     if unexpected:
         raise RuntimeError(
-            f"LPT event tables contain unexpected sources: {sorted(unexpected)}"
+            f"LPO event tables contain unexpected sources: {sorted(unexpected)}"
         )
     ordered = [source for source in ORGANISATION_SOURCE_ORDER if source in present]
     return ordered
 
 
-def lpt_source_role(source):
-    if source == LPT_TRACK_SOURCE:
+def lpo_source_role(source):
+    if source == LPO_TRACK_SOURCE:
         return "large_scale_precipitation_envelopes"
     raise RuntimeError(
-        f"LPT event tables contain an unexpected source: {source!r}"
+        f"LPO event tables contain an unexpected source: {source!r}"
     )
 
 
-def plot_lpt_envelope_bootstrap_summary(org_df, org_source_labels):
+def plot_lpo_envelope_bootstrap_summary(org_df, org_source_labels):
     if not should_run_figure(5) or len(org_df) == 0:
         return
 
@@ -1737,7 +1770,7 @@ def plot_lpt_envelope_bootstrap_summary(org_df, org_source_labels):
         ("total_zonal_displacement_km", "Net zonal displacement (km)"),
     ]
     plot_df = org_df[
-        (org_df["category"] == "lpt_envelope_event_properties")
+        (org_df["category"] == "lpo_envelope_event_properties")
         & (org_df["metric"].isin([metric for metric, _ in display_metrics]))
     ].copy()
     if len(plot_df) == 0:
@@ -1763,7 +1796,10 @@ def plot_lpt_envelope_bootstrap_summary(org_df, org_source_labels):
         for comp_name, _, _, comp_label in COMPARISONS:
             sub = sub_metric[sub_metric["comparison"] == comp_name]
             if len(sub) == 0:
-                continue
+                raise RuntimeError(
+                    f"Missing LPO bootstrap comparison {comp_name} for "
+                    f"metric {metric}"
+                )
             yvals = []
             xvals = []
             xerr_low = []
@@ -1772,7 +1808,10 @@ def plot_lpt_envelope_bootstrap_summary(org_df, org_source_labels):
             for si, source in enumerate(sources):
                 row = sub[sub["diagnostic"] == source]
                 if len(row) == 0:
-                    continue
+                    raise RuntimeError(
+                        f"Missing LPO bootstrap row for {source} {metric} "
+                        f"{comp_name}"
+                    )
                 row = row.iloc[0]
                 x = float(row["mean_response"])
                 yvals.append(ybase[si] + offsets[comp_name])
@@ -1780,9 +1819,7 @@ def plot_lpt_envelope_bootstrap_summary(org_df, org_source_labels):
                 xerr_low.append(max(0.0, x - float(row["ci_low"])))
                 xerr_high.append(max(0.0, float(row["ci_high"]) - x))
                 robust.append(bool(row["robust"]))
-            if not xvals:
-                continue
-            color = colors_by_comp.get(comp_name, "k")
+            color = colors_by_comp[comp_name]
             ax.errorbar(
                 xvals,
                 yvals,
@@ -1800,24 +1837,24 @@ def plot_lpt_envelope_bootstrap_summary(org_df, org_source_labels):
                     ax.plot(x, y, marker="o", ms=4.5, mfc="white", mec=color, mew=1.0, linestyle="none")
         ax.axvline(0.0, color="0.55", lw=0.8)
         ax.set_yticks(ybase)
-        ax.set_yticklabels([org_source_labels.get(source, source) for source in sources])
+        ax.set_yticklabels([org_source_labels[source] for source in sources])
         ax.invert_yaxis()
         ax.grid(axis="x", alpha=0.18)
         ax.set_xlabel(f"{label} response")
     axes.ravel()[0].legend(frameon=False, fontsize=8, loc="best")
     fig.suptitle(
-        "LPT precipitation-envelope responses with each event weighted equally; "
+        "LPO precipitation-envelope responses with each event weighted equally; "
         "filled points exclude zero"
     )
-    figsave.save(fig, "lpt_envelope_bootstrap_summary", number=5)
+    figsave.save(fig, "lpo_envelope_bootstrap_summary", number=5)
     plt.close(fig)
 
 
-def run_lpt_envelope_bootstrap():
+def run_lpo_envelope_bootstrap():
     try:
-        tracks = load_lpt_envelope_events()
+        tracks = load_lpo_envelope_events()
         cache_signature = base_bootstrap_cache_signature(
-            "lpt_envelope_event_properties",
+            "lpo_envelope_event_properties",
             extra=dict(
                 organisation_tracks_file=ORGANISATION_TRACKS_FILE,
                 track_metric_specs=jsonable_value(ORGANISATION_TRACK_METRIC_SPECS),
@@ -1829,25 +1866,24 @@ def run_lpt_envelope_bootstrap():
             ),
         )
         cached_rows = load_cached_table(
-            "lpt_envelope_bootstrap_metrics", cache_signature
+            "lpo_envelope_bootstrap_metrics", cache_signature
         )
         if cached_rows is not None:
             append_cached_scalar_rows(cached_rows)
-            save_table(cached_rows, "lpt_envelope_bootstrap_metrics.csv")
+            save_table(cached_rows, "lpo_envelope_bootstrap_metrics.csv")
             source_labels = (
                 cached_rows.dropna(subset=["diagnostic", "source_label"])
                 .drop_duplicates("diagnostic")
                 .set_index("diagnostic")["source_label"]
                 .to_dict()
             )
-            plot_lpt_envelope_bootstrap_summary(cached_rows, source_labels)
-            record_implemented("cached LPT-envelope event bootstrap")
+            plot_lpo_envelope_bootstrap_summary(cached_rows, source_labels)
+            record_implemented("cached LPO-envelope event bootstrap")
             return
 
         source_labels = {}
         row_start = len(scalar_metric_rows)
-        skipped = 0
-        for source in ordered_lpt_sources(tracks):
+        for source in ordered_lpo_sources(tracks):
             for population in ANALYSIS_TRACK_POPULATIONS:
                 diagnostic = f"{source}:{population}"
                 population_label = TRACK_POPULATION_LABELS[population]
@@ -1863,42 +1899,41 @@ def run_lpt_envelope_bootstrap():
                         ].to_numpy(dtype=float)
                         values = values[np.isfinite(values)]
                         if values.size < MIN_BLOCKS:
-                            values_by_run = None
-                            skipped += 1
-                            break
+                            raise RuntimeError(
+                                f"{source} {population} {metric}: "
+                                f"{simulation} has {values.size} finite events; "
+                                f"at least {MIN_BLOCKS} are required"
+                            )
                         values_by_run[simulation_index] = values
-                    if values_by_run is None:
-                        continue
                     append_bootstrap_metric_rows(
                         scalar_metric_rows,
                         values_by_run,
-                        "lpt_envelope_event_properties",
+                        "lpo_envelope_event_properties",
                         diagnostic,
                         metric,
                         units=units,
                         extra={
                             "source_label": population_label,
                             "track_population": population,
-                            "organisation_role": lpt_source_role(source),
+                            "organisation_role": lpo_source_role(source),
                             "weighting": "tracks resampled equally within population",
                         },
                     )
 
         result = pd.DataFrame(scalar_metric_rows[row_start:])
         if len(result) == 0:
-            record_skip("LPT-envelope event bootstrap (too few events)")
-            return
-        save_table(result, "lpt_envelope_bootstrap_metrics.csv")
-        plot_lpt_envelope_bootstrap_summary(result, source_labels)
-        write_cached_table("lpt_envelope_bootstrap_metrics", result, cache_signature)
-        message = (
-            "bootstrap of tropical LPT-envelope properties with equal event weights"
+            raise RuntimeError(
+                "LPO-envelope event bootstrap produced no configured metrics"
+            )
+        save_table(result, "lpo_envelope_bootstrap_metrics.csv")
+        plot_lpo_envelope_bootstrap_summary(result, source_labels)
+        write_cached_table("lpo_envelope_bootstrap_metrics", result, cache_signature)
+        record_implemented(
+            "bootstrap of tropical LPO-envelope properties with equal event "
+            "weights"
         )
-        if skipped:
-            message += f" ({skipped} metric/run combinations skipped for small samples)"
-        record_implemented(message)
     except Exception as exc:
-        record_failure("LPT-envelope event bootstrap", exc)
+        record_failure("LPO-envelope event bootstrap", exc)
         raise
 
 
@@ -1910,7 +1945,7 @@ wave_label = partial(configured_label, WAVE_BOXES)
 
 
 def wave_cache_dir():
-    path = diagnostic_cache_dir("significance_bootstrap_wave_cache", root_dir=root_dir)
+    path = diagnostic_cache_dir("significance_bootstrap_wave_cache")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -1990,13 +2025,18 @@ def filter_projected_wave(projected, wave_name, sim_index, field_name):
         except Exception:
             pass
 
-    if kf_filter is None:
-        raise ModuleNotFoundError("waveFilter.kf_filter is unavailable")
-
     x = projected.load()
     arr = np.asarray(x.values, dtype=np.float32)
     arr = arr - np.nanmean(arr, axis=0, keepdims=True)
-    arr[~np.isfinite(arr)] = 0.0
+    if not np.all(np.isfinite(arr)):
+        raise RuntimeError(
+            f"{sim_names[sim_index]} {field_name} {wave_name}: projected "
+            "filter input contains non-finite values"
+        )
+    if "units" not in x.attrs or not str(x.attrs["units"]).strip():
+        raise RuntimeError(
+            f"{sim_names[sim_index]} {field_name}: source field lacks units"
+        )
 
     box = WAVE_BOXES[wave_name]
     k0, k1 = box["k"]
@@ -2015,7 +2055,7 @@ def filter_projected_wave(projected, wave_name, sim_index, field_name):
             "wave": wave_name,
             "wave_label": box["label"],
             "source_simulation": sim_names[sim_index],
-            "units": x.attrs.get("units", ""),
+            "units": x.attrs["units"],
         },
     )
     out_ds = out.to_dataset()
@@ -2037,15 +2077,6 @@ def block_variance_values(da):
 
 
 def run_wave_pathway():
-    if kf_filter is None:
-        record_skip("wave-mediated block-consistency diagnostics (waveFilter.kf_filter unavailable)")
-        record_todo(
-            "CCEW wave-box bootstrap",
-            "Integrated wave-box variance tests whether nudged responses are tied to organised equatorial wave-coupled convection.",
-            "equatorial_wave_diagnostics.py or waveFilter import configuration",
-        )
-        return
-
     try:
         cache_signature = base_bootstrap_cache_signature(
             "wave_pathway",
@@ -2108,6 +2139,48 @@ def run_wave_pathway():
         record_failure("wave-mediated pathway bootstrap", exc)
 
 
+def consume_wave_response_metrics():
+    """Reuse the authoritative shared-metric table instead of re-regressing."""
+    if not os.path.exists(WAVE_RESPONSE_METRIC_OUTPUT):
+        raise FileNotFoundError(
+            f"{WAVE_RESPONSE_METRIC_OUTPUT} is missing; run "
+            "equatorial_wave_diagnostics.py Figure 11 before significance "
+            "diagnostics"
+        )
+    table = pd.read_csv(WAVE_RESPONSE_METRIC_OUTPUT)
+    required = {
+        "wave_metrics_version",
+        "wave_config_version",
+        "precipitation_rms_mm_day",
+        "precipitation_variance_mm2_day2",
+        "covariance",
+        "regression_slope",
+        "sensitivity_subset",
+    }
+    missing = sorted(required - set(table.columns))
+    if missing:
+        raise RuntimeError(
+            f"Shared wave-response table {WAVE_RESPONSE_METRIC_OUTPUT} "
+            f"lacks {missing}"
+        )
+    versions = set(table.wave_config_version.dropna().astype(str))
+    if versions != {WAVE_CONFIG_VERSION}:
+        raise RuntimeError(
+            f"Stale wave configuration {sorted(versions)} in "
+            f"{WAVE_RESPONSE_METRIC_OUTPUT}; expected {WAVE_CONFIG_VERSION}"
+        )
+    metric_versions = set(table.wave_metrics_version.dropna().astype(str))
+    if metric_versions != {METRICS_VERSION}:
+        raise RuntimeError(
+            f"Stale wave metrics {sorted(metric_versions)} in "
+            f"{WAVE_RESPONSE_METRIC_OUTPUT}; expected {METRICS_VERSION}"
+        )
+    save_table(table, "wave_response_efficiency_metrics_shared.csv")
+    record_implemented(
+        "shared precipitation-amplitude, filtered-cloud-efficiency, and TOA-longwave-response metrics"
+    )
+
+
 def plot_wave_summary(wave_df):
     if not should_run_figure(4) or len(wave_df) == 0:
         return
@@ -2143,11 +2216,11 @@ def plot_wave_summary(wave_df):
                 err_high = []
                 for wave in waves:
                     row = metric_sub[(metric_sub["comparison"] == comp) & (metric_sub["wave"] == wave)]
-                    if len(row) == 0:
-                        y.append(np.nan)
-                        err_low.append(np.nan)
-                        err_high.append(np.nan)
-                        continue
+                    if len(row) != 1:
+                        raise RuntimeError(
+                            f"Wave-box figure requires one {field} {metric} "
+                            f"{comp} {wave} row; found {len(row)}"
+                        )
                     row = row.iloc[0]
                     y.append(row["mean_response"])
                     err_low.append(row["mean_response"] - row["ci_low"])
@@ -2185,8 +2258,8 @@ def plot_vertical_wave_power_profiles(profile_df):
     ].copy()
     if len(plot_df) == 0:
         return
-    fields = [spec["name"] for spec in WAVE_PROFILE_FIELDS if spec["name"] in set(plot_df["field"])]
-    waves = [wave for wave in WAVE_PROFILE_WAVES if wave in set(plot_df["wave"])]
+    fields = [spec["name"] for spec in WAVE_PROFILE_FIELDS]
+    waves = list(WAVE_PROFILE_WAVES)
     fig, axes = plt.subplots(
         len(fields), len(waves),
         figsize=(3.4 * len(waves), 3.0 * len(fields)),
@@ -2201,7 +2274,10 @@ def plot_vertical_wave_power_profiles(profile_df):
             for comp in ("u_minus_control", "T_minus_control"):
                 sub = plot_df[(plot_df["field"] == field) & (plot_df["wave"] == wave) & (plot_df["comparison"] == comp)].sort_values("pressure_hpa")
                 if len(sub) == 0:
-                    continue
+                    raise RuntimeError(
+                        f"Missing vertical wave-power profile for {field} "
+                        f"{wave} {comp}"
+                    )
                 color = colors_by_comp[comp]
                 label = next(text for name, _, _, text in COMPARISONS if name == comp)
                 ax.plot(sub["mean_response"], sub["pressure_hpa"], color=color, marker="o", ms=3, lw=1.1, label=label)
@@ -2224,9 +2300,6 @@ def plot_vertical_wave_power_profiles(profile_df):
 
 
 def run_vertical_wave_power_profile_bootstrap():
-    if kf_filter is None:
-        record_skip("vertical wave-power profile block-consistency diagnostics (waveFilter.kf_filter unavailable)")
-        return
     try:
         cache_signature = base_bootstrap_cache_signature(
             "vertical_wave_power_profile",
@@ -2250,16 +2323,14 @@ def run_vertical_wave_power_profile_bootstrap():
             for field_spec in WAVE_PROFILE_FIELDS:
                 for level_hpa in WAVE_PROFILE_LEVELS_HPA:
                     field_name = wave_profile_field_name(field_spec, level_hpa)
-                    try:
-                        values_by_run = {}
-                        for i in range(len(dss)):
-                            raw = get_wave_filter_field(dss[i], field_name)
-                            projected = project_wave_latitude(raw, wave_name)
-                            filtered = filter_projected_wave(projected, wave_name, i, field_name)
-                            values_by_run[i] = block_variance_values(filtered)
-                    except Exception as exc:
-                        record_skip(f"vertical wave power {field_name} {wave_name} ({exc})")
-                        continue
+                    values_by_run = {}
+                    for i in range(len(dss)):
+                        raw = get_wave_filter_field(dss[i], field_name)
+                        projected = project_wave_latitude(raw, wave_name)
+                        filtered = filter_projected_wave(
+                            projected, wave_name, i, field_name
+                        )
+                        values_by_run[i] = block_variance_values(filtered)
 
                     before = len(scalar_metric_rows)
                     append_bootstrap_metric_rows(
@@ -2328,8 +2399,8 @@ def block_lag_correlation_values(wave_amp, target_ts):
 def plot_wave_lag_correlation_differences(lag_diffs):
     if not should_run_figure(8) or not lag_diffs:
         return
-    waves = [wave for wave in WAVE_LAG_WAVES if any(key[0] == wave for key in lag_diffs)]
-    targets = [target for target in WAVE_LAG_TARGET_FIELDS if any(key[1] == target for key in lag_diffs)]
+    waves = list(WAVE_LAG_WAVES)
+    targets = list(WAVE_LAG_TARGET_FIELDS)
     fig, axes = plt.subplots(
         len(waves), len(targets),
         figsize=(3.7 * len(targets), 2.5 * len(waves)),
@@ -2342,10 +2413,15 @@ def plot_wave_lag_correlation_differences(lag_diffs):
     for wi, wave in enumerate(waves):
         for ti, target in enumerate(targets):
             ax = axes[wi, ti]
-            diffs = lag_diffs.get((wave, target), {})
+            key = (wave, target)
+            if key not in lag_diffs:
+                raise RuntimeError(
+                    f"Missing wave-lag bootstrap response for {wave} {target}"
+                )
+            diffs = lag_diffs[key]
             for comp_name, ds in diffs.items():
                 label = next(label for name, _, _, label in COMPARISONS if name == comp_name)
-                color = colors_by_comp.get(comp_name, "k")
+                color = colors_by_comp[comp_name]
                 lag = ds.lag_days.values
                 ax.plot(lag, ds.mean_response.values, color=color, lw=1.1, label=label)
                 ax.fill_between(lag, ds.ci_low.values, ds.ci_high.values, color=color, alpha=0.12)
@@ -2365,9 +2441,6 @@ def plot_wave_lag_correlation_differences(lag_diffs):
 
 
 def run_wave_lag_correlation_bootstrap():
-    if kf_filter is None:
-        record_skip("wave lag-correlation block-consistency diagnostics (waveFilter.kf_filter unavailable)")
-        return
     try:
         cache_signature = base_bootstrap_cache_signature(
             "wave_lag_correlation",
@@ -2399,16 +2472,20 @@ def run_wave_lag_correlation_bootstrap():
                 amp_by_run[i].name = "wave_amplitude"
 
             for target_name in WAVE_LAG_TARGET_FIELDS:
-                try:
-                    blocks_by_run = {}
-                    for i in range(len(dss)):
-                        target_raw = get_wave_filter_field(dss[i], target_name)
-                        target_projected = project_wave_latitude(target_raw, wave_name)
-                        target_ts = target_projected.mean(dim="longitude", skipna=True)
-                        blocks_by_run[i] = block_lag_correlation_values(amp_by_run[i], target_ts)
-                except Exception as exc:
-                    record_skip(f"wave lag correlation {wave_name} {target_name} ({exc})")
-                    continue
+                blocks_by_run = {}
+                for i in range(len(dss)):
+                    target_raw = get_wave_filter_field(
+                        dss[i], target_name
+                    )
+                    target_projected = project_wave_latitude(
+                        target_raw, wave_name
+                    )
+                    target_ts = target_projected.mean(
+                        dim="longitude", skipna=True
+                    )
+                    blocks_by_run[i] = block_lag_correlation_values(
+                        amp_by_run[i], target_ts
+                    )
 
                 diffs = {}
                 for comp_name, run_idx, ref_idx, comp_label in COMPARISONS:
@@ -2442,168 +2519,15 @@ def run_wave_lag_correlation_bootstrap():
 
 
 # -----------------------------------------------------------------------------
-# Matched-pattern attribution diagnostics
-# -----------------------------------------------------------------------------
-
-def block_latpres_field(zds, var, parity="even"):
-    if var not in zds.data_vars:
-        raise ValueError(f"{var} unavailable")
-    da = finite_or_nan(zds[var])
-    if "pres" not in da.dims:
-        raise ValueError(f"{var} has no pres dimension")
-    blocks = []
-    for slc in block_slices(da):
-        xb = da.isel(Time=slc).mean(dim="Time", skipna=True).transpose("pres", "latitude")
-        xb = hemispheric_fold(xb, parity=parity)
-        blocks.append(xb.load())
-    return xr.concat(blocks, dim=xr.IndexVariable("block", np.arange(len(blocks))))
-
-
-def subset_latpres_domain(blocks, lat_bounds, p_bounds):
-    x = subset_between(blocks, "latitude", lat_bounds)
-    x = subset_between(x, "pres", p_bounds)
-    if x.sizes.get("pres", 0) == 0 or x.sizes.get("latitude", 0) == 0:
-        raise ValueError("empty matched-pattern domain")
-    return x
-
-
-def latpres_weights(template):
-    weight = xr.ones_like(template)
-    weight = weight * latitude_weights(template)
-    weight = weight * pressure_layer_weights(template.pres)
-    return np.asarray(weight.values, dtype=float)
-
-
-def weighted_projection_metrics(target, basis, weight):
-    target = np.asarray(target, dtype=float)
-    basis = np.asarray(basis, dtype=float)
-    valid = np.isfinite(target) & np.isfinite(basis) & np.isfinite(weight) & (weight > 0)
-    if np.count_nonzero(valid) < 3:
-        return np.nan, np.nan, np.nan, np.nan
-    t = target[valid]
-    b = basis[valid]
-    w = weight[valid]
-    numerator = np.sum(t * b * w)
-    denominator = np.sum(b * b * w)
-    target_norm2 = np.sum(t * t * w)
-    basis_norm2 = denominator
-    if denominator <= 0 or target_norm2 <= 0 or basis_norm2 <= 0:
-        return np.nan, np.nan, np.nan, np.nan
-    alpha = numerator / denominator
-    residual = t - alpha * b
-    residual_norm2 = np.sum(residual * residual * w)
-    corr = numerator / np.sqrt(target_norm2 * basis_norm2)
-    residual_fraction = np.sqrt(residual_norm2 / target_norm2)
-    explained_fraction = 1.0 - residual_norm2 / target_norm2
-    return float(alpha), float(corr), float(residual_fraction), float(explained_fraction)
-
-
-def bootstrap_matched_pattern(blocks_control, blocks_u, blocks_T, domain_name, domain):
-    u = subset_latpres_domain(blocks_u, domain["lat_bounds"], domain["p_bounds"])
-    T = subset_latpres_domain(blocks_T, domain["lat_bounds"], domain["p_bounds"])
-    c = subset_latpres_domain(blocks_control, domain["lat_bounds"], domain["p_bounds"])
-    T, _ = xr.align(T, u, join="exact", exclude={"block"})
-    c, _ = xr.align(c, u, join="exact", exclude={"block"})
-    template = u.isel(block=0, drop=True)
-    weight = latpres_weights(template)
-
-    u_values = np.asarray(u.values, dtype=float)
-    T_values = np.asarray(T.values, dtype=float)
-    c_values = np.asarray(c.values, dtype=float)
-
-    mean_du = np.nanmean(u_values, axis=0) - np.nanmean(c_values, axis=0)
-    mean_dT = np.nanmean(T_values, axis=0) - np.nanmean(c_values, axis=0)
-    alpha, corr, resid, explained = weighted_projection_metrics(mean_du, mean_dT, weight)
-
-    rng = np.random.default_rng(BOOTSTRAP_SEED + 404 + len(domain_name))
-    metrics = {"alpha_pattern": [], "weighted_pattern_corr": [], "residual_fraction": [], "explained_fraction": []}
-    for _ in range(N_BOOTSTRAP):
-        ui = rng.integers(0, u_values.shape[0], u_values.shape[0])
-        Ti = rng.integers(0, T_values.shape[0], T_values.shape[0])
-        ci_u = rng.integers(0, c_values.shape[0], c_values.shape[0])
-        ci_T = rng.integers(0, c_values.shape[0], c_values.shape[0])
-        du = np.nanmean(u_values[ui], axis=0) - np.nanmean(c_values[ci_u], axis=0)
-        dT = np.nanmean(T_values[Ti], axis=0) - np.nanmean(c_values[ci_T], axis=0)
-        a, r, rf, ef = weighted_projection_metrics(du, dT, weight)
-        metrics["alpha_pattern"].append(a)
-        metrics["weighted_pattern_corr"].append(r)
-        metrics["residual_fraction"].append(rf)
-        metrics["explained_fraction"].append(ef)
-
-    rows = []
-    point = {
-        "alpha_pattern": alpha,
-        "weighted_pattern_corr": corr,
-        "residual_fraction": resid,
-        "explained_fraction": explained,
-    }
-    for metric, vals in metrics.items():
-        vals = np.asarray(vals, dtype=float)
-        ci_low, ci_high = np.nanpercentile(vals, CI_PERCENTILES)
-        rows.append(
-            {
-                "category": "matched_pattern_attribution",
-                "diagnostic": "temperature_latpres",
-                "domain": domain_name,
-                "metric": metric,
-                "mean_response": point[metric],
-                "ci_low": float(ci_low),
-                "ci_high": float(ci_high),
-                "bootstrap_noise": float(np.nanstd(vals, ddof=1)),
-                "n_bootstrap": N_BOOTSTRAP,
-                "lat_min": domain["lat_bounds"][0],
-                "lat_max": domain["lat_bounds"][1],
-                "p_min_hPa": min(domain["p_bounds"]),
-                "p_max_hPa": max(domain["p_bounds"]),
-            }
-        )
-    return rows
-
-
-def run_matched_pattern_attribution():
-    try:
-        cache_signature = base_bootstrap_cache_signature(
-            "matched_pattern_attribution",
-            extra=dict(
-                domains=jsonable_value(MATCHED_PATTERN_DOMAINS),
-                source_variable="t_isobaric",
-            ),
-        )
-        cached_rows = load_cached_table("matched_pattern_bootstrap_metrics", cache_signature)
-        if cached_rows is not None:
-            save_table(cached_rows, "matched_pattern_bootstrap_metrics.csv")
-            record_implemented("cached matched-pattern projection bootstrap")
-            return cached_rows
-
-        blocks_c = block_latpres_field(dss_zm[0], "t_isobaric", parity="even")
-        blocks_u = block_latpres_field(dss_zm[1], "t_isobaric", parity="even")
-        blocks_T = block_latpres_field(dss_zm[2], "t_isobaric", parity="even")
-        rows = []
-        for domain_name, domain in MATCHED_PATTERN_DOMAINS.items():
-            rows.extend(bootstrap_matched_pattern(blocks_c, blocks_u, blocks_T, domain_name, domain))
-        df = pd.DataFrame(rows)
-        save_table(df, "matched_pattern_bootstrap_metrics.csv")
-        write_cached_table("matched_pattern_bootstrap_metrics", df, cache_signature)
-        record_implemented("matched-pattern projection bootstrap for u-nudged temperature response onto T-nudged temperature response")
-        return df
-    except Exception as exc:
-        record_failure("matched-pattern attribution bootstrap", exc)
-        record_todo(
-            "Matched convective/cloud/precipitation pattern projections",
-            "These would directly test whether U-nudged or T-nudged responses project more strongly onto the actual precipitation/cloud-change pattern.",
-            "matched_pattern_response.py by adding import-safe basis/target projection helpers for surface and cloud fields",
-        )
-        return pd.DataFrame()
-
-
-# -----------------------------------------------------------------------------
 # Reporting
 # -----------------------------------------------------------------------------
 
 def concise_metric_table(df):
     if len(df) == 0:
         return
-    robust = df[df.get("robust", False) == True].copy()
+    if "robust" not in df:
+        raise RuntimeError("Scalar metric table lacks required 'robust' column")
+    robust = df[df["robust"] == True].copy()
     print("\nChunk-consistent scalar responses (central resampling interval excludes zero and sign consistency is high):")
     if len(robust) == 0:
         print("  None by the current thresholds.")
@@ -2616,54 +2540,44 @@ def concise_metric_table(df):
     print(robust.sort_values("abs_rtn", ascending=False)[cols_to_show].head(25).to_string(index=False))
 
 
-def print_mechanism_cues(metrics_df, matched_df):
+def print_mechanism_cues(metrics_df):
     print("\nMechanism-oriented cues:")
-    if len(matched_df) > 0:
-        pivot = matched_df.pivot_table(index="domain", columns="metric", values="mean_response", aggfunc="first")
-        for domain, row in pivot.iterrows():
-            corr = row.get("weighted_pattern_corr", np.nan)
-            resid = row.get("residual_fraction", np.nan)
-            alpha = row.get("alpha_pattern", np.nan)
-            print(
-                f"  Matched thermal pattern {domain}: alpha={alpha:.2f}, "
-                f"corr={corr:.2f}, residual_fraction={resid:.2f}."
-            )
-        print("  High correlation and low residual_fraction support a shared thermal pattern; coherent robust residuals or wave/wind-only changes support an added wind/dynamical pathway.")
-    else:
-        print("  Matched-pattern metrics were not available.")
-
     if len(metrics_df) > 0:
+        if "robust" not in metrics_df:
+            raise RuntimeError(
+                "Significance metric table lacks required 'robust' column"
+            )
         wave_robust = metrics_df[
             (metrics_df["category"] == "wave_mediated_pathway")
             & (metrics_df["comparison"].isin(["u_minus_control", "T_minus_control"]))
-            & (metrics_df.get("robust", False) == True)
+            & (metrics_df["robust"] == True)
         ]
         if len(wave_robust) > 0:
             print("  Robust wave-box changes are present; compare U-control and T-control rows in wave_box_variance_bootstrap_metrics.csv for wind-mediated organisation.")
         org_robust = metrics_df[
             (metrics_df["category"].isin([
-                "lpt_envelope_event_properties",
+                "lpo_envelope_event_properties",
             ]))
             & (metrics_df["comparison"].isin(["u_minus_control", "T_minus_control"]))
-            & (metrics_df.get("robust", False) == True)
+            & (metrics_df["robust"] == True)
         ]
         if len(org_robust) > 0:
             print(
-                "  Robust LPT-envelope property changes are present; use "
-                "lpt_envelope_bootstrap_metrics.csv to compare equally "
+                "  Robust LPO-envelope property changes are present; use "
+                "lpo_envelope_bootstrap_metrics.csv to compare equally "
                 "weighted tracked systems."
             )
         thermal_robust = metrics_df[
             (metrics_df["category"] == "mean_state_pathway")
             & (metrics_df["diagnostic"].isin(["temperature", "static_stability_N2", "lapse_rate", "cloud_fraction"]))
             & (metrics_df["comparison"].isin(["u_minus_control", "T_minus_control"]))
-            & (metrics_df.get("robust", False) == True)
+            & (metrics_df["robust"] == True)
         ]
         if len(thermal_robust) > 0:
             print("  Robust temperature/static-stability/cloud-depth changes are present; these are the core thermal-pathway checks.")
 
 
-def print_final_summary(metrics_df, matched_df):
+def print_final_summary(metrics_df):
     print("\n" + "=" * 78)
     print("Block-resampling consistency summary")
     print("=" * 78)
@@ -2671,13 +2585,6 @@ def print_final_summary(metrics_df, matched_df):
     print("\nDiagnostics implemented and run:")
     if implemented:
         for item in implemented:
-            print(f"  - {item}")
-    else:
-        print("  - None")
-
-    print("\nDiagnostics skipped because variables or helpers were unavailable:")
-    if skipped_unavailable:
-        for item in skipped_unavailable:
             print(f"  - {item}")
     else:
         print("  - None")
@@ -2697,11 +2604,11 @@ def print_final_summary(metrics_df, matched_df):
         print("  - None beyond sensitivity tests/threshold refinements.")
 
     concise_metric_table(metrics_df)
-    print_mechanism_cues(metrics_df, matched_df)
+    print_mechanism_cues(metrics_df)
 
     print("\nAnswering the headline question:")
-    print("  Use bootstrap_scalar_metrics.csv for scalar robustness, basic_convection_pdf_bootstrap_response.csv for PR/OLR/PW/CAPE distribution changes, wavenumber_variance_fraction_bootstrap_response.csv for planetary-scale organisation/noise checks, lpt_envelope_bootstrap_metrics.csv for LPT-envelope properties, the lat-height figures for coherent structures rather than isolated gridpoints, wave_box_variance_bootstrap_metrics.csv plus vertical_wave_power_profile_bootstrap_metrics.csv and wave_lag_correlation_bootstrap_metrics.csv for organised wave-mediated changes, and matched_pattern_bootstrap_metrics.csv for thermal-pattern attribution.")
-    print("  Robust U-control changes in zonal wind or CCEW variance that are absent from T-control point toward a wind-driven pathway; robust shared temperature/N2/cloud-depth structures with high matched-pattern correlation point toward a temperature-driven pathway.")
+    print("  Use bootstrap_scalar_metrics.csv for scalar robustness, basic_convection_pdf_bootstrap_response.csv for PR/OLR/PW/CAPE distribution changes, wavenumber_variance_fraction_bootstrap_response.csv for planetary-scale organisation/noise checks, lpo_envelope_bootstrap_metrics.csv for LPO properties, the lat-height figures for coherent structures rather than isolated gridpoints, and the wave response, vertical-wave-power and lag-correlation tables for organised wave-mediated changes.")
+    print("  Compare the independently diagnosed u-nudged and T-nudged changes directly; no scalar thermal-residual attribution is applied.")
 
 
 # -----------------------------------------------------------------------------
@@ -2715,12 +2622,17 @@ run_basic_convection_pdf_bootstrap()
 run_wavenumber_variance_bootstrap()
 run_cloud_response(precip_by_run)
 run_conditional_precipitation_states(precip_by_run)
-run_lpt_envelope_bootstrap()
+run_lpo_envelope_bootstrap()
+consume_wave_response_metrics()
 run_wave_pathway()
 run_vertical_wave_power_profile_bootstrap()
 run_wave_lag_correlation_bootstrap()
-matched_pattern_df = run_matched_pattern_attribution()
 
 metrics_df = pd.DataFrame(scalar_metric_rows)
 save_table(metrics_df, "bootstrap_scalar_metrics.csv")
-print_final_summary(metrics_df, matched_pattern_df)
+print_final_summary(metrics_df)
+if failed:
+    raise RuntimeError(
+        "One or more configured significance diagnostics failed:\n"
+        + "\n".join(f"  - {message}" for message in failed)
+    )
