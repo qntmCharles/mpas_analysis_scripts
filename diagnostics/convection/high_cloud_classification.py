@@ -10,11 +10,6 @@ remaining high cloud is stratiform where surface rain is at least 0.5 mm h-1
 and non-precipitating otherwise. The native PyFLEXTRKR cold- and warm-shield
 masks are retained as scene context, but are not additional cloud classes and
 do not alter this exhaustive three-way baseline classification.
-
-The established downstream variable names are retained. In particular,
-``convective_precipitating_high_cloud_mask`` is now a legacy name for the
-PyFLEXTRKR core/high-cloud intersection; precipitation is not required to
-identify that class.
 """
 
 from dataclasses import asdict, dataclass
@@ -296,9 +291,8 @@ def classify_high_cloud_3d(
     for key, da in out.items():
         if key.endswith("_mask"):
             da.attrs["logical_type"] = "bool"
-    convective.attrs.update(
-        long_name="high cloud intersecting a PyFLEXTRKR 225-K cold core",
-        legacy_name_note="Precipitation is not required despite the retained downstream variable name",
+    convective.attrs["long_name"] = (
+        "high cloud intersecting a PyFLEXTRKR 225-K cold core"
     )
     stratiform.attrs["long_name"] = "rainy high cloud outside the PyFLEXTRKR convective core"
     nonprecipitating.attrs["long_name"] = "non-raining high cloud outside the PyFLEXTRKR convective core"

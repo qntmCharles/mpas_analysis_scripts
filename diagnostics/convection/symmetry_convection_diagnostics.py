@@ -25,7 +25,8 @@ from diagnostics.diagnostic_helpers import (
     hemispheric_fold, lat_height_mesh,
     load_latlon_dataset, midlevel_height_from_latlon, model_lat_field,
     positive_levels, precip_rate_from_accum, precipitation_rate_from_dataset,
-    safe_nanpercentile, set_latheight_labels, standardize_latlon_dataset,
+    safe_nanpercentile, set_latheight_labels, simulation_colour,
+    standardize_latlon_dataset,
     symmetric_levels, time_step_days, total_precip_accum,
 )
 from diagnostics.convection.high_cloud_classification import (
@@ -86,9 +87,9 @@ sim_names = ['control', 'nudged u', 'nudged T']
 CF_THRESH = 0.05
 P_HIGH_HPA = 440.0
 P_PRECIP_MIN = 12.0  # 0.5 mm h-1 PF threshold (Feng et al. 2021)
-classification_cache_dir = diagnostic_cache_dir("classification_cache", root_dir=root_dir)
+classification_cache_dir = diagnostic_cache_dir("classification_cache")
 
-cols = ['k', 'b', 'r']
+cols = [simulation_colour(name) for name in sim_names]
 
 
 
@@ -1170,7 +1171,9 @@ if should_run_figure(14):
 
             # Use a common absolute colour scale from the control where possible.
             q0, _, _ = condensate_latheight(dss[0], dss_zm[0], varlist)
-            vmax = safe_nanpercentile(q0.values, 99.5, default=1e-4)
+            vmax = safe_nanpercentile(
+                q0.values, 99.5, zero_value=1e-4
+            )
             levs = positive_levels(vmax, n=21)
 
             for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
@@ -1189,7 +1192,11 @@ if should_run_figure(14):
                 else:
                     c = control_q.interp(z=q.z, latitude=q.latitude, kwargs={"fill_value": np.nan})
                     diff = q - c
-                    dmax = safe_nanpercentile(np.abs(diff.values), 99.0, default=max(vmax * 0.25, 1e-6))
+                    dmax = safe_nanpercentile(
+                        np.abs(diff.values),
+                        99.0,
+                        zero_value=max(vmax * 0.25, 1e-6),
+                    )
                     q_diff_levels = symmetric_levels(dmax, ndiv=11)
                     im3 = ax2[i].contourf(lat2d, z2d / 1000.0, diff.values, levels=q_diff_levels, cmap=difference_cmap(q_diff_levels), extend="both")
 
