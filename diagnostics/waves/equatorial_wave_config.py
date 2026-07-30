@@ -6,11 +6,21 @@ rectangular TD/easterly-wave filter, not a shallow-water normal-mode filter.
 """
 
 MISSING_EQUIVALENT_DEPTH = -999.0
+WAVE_CONFIG_VERSION = "equatorial-wave-bands-v3-strict-schema"
+FILTERED_WAVE_PRODUCT_VERSION = (
+    "equatorial-wave-filtered-v5-tapered-record"
+)
+EASTWARD_INTRASEASONAL_FILTER = "Eastward_intraseasonal"
 
 WAVE_VARIABILITY_FIELDS = (
     "Precip",
     "OLR",
     "PW",
+    "high_cloud",
+    "active_high_cloud",
+    "stratiform_high_cloud",
+    "nonprecipitating_high_cloud",
+    "ttl_reaching_high_cloud",
     "cldfrac",
     "u850",
     "u250",
@@ -23,9 +33,15 @@ WAVE_VARIABILITY_FIELDS = (
     "T100",
 )
 
-CORE_WAVE_NAMES = ("Kelvin", "Easterly", "ER")
-
 WAVE_BOXES = {
+    EASTWARD_INTRASEASONAL_FILTER: dict(
+        k=(1, 5),
+        period=(20.0, 100.0),
+        depth=(MISSING_EQUIVALENT_DEPTH, MISSING_EQUIVALENT_DEPTH),
+        label="Eastward intraseasonal",
+        filter_name="None",
+        components=("symmetric",),
+    ),
     "Kelvin": dict(
         k=(1, 14), period=(2.5, 20.0), depth=(8, 90),
         label="Kelvin", filter_name="Kelvin", components=("symmetric",),
@@ -51,6 +67,7 @@ WAVE_BOXES = {
 }
 
 WAVE_LATITUDE_PROJECTION = {
+    EASTWARD_INTRASEASONAL_FILTER: "symmetric",
     "Kelvin": "symmetric",
     "EIG": "antisymmetric",
     "IG_antisym": "antisymmetric",
@@ -59,3 +76,31 @@ WAVE_LATITUDE_PROJECTION = {
     "Easterly": "direct",
     "ER": "symmetric",
 }
+
+# Diagnostic-specific collections prevent the 20--100-day band from being
+# inserted into calculations whose lag windows or dispersion assumptions are
+# designed for shorter-period CCEWs.
+ALL_CACHED_FILTERS = tuple(WAVE_BOXES)
+WAVE_RESPONSE_FILTERS = (
+    EASTWARD_INTRASEASONAL_FILTER,
+    "Kelvin",
+    "Easterly",
+    "ER",
+)
+VERTICAL_STRUCTURE_FILTERS = ALL_CACHED_FILTERS
+TOP_HEAVINESS_FILTERS = (
+    EASTWARD_INTRASEASONAL_FILTER,
+    "Kelvin",
+    "ER",
+    "Easterly",
+)
+SHORT_LAG_FILTERS = ("Kelvin", "Easterly", "ER")
+SHORT_PERIOD_CRITICAL_LEVEL_FILTERS = (
+    "Kelvin",
+    "EIG",
+    "IG_antisym",
+    "Easterly",
+    "ER",
+)
+EDDY_FLUX_FILTERS = SHORT_PERIOD_CRITICAL_LEVEL_FILTERS
+LPO_LIFECYCLE_FILTERS = WAVE_RESPONSE_FILTERS
