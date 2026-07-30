@@ -6,9 +6,16 @@ The affected control files contain 22 isobaric slots whose true pressures are
 1-650 hPa.  This script writes fixed copies with eight appended lower-level
 pressure surfaces: 700, 750, 800, 850, 900, 925, 950, and 1000 hPa.
 
-Pass --target-levels to replace the isobaric grid entirely.  In that mode all
-isobaric fields are recomputed from the model-level fields in the full latlon
-files and written on exactly the requested pressure grid.
+Pass --target-levels to replace the isobaric grid entirely. In that mode the
+script first interpolates every field from the native model levels, then
+overlays the stored isobaric fields wherever their verified true pressure
+range covers the requested grid. This retains the original pressure-level
+diagnostics where possible without propagating an incorrectly labelled axis.
+
+Before a target-grid repair starts, the old pressure levels supplied through
+``--old-levels`` (or read from trustworthy in-file coordinates) are checked
+against native model-level interpolation. The script fails before writing if
+another candidate pressure axis fits the stored fields materially better.
 
 Examples
 --------
@@ -106,6 +113,8 @@ P0_PA = 100000.0
 G = 9.80665
 FILL_THRESHOLD = 1.0e30
 PERCENT_REFERENCE_SCALE_PERCENTILE = 98.0
+LEVEL_MAPPING_ABSOLUTE_TOLERANCE_PERCENT = 0.5
+LEVEL_MAPPING_RELATIVE_TOLERANCE = 0.1
 
 ISO_DIMS = ("nIsoLevelsT", "nIsoLevelsU", "nIsoLevelsZ")
 ISO_LEVEL_VAR_BY_DIM = {
@@ -235,10 +244,12 @@ def levels_for_source_variable(src, var_name, iso_dim, old_levels_hpa=None):
         levels = np.asarray(old_levels_hpa, dtype=np.float64)
     else:
         levels = source_levels_for_dim(src, iso_dim)
-        if levels is None and iso_dim in src.dimensions and len(src.dimensions[iso_dim]) == CONTROL_LEVELS_HPA.size:
-            levels = CONTROL_LEVELS_HPA
         if levels is None:
-            raise ValueError(f"Could not determine old pressure levels for {src.filepath()}:{var_name}")
+            raise ValueError(
+                f"Could not determine the true old pressure levels for "
+                f"{src.filepath()}:{var_name}. Supply --old-levels explicitly; "
+                "the repair will validate them before writing."
+            )
 
     if iso_dim in src.dimensions and len(src.dimensions[iso_dim]) != levels.size:
         raise ValueError(
@@ -361,11 +372,39 @@ def create_coordinate_variables(src, dst, planned_sizes, names):
             create_variable_like(src, dst, name, planned_sizes)
 
 
-def add_history(src, dst, output_levels, replace_levels=False):
+def add_history(src, dst, output_levels, replace_levels=False, old_levels_hpa=None):
     copy_attrs(src, dst, skip=("history",))
     stamp = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     if replace_levels:
-        action = f"regridded isobaric variables to {output_levels.tolist()} hPa"
+        action = (
+            f"regridded isobaric variables to {output_levels.tolist()} hPa using "
+            "native-level interpolation outside the verified stored-isobaric range "
+            "and stored-isobaric interpolation within it"
+        )
+        if old_levels_hpa is not None:
+            dst.setncattr(
+                "verified_source_isobaric_levels_hpa",
+                ",".join(f"{level:g}" for level in np.asarray(old_levels_hpa)),
+            )
+        else:
+            for dim_name, level_name in ISO_LEVEL_VAR_BY_DIM.items():
+                levels = source_levels_for_dim(src, dim_name)
+                if levels is not None:
+                    dst.setncattr(
+                        f"verified_source_{level_name}_hpa",
+                        ",".join(f"{level:g}" for level in levels),
+                    )
+            pres_levels = source_levels_for_dim(src, "pres")
+            if pres_levels is not None:
+                dst.setncattr(
+                    "verified_source_pres_hpa",
+                    ",".join(f"{level:g}" for level in pres_levels),
+                )
+        dst.setncattr(
+            "isobaric_regrid_method",
+            "verified stored isobaric values retained where available; "
+            "native model-level interpolation used elsewhere",
+        )
     else:
         action = f"appended control-run isobaric levels {EXTRA_LEVELS_HPA.tolist()} hPa"
     message = f"{stamp}: {action} using {Path(__file__).name}"
@@ -535,15 +574,31 @@ def interp_constant_pressure_axis(data, old_levels_hpa, target_levels_hpa):
     return out
 
 
-def overlay_stored_omega_where_available(src, time_slice, dim_slices, target_levels, target_data, old_levels_hpa=None):
-    name = "omg_isobaric"
-    if name not in src.variables:
+def overlay_stored_isobaric_where_available(
+    src,
+    var_name,
+    time_slice,
+    dim_slices,
+    target_levels,
+    target_data,
+    old_levels_hpa=None,
+    *,
+    is_zm=False,
+):
+    """Overlay stored isobaric data using a verified true source pressure axis."""
+
+    if var_name not in src.variables:
         return target_data
 
-    src_var = src.variables[name]
-    iso_dim = LATLON_ISOBARIC_SPECS[name][0]
+    src_var = src.variables[var_name]
+    iso_dim = "pres" if is_zm else LATLON_ISOBARIC_SPECS[var_name][0]
     iso_axis = src_var.dimensions.index(iso_dim)
-    old_levels = levels_for_source_variable(src, name, iso_dim, old_levels_hpa)
+    old_levels = levels_for_source_variable(
+        src,
+        var_name,
+        iso_dim,
+        old_levels_hpa,
+    )
     key = source_key_for_dims(src_var.dimensions, dim_slices, time_slice)
     old_data = as_float_array(src_var[key], get_fill_value(src_var))
     old_data = np.moveaxis(old_data, iso_axis, 1)
@@ -631,14 +686,16 @@ def repair_latlon_isobaric_variables(
         interp_levels = output_levels if replace_levels else EXTRA_LEVELS_HPA
         interpolated = compute_interpolated_fields(src, src_time, dim_slices, zmid, interp_levels, extrapolate)
         if replace_levels:
-            interpolated["omg_isobaric"] = overlay_stored_omega_where_available(
-                src,
-                src_time,
-                dim_slices,
-                output_levels,
-                interpolated["omg_isobaric"],
-                old_levels_hpa,
-            )
+            for name in interpolated:
+                interpolated[name] = overlay_stored_isobaric_where_available(
+                    src,
+                    name,
+                    src_time,
+                    dim_slices,
+                    output_levels,
+                    interpolated[name],
+                    old_levels_hpa,
+                )
         for name, (iso_dim, _) in LATLON_ISOBARIC_SPECS.items():
             if name not in src.variables:
                 continue
@@ -676,16 +733,22 @@ def repair_zm_isobaric_variables(
     for lat_src_time, zm_dst_time in iter_time_chunks(zm_src, zm_dim_slices, time_chunk):
         interp_levels = output_levels if replace_levels else EXTRA_LEVELS_HPA
         fields_full = compute_interpolated_fields(lat_src, lat_src_time, lat_dim_slices, zmid, interp_levels, extrapolate)
+        fields_zm = {
+            name: nanmean_last_axis(values)
+            for name, values in fields_full.items()
+        }
         if replace_levels:
-            fields_full["omg_isobaric"] = overlay_stored_omega_where_available(
-                lat_src,
-                lat_src_time,
-                lat_dim_slices,
-                output_levels,
-                fields_full["omg_isobaric"],
-                old_levels_hpa,
-            )
-        fields_zm = {name: nanmean_last_axis(values) for name, values in fields_full.items()}
+            for name in fields_zm:
+                fields_zm[name] = overlay_stored_isobaric_where_available(
+                    zm_src,
+                    name,
+                    lat_src_time,
+                    zm_dim_slices,
+                    output_levels,
+                    fields_zm[name],
+                    old_levels_hpa,
+                    is_zm=True,
+                )
 
         for name in ZM_ISOBARIC_SPECS:
             if name not in zm_src.variables:
@@ -714,10 +777,11 @@ def old_levels_for_variable(src, var_name, args, is_zm=False):
         dim_name = LATLON_ISOBARIC_SPECS[var_name][0]
         levels = source_levels_for_dim(src, dim_name)
 
-    if levels is None and dim_name in src.dimensions and len(src.dimensions[dim_name]) == CONTROL_LEVELS_HPA.size:
-        levels = CONTROL_LEVELS_HPA
-    if levels is None and dim_name in src.dimensions:
-        levels = np.arange(len(src.dimensions[dim_name]), dtype=np.float64)
+    if levels is None:
+        raise ValueError(
+            f"Could not determine the true old pressure levels for "
+            f"{src.filepath()}:{var_name}. Supply --old-levels explicitly."
+        )
 
     return np.asarray(levels, dtype=np.float64)
 
@@ -1187,6 +1251,8 @@ def add_candidate_level_set(candidates, name, levels, nlev=None):
 
 def candidate_level_sets(ds, args, is_zm=False, nlev=None):
     candidates = []
+    if args.old_levels_hpa is not None:
+        add_candidate_level_set(candidates, "supplied_old_levels", args.old_levels_hpa, nlev=nlev)
     if is_zm:
         add_candidate_level_set(candidates, "file:pres", source_levels_for_dim(ds, "pres"), nlev=nlev)
     else:
@@ -1442,6 +1508,185 @@ def detect_pressure_levels(latlon_files, zm_files, args):
             detect_zm_pressure_levels(latlon_path, zm_path, args)
 
 
+def materially_worse_mapping(selected_score, best_score):
+    """Return whether a proposed pressure axis fits materially worse than the best candidate."""
+
+    selected = selected_score["rms"]
+    best = best_score["rms"]
+    if not np.isfinite(selected):
+        return True
+    if not np.isfinite(best):
+        return False
+    tolerance = max(
+        LEVEL_MAPPING_ABSOLUTE_TOLERANCE_PERCENT,
+        LEVEL_MAPPING_RELATIVE_TOLERANCE * max(abs(best), 1.0),
+    )
+    return selected > best + tolerance
+
+
+def validate_latlon_old_pressure_levels(path, args):
+    """Validate the source pressure axis against native fields before any write."""
+
+    with Dataset(path, "r") as src:
+        dim_slices = detection_slices(src, args, include_lon=True, full_lon=False)
+        time_slice = dim_slices.get("Time", slice(None))
+        variables = [
+            name
+            for name in parse_detection_variables(args, is_zm=False)
+            if name in src.variables
+        ]
+        if not variables:
+            raise ValueError(
+                f"Cannot validate old pressure levels in {path}: none of "
+                f"{DEFAULT_DETECTION_VARS} is available"
+            )
+
+        pressure = read_model_var(src, "pressure", time_slice, dim_slices)
+        zmid = read_zmid(src, dim_slices)
+        checked = 0
+        failures = []
+        sample = ", ".join(
+            f"{dim}={slice_label(slc)}" for dim, slc in dim_slices.items()
+        )
+        print(f"Validating old isobaric levels before writing {path}")
+        print(f"  sample: {sample}")
+
+        for name in variables:
+            iso_dim = LATLON_ISOBARIC_SPECS[name][0]
+            nlev = len(src.dimensions[iso_dim])
+            selected_levels = levels_for_source_variable(
+                src,
+                name,
+                iso_dim,
+                args.old_levels_hpa,
+            )
+            candidates = []
+            add_candidate_level_set(
+                candidates,
+                "selected_old_levels",
+                selected_levels,
+                nlev=nlev,
+            )
+            for candidate_name, candidate_levels in candidate_level_sets(
+                src,
+                args,
+                is_zm=False,
+                nlev=nlev,
+            ):
+                add_candidate_level_set(
+                    candidates,
+                    candidate_name,
+                    candidate_levels,
+                    nlev=nlev,
+                )
+
+            probe_levels = probe_levels_from_candidates(candidates)
+            stored = stored_isobaric_sample(
+                src,
+                name,
+                dim_slices,
+                time_slice,
+                is_zm=False,
+            )
+            source = source_values_for_isobaric_var(
+                src,
+                name,
+                time_slice,
+                dim_slices,
+                zmid,
+                pressure,
+            )
+            interpolated = vertical_interp_pressure(
+                pressure,
+                source,
+                probe_levels,
+                args.extrapolate,
+            )
+            scores = candidate_scores_for_variable(
+                stored,
+                interpolated,
+                probe_levels,
+                candidates,
+            )
+            selected_score = scores["selected_old_levels"]
+            ranked = sorted(
+                scores.items(),
+                key=lambda item: (
+                    item[1]["rms"]
+                    if np.isfinite(item[1]["rms"])
+                    else np.inf
+                ),
+            )
+            best_name, best_score = ranked[0]
+            print(
+                f"  {name}: selected rms={selected_score['rms']:.6g}% "
+                f"(coverage={selected_score['coverage']:.3f}); "
+                f"best={best_name} rms={best_score['rms']:.6g}%"
+            )
+            if selected_score["count"] == 0:
+                failures.append(f"{name}: selected pressure axis has no valid comparison points")
+            elif materially_worse_mapping(selected_score, best_score):
+                failures.append(
+                    f"{name}: selected pressure axis {format_levels(selected_levels)} "
+                    f"has rms {selected_score['rms']:.6g}%, but {best_name} fits "
+                    f"materially better at {best_score['rms']:.6g}%"
+                )
+            checked += 1
+
+        if not checked:
+            raise ValueError(f"No stored isobaric variables could be validated in {path}")
+        if failures:
+            raise ValueError(
+                f"Old pressure-level validation failed for {path}; no output was written:\n  "
+                + "\n  ".join(failures)
+            )
+
+
+def validate_zm_old_pressure_metadata(latlon_path, zm_path, args):
+    """Require paired full and zonal-mean files to use the same true source levels."""
+
+    with Dataset(latlon_path, "r") as lat_src, Dataset(zm_path, "r") as zm_src:
+        for name in ZM_ISOBARIC_SPECS:
+            if name not in lat_src.variables or name not in zm_src.variables:
+                continue
+            lat_dim = LATLON_ISOBARIC_SPECS[name][0]
+            lat_levels = levels_for_source_variable(
+                lat_src,
+                name,
+                lat_dim,
+                args.old_levels_hpa,
+            )
+            zm_levels = levels_for_source_variable(
+                zm_src,
+                name,
+                "pres",
+                args.old_levels_hpa,
+            )
+            if lat_levels.shape != zm_levels.shape or not np.allclose(
+                lat_levels,
+                zm_levels,
+                rtol=0.0,
+                atol=1.0e-8,
+            ):
+                raise ValueError(
+                    f"Paired source pressure levels differ for {name}: "
+                    f"{latlon_path} has {format_levels(lat_levels)}, while "
+                    f"{zm_path} has {format_levels(zm_levels)}"
+                )
+
+
+def preflight_target_regrids(latlon_files, zm_files, args):
+    """Validate every target-regrid input before creating the first output file."""
+
+    if args.target_levels_hpa is None:
+        return
+    for path in latlon_files:
+        validate_latlon_old_pressure_levels(path, args)
+    for latlon_path, zm_path in zip(latlon_files, zm_files):
+        validate_zm_old_pressure_metadata(latlon_path, zm_path, args)
+    print("Old pressure-level validation passed for all target-regrid inputs")
+
+
 def repair_latlon_file(input_path, output_dir, args):
     with Dataset(input_path, "r") as src:
         output_levels = args.output_levels_hpa
@@ -1469,7 +1714,13 @@ def repair_latlon_file(input_path, output_dir, args):
                 planned_sizes = create_isobaric_only_dimensions(src, dst, dim_slices, output_levels, include_lon=True)
             else:
                 create_dimensions(src, dst, dim_slices, output_levels, replace_levels)
-            add_history(src, dst, output_levels, replace_levels)
+            add_history(
+                src,
+                dst,
+                output_levels,
+                replace_levels,
+                args.old_levels_hpa,
+            )
             if args.isobaric_only:
                 create_coordinate_variables(src, dst, planned_sizes, ("Time", "latitude", "longitude"))
                 for name in LATLON_ISOBARIC_SPECS:
@@ -1527,7 +1778,13 @@ def repair_zm_file(latlon_path, zm_path, output_dir, args):
                 planned_sizes = create_isobaric_only_dimensions(zm_src, dst, zm_slices, output_levels, include_lon=False)
             else:
                 create_dimensions(zm_src, dst, zm_slices, output_levels, replace_levels)
-            add_history(zm_src, dst, output_levels, replace_levels)
+            add_history(
+                zm_src,
+                dst,
+                output_levels,
+                replace_levels,
+                args.old_levels_hpa,
+            )
             if args.isobaric_only:
                 create_coordinate_variables(zm_src, dst, planned_sizes, ("Time", "latitude"))
                 for name in ZM_ISOBARIC_SPECS:
@@ -1625,7 +1882,11 @@ def build_parser():
     parser.add_argument(
         "--old-levels",
         nargs="+",
-        help="Previous hPa levels for comparison plots when the source file has no pressure-level metadata",
+        help=(
+            "True source hPa levels for the stored isobaric slots. In target-regrid "
+            "mode these levels are validated against native fields before writing "
+            "and are used to retain stored isobaric values where possible."
+        ),
     )
     parser.add_argument("--comparison-dir", type=Path, help="Directory for old/new pressure-level comparison figures")
     parser.add_argument(
@@ -1740,6 +2001,8 @@ def main(argv=None):
     print_plan(latlon_files, zm_files, args)
     if args.dry_run:
         return 0
+
+    preflight_target_regrids(latlon_files, zm_files, args)
 
     if args.output_dir:
         for path in latlon_files:

@@ -1,7 +1,6 @@
 import glob
 import json
 import os
-import warnings
 from datetime import datetime
 
 import dask
@@ -26,18 +25,14 @@ QUICK_TEST_LAT_BOUNDS = (-20.0, 20.0)
 QUICK_TEST_LON_BOUNDS = (60.0, 180.0)
 
 
-def simulation_parent_dir(root_dir=None):
+def simulation_parent_dir():
     """Return the parent directory containing the simulation subdirectories."""
-    return os.path.abspath(
-        os.environ.get("MPAS_SIMULATION_ROOT", root_dir or DEFAULT_SIMULATION_PARENT_DIR)
-    )
+    return os.path.abspath(DEFAULT_SIMULATION_PARENT_DIR)
 
 
-def diagnostic_cache_dir(*parts, root_dir=None):
+def diagnostic_cache_dir(*parts):
     """Return a diagnostic cache path beside the source simulations."""
-    base = os.path.abspath(
-        os.environ.get("MPAS_DIAGNOSTIC_CACHE_ROOT", simulation_parent_dir(root_dir))
-    )
+    base = simulation_parent_dir()
     return os.path.join(base, *parts)
 
 
@@ -113,6 +108,8 @@ def load_latlon_dataset(
     latlon_pattern,
     chunks,
     direct_chunks=False,
+    start=ANALYSIS_START,
+    end=ANALYSIS_END,
 ):
     latlon_files = sorted(glob.glob(os.path.join(data_dir, latlon_pattern)))
     if not latlon_files:
@@ -129,8 +126,8 @@ def load_latlon_dataset(
     if not np.issubdtype(ds.Time.dtype, np.datetime64):
         raise TypeError(f"Expected decoded datetime Time coordinate, got {ds.Time.dtype}")
     expected_time = pd.date_range(
-        start=ANALYSIS_START,
-        end=ANALYSIS_END,
+        start=start,
+        end=end,
         freq="6h",
     )
     ds = ds.sel(Time=expected_time)
@@ -148,14 +145,16 @@ def finite_or_nan(da, max_abs=1e30):
     return da.where(np.isfinite(da) & (np.abs(da) < max_abs))
 
 
-def safe_nanpercentile(values, q, default=1.0):
+def safe_nanpercentile(values, q, zero_value=1.0):
     vals = np.asarray(values)
     vals = vals[np.isfinite(vals)]
     if vals.size == 0:
-        return default
+        raise ValueError("Cannot calculate a percentile from non-finite data")
     out = np.nanpercentile(vals, q)
-    if not np.isfinite(out) or out == 0:
-        return default
+    if not np.isfinite(out):
+        raise ValueError("Calculated percentile is non-finite")
+    if out == 0:
+        return zero_value
     return out
 
 
@@ -230,16 +229,11 @@ def align_vertical_velocity_to_reference(w, reference):
     w_dim = vertical_dim(w)
     target_dim = vertical_dim(reference)
 
-    if w.sizes[w_dim] == reference.sizes[target_dim] + 1:
-        lower = w.isel({w_dim: slice(0, -1)})
-        upper = w.isel({w_dim: slice(1, None)})
-        if w_dim in lower.coords and w_dim in upper.coords:
-            upper = upper.assign_coords({w_dim: lower[w_dim]})
-        w = 0.5 * (lower + upper)
-    elif w.sizes[w_dim] != reference.sizes[target_dim]:
+    if w.sizes[w_dim] != reference.sizes[target_dim]:
         raise ValueError(
-            f"Cannot align w levels ({w.sizes[w_dim]}) with reference levels "
-            f"({reference.sizes[target_dim]})"
+            "Standard vertical velocity and its reference field must use the "
+            "same native mid-level grid; got "
+            f"{w.sizes[w_dim]} and {reference.sizes[target_dim]} levels"
         )
 
     if w_dim != target_dim:
@@ -249,16 +243,79 @@ def align_vertical_velocity_to_reference(w, reference):
     return w
 
 
+def native_layer_interfaces(ds, template):
+    """Return MPAS native-layer interfaces aligned to a mid-level field."""
+
+    if "zgrid" not in ds.data_vars:
+        raise ValueError("zgrid is required for native geometric height")
+    level_dim = vertical_dim(template)
+    if level_dim == "nVertLevelsP1":
+        raise ValueError("template must be defined at native layer midpoints")
+    if ds.zgrid.sizes.get("nVertLevelsP1") != template.sizes[level_dim] + 1:
+        raise ValueError(
+            "zgrid interface count is inconsistent with the native mid-level "
+            f"field: {ds.zgrid.sizes.get('nVertLevelsP1')} interfaces for "
+            f"{template.sizes[level_dim]} levels"
+        )
+
+    target_coord = template[level_dim]
+    first = ds.zgrid.isel(nVertLevelsP1=slice(0, -1)).rename(
+        {"nVertLevelsP1": level_dim}
+    ).assign_coords({level_dim: target_coord})
+    second = ds.zgrid.isel(nVertLevelsP1=slice(1, None)).rename(
+        {"nVertLevelsP1": level_dim}
+    ).assign_coords({level_dim: target_coord})
+    lower = xr.where(first <= second, first, second)
+    upper = xr.where(first <= second, second, first)
+    return lower, upper
+
+
+def native_midlevel_height(ds, template):
+    """Return full MPAS native mid-level height aligned to ``template``."""
+
+    lower, upper = native_layer_interfaces(ds, template)
+    height = 0.5 * (lower + upper)
+    height.name = "native_midlevel_height"
+    height.attrs.update(
+        units="m",
+        long_name="geometric height of MPAS native layer midpoint",
+        source="midpoint of zgrid interfaces",
+    )
+    return height
+
+
+def pressure_to_pa(pressure):
+    """Return pressure in Pa without corrupting valid low-pressure levels."""
+
+    units = str(pressure.attrs.get("units", "")).strip().lower()
+    normalised = units.replace(" ", "")
+    if normalised in {"hpa", "hectopascal", "hectopascals", "mb", "mbar"}:
+        out = pressure * 100.0
+    elif normalised in {"pa", "pascal", "pascals"}:
+        out = pressure
+    else:
+        raise ValueError(
+            "Pressure must declare Pa or hPa units; got "
+            f"{units!r}"
+        )
+    out.attrs.update(getattr(pressure, "attrs", {}))
+    out.attrs["units"] = "Pa"
+    return out
+
+
 def vertical_velocity_from_zm(zds):
     """Return standard zonal-mean vertical velocity from a zm dataset."""
-    if "w" not in zds.data_vars:
-        raise ValueError("Missing standard vertical velocity variable 'w'")
+    missing = [name for name in ("w", "pressure") if name not in zds.data_vars]
+    if missing:
+        raise ValueError(
+            "Zonal-mean vertical velocity requires the standard MPAS fields "
+            f"'w' and 'pressure'; missing {missing}"
+        )
 
     w = finite_or_nan(zds.w)
-    if "pressure" in zds.data_vars:
-        w = align_vertical_velocity_to_reference(w, finite_or_nan(zds.pressure))
-    elif vertical_dim(w) != "z":
-        w = w.rename({vertical_dim(w): "z"})
+    w = align_vertical_velocity_to_reference(
+        w, finite_or_nan(zds.pressure)
+    )
 
     w.name = "w"
     w.attrs.update(units="m s-1", long_name="standard vertical velocity")
@@ -458,7 +515,7 @@ def latitude_is_hemispherically_symmetric(latitude, rtol=1e-7, atol=1e-8):
     return np.allclose(values, -values[::-1], rtol=rtol, atol=atol)
 
 
-def hemispheric_fold(da, lat_dim="latitude", parity="even", warn=True):
+def hemispheric_fold(da, lat_dim="latitude", parity="even"):
     """
     Average paired hemispheres on the original latitude grid.
 
@@ -466,19 +523,22 @@ def hemispheric_fold(da, lat_dim="latitude", parity="even", warn=True):
     vertical velocity, and energies. ``parity="odd"`` flips the reflected sign,
     appropriate for northward vectors and meridional fluxes.
     """
-    if da is None or lat_dim not in da.dims:
-        return da
     if parity is None:
         return da
+    if da is None:
+        raise ValueError("Cannot hemispherically fold a missing field")
+    if lat_dim not in da.dims:
+        raise ValueError(
+            f"Cannot hemispherically fold {getattr(da, 'name', None)!r}: "
+            f"dimension {lat_dim!r} is absent from {da.dims!r}"
+        )
     if parity not in ("even", "odd"):
         raise ValueError(f"Unknown hemispheric parity {parity!r}; expected 'even' or 'odd'")
     if not latitude_is_hemispherically_symmetric(da[lat_dim]):
-        if warn:
-            warnings.warn(
-                f"Skipping hemispheric fold for {getattr(da, 'name', None)!r}: "
-                f"{lat_dim!r} is not symmetric about the equator."
-            )
-        return da
+        raise ValueError(
+            f"Cannot hemispherically fold {getattr(da, 'name', None)!r}: "
+            f"{lat_dim!r} is not symmetric about the equator"
+        )
 
     reflected = da.isel({lat_dim: slice(None, None, -1)})
     reflected = reflected.assign_coords({lat_dim: da[lat_dim].values})
@@ -645,11 +705,38 @@ PRECIP_RATE_COLORS = [
 ]
 PRECIP_RATE_LEVELS = np.linspace(0.01, 25.0, len(PRECIP_RATE_COLORS))
 
+SIMULATION_COLOURS = {
+    "control": "#222222",
+    "nudged-u": "#1f77b4",
+    "nudged-T": "#d62728",
+}
+
+_SIMULATION_COLOUR_ALIASES = {
+    "control": "control",
+    "nudged-u": "nudged-u",
+    "u-nudged": "nudged-u",
+    "nudged u": "nudged-u",
+    "nudged-t": "nudged-T",
+    "t-nudged": "nudged-T",
+    "nudged t": "nudged-T",
+}
+
+
+def simulation_colour(simulation):
+    """Return the project-standard colour for a simulation name or label."""
+    key = str(simulation).strip().lower()
+    try:
+        canonical = _SIMULATION_COLOUR_ALIASES[key]
+    except KeyError as exc:
+        raise KeyError(f"Unknown simulation name {simulation!r}") from exc
+    return SIMULATION_COLOURS[canonical]
+
+
 HIGH_CLOUD_CLASS_SPECS = (
     (1, "Deep convection", "tab:red"),
-    (2, "Stratiform", "tab:blue"),
-    (3, "Non-precipitating", "tab:green"),
-    (4, "Invalid/unclassified", "0.70"),
+    (2, "Stratiform cloud", "tab:blue"),
+    (3, "Non-precipitating cloud", "tab:green"),
+    (4, "Unclassified cloud", "0.70"),
 )
 
 
@@ -728,7 +815,9 @@ def tropopause_region_masks(vertical2d, tropopause, coord="height"):
     return tropo, ~tropo
 
 
-def region_symmetric_levels(value_mask_pairs, ndiv=10, fallback=1.0, percentile=None):
+def region_symmetric_levels(
+    value_mask_pairs, ndiv=10, zero_field_scale=1.0, percentile=None
+):
     """Symmetric contour levels from the masked region of one or more fields."""
     pooled = []
     for values, mask in value_mask_pairs:
@@ -736,13 +825,17 @@ def region_symmetric_levels(value_mask_pairs, ndiv=10, fallback=1.0, percentile=
         pooled.append(vals[np.isfinite(vals)])
     pooled = np.concatenate(pooled) if pooled else np.array([], dtype=float)
     if pooled.size == 0:
-        vmax = fallback
-    elif percentile is None:
+        raise ValueError(
+            "Cannot calculate regional contour levels from non-finite data"
+        )
+    if percentile is None:
         vmax = np.max(np.abs(pooled))
     else:
         vmax = np.percentile(np.abs(pooled), percentile)
-    if not np.isfinite(vmax) or vmax <= 0:
-        vmax = fallback
+    if not np.isfinite(vmax):
+        raise ValueError("Calculated regional contour scale is non-finite")
+    if vmax == 0.0:
+        vmax = zero_field_scale
     return symmetric_levels(vmax, ndiv=ndiv)
 
 
@@ -908,6 +1001,12 @@ def jsonable_value(value):
 def safe_name(text):
     """Return the filename-safe convention used by diagnostic cache products."""
     return str(text).replace(" ", "_").replace("/", "-").replace(".", "p").replace("-", "m")
+
+
+def configured_label(mapping, name):
+    """Return a configured display label, falling back to the key itself."""
+
+    return mapping.get(name, {}).get("label", name)
 
 
 def read_json_file(path):
@@ -1264,15 +1363,15 @@ def count_rows_to_frame(rows, stem, save=False, save_loc=None):
     return frame
 
 
-def configured_label(mapping, name):
-    """Return a configured display label with the key itself as fallback."""
-    return mapping.get(name, {}).get("label", name)
-
-
 def subset_latitude(da, lat_bounds=None):
-    """Subset a latitude dimension while tolerating fields without latitude."""
-    if lat_bounds is None or "latitude" not in da.dims:
+    """Subset a required latitude dimension to configured physical bounds."""
+    if lat_bounds is None:
         return da
+    if "latitude" not in da.dims:
+        raise ValueError(
+            f"Cannot apply latitude bounds to {getattr(da, 'name', None)!r}: "
+            f"'latitude' is absent from {da.dims!r}"
+        )
     lo, hi = sorted(lat_bounds)
     return da.where((da.latitude >= lo) & (da.latitude <= hi), drop=True)
 
@@ -1614,20 +1713,24 @@ def symmetric_percentile_levels_for_fields(
     fields,
     percentile=99.0,
     ndiv=12,
-    fallback=1.0,
+    zero_field_scale=1.0,
 ):
     """Build shared symmetric levels from the finite values in several fields."""
     values = []
     for field in fields:
         if field is None:
-            continue
+            raise ValueError("Cannot calculate contour levels for a missing field")
         finite = np.asarray(field.values, dtype=float)
         finite = finite[np.isfinite(finite)]
         if finite.size:
             values.append(np.abs(finite))
-    vmax = np.nanpercentile(np.concatenate(values), percentile) if values else fallback
-    if not np.isfinite(vmax) or vmax <= 0:
-        vmax = fallback
+    if not values:
+        raise ValueError("Cannot calculate contour levels from non-finite data")
+    vmax = np.nanpercentile(np.concatenate(values), percentile)
+    if not np.isfinite(vmax):
+        raise ValueError("Calculated contour scale is non-finite")
+    if vmax == 0.0:
+        vmax = zero_field_scale
     return symmetric_levels(vmax, ndiv=ndiv)
 
 

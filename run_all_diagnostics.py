@@ -22,14 +22,9 @@ ANALYSIS_DIR = Path(__file__).resolve().parent
 DIAGNOSTICS_DIR = ANALYSIS_DIR / "diagnostics"
 DEFAULT_LOG_DIR = ANALYSIS_DIR / "diagnostic_logs"
 DEFAULT_SIMULATION_ROOT = Path(
-    os.environ.get(
-        "MPAS_SIMULATION_ROOT",
-        "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on",
-    )
+    "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on"
 )
-DEFAULT_DIAGNOSTIC_CACHE_ROOT = Path(
-    os.environ.get("MPAS_DIAGNOSTIC_CACHE_ROOT", str(DEFAULT_SIMULATION_ROOT))
-)
+DEFAULT_DIAGNOSTIC_CACHE_ROOT = DEFAULT_SIMULATION_ROOT
 DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
 MODULE_SEARCH_DIRS = [
     ANALYSIS_DIR,
@@ -40,20 +35,25 @@ DEFAULT_SCRIPT_ORDER = [
     "mean_state/mean_state_diagnostics.py",
     "mean_state/energy_budget.py",
     "mean_state/vapour_transport_budget.py",
-    "mean_state/thermal_wind_scaled_response.py",
-    "mean_state/matched_pattern_response.py",
+    "mean_state/thermal_wind.py",
     "mean_state/jet_variability_diagnostics.py",
     "convection/refined_high_cloud_classification_diagnostics.py",
-    "convection/lpt_precipitation_envelope_diagnostics.py",
+    "convection/lpo_tracking.py",
     "waves/equatorial_wave_diagnostics.py",
-    "convection/convective_pathway_diagnostics.py",
-    "convection/convective_lifecycle_composite_diagnostics.py",
+    "convection/lpo_lifecycle_analysis.py",
     "significance/significance_bootstrap_diagnostics.py",
 ]
 
-QC_CAPABLE_SCRIPTS = {
-    "convection/refined_high_cloud_classification_diagnostics.py",
-    "convection/lpt_precipitation_envelope_diagnostics.py",
+QC_ARGUMENTS_BY_SCRIPT = {
+    "convection/refined_high_cloud_classification_diagnostics.py": ("--qc",),
+    "convection/lpo_tracking.py": (
+        "--mode",
+        "validation",
+    ),
+    "convection/lpo_lifecycle_analysis.py": (
+        "--mode",
+        "validation",
+    ),
 }
 
 def parse_args() -> argparse.Namespace:
@@ -99,8 +99,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Request validation figures from selected diagnostics that support "
-            "--qc (currently refined high-cloud classification and convective "
-            "LPT precipitation-envelope tracking)."
+            "validation mode (currently refined high-cloud classification, "
+            "LPO tracking, and LPO lifecycle enrichment)."
         ),
     )
     parser.add_argument(
@@ -191,8 +191,8 @@ def print_script_list(scripts: list[str]) -> None:
 def child_environment(args: argparse.Namespace) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    env.setdefault("MPAS_SIMULATION_ROOT", str(DEFAULT_SIMULATION_ROOT))
-    env.setdefault("MPAS_DIAGNOSTIC_CACHE_ROOT", str(DEFAULT_DIAGNOSTIC_CACHE_ROOT))
+    env.pop("MPAS_SIMULATION_ROOT", None)
+    env.pop("MPAS_DIAGNOSTIC_CACHE_ROOT", None)
     env.setdefault("MPLCONFIGDIR", str(Path("/tmp") / f"matplotlib-{os.getuid()}"))
     env.setdefault("XDG_CACHE_HOME", str(DEFAULT_DIAGNOSTIC_CACHE_ROOT / f"xdg-cache-{os.getuid()}"))
     if args.figure_root:
@@ -215,8 +215,8 @@ def child_environment(args: argparse.Namespace) -> dict[str, str]:
 def run_script(script: str, args: argparse.Namespace) -> int:
     script_path = DIAGNOSTICS_DIR / script
     command = [args.python, "-u", str(script_path)]
-    if args.qc and script in QC_CAPABLE_SCRIPTS:
-        command.append("--qc")
+    if args.qc and script in QC_ARGUMENTS_BY_SCRIPT:
+        command.extend(QC_ARGUMENTS_BY_SCRIPT[script])
     command_text = shlex.join(command)
     env = child_environment(args)
 
@@ -293,8 +293,8 @@ def main() -> int:
         print("\nDry run only; no diagnostics were executed.")
         for script in scripts:
             command_parts = [args.python, "-u", str(DIAGNOSTICS_DIR / script)]
-            if args.qc and script in QC_CAPABLE_SCRIPTS:
-                command_parts.append("--qc")
+            if args.qc and script in QC_ARGUMENTS_BY_SCRIPT:
+                command_parts.extend(QC_ARGUMENTS_BY_SCRIPT[script])
             command = shlex.join(command_parts)
             if args.no_log or not args.log_dir:
                 print(command)
