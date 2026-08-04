@@ -8,7 +8,7 @@ rectangular TD/easterly-wave filter, not a shallow-water normal-mode filter.
 MISSING_EQUIVALENT_DEPTH = -999.0
 WAVE_CONFIG_VERSION = "equatorial-wave-bands-v3-strict-schema"
 FILTERED_WAVE_PRODUCT_VERSION = (
-    "equatorial-wave-filtered-v5-tapered-record"
+    "equatorial-wave-filtered-v6-corrected-t-nudge-omega"
 )
 EASTWARD_INTRASEASONAL_FILTER = "Eastward_intraseasonal"
 

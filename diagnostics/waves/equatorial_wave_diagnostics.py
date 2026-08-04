@@ -71,6 +71,7 @@ from diagnostics.waves.equatorial_wave_config import (
     EASTWARD_INTRASEASONAL_FILTER,
     EDDY_FLUX_FILTERS,
     FILTERED_WAVE_PRODUCT_VERSION,
+    LPO_LIFECYCLE_FILTERS,
     MISSING_EQUIVALENT_DEPTH,
     SHORT_LAG_FILTERS,
     SHORT_PERIOD_CRITICAL_LEVEL_FILTERS,
@@ -81,6 +82,20 @@ from diagnostics.waves.equatorial_wave_config import (
     WAVE_CONFIG_VERSION,
     WAVE_LATITUDE_PROJECTION,
     WAVE_VARIABILITY_FIELDS,
+)
+from diagnostics.waves.cached_wave_products import (
+    LPO_WAVE_SECTION_CACHE_VERSION,
+    lpo_wave_section_cache_path,
+    wave_response_contrasts_product_path,
+    wave_response_metrics_product_path,
+)
+from diagnostics.convection.lpo_tracking import (
+    DEFAULT_TEST_DAYS as DEFAULT_LPO_TEST_DAYS,
+    DEFAULT_TEST_MINIMUM_DURATION_DAYS,
+    PRODUCT_VERSION as LPO_TRACKING_PRODUCT_VERSION,
+    SIMULATION_DIRS as LPO_SIMULATION_DIRS,
+    require_actual_test_products,
+    require_publication_products,
 )
 from diagnostics.convection.high_cloud_classification import (
     CLASSIFICATION_CACHE_VERSION,
@@ -93,6 +108,7 @@ from diagnostics.waves.wave_metrics import (
     common_vertical_motion_eofs,
     complex_top_heaviness,
     filtered_wave_metrics,
+    filtered_wave_phase_diagnostics,
     kelvin_group_velocities,
     pressure_layer_weights,
     project_onto_eofs,
@@ -151,9 +167,17 @@ def parse_command_line(argv=None):
         "--figures",
         nargs="+",
         type=int,
-        choices=range(1, 14),
+        choices=range(1, 15),
         default=None,
         help="Build only these numbered figures.",
+    )
+    parser.add_argument(
+        "--force-recompute-caches",
+        action="store_true",
+        help=(
+            "Ignore reusable wave, intermediate and product caches once per "
+            "cache path during this run, then replace them atomically."
+        ),
     )
     args = parser.parse_args(argv)
     if args.test and args.test_days < MINIMUM_WAVE_TEST_DAYS:
@@ -209,17 +233,20 @@ save_loc = diagnostic_output_dir(
 #   11: wave precipitation amplitude and cloud/OLR response efficiency
 #   12: Sakaeda/Inoue two-EOF top-heaviness
 #   13: Lim-Son Kelvin reference energy dispersion
+#   14: compact LPO-following wave sections (explicit prerequisite)
 #
 # LPO lifecycle composites live in ``lpo_lifecycle_analysis.py`` and reuse
 # these wave caches. Wave-response regressions are owned by this script.
-figures_to_run = runtime_args.figures or [1, 2, 6, 7, 11, 12, 13]
+figures_to_run = runtime_args.figures or [1, 2, 6, 7, 11, 12, 13, 14]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 # Restart/resume controls.  With the default full run, existing figure files are
 # treated as completed products; set this to False if you explicitly want to
 # redraw figures from cached/intermediate data.
 skip_existing_figures = False
-force_recompute_caches = False
+force_recompute_caches = bool(runtime_args.force_recompute_caches)
+_rebuilt_filter_input_paths = set()
+_rebuilt_wave_cache_paths = set()
 
 # Figure 8 is deliberately excluded from the default list because it filters
 # latitude-resolved u and v. Add 8 to figures_to_run after the cheaper figures
@@ -309,6 +336,22 @@ kelvin_sensitivity_wavenumbers = (1, 2, 3)
 kelvin_sensitivity_vertical_wavelengths_km = (5.0, 10.0, 15.0)
 kelvin_profile_height_m = np.arange(0.0, 25_000.1, 250.0)
 
+# Compact Figure-14 caches retain only the LPO-following samples needed by the
+# lifecycle diagnostic. Filtering is still performed here over the complete
+# configured time/longitude record. The relative-longitude stencil, rather
+# than a pre-averaged box, lets the lifecycle renderer compare point, 2.5,
+# 3.75 and 5 degree half-widths without filtering or reopening model data.
+LPO_SECTION_DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES = 5.0
+LPO_SECTION_LONGITUDE_HALF_WIDTH_SENSITIVITY_DEGREES = (0.0, 2.5, 3.75, 5.0)
+LPO_SECTION_RELATIVE_LONGITUDE_DEGREES = np.arange(-7.5, 7.51, 0.5)
+LPO_SECTION_RELATIVE_LATITUDE_DEGREES = np.arange(-10.0, 10.01, 0.5)
+LPO_SECTION_PRESSURE_HPA = np.asarray(
+    [50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 850, 900, 950, 1000],
+    dtype=float,
+)
+LPO_SECTION_VERTICAL_FIELDS = ("T", "w", "qv", "RH")
+LPO_SECTION_SURFACE_FIELDS = ("Precip", "PW", "OLR")
+
 # Figure 8 keeps latitude resolved and applies each wave box directly.
 eddy_flux_waves = list(EDDY_FLUX_FILTERS)
 eddy_flux_levels = [70, 100, 250, 850]
@@ -368,10 +411,14 @@ if test_mode:
 # Bump this when the pressure-level source fields or their coordinate handling
 # changes. Existing pressure-level filter inputs/wave caches without this marker
 # are regenerated automatically.
-PRESSURE_FIELD_CACHE_VERSION = "pressure-axis-v2-native-omega"
-FILTER_INPUT_CACHE_VERSION = "equatorial-wave-filter-input-v3-runtime-window"
+PRESSURE_FIELD_CACHE_VERSION = (
+    "pressure-axis-v3-corrected-t-nudge-omega"
+)
+FILTER_INPUT_CACHE_VERSION = (
+    "equatorial-wave-filter-input-v4-corrected-t-nudge-omega"
+)
 FILTERED_WAVE_CACHE_VERSION = FILTERED_WAVE_PRODUCT_VERSION
-PRESSURE_FIELD_PREFIXES = ("w", "u", "v", "T")
+PRESSURE_FIELD_PREFIXES = ("w", "u", "v", "T", "qv", "RH")
 DERIVED_CACHE_VERSION = "equatorial-wave-derived-v9-filter-power"
 SPECTRUM_CACHE_VERSION = "equatorial-wave-spectrum-v3-strict-config"
 
@@ -811,6 +858,8 @@ def get_filter_field(ds, field_name):
         ("u", "uzonal_isobaric"),
         ("v", "umeridional_isobaric"),
         ("T", "t_isobaric"),
+        ("qv", "qv_isobaric"),
+        ("RH", "rh_isobaric"),
     ]
     for prefix, var in prefixes:
         if field_name.startswith(prefix):
@@ -933,7 +982,11 @@ def filter_input_cache_matches(fname, field_name):
 def write_filter_input_if_needed(ds, sim_index, field_name):
     """Cache a standard NetCDF input for kf_filter."""
     fname = os.path.join(input_cache_dir, f"{safe_name(sim_names[sim_index])}_{safe_name(field_name)}.nc")
-    if filter_input_cache_matches(fname, field_name):
+    force_this_path = (
+        force_recompute_caches
+        and fname not in _rebuilt_filter_input_paths
+    )
+    if not force_this_path and filter_input_cache_matches(fname, field_name):
         return fname
     if os.path.exists(fname):
         print(f"Regenerating stale filter input: {fname}")
@@ -964,6 +1017,7 @@ def write_filter_input_if_needed(ds, sim_index, field_name):
     tmp_fname = fname + ".tmp"
     fds.to_netcdf(tmp_fname, encoding=encoding)
     os.replace(tmp_fname, fname)
+    _rebuilt_filter_input_paths.add(fname)
     return fname
 
 
@@ -1079,7 +1133,14 @@ def wave_cache_matches(wave_da, field_name, wave_name, avgLat, lat_bounds, proje
 
 
 def read_cached_wave(cache_path, field_name, wave_name, avgLat, lat_bounds, projection, force=False):
-    if force or not os.path.exists(cache_path):
+    force_this_path = (
+        force
+        or (
+            force_recompute_caches
+            and cache_path not in _rebuilt_wave_cache_paths
+        )
+    )
+    if force_this_path or not os.path.exists(cache_path):
         return None
     cached = xr.open_dataset(cache_path)
     wave_cached = cached["wave"]
@@ -1095,6 +1156,7 @@ def write_wave_cache(wave, cache_path):
     tmp_cache_path = cache_path + ".tmp"
     netcdf_safe_dataset(wave.to_dataset()).to_netcdf(tmp_cache_path)
     os.replace(tmp_cache_path, cache_path)
+    _rebuilt_wave_cache_paths.add(cache_path)
 
 
 def filter_input_with_wave_box(input_path, obs_var, wave_name, lat_bounds, avgLat):
@@ -1311,6 +1373,468 @@ def get_filtered_wave(ds, sim_index, field_name, wave_name, avgLat=True, lat_bou
     if projection == "direct":
         return direct_filtered_wave(ds, sim_index, field_name, wave_name, True, lat_bounds, projection, force=force)
     raise ValueError(f"Unhandled latitude projection {projection!r}")
+
+
+def _lpo_wave_tracking_steps(*, test=False):
+    """Read only the stable tracking tables needed for compact wave caches."""
+
+    mode_directory = (
+        require_actual_test_products(
+            start=runtime_args.test_start,
+            days=DEFAULT_LPO_TEST_DAYS,
+            minimum_duration_days=DEFAULT_TEST_MINIMUM_DURATION_DAYS,
+        )
+        if test
+        else require_publication_products()
+    )
+    tables = {}
+    for simulation in LPO_SIMULATION_DIRS:
+        standard = mode_directory / "primary" / simulation / "standard"
+        timing = pd.read_csv(
+            standard / "lpt_event_relative_diagnostics.csv"
+        )
+        timing["Time"] = pd.to_datetime(timing.Time)
+        selected = timing[
+            timing.primary_tropical_sample.astype(bool)
+            & timing.reference_in_record_subset.astype(bool)
+            & timing.in_primary_lifecycle_window.astype(bool)
+        ].copy()
+        complete = selected.complete_primary_lag_window.astype(bool)
+        if complete.any():
+            selected = selected[complete]
+        elif not test:
+            raise RuntimeError(
+                f"{simulation}: no complete publication LPO sequence for "
+                "compact wave sections"
+            )
+        selected = selected.sort_values(
+            ["event_id", "lag_hours", "Time"]
+        ).drop_duplicates(["event_id", "lag_hours"], keep="last")
+        required = {
+            "event_id",
+            "Time",
+            "lag_hours",
+            "precip_weighted_centroid_lon",
+            "precip_weighted_centroid_lat",
+        }
+        missing = sorted(required - set(selected.columns))
+        if missing:
+            raise RuntimeError(
+                f"{standard}: tracking timing table lacks {missing}"
+            )
+        tables[simulation] = selected.reset_index(drop=True)
+    return tables
+
+
+def _filter_2d_wave(values, wave_name):
+    """Filter one complete time-longitude field with a configured wave box."""
+
+    box = WAVE_BOXES[wave_name]
+    filtered = kf_filter(
+        np.asarray(values, dtype="f"),
+        obs_per_day,
+        box["period"][0],
+        box["period"][1],
+        box["k"][0],
+        box["k"][1],
+        box["depth"][0],
+        box["depth"][1],
+        box["filter_name"],
+    )
+    return np.asarray(filtered[: np.shape(values)[0]], dtype=float)
+
+
+def _tracking_time_indices(source_time, steps):
+    source_index = pd.DatetimeIndex(pd.to_datetime(source_time))
+    requested = pd.DatetimeIndex(pd.to_datetime(steps.Time))
+    indices = source_index.get_indexer(requested)
+    if np.any(indices < 0):
+        missing = requested[indices < 0]
+        raise RuntimeError(
+            "Wave-filter input does not contain exact saved LPO times: "
+            + ", ".join(str(value) for value in missing[:4])
+        )
+    return indices
+
+
+def _sample_filtered_relative_longitudes(
+    filtered,
+    longitude,
+    time_indices,
+    centroid_longitude,
+):
+    """Sample a periodic field on the configured LPO-relative stencil."""
+
+    longitude = np.asarray(longitude, dtype=float)
+    centroids = np.asarray(centroid_longitude, dtype=float)
+    relative = LPO_SECTION_RELATIVE_LONGITUDE_DEGREES
+    output = np.full((len(time_indices), len(relative)), np.nan)
+    for index, (time_index, centroid) in enumerate(
+        zip(time_indices, centroids)
+    ):
+        targets = np.mod(centroid + relative, 360.0)
+        longitude_indices = np.asarray(
+            [
+                np.argmin(
+                    np.abs(((longitude - target + 180.0) % 360.0) - 180.0)
+                )
+                for target in targets
+            ],
+            dtype=int,
+        )
+        output[index] = np.asarray(
+            filtered[int(time_index), longitude_indices], dtype=float
+        )
+    return output
+
+
+def _wave_phase_diagnostics(filtered, time_indices, longitude, centroids):
+    """Return Rios-Berrios-style eight-phase metadata at LPO centroids.
+
+    The construction uses filtered precipitation and its time derivative.
+    Phase 5 is the positive precipitation maximum, phases 4 and 6 are its
+    growing and decaying flanks, and amplitude is the radius in the jointly
+    standardised phase plane.
+    """
+
+    result = filtered_wave_phase_diagnostics(
+        filtered,
+        time_indices,
+        longitude,
+        centroids,
+        observations_per_day=obs_per_day,
+    )
+    return (
+        result["phase_angle_degrees"],
+        result["phase_number"],
+        result["normalized_amplitude"],
+        result["strong_amplitude"],
+    )
+
+
+def _latitude_resolved_lpo_wave_values(
+    field,
+    steps,
+    wave_names,
+):
+    """Filter one surface field by latitude and retain moving LPO sections."""
+
+    field = field.transpose("Time", "latitude", "longitude")
+    latitude = np.asarray(field.latitude.values, dtype=float)
+    relative_latitude = LPO_SECTION_RELATIVE_LATITUDE_DEGREES
+    targets = (
+        np.asarray(steps.precip_weighted_centroid_lat, dtype=float)[:, None]
+        + relative_latitude[None, :]
+    )
+    latitude_indices = np.abs(
+        latitude[None, None, :] - targets[:, :, None]
+    ).argmin(axis=2)
+    nearest = latitude[latitude_indices]
+    if np.nanmax(np.abs(nearest - targets)) > 0.251:
+        raise RuntimeError(
+            "LPO relative-latitude section extends beyond the fixed "
+            "half-degree wave-filter grid"
+        )
+    time_indices = _tracking_time_indices(field.Time.values, steps)
+    output = np.full(
+        (
+            len(steps),
+            len(relative_latitude),
+            len(LPO_SECTION_RELATIVE_LONGITUDE_DEGREES),
+            len(wave_names),
+        ),
+        np.nan,
+    )
+    for latitude_index in np.unique(latitude_indices):
+        positions = np.argwhere(latitude_indices == latitude_index)
+        source = np.asarray(
+            field.isel(latitude=int(latitude_index)).values,
+            dtype="f",
+        )
+        for wave_index, wave_name in enumerate(wave_names):
+            filtered = _filter_2d_wave(source, wave_name)
+            step_indices = np.unique(positions[:, 0])
+            sampled = _sample_filtered_relative_longitudes(
+                filtered,
+                field.longitude.values,
+                time_indices[step_indices],
+                np.asarray(
+                    steps.precip_weighted_centroid_lon,
+                    dtype=float,
+                )[step_indices],
+            )
+            sample_lookup = dict(zip(step_indices, sampled))
+            for step_index, relative_index in positions:
+                output[step_index, relative_index, :, wave_index] = (
+                    sample_lookup[step_index]
+                )
+    return output
+
+
+def _latitude_mean_lpo_wave_values(field, steps, wave_names):
+    """Filter a 10S--10N mean and sample it along saved centroid longitudes."""
+
+    field = field.sel(latitude=slice(*filter_lat_bounds)).mean(
+        "latitude", skipna=True
+    ).transpose("Time", "longitude")
+    source = np.asarray(field.values, dtype="f")
+    time_indices = _tracking_time_indices(field.Time.values, steps)
+    output = np.full(
+        (
+            len(steps),
+            len(LPO_SECTION_RELATIVE_LONGITUDE_DEGREES),
+            len(wave_names),
+        ),
+        np.nan,
+    )
+    rms = np.full(len(wave_names), np.nan)
+    for wave_index, wave_name in enumerate(wave_names):
+        filtered = _filter_2d_wave(source, wave_name)
+        output[:, :, wave_index] = _sample_filtered_relative_longitudes(
+            filtered,
+            field.longitude.values,
+            time_indices,
+            steps.precip_weighted_centroid_lon,
+        )
+        finite = np.isfinite(filtered)
+        if finite.any():
+            rms[wave_index] = float(
+                np.sqrt(np.mean(filtered[finite] ** 2))
+            )
+    return output, rms
+
+
+def _precipitation_phase_at_lpo(field, steps, wave_names):
+    """Diagnose phase from 10S--10N filtered precipitation at each LPO."""
+
+    field = field.sel(latitude=slice(*filter_lat_bounds)).mean(
+        "latitude", skipna=True
+    ).transpose("Time", "longitude")
+    source = np.asarray(field.values, dtype="f")
+    time_indices = _tracking_time_indices(field.Time.values, steps)
+    shape = (len(steps), len(wave_names))
+    angle = np.full(shape, np.nan)
+    phase = np.full(shape, np.nan)
+    amplitude = np.full(shape, np.nan)
+    strong = np.zeros(shape, dtype=bool)
+    rms = np.full(len(wave_names), np.nan)
+    for wave_index, wave_name in enumerate(wave_names):
+        filtered = _filter_2d_wave(source, wave_name)
+        (
+            angle[:, wave_index],
+            phase[:, wave_index],
+            amplitude[:, wave_index],
+            strong[:, wave_index],
+        ) = _wave_phase_diagnostics(
+            filtered,
+            time_indices,
+            field.longitude.values,
+            steps.precip_weighted_centroid_lon,
+        )
+        finite = np.isfinite(filtered)
+        if finite.any():
+            rms[wave_index] = float(np.sqrt(np.mean(filtered[finite] ** 2)))
+    return angle, phase, amplitude, strong, rms
+
+
+def build_compact_lpo_wave_sections(ds, simulation, steps):
+    """Build the compact prefiltered interface consumed by LPO lifecycle."""
+
+    wave_names = tuple(LPO_LIFECYCLE_FILTERS)
+    step_count = len(steps)
+    surface_shape = (
+        step_count,
+        len(LPO_SECTION_RELATIVE_LATITUDE_DEGREES),
+        len(LPO_SECTION_RELATIVE_LONGITUDE_DEGREES),
+        len(wave_names),
+    )
+    vertical_shape = (
+        step_count,
+        len(LPO_SECTION_PRESSURE_HPA),
+        len(LPO_SECTION_RELATIVE_LONGITUDE_DEGREES),
+        len(wave_names),
+    )
+    surface = {
+        name: np.full(surface_shape, np.nan)
+        for name in LPO_SECTION_SURFACE_FIELDS
+    }
+    vertical = {
+        name: np.full(vertical_shape, np.nan)
+        for name in LPO_SECTION_VERTICAL_FIELDS
+    }
+    precipitation_rms = np.full(len(wave_names), np.nan)
+    phase_angle = np.full((step_count, len(wave_names)), np.nan)
+    phase_number = np.full((step_count, len(wave_names)), np.nan)
+    normalized_amplitude = np.full((step_count, len(wave_names)), np.nan)
+    strong_amplitude = np.zeros((step_count, len(wave_names)), dtype=bool)
+
+    for field_name in LPO_SECTION_SURFACE_FIELDS:
+        progress(
+            f"{simulation}: compact LPO latitude sections for {field_name}"
+        )
+        field = get_filter_field(ds, field_name)
+        surface[field_name] = _latitude_resolved_lpo_wave_values(
+            field, steps, wave_names
+        )
+        if field_name == "Precip":
+            (
+                phase_angle,
+                phase_number,
+                normalized_amplitude,
+                strong_amplitude,
+                precipitation_rms,
+            ) = _precipitation_phase_at_lpo(
+                field,
+                steps,
+                wave_names,
+            )
+
+    for field_name in LPO_SECTION_VERTICAL_FIELDS:
+        for level_index, pressure_hpa in enumerate(
+            LPO_SECTION_PRESSURE_HPA
+        ):
+            cache_field = f"{field_name}{pressure_hpa:g}"
+            progress(
+                f"{simulation}: compact LPO {cache_field} wave profile"
+            )
+            field = get_filter_field(ds, cache_field)
+            sampled, _rms = _latitude_mean_lpo_wave_values(
+                field, steps, wave_names
+            )
+            if field_name == "qv":
+                sampled = 1000.0 * sampled
+            vertical[field_name][:, level_index, :] = sampled
+
+    coords = {
+        "event_step": np.arange(step_count),
+        "relative_latitude": LPO_SECTION_RELATIVE_LATITUDE_DEGREES,
+        "relative_longitude": LPO_SECTION_RELATIVE_LONGITUDE_DEGREES,
+        "pressure_hpa": LPO_SECTION_PRESSURE_HPA,
+        "wave_band": np.asarray(wave_names, dtype=str),
+    }
+    dataset = xr.Dataset(
+        {
+            "event_id": (("event_step",), steps.event_id.astype(str)),
+            "Time": (("event_step",), pd.to_datetime(steps.Time)),
+            "lag_hours": (("event_step",), steps.lag_hours.astype(int)),
+            "precip_weighted_centroid_lon": (
+                ("event_step",),
+                steps.precip_weighted_centroid_lon.astype(float),
+            ),
+            "precip_weighted_centroid_lat": (
+                ("event_step",),
+                steps.precip_weighted_centroid_lat.astype(float),
+            ),
+            "filtered_precipitation": (
+                (
+                    "event_step", "relative_latitude",
+                    "relative_longitude", "wave_band",
+                ),
+                surface["Precip"],
+            ),
+            "filtered_precipitable_water": (
+                (
+                    "event_step", "relative_latitude",
+                    "relative_longitude", "wave_band",
+                ),
+                surface["PW"],
+            ),
+            "filtered_olr": (
+                (
+                    "event_step", "relative_latitude",
+                    "relative_longitude", "wave_band",
+                ),
+                surface["OLR"],
+            ),
+            "filtered_temperature": (
+                (
+                    "event_step", "pressure_hpa",
+                    "relative_longitude", "wave_band",
+                ),
+                vertical["T"],
+            ),
+            "filtered_upward_pressure_velocity": (
+                (
+                    "event_step", "pressure_hpa",
+                    "relative_longitude", "wave_band",
+                ),
+                vertical["w"],
+            ),
+            "filtered_specific_humidity": (
+                (
+                    "event_step", "pressure_hpa",
+                    "relative_longitude", "wave_band",
+                ),
+                vertical["qv"],
+            ),
+            "filtered_relative_humidity": (
+                (
+                    "event_step", "pressure_hpa",
+                    "relative_longitude", "wave_band",
+                ),
+                vertical["RH"],
+            ),
+            "wave_phase_angle_degrees": (
+                ("event_step", "wave_band"), phase_angle
+            ),
+            "wave_phase_number": (
+                ("event_step", "wave_band"), phase_number
+            ),
+            "wave_normalized_amplitude": (
+                ("event_step", "wave_band"), normalized_amplitude
+            ),
+            "wave_strong_amplitude": (
+                ("event_step", "wave_band"), strong_amplitude
+            ),
+            "precipitation_wave_rms": (
+                ("wave_band",), precipitation_rms
+            ),
+        },
+        coords=coords,
+        attrs={
+            "cache_version": LPO_WAVE_SECTION_CACHE_VERSION,
+            "wave_config_version": WAVE_CONFIG_VERSION,
+            "tracking_product_version": LPO_TRACKING_PRODUCT_VERSION,
+            "source_simulation": simulation,
+            "test_subset": int(test_mode),
+            "event_selection": (
+                "saved primary_tropical_sample and reference_in_record_subset; "
+                "complete -72 to +72 hour sequences where available"
+            ),
+            "default_longitude_half_width_degrees": (
+                LPO_SECTION_DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES
+            ),
+            "longitude_half_width_sensitivity_degrees": json.dumps(
+                LPO_SECTION_LONGITUDE_HALF_WIDTH_SENSITIVITY_DEGREES
+            ),
+            "vertical_latitude_projection": "mean from 10S to 10N",
+            "surface_latitude_geometry": (
+                "latitude relative to saved precipitation-weighted centroid"
+            ),
+            "filtering_owner": "equatorial_wave_diagnostics.py",
+            "phase_method": (
+                "Rios-Berrios-style eight phases from standardized filtered "
+                "precipitation and its time derivative at the LPO centroid; "
+                "phase 5 is the positive precipitation maximum"
+            ),
+            "phase_is_not_lpo_lag": True,
+        },
+    )
+    for name, units in (
+        ("filtered_precipitation", "mm day-1"),
+        ("filtered_precipitable_water", "kg m-2"),
+        ("filtered_olr", "W m-2"),
+        ("filtered_temperature", "K"),
+        ("filtered_upward_pressure_velocity", "Pa s-1"),
+        ("filtered_specific_humidity", "g kg-1"),
+        ("filtered_relative_humidity", "%"),
+        ("precipitation_wave_rms", "mm day-1"),
+    ):
+        dataset[name].attrs["units"] = units
+    dataset.filtered_upward_pressure_velocity.attrs[
+        "sign_convention"
+    ] = "positive values represent ascent (-omega)"
+    return dataset
 
 
 def project_latitude_field(da, projection, lat_bounds=None):
@@ -4050,13 +4574,11 @@ if should_build_versioned_figure(
     wave_response_contrasts = wave_response_direct_contrasts(wave_response)
     if save:
         wave_response.to_csv(
-            os.path.join(product_output_dir, "wave_response_efficiency_metrics.csv"),
+            wave_response_metrics_product_path(test=test_mode),
             index=False,
         )
         wave_response_contrasts.to_csv(
-            os.path.join(
-                product_output_dir, "wave_response_efficiency_contrasts.csv"
-            ),
+            wave_response_contrasts_product_path(test=test_mode),
             index=False,
         )
     plot_wave_response_metrics(wave_response, wave_response_contrasts)
@@ -4328,5 +4850,50 @@ if should_build_figure(13, "kelvin_reference_energy_dispersion"):
     )
     figsave.save(fig, "kelvin_reference_energy_dispersion", number=13)
     print("Done with figure: kelvin_reference_energy_dispersion")
+
+
+# -----------------------------------------------------------------------------
+# 14. Compact LPO-following sections for the lifecycle diagnostic
+# -----------------------------------------------------------------------------
+# This numbered action intentionally writes no figure. It is an explicit,
+# restartable prerequisite: expensive filtering remains owned by this script,
+# while lifecycle compositing and figure refinements read only these compact
+# event-level stencils.
+
+if 14 in figures_to_run:
+    tracking_steps = _lpo_wave_tracking_steps(test=test_mode)
+    for simulation, dataset in zip(LPO_SIMULATION_DIRS, dss):
+        output_path = lpo_wave_section_cache_path(
+            simulation, test=test_mode
+        )
+        reuse = False
+        if os.path.exists(output_path) and not force_recompute_caches:
+            try:
+                with xr.open_dataset(output_path) as existing:
+                    reuse = (
+                        existing.attrs.get("cache_version")
+                        == LPO_WAVE_SECTION_CACHE_VERSION
+                        and existing.attrs.get("source_simulation")
+                        == simulation
+                        and int(existing.attrs.get("test_subset", -1))
+                        == int(test_mode)
+                        and "relative_longitude" in existing.sizes
+                        and "wave_phase_number" in existing
+                    )
+            except (OSError, ValueError):
+                reuse = False
+        if reuse:
+            progress(f"Reusing compact LPO wave sections: {output_path}")
+            continue
+        sections = build_compact_lpo_wave_sections(
+            dataset,
+            simulation,
+            tracking_steps[simulation],
+        )
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        temporary_path = output_path + ".tmp"
+        netcdf_safe_dataset(sections).to_netcdf(temporary_path)
+        os.replace(temporary_path, output_path)
+        progress(f"Wrote compact LPO wave sections: {output_path}")
 
 print("\nFinished equatorial_wave_diagnostics.py")

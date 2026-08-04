@@ -18,6 +18,149 @@ METRICS_VERSION = "wave-metrics-v4-native-omega"
 PREDICTOR_VARIANCE_EPS = 1.0e-12
 
 
+def wave_filter_field_units(field_name: str) -> str:
+    """Return the canonical units for a named wave-filter input field."""
+
+    surface_units = {
+        "Precip": "mm day-1",
+        "OLR": "W m-2",
+        "PW": "kg m-2",
+        "CAPE": "J kg-1",
+    }
+    if field_name in surface_units:
+        return surface_units[field_name]
+    for prefix, units in (
+        ("RH", "%"),
+        ("qv", "kg kg-1"),
+        ("T", "K"),
+        ("u", "m s-1"),
+        ("v", "m s-1"),
+        ("w", "Pa s-1"),
+    ):
+        level = field_name.removeprefix(prefix)
+        if level == field_name or not level:
+            continue
+        try:
+            float(level.replace("p", "."))
+        except ValueError:
+            continue
+        return units
+    raise ValueError(f"No canonical wave-filter units for {field_name!r}")
+
+
+def project_latitude_for_wave_filter(
+    field: xr.DataArray,
+    projection: str,
+    latitude_bounds: tuple[float, float],
+) -> xr.DataArray:
+    """Project latitude while retaining the source field metadata."""
+
+    if "latitude" not in field.dims:
+        raise ValueError("Wave-filter latitude projection requires latitude")
+    if projection not in {"symmetric", "antisymmetric", "direct"}:
+        raise ValueError(f"Unsupported wave latitude projection {projection}")
+    lower, upper = sorted(map(float, latitude_bounds))
+
+    def subset(lo: float, hi: float) -> xr.DataArray:
+        return field.where(
+            (field.latitude >= lo) & (field.latitude <= hi),
+            drop=True,
+        )
+
+    def cosine_mean(value: xr.DataArray) -> xr.DataArray:
+        weights = np.cos(np.deg2rad(value.latitude))
+        return value.weighted(weights).mean("latitude", skipna=True)
+
+    if projection == "direct":
+        projected = subset(lower, upper).mean("latitude", skipna=True)
+    elif projection == "symmetric":
+        projected = cosine_mean(subset(lower, upper))
+    else:
+        half_width = max(abs(lower), abs(upper))
+        north = cosine_mean(subset(0.0, half_width))
+        south = cosine_mean(subset(-half_width, 0.0))
+        north, south = xr.align(north, south, join="inner")
+        projected = 0.5 * (north - south)
+
+    projected = projected.transpose("Time", "longitude")
+    projected.name = field.name
+    projected.attrs = dict(field.attrs)
+    return projected
+
+
+def filtered_wave_phase_diagnostics(
+    filtered,
+    time_indices,
+    longitude,
+    centroid_longitude,
+    *,
+    observations_per_day: float,
+) -> dict[str, np.ndarray]:
+    """Return eight-phase precipitation-wave metadata at moving centroids.
+
+    Filtered precipitation and its time derivative are independently
+    standardised at each longitude, following the phase-plane construction
+    used by Rios-Berrios et al. Phase 5 is the positive precipitation maximum;
+    phases 4 and 6 are its growing and decaying flanks.
+    """
+
+    filtered = np.asarray(filtered, dtype=float)
+    if filtered.ndim != 2:
+        raise ValueError("Filtered wave phase requires time by longitude data")
+    if observations_per_day <= 0:
+        raise ValueError("observations_per_day must be positive")
+    precipitation_scale = np.nanstd(filtered, axis=0)
+    precipitation_scale[precipitation_scale <= 0.0] = np.nan
+    tendency = np.gradient(
+        filtered, 1.0 / float(observations_per_day), axis=0
+    )
+    tendency_scale = np.nanstd(tendency, axis=0)
+    tendency_scale[tendency_scale <= 0.0] = np.nan
+    longitude = np.asarray(longitude, dtype=float)
+    longitude_indices = np.asarray(
+        [
+            np.argmin(
+                np.abs(((longitude - value + 180.0) % 360.0) - 180.0)
+            )
+            for value in np.asarray(centroid_longitude, dtype=float)
+        ],
+        dtype=int,
+    )
+    time_indices = np.asarray(time_indices, dtype=int)
+    if len(time_indices) != len(longitude_indices):
+        raise ValueError(
+            "Wave phase time indices and centroid longitudes must align"
+        )
+    precipitation = (
+        filtered[time_indices, longitude_indices]
+        / precipitation_scale[longitude_indices]
+    )
+    normalized_tendency = (
+        tendency[time_indices, longitude_indices]
+        / tendency_scale[longitude_indices]
+    )
+    angle = np.mod(
+        np.degrees(np.arctan2(-normalized_tendency, precipitation)),
+        360.0,
+    )
+    amplitude = np.hypot(precipitation, normalized_tendency)
+    valid = np.isfinite(angle) & np.isfinite(amplitude)
+    phase = np.full(angle.shape, np.nan)
+    phase[valid] = (
+        (
+            np.floor((angle[valid] + 22.5) / 45.0).astype(int)
+            + 4
+        )
+        % 8
+    ) + 1
+    return {
+        "phase_angle_degrees": angle,
+        "phase_number": phase,
+        "normalized_amplitude": amplitude,
+        "strong_amplitude": valid & (amplitude > 1.0),
+    }
+
+
 def upward_pressure_velocity(
     dataset: xr.Dataset,
     pressure_hpa: float,
