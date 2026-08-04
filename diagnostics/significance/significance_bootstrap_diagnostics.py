@@ -46,8 +46,8 @@ from diagnostics.diagnostic_helpers import (
     read_json_file, safe_name,
     simulation_colour, standardize_latlon_dataset, subset_between,
     subset_latitude, symmetric_levels, time_block_slices, time_step_days,
-    total_precip_accum, vertical_dim, vertical_velocity_at_pressure,
-    vertical_velocity_from_zm, write_json_file,
+    total_precip_accum, vertical_dim, vertical_velocity_from_zm,
+    write_json_file,
 )
 from diagnostics.convection.high_cloud_classification import (
     CLASSIFICATION_CACHE_VERSION,
@@ -62,13 +62,21 @@ from diagnostics.waves.equatorial_wave_config import (
     WAVE_CONFIG_VERSION,
     WAVE_LATITUDE_PROJECTION as SHARED_WAVE_LATITUDE_PROJECTION,
 )
+from diagnostics.waves.cached_wave_products import (
+    wave_response_metrics_product_path,
+)
 from diagnostics.convection.lpo_tracking import (
     PRODUCT_VERSION as LPO_TRACKING_PRODUCT_VERSION,
     publication_output_directory,
     read_standard_event_tables,
     require_publication_products,
 )
-from diagnostics.waves.wave_metrics import METRICS_VERSION
+from diagnostics.waves.wave_metrics import (
+    METRICS_VERSION,
+    project_latitude_for_wave_filter,
+    upward_pressure_velocity,
+    wave_filter_field_units,
+)
 from waveFilter import kf_filter
 
 
@@ -113,6 +121,14 @@ obs_per_day = int(round(24 / dt))
 
 USE_BOOTSTRAP_CACHE = True
 FORCE_RECOMPUTE_BOOTSTRAP_CACHE = False
+BOOTSTRAP_CACHE_VERSION = (
+    "significance-bootstrap-v4-corrected-t-nudge-omega"
+)
+BOOTSTRAP_WAVE_CACHE_VERSION = (
+    "significance-bootstrap-wave-v3-native-omega-units"
+)
+WAVE_SOURCE_CONTRACT_VERSION = "significance-wave-source-v2-native-omega-units"
+_rebuilt_wave_cache_paths = set()
 
 USE_BOOTSTRAP_CACHE = USE_BOOTSTRAP_CACHE and not env_flag("DISABLE_BOOTSTRAP_CACHE")
 FORCE_RECOMPUTE_BOOTSTRAP_CACHE = (
@@ -168,7 +184,7 @@ WAVE_PROFILE_WAVES = tuple(
 WAVE_PROFILE_FIELDS = [
     dict(name="u", prefix="u", units="m s-1"),
     dict(name="T", prefix="T", units="K"),
-    dict(name="w", prefix="w", units="m s-1"),
+    dict(name="w", prefix="w", units="Pa s-1"),
 ]
 WAVE_PROFILE_LEVELS_HPA = [100, 150, 200, 250, 300, 500, 700, 850]
 
@@ -229,12 +245,7 @@ WAVE_LATITUDE_PROJECTION = {
     for name in WAVE_BOXES
 }
 WAVE_FIELDS = ["Precip", "OLR", "PW"]
-WAVE_RESPONSE_METRIC_OUTPUT = os.path.join(
-    diagnostic_output_dir(
-        "/home/cwp29/tmp/mpas/crf_on/final/waves/"
-    ),
-    "wave_response_efficiency_metrics.csv",
-)
+WAVE_RESPONSE_METRIC_OUTPUT = wave_response_metrics_product_path()
 
 latlon_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw", "olrtoa", "cape",
@@ -242,7 +253,7 @@ latlon_vars = [
     "theta", "pressure", "zgrid", "cldfrac",
     "uReconstructZonal", "uReconstructMeridional",
     "t_isobaric", "uzonal_isobaric", "umeridional_isobaric", "rh_isobaric",
-    "qv_isobaric",
+    "qv_isobaric", "omg_isobaric",
 ]
 zonal_mean_vars = [
     "relhum", "w", "theta", "pressure", "cldfrac", "uReconstructZonal",
@@ -303,7 +314,7 @@ def bootstrap_cache_path(filename):
 
 def base_bootstrap_cache_signature(family, extra=None):
     signature = dict(
-        cache_version="significance_bootstrap_v3-strict-input-contract",
+        cache_version=BOOTSTRAP_CACHE_VERSION,
         family=family,
         root_dir=root_dir,
         data_locs=list(data_locs),
@@ -1953,10 +1964,18 @@ def wave_cache_dir():
 def get_surface_convection_field(ds, field_name, ref=None):
     pr = get_precip_rate(ds)
     if field_name == "Precip":
-        return pr
-    variable = {"OLR": "olrtoa", "PW": "precipw", "CAPE": "cape"}[field_name]
-    time = ref.Time if ref is not None else pr.Time
-    return ds[variable].sel(Time=time).rename(field_name)
+        out = pr
+    else:
+        variable = {
+            "OLR": "olrtoa",
+            "PW": "precipw",
+            "CAPE": "cape",
+        }[field_name]
+        time = ref.Time if ref is not None else pr.Time
+        out = ds[variable].sel(Time=time).rename(field_name)
+    out.attrs = dict(out.attrs)
+    out.attrs["units"] = wave_filter_field_units(field_name)
+    return out
 
 
 def get_wave_filter_field(ds, field_name):
@@ -1977,34 +1996,24 @@ def get_wave_filter_field(ds, field_name):
             continue
         plev = float(level_text)
         if var is None:
-            out = vertical_velocity_at_pressure(ds, plev).sel(Time=pr.Time)
+            out = upward_pressure_velocity(ds, plev, times=pr.Time)
         else:
             out = ds[var].sel(pres=plev).sel(Time=pr.Time)
         out.name = field_name
+        out.attrs = dict(out.attrs)
+        out.attrs["units"] = wave_filter_field_units(field_name)
+        out.attrs["selected_pressure_hpa"] = plev
         return out
 
     raise ValueError(f"Unsupported wave field {field_name}")
 
 
 def project_wave_latitude(da, wave_name):
-    projection = WAVE_LATITUDE_PROJECTION[wave_name]
-    lo, hi = WAVE_FILTER_LAT_BOUNDS
-    if projection == "symmetric":
-        x = subset_between(da, "latitude", (lo, hi))
-        return weighted_mean_dims(x, ["latitude"]).transpose("Time", "longitude")
-    if projection == "direct":
-        x = subset_between(da, "latitude", (lo, hi))
-        return x.mean(dim="latitude", skipna=True).transpose("Time", "longitude")
-
-    half = max(abs(lo), abs(hi))
-    north = subset_between(da, "latitude", (0.0, half))
-    south = subset_between(da, "latitude", (-half, 0.0))
-    north_mean = weighted_mean_dims(north, ["latitude"])
-    south_mean = weighted_mean_dims(south, ["latitude"])
-    north_mean, south_mean = xr.align(north_mean, south_mean, join="inner")
-    if projection == "antisymmetric":
-        return (0.5 * (north_mean - south_mean)).transpose("Time", "longitude")
-    raise ValueError(f"Unsupported wave projection {projection}")
+    return project_latitude_for_wave_filter(
+        da,
+        WAVE_LATITUDE_PROJECTION[wave_name],
+        WAVE_FILTER_LAT_BOUNDS,
+    )
 
 
 def filter_projected_wave(projected, wave_name, sim_index, field_name):
@@ -2012,11 +2021,17 @@ def filter_projected_wave(projected, wave_name, sim_index, field_name):
         wave_cache_dir(),
         f"{safe_name(sim_names[sim_index])}_{safe_name(field_name)}_{safe_name(wave_name)}_bootstrap.nc",
     )
-    if os.path.exists(cache_path):
+    force_this_path = (
+        FORCE_RECOMPUTE_BOOTSTRAP_CACHE
+        and cache_path not in _rebuilt_wave_cache_paths
+    )
+    if os.path.exists(cache_path) and not force_this_path:
         try:
             cached = xr.open_dataset(cache_path)
             if (
-                cached.attrs.get("field") == field_name
+                cached.attrs.get("cache_version")
+                == BOOTSTRAP_WAVE_CACHE_VERSION
+                and cached.attrs.get("field") == field_name
                 and cached.attrs.get("wave") == wave_name
                 and cached.attrs.get("source_simulation") == sim_names[sim_index]
             ):
@@ -2055,6 +2070,7 @@ def filter_projected_wave(projected, wave_name, sim_index, field_name):
             "wave": wave_name,
             "wave_label": box["label"],
             "source_simulation": sim_names[sim_index],
+            "cache_version": BOOTSTRAP_WAVE_CACHE_VERSION,
             "units": x.attrs["units"],
         },
     )
@@ -2063,6 +2079,7 @@ def filter_projected_wave(projected, wave_name, sim_index, field_name):
     tmp_cache_path = cache_path + ".tmp"
     out_ds.to_netcdf(tmp_cache_path)
     os.replace(tmp_cache_path, cache_path)
+    _rebuilt_wave_cache_paths.add(cache_path)
     return xr.open_dataset(cache_path)["wave"]
 
 
@@ -2085,6 +2102,7 @@ def run_wave_pathway():
                 wave_boxes=jsonable_value(WAVE_BOXES),
                 latitude_projection=jsonable_value(WAVE_LATITUDE_PROJECTION),
                 wave_filter_lat_bounds=list(WAVE_FILTER_LAT_BOUNDS),
+                wave_source_contract_version=WAVE_SOURCE_CONTRACT_VERSION,
             ),
         )
         cached_rows = load_cached_table("wave_box_variance_bootstrap_metrics", cache_signature)
@@ -2308,6 +2326,7 @@ def run_vertical_wave_power_profile_bootstrap():
                 fields=jsonable_value(WAVE_PROFILE_FIELDS),
                 levels_hpa=jsonable_value(WAVE_PROFILE_LEVELS_HPA),
                 wave_filter_lat_bounds=list(WAVE_FILTER_LAT_BOUNDS),
+                wave_source_contract_version=WAVE_SOURCE_CONTRACT_VERSION,
             ),
         )
         cached_rows = load_cached_table("vertical_wave_power_profile_bootstrap_metrics", cache_signature)
@@ -2450,6 +2469,7 @@ def run_wave_lag_correlation_bootstrap():
                 max_days=float(WAVE_LAG_MAX_DAYS),
                 block_days=float(WAVE_LAG_BLOCK_DAYS),
                 wave_filter_lat_bounds=list(WAVE_FILTER_LAT_BOUNDS),
+                wave_source_contract_version=WAVE_SOURCE_CONTRACT_VERSION,
             ),
         )
         cached_rows = load_cached_table("wave_lag_correlation_bootstrap_metrics", cache_signature)

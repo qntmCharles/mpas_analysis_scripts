@@ -103,6 +103,7 @@ CLOUD_STRUCTURE_DOMAIN_SPECS = (
     ("subtropical", (20.0, 40.0), "20–40° in both hemispheres"),
 )
 CLOUD_TOP_PRESSURE_BIN_WIDTH_HPA = 5.0
+CLOUD_TOP_PRESSURE_DISPLAY_BIN_WIDTH_HPA = 20.0
 OLR_BIN_WIDTH_W_M2 = 5.0
 
 # Cloud-top pressure avoids tying tropical high cloud to one geometric height.
@@ -192,7 +193,7 @@ PRECIPITATING_COMPOSITION_SPECS = [
 CIRRUS_COMPARISON_SPECS = [
     (
         "noncore_high_cloud_aggregate",
-        "Stratiform + non-precip. cloud",
+        "Stratiform + non-precipitating cloud",
         "tab:purple",
     ),
     (
@@ -1742,6 +1743,50 @@ def label_percentage(ax, x, y, suffix=""):
     )
 
 
+BAR_CATEGORY_LABELS = {
+    "Total high cloud": "Total\nhigh cloud",
+    "Deep convection": "Deep\nconvection",
+    "Stratiform cloud": "Stratiform\ncloud",
+    "Non-precipitating cloud": "Non-precipitating\ncloud",
+    (
+        "Stratiform + non-precipitating cloud"
+    ): "Stratiform +\nnon-precipitating cloud",
+    "Inside 261-K convective shield": "Inside 261-K\nconvective shield",
+    "Outside 261-K convective shield": "Outside 261-K\nconvective shield",
+}
+
+
+def two_line_bar_labels(labels):
+    """Return compact category labels without removing scientific meaning."""
+
+    return [BAR_CATEGORY_LABELS.get(label, label) for label in labels]
+
+
+def draw_literature_legend(legend_axis, source_axis, simulation_names):
+    """Put a panel's literature markers in a dedicated boxed legend."""
+
+    handles, labels = source_axis.get_legend_handles_labels()
+    literature_entries = [
+        (handle, label)
+        for handle, label in zip(handles, labels)
+        if label not in simulation_names
+    ]
+    legend_axis.axis("off")
+    if not literature_entries:
+        return
+    legend_axis.legend(
+        [entry[0] for entry in literature_entries],
+        [entry[1] for entry in literature_entries],
+        loc="center",
+        frameon=True,
+        fancybox=False,
+        facecolor="white",
+        edgecolor="0.55",
+        framealpha=1.0,
+        fontsize=6.5,
+    )
+
+
 def plot_class_budget(classifications, fields_by_run, budget=None):
     if not should_run_figure(1):
         return
@@ -1784,22 +1829,26 @@ def plot_class_budget(classifications, fields_by_run, budget=None):
 
     has_differences = len(sim_names) > 1
     population_fig = plt.figure(
-        figsize=(12.0, 4.8), constrained_layout=True
+        figsize=(12.0, 6.2), constrained_layout=True
     )
     population_grid = population_fig.add_gridspec(
-        2, 3, height_ratios=(1.0, 0.13)
+        3, 3, height_ratios=(1.0, 0.34, 0.12)
     )
     occurrence_ax = population_fig.add_subplot(population_grid[0, 0])
     difference_ax = population_fig.add_subplot(population_grid[0, 1])
     composition_ax = population_fig.add_subplot(population_grid[0, 2])
-    population_legend_ax = population_fig.add_subplot(population_grid[1, :])
+    population_literature_axes = [
+        population_fig.add_subplot(population_grid[1, column])
+        for column in range(3)
+    ]
+    population_legend_ax = population_fig.add_subplot(population_grid[2, :])
     population_legend_ax.axis("off")
 
     attribution_fig = plt.figure(
-        figsize=(12.0, 4.8), constrained_layout=True
+        figsize=(12.0, 6.2), constrained_layout=True
     )
     attribution_grid = attribution_fig.add_gridspec(
-        2, 3, height_ratios=(1.0, 0.13)
+        3, 3, height_ratios=(1.0, 0.24, 0.12)
     )
     precip_ax = attribution_fig.add_subplot(attribution_grid[0, 0])
     cirrus_comparison_ax = attribution_fig.add_subplot(
@@ -1808,8 +1857,12 @@ def plot_class_budget(classifications, fields_by_run, budget=None):
     shield_association_ax = attribution_fig.add_subplot(
         attribution_grid[0, 2]
     )
+    attribution_literature_axes = [
+        attribution_fig.add_subplot(attribution_grid[1, column])
+        for column in range(3)
+    ]
     attribution_legend_ax = attribution_fig.add_subplot(
-        attribution_grid[1, :]
+        attribution_grid[2, :]
     )
     attribution_legend_ax.axis("off")
     abs_df = budget[budget.statistic == "absolute_fraction"].set_index(["simulation", "class_key"])
@@ -2032,7 +2085,7 @@ def plot_class_budget(classifications, fields_by_run, budget=None):
     )
 
     occurrence_ax.set_yticks(occurrence_y)
-    occurrence_ax.set_yticklabels(occurrence_labels)
+    occurrence_ax.set_yticklabels(two_line_bar_labels(occurrence_labels))
     occurrence_ax.invert_yaxis()
     occurrence_ax.set_xlabel("Tropical area-time occurrence (%)")
     occurrence_ax.set_title("(a) High-cloud occurrence")
@@ -2040,7 +2093,7 @@ def plot_class_budget(classifications, fields_by_run, budget=None):
     occurrence_ax.margins(x=0.14)
 
     composition_ax.set_yticks(composition_y)
-    composition_ax.set_yticklabels(composition_labels)
+    composition_ax.set_yticklabels(two_line_bar_labels(composition_labels))
     composition_ax.invert_yaxis()
     composition_ax.set_xlabel("Share of total high cloud (%)")
     composition_ax.set_title("(c) High-cloud composition")
@@ -2048,7 +2101,7 @@ def plot_class_budget(classifications, fields_by_run, budget=None):
     composition_ax.margins(x=0.14)
 
     precip_ax.set_yticks(precip_y)
-    precip_ax.set_yticklabels(precip_labels)
+    precip_ax.set_yticklabels(two_line_bar_labels(precip_labels))
     precip_ax.invert_yaxis()
     precip_ax.set_xlim(0.0, 108.0)
     precip_ax.set_xlabel("Share of precipitating high cloud (%)")
@@ -2057,7 +2110,9 @@ def plot_class_budget(classifications, fields_by_run, budget=None):
 
     if has_differences:
         difference_ax.set_yticks(occurrence_y)
-        difference_ax.set_yticklabels(occurrence_labels)
+        difference_ax.set_yticklabels(
+            two_line_bar_labels(occurrence_labels)
+        )
         difference_ax.invert_yaxis()
         difference_ax.axvline(0.0, color="0.45", lw=0.8)
         difference_ax.set_xlabel("Change from control (percentage points)")
@@ -2074,7 +2129,9 @@ def plot_class_budget(classifications, fields_by_run, budget=None):
         )
 
     cirrus_comparison_ax.set_yticks(cirrus_comparison_y)
-    cirrus_comparison_ax.set_yticklabels(cirrus_comparison_labels)
+    cirrus_comparison_ax.set_yticklabels(
+        two_line_bar_labels(cirrus_comparison_labels)
+    )
     cirrus_comparison_ax.invert_yaxis()
     cirrus_comparison_ax.set_xlim(0.0, 108.0)
     cirrus_comparison_ax.set_xlabel("Share of total high cloud (%)")
@@ -2082,7 +2139,9 @@ def plot_class_budget(classifications, fields_by_run, budget=None):
     cirrus_comparison_ax.grid(axis="x", alpha=0.22)
 
     shield_association_ax.set_yticks(shield_association_y)
-    shield_association_ax.set_yticklabels(shield_association_labels)
+    shield_association_ax.set_yticklabels(
+        two_line_bar_labels(shield_association_labels)
+    )
     shield_association_ax.invert_yaxis()
     shield_association_ax.set_xlim(0.0, 108.0)
     shield_association_ax.set_xlabel(
@@ -2099,26 +2158,17 @@ def plot_class_budget(classifications, fields_by_run, budget=None):
             ha="center", va="center", color="0.35", fontsize=9,
         )
 
-    for axis in (
-        occurrence_ax,
-        composition_ax,
-        precip_ax,
-        cirrus_comparison_ax,
+    population_literature_axes[1].axis("off")
+    for source_axis, legend_axis in (
+        (occurrence_ax, population_literature_axes[0]),
+        (composition_ax, population_literature_axes[2]),
     ):
-        handles, labels = axis.get_legend_handles_labels()
-        literature_entries = [
-            (handle, label)
-            for handle, label in zip(handles, labels)
-            if label not in sim_names
-        ]
-        if literature_entries:
-            axis.legend(
-                [entry[0] for entry in literature_entries],
-                [entry[1] for entry in literature_entries],
-                frameon=False,
-                fontsize=6.5,
-                loc="best",
-            )
+        draw_literature_legend(legend_axis, source_axis, sim_names)
+    for source_axis, legend_axis in zip(
+        (precip_ax, cirrus_comparison_ax, shield_association_ax),
+        attribution_literature_axes,
+    ):
+        draw_literature_legend(legend_axis, source_axis, sim_names)
 
     simulation_handles = [
         Line2D(
@@ -3506,25 +3556,52 @@ def control_occurrence_contour_levels(class_key, values_percent):
     return [level for level in preferred if lo < level < hi]
 
 
-def plot_zonal_mean_axis(ax, field_percent, difference=False):
-    """Plot a longitude mean in a subplot aligned with its map."""
-    zonal = field_percent.mean("longitude", skipna=True)
-    values = np.asarray(zonal.values, dtype=float)
-    finite = values[np.isfinite(values)]
-    ax.plot(values, zonal.latitude.values, color="0.10", lw=1.25)
+def shared_zonal_mean_limits(fields_percent, difference=False):
+    """Return one zonal-mean x range for comparable simulation panels."""
+
+    finite_values = []
+    for field in fields_percent:
+        zonal = field.mean("longitude", skipna=True)
+        values = np.asarray(zonal.values, dtype=float)
+        finite_values.append(values[np.isfinite(values)])
+    finite_values = [values for values in finite_values if values.size]
+    pooled = (
+        np.concatenate(finite_values)
+        if finite_values
+        else np.asarray([], dtype=float)
+    )
     if difference:
         limit = max(
             0.02,
-            1.08 * float(np.nanmax(np.abs(finite))) if finite.size else 0.02,
+            1.08 * float(np.nanmax(np.abs(pooled)))
+            if pooled.size else 0.02,
         )
-        ax.set_xlim(-limit, limit)
+        return (-limit, limit)
+    upper = max(
+        0.1,
+        1.08 * float(np.nanmax(pooled)) if pooled.size else 0.1,
+    )
+    return (0.0, upper)
+
+
+def plot_zonal_mean_axis(
+    ax,
+    field_percent,
+    difference=False,
+    x_limits=None,
+):
+    """Plot a longitude mean in a subplot aligned with its map."""
+    zonal = field_percent.mean("longitude", skipna=True)
+    values = np.asarray(zonal.values, dtype=float)
+    ax.plot(values, zonal.latitude.values, color="0.10", lw=1.25)
+    if x_limits is None:
+        x_limits = shared_zonal_mean_limits(
+            [field_percent],
+            difference=difference,
+        )
+    ax.set_xlim(*x_limits)
+    if difference:
         ax.axvline(0.0, color="0.55", lw=0.6)
-    else:
-        upper = max(
-            0.1,
-            1.08 * float(np.nanmax(finite)) if finite.size else 0.1,
-        )
-        ax.set_xlim(0.0, upper)
     ax.set_ylim(float(zonal.latitude.min()), float(zonal.latitude.max()))
     ax.set_xlabel(
         "Change (pp)" if difference else "Occurrence (%)",
@@ -3635,6 +3712,16 @@ def plot_class_spatial_response(classifications, occurrence_maps=None):
         norm = colors.BoundaryNorm(
             difference_levels, ncolors=difference_colormap.N
         )
+        zonal_limits = {
+            key: shared_zonal_mean_limits(
+                [
+                    differences[(sim_name, key)]
+                    for sim_name in contrast_names
+                ],
+                difference=True,
+            )
+            for key, _label, _color in class_specs
+        }
         image = None
         for column, (key, label, class_color) in enumerate(class_specs):
             control_percent = 100.0 * control[key]
@@ -3651,7 +3738,12 @@ def plot_class_spatial_response(classifications, occurrence_maps=None):
                     difference.longitude, difference.latitude, difference,
                     shading="auto", cmap=difference_colormap, norm=norm,
                 )
-                plot_zonal_mean_axis(mean_ax, difference, difference=True)
+                plot_zonal_mean_axis(
+                    mean_ax,
+                    difference,
+                    difference=True,
+                    x_limits=zonal_limits[key],
+                )
                 if contour_levels:
                     ax.contour(
                         control_percent.longitude,
@@ -4249,6 +4341,63 @@ def cloud_structure_metrics_table(structure):
     return pd.DataFrame(rows)
 
 
+def coarsen_histogram_for_plot(
+    bin_centres,
+    histogram,
+    target_bin_width,
+):
+    """Combine adjacent regular histogram bins for a clearer plotted PDF."""
+
+    centres = np.asarray(bin_centres, dtype=float)
+    values = np.asarray(histogram, dtype=float)
+    if centres.ndim != 1 or values.shape[-1] != centres.size:
+        raise ValueError(
+            "Histogram values must end with the one-dimensional bin axis"
+        )
+    if centres.size < 2:
+        return centres, values
+    spacing = np.diff(centres)
+    source_width = float(np.median(spacing))
+    if not np.allclose(spacing, source_width):
+        raise ValueError("Histogram bin centres must be regularly spaced")
+    factor = int(round(float(target_bin_width) / source_width))
+    if factor < 1 or not np.isclose(
+        factor * source_width,
+        target_bin_width,
+    ):
+        raise ValueError(
+            "Display bin width must be a positive integer multiple of the "
+            "cached bin width"
+        )
+    if centres.size % factor:
+        raise ValueError(
+            "Cached histogram bins cannot be evenly combined at the "
+            "requested display width"
+        )
+    if factor == 1:
+        return centres, values
+    output_shape = values.shape[:-1] + (centres.size // factor, factor)
+    return (
+        centres.reshape(-1, factor).mean(axis=1),
+        values.reshape(output_shape).sum(axis=-1),
+    )
+
+
+def regular_histogram_bin_edges(bin_centres):
+    """Return exact edges for regularly spaced histogram centres."""
+
+    centres = np.asarray(bin_centres, dtype=float)
+    if centres.ndim != 1 or centres.size < 2:
+        raise ValueError("At least two one-dimensional bin centres are required")
+    spacing = np.diff(centres)
+    width = float(np.median(spacing))
+    if not np.allclose(spacing, width):
+        raise ValueError("Histogram bin centres must be regularly spaced")
+    return np.concatenate(
+        ([centres[0] - 0.5 * width], centres + 0.5 * width)
+    )
+
+
 def plot_literature_high_cloud_structure(
     fields_by_run,
     classifications,
@@ -4264,11 +4413,21 @@ def plot_literature_high_cloud_structure(
         structure = compute_cloud_structure_product(
             fields_by_run, classifications
         )
-    ctp_centres = np.asarray(
+    cached_ctp_centres = np.asarray(
         structure.cloud_top_pressure_bin.values, dtype=float
     )
+    ctp_centres, _ = coarsen_histogram_for_plot(
+        cached_ctp_centres,
+        np.zeros_like(cached_ctp_centres),
+        CLOUD_TOP_PRESSURE_DISPLAY_BIN_WIDTH_HPA,
+    )
+    ctp_edges = regular_histogram_bin_edges(ctp_centres)
     olr_centres = np.asarray(structure.olr_bin.values, dtype=float)
     rows = cloud_structure_metrics_table(structure)
+    rows["cloud_top_pdf_display_bin_width_hpa"] = (
+        CLOUD_TOP_PRESSURE_DISPLAY_BIN_WIDTH_HPA
+    )
+    rows["cloud_top_pdf_display_style"] = "unsmoothed histogram staircase"
 
     literature_color = "#7a4e00"
     ctp_literature = {
@@ -4333,10 +4492,15 @@ def plot_literature_high_cloud_structure(
                     class_statistics.mean_cloud_top_pressure_hpa
                 )
                 olr_mean = float(class_statistics.mean_olr_w_m2)
-                ctp_axes[column].plot(
-                    100.0
-                    * class_statistics.cloud_top_pressure_histogram.values,
-                    ctp_centres,
+                _, ctp_histogram = coarsen_histogram_for_plot(
+                    cached_ctp_centres,
+                    class_statistics.cloud_top_pressure_histogram.values,
+                    CLOUD_TOP_PRESSURE_DISPLAY_BIN_WIDTH_HPA,
+                )
+                ctp_axes[column].stairs(
+                    100.0 * ctp_histogram,
+                    ctp_edges,
+                    orientation="horizontal",
                     color=cols[isim],
                     lw=1.8,
                     label=sim_name,
@@ -4398,8 +4562,8 @@ def plot_literature_high_cloud_structure(
             )
             ctp_ax.set_ylim(P_HIGH_HPA, max(10.0, ctp_centres[0]))
             ctp_ax.set_xlabel(
-                f"Probability per {CLOUD_TOP_PRESSURE_BIN_WIDTH_HPA:g} hPa "
-                "bin (%)"
+                "Probability per "
+                f"{CLOUD_TOP_PRESSURE_DISPLAY_BIN_WIDTH_HPA:g} hPa bin (%)"
             )
             ctp_ax.set_title(
                 f"({panel_letters[column]}) {label}",

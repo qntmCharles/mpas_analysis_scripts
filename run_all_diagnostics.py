@@ -44,6 +44,45 @@ DEFAULT_SCRIPT_ORDER = [
     "significance/significance_bootstrap_diagnostics.py",
 ]
 
+# Complete publication workflow for the convection/LPO analysis.  The ordering
+# is a dependency contract, not just a preferred presentation order:
+#
+# * tracking consumes the shared high-cloud classification;
+# * wave Figure 14 consumes the saved primary LPO tracks;
+# * lifecycle analysis consumes wave Figures 13 and 14 products; and
+# * significance consumes the tracks and the wave Figure 11 response table.
+CONVECTION_WORKFLOW_ORDER = [
+    "convection/refined_high_cloud_classification_diagnostics.py",
+    "convection/lpo_tracking.py",
+    "waves/equatorial_wave_diagnostics.py",
+    "convection/lpo_lifecycle_analysis.py",
+    "significance/significance_bootstrap_diagnostics.py",
+]
+
+CONVECTION_ARGUMENTS_BY_SCRIPT = {
+    "waves/equatorial_wave_diagnostics.py": (
+        "--figures",
+        "11",
+        "13",
+        "14",
+    ),
+}
+
+# Corrected T-nudge omg_isobaric affects wave filtering, unfiltered lifecycle
+# sections and the vertical-motion bootstrap products.  Classification and
+# tracking do not derive any products from omg_isobaric and need no forced
+# cache rebuild.
+CONVECTION_REBUILD_ARGUMENTS_BY_SCRIPT = {
+    "waves/equatorial_wave_diagnostics.py": ("--force-recompute-caches",),
+    "convection/lpo_lifecycle_analysis.py": ("--force-recompute-caches",),
+}
+
+CONVECTION_REBUILD_ENV_BY_SCRIPT = {
+    "significance/significance_bootstrap_diagnostics.py": {
+        "FORCE_RECOMPUTE_BOOTSTRAP_CACHE": "1",
+    },
+}
+
 QC_ARGUMENTS_BY_SCRIPT = {
     "convection/refined_high_cloud_classification_diagnostics.py": ("--qc",),
     "convection/lpo_tracking.py": (
@@ -56,7 +95,8 @@ QC_ARGUMENTS_BY_SCRIPT = {
     ),
 }
 
-def parse_args() -> argparse.Namespace:
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run all configured diagnostic scripts sequentially.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -70,6 +110,22 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Print the commands without running them.",
+    )
+    parser.add_argument(
+        "--convection-workflow",
+        action="store_true",
+        help=(
+            "Run the complete publication convection/LPO workflow in dependency "
+            "order, including the required wave and significance products."
+        ),
+    )
+    parser.add_argument(
+        "--rebuild-convection-caches",
+        action="store_true",
+        help=(
+            "With --convection-workflow, force regeneration of wave, lifecycle "
+            "and bootstrap caches affected by corrected T-nudge omg_isobaric."
+        ),
     )
     parser.add_argument(
         "--only",
@@ -129,7 +185,21 @@ def parse_args() -> argparse.Namespace:
             "keeps its usual relative subdirectory under this root."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.rebuild_convection_caches and not args.convection_workflow:
+        parser.error("--rebuild-convection-caches requires --convection-workflow")
+    if args.convection_workflow and args.only:
+        parser.error("--convection-workflow cannot be combined with --only")
+    if args.convection_workflow and args.skip:
+        parser.error("--convection-workflow cannot be combined with --skip")
+    if args.convection_workflow and args.qc:
+        parser.error("--convection-workflow cannot be combined with --qc")
+    if args.convection_workflow and args.continue_on_error:
+        parser.error(
+            "--convection-workflow is dependency ordered and cannot continue "
+            "after a failed prerequisite"
+        )
+    return args
 
 
 def normalise_name(name: str) -> str:
@@ -168,11 +238,14 @@ def resolve_script_name(name: str, available: list[str]) -> str:
 def selected_scripts(args: argparse.Namespace) -> list[str]:
     diagnostic_scripts = discover_diagnostic_scripts()
     available = set(diagnostic_scripts)
-    selected = (
-        [resolve_script_name(name, diagnostic_scripts) for name in args.only]
-        if args.only
-        else list(diagnostic_scripts)
-    )
+    if args.convection_workflow:
+        selected = list(CONVECTION_WORKFLOW_ORDER)
+    elif args.only:
+        selected = [
+            resolve_script_name(name, diagnostic_scripts) for name in args.only
+        ]
+    else:
+        selected = list(diagnostic_scripts)
     skipped = {resolve_script_name(name, diagnostic_scripts) for name in args.skip}
 
     unknown = sorted((set(selected) | skipped) - available)
@@ -212,13 +285,57 @@ def child_environment(args: argparse.Namespace) -> dict[str, str]:
     return env
 
 
-def run_script(script: str, args: argparse.Namespace) -> int:
-    script_path = DIAGNOSTICS_DIR / script
-    command = [args.python, "-u", str(script_path)]
+def script_arguments(script: str, args: argparse.Namespace) -> list[str]:
+    """Return diagnostic-specific arguments for one selected workflow."""
+
+    script_args: list[str] = []
     if args.qc and script in QC_ARGUMENTS_BY_SCRIPT:
-        command.extend(QC_ARGUMENTS_BY_SCRIPT[script])
-    command_text = shlex.join(command)
+        script_args.extend(QC_ARGUMENTS_BY_SCRIPT[script])
+    if args.convection_workflow:
+        script_args.extend(CONVECTION_ARGUMENTS_BY_SCRIPT.get(script, ()))
+    if args.rebuild_convection_caches:
+        script_args.extend(
+            CONVECTION_REBUILD_ARGUMENTS_BY_SCRIPT.get(script, ())
+        )
+    return script_args
+
+
+def script_environment_overrides(
+    script: str,
+    args: argparse.Namespace,
+) -> dict[str, str]:
+    """Return explicit environment overrides for one diagnostic process."""
+
+    if not args.rebuild_convection_caches:
+        return {}
+    return dict(CONVECTION_REBUILD_ENV_BY_SCRIPT.get(script, {}))
+
+
+def script_command(script: str, args: argparse.Namespace) -> list[str]:
+    command = [args.python, "-u", str(DIAGNOSTICS_DIR / script)]
+    command.extend(script_arguments(script, args))
+    return command
+
+
+def display_command(script: str, args: argparse.Namespace) -> str:
+    """Return a shell-safe command display, including environment overrides."""
+
+    command = script_command(script, args)
+    overrides = script_environment_overrides(script, args)
+    if overrides:
+        command = [
+            "env",
+            *(f"{name}={value}" for name, value in sorted(overrides.items())),
+            *command,
+        ]
+    return shlex.join(command)
+
+
+def run_script(script: str, args: argparse.Namespace) -> int:
+    command = script_command(script, args)
+    command_text = display_command(script, args)
     env = child_environment(args)
+    env.update(script_environment_overrides(script, args))
 
     start = datetime.now()
     print(f"\n[{start:%Y-%m-%d %H:%M:%S}] Starting {script}", flush=True)
@@ -282,6 +399,13 @@ def main() -> int:
 
     print("Diagnostics to run:")
     print_script_list(scripts)
+    if args.convection_workflow:
+        print("Mode: complete dependency-ordered convection workflow.")
+    if args.rebuild_convection_caches:
+        print(
+            "Cache policy: rebuild corrected-omg wave, lifecycle and "
+            "bootstrap products."
+        )
     if args.no_log:
         print("Logging disabled (--no-log).")
     elif args.log_dir:
@@ -292,10 +416,7 @@ def main() -> int:
     if args.dry_run:
         print("\nDry run only; no diagnostics were executed.")
         for script in scripts:
-            command_parts = [args.python, "-u", str(DIAGNOSTICS_DIR / script)]
-            if args.qc and script in QC_ARGUMENTS_BY_SCRIPT:
-                command_parts.extend(QC_ARGUMENTS_BY_SCRIPT[script])
-            command = shlex.join(command_parts)
+            command = display_command(script, args)
             if args.no_log or not args.log_dir:
                 print(command)
             else:
