@@ -128,6 +128,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reuse-lpo-tracking",
+        action="store_true",
+        help=(
+            "With --convection-workflow, skip LPO tracking and reuse the "
+            "existing publication tracking products."
+        ),
+    )
+    parser.add_argument(
         "--only",
         nargs="+",
         metavar="NAME",
@@ -188,6 +196,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.rebuild_convection_caches and not args.convection_workflow:
         parser.error("--rebuild-convection-caches requires --convection-workflow")
+    if args.reuse_lpo_tracking and not args.convection_workflow:
+        parser.error("--reuse-lpo-tracking requires --convection-workflow")
     if args.convection_workflow and args.only:
         parser.error("--convection-workflow cannot be combined with --only")
     if args.convection_workflow and args.skip:
@@ -240,6 +250,8 @@ def selected_scripts(args: argparse.Namespace) -> list[str]:
     available = set(diagnostic_scripts)
     if args.convection_workflow:
         selected = list(CONVECTION_WORKFLOW_ORDER)
+        if args.reuse_lpo_tracking:
+            selected.remove("convection/lpo_tracking.py")
     elif args.only:
         selected = [
             resolve_script_name(name, diagnostic_scripts) for name in args.only

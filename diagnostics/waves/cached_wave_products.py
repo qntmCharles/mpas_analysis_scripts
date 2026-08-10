@@ -18,7 +18,7 @@ import json
 
 
 LPO_WAVE_SECTION_CACHE_VERSION = (
-    "lpo-wave-sections-v3-corrected-t-nudge-omega"
+    "lpo-wave-sections-v9-tropics-20deg"
 )
 LPO_WAVE_SECTION_FILENAME_TEMPLATE = "lpo_wave_sections_{simulation}.nc"
 KELVIN_DISPERSION_FILENAME = "kelvin_reference_energy_dispersion.nc"
@@ -188,11 +188,20 @@ def load_existing_lpo_wave_sections(simulation, *, test=False):
             "filtered_upward_pressure_velocity",
             "filtered_specific_humidity",
             "filtered_relative_humidity",
+            "filtered_zonal_wind",
+            "filtered_static_stability",
+            "filtered_native_pressure_hpa",
             "wave_phase_angle_degrees",
             "wave_phase_number",
             "wave_normalized_amplitude",
             "wave_strong_amplitude",
+            "random_wave_phase_angle_degrees",
+            "random_wave_phase_number",
+            "random_wave_normalized_amplitude",
+            "random_wave_strong_amplitude",
             "precipitation_wave_rms",
+            "peak_event_id",
+            "ray_filtered_temperature",
         }
         missing_variables = sorted(
             required_variables - set(dataset.data_vars)
@@ -201,8 +210,12 @@ def load_existing_lpo_wave_sections(simulation, *, test=False):
             "event_step",
             "relative_latitude",
             "relative_longitude",
-            "pressure_hpa",
+            "native_level",
             "wave_band",
+            "peak_event",
+            "ray_height_m",
+            "ray_relative_longitude",
+            "ray_wave_band",
         }
         missing_dimensions = sorted(
             required_dimensions - set(dataset.sizes)
@@ -243,6 +256,8 @@ def load_existing_kelvin_dispersion(*, test=False):
         required = {
             "background_zonal_wind",
             "buoyancy_frequency",
+            "static_stability",
+            "background_pressure_hpa",
             "horizontal_group_velocity",
             "vertical_group_velocity",
         }

@@ -62,6 +62,7 @@ from diagnostics.diagnostic_helpers import (
     symmetric_percentile_levels_for_fields,
     total_precip_accum,
 )
+from diagnostics.ttl import TTL_HEIGHT_BOUNDS_M
 
 
 ROOT_DIR = Path("/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on")
@@ -82,9 +83,9 @@ G = 9.80665
 EARTH_ROTATION_RATE = 7.2921159e-5
 EARTH_RADIUS_M = 6.371e6
 
-TTL_Z_BOUNDS = (14_000.0, 18_000.0)
+TTL_Z_BOUNDS = TTL_HEIGHT_BOUNDS_M
 TTL_REFERENCE_HEIGHT_M = 16_000.0
-TTL_LATITUDE_BOUNDS = (-10.0, 10.0)
+DEEP_TROPICAL_TTL_LATITUDE_BOUNDS = (-10.0, 10.0)
 THERMAL_WIND_METRIC_Z_BOUNDS = (10_000.0, 22_000.0)
 THERMAL_WIND_METRIC_LAT_BOUNDS = (-60.0, 60.0)
 EQUATOR_MASK_DEGREES = 5.0
@@ -143,11 +144,11 @@ def latheight_weights(field: xr.DataArray) -> xr.DataArray:
     return weights
 
 
-def tropical_mean_surface(
+def deep_tropical_mean_surface(
     field: xr.DataArray,
-    latitude_bounds: tuple[float, float] = TTL_LATITUDE_BOUNDS,
+    latitude_bounds: tuple[float, float] = DEEP_TROPICAL_TTL_LATITUDE_BOUNDS,
 ) -> xr.DataArray:
-    """Return a cosine-latitude-weighted tropical mean."""
+    """Return a cosine-latitude-weighted deep-tropical mean."""
 
     selected = subset_between(field, "latitude", latitude_bounds)
     dimensions = [
@@ -160,12 +161,12 @@ def tropical_mean_surface(
     ).mean(dimensions)
 
 
-def tropical_mean_latheight(
+def deep_tropical_mean_latheight(
     field: xr.DataArray,
     *,
     height: float | None = None,
     height_bounds: tuple[float, float] | None = None,
-    latitude_bounds: tuple[float, float] = TTL_LATITUDE_BOUNDS,
+    latitude_bounds: tuple[float, float] = DEEP_TROPICAL_TTL_LATITUDE_BOUNDS,
 ) -> xr.DataArray:
     """Return a weighted mean over a latitude-height region."""
 
@@ -579,47 +580,47 @@ def realised_state_summary(
             {
                 "simulation": SIMULATIONS[index][0],
                 "T16km_K": float(
-                    tropical_mean_latheight(
+                    deep_tropical_mean_latheight(
                         temperature,
                         height=TTL_REFERENCE_HEIGHT_M,
                     ).values
                 ),
                 "u16km_ms-1": float(
-                    tropical_mean_latheight(
+                    deep_tropical_mean_latheight(
                         wind,
                         height=TTL_REFERENCE_HEIGHT_M,
                     ).values
                 ),
                 "T_TTL_K": float(
-                    tropical_mean_latheight(
+                    deep_tropical_mean_latheight(
                         temperature,
                         height_bounds=TTL_Z_BOUNDS,
                     ).values
                 ),
                 "u_TTL_ms-1": float(
-                    tropical_mean_latheight(
+                    deep_tropical_mean_latheight(
                         wind,
                         height_bounds=TTL_Z_BOUNDS,
                     ).values
                 ),
-                "N2_14_18km_1e-4s-2": float(
-                    tropical_mean_latheight(
+                "N2_TTL_1e-4s-2": float(
+                    deep_tropical_mean_latheight(
                         n2 * 1.0e4,
                         height_bounds=TTL_Z_BOUNDS,
                     ).values
                 ),
                 "OLR_Wm-2": float(
-                    tropical_mean_surface(latlon.olrtoa)
+                    deep_tropical_mean_surface(latlon.olrtoa)
                     .mean("Time")
                     .values
                 ),
                 "PW_kgm-2": float(
-                    tropical_mean_surface(latlon.precipw)
+                    deep_tropical_mean_surface(latlon.precipw)
                     .mean("Time")
                     .values
                 ),
                 "precip_mmday-1": float(
-                    tropical_mean_surface(precipitation)
+                    deep_tropical_mean_surface(precipitation)
                     .mean("Time")
                     .values
                 ),
@@ -637,11 +638,11 @@ def plot_realised_state_summary(table: pd.DataFrame) -> plt.Figure:
     specifications = (
         ("dT16km_K", r"$\Delta T_{16km}$ (K)"),
         ("du16km_ms-1", r"$\Delta u_{16km}$ (m s$^{-1}$)"),
-        ("dT_TTL_K", r"$\Delta T_{14-18km}$ (K)"),
-        ("du_TTL_ms-1", r"$\Delta u_{14-18km}$ (m s$^{-1}$)"),
+        ("dT_TTL_K", r"$\Delta T_{TTL}$ (K)"),
+        ("du_TTL_ms-1", r"$\Delta u_{TTL}$ (m s$^{-1}$)"),
         (
-            "dN2_14_18km_1e-4s-2",
-            r"$\Delta N^2_{14-18 km}$ ($10^{-4}$ s$^{-2}$)",
+            "dN2_TTL_1e-4s-2",
+            r"$\Delta N^2_{TTL}$ ($10^{-4}$ s$^{-2}$)",
         ),
         ("dOLR_Wm-2", r"$\Delta$ OLR (W m$^{-2}$)"),
         ("dPW_kgm-2", r"$\Delta$ PW (kg m$^{-2}$)"),

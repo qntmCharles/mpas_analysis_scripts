@@ -52,7 +52,7 @@ save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/convection/'
 #   9:  diag_convective_distributions
 #   10: diag_olr_precip_coupling
 #   11: diag_radiative_heating_precip
-#   12: diag_tropical_lag_correlations
+#   12: diag_deep_tropical_lag_correlations
 #   13: comp_zonalmean_convective_state
 #   14: comp_hydrometeor_latheight
 #   15: superseded by refined high-cloud Figures 4-5
@@ -60,7 +60,7 @@ save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/convection/'
 #   17: moved to refined high-cloud Figure 6
 #   18: rain-matched part moved to refined Figure 6; environment curves omitted
 #   19: comp_atmos_radiative_heating_proxy
-#   20: comp_tropical_timeseries_extended
+#   20: comp_latitude_band_timeseries_extended
 #   21: diag_meridional_wavenumber_variance
 figures_to_run = []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
@@ -195,14 +195,14 @@ def sel_time_like(da, ref):
     """Select exact times from da matching ref.Time; used after precip differencing."""
     return da.sel(Time=ref.Time)
 
-def tropics(da, latmax=10):
+def symmetric_latitude_band(da, latmax=10):
     return da.sel(latitude=slice(-latmax, latmax))
 
 def lat_weights(da):
     return np.cos(np.deg2rad(da.latitude))
 
 def area_mean(da, latmax=None):
-    x = tropics(da, latmax) if latmax is not None else da
+    x = symmetric_latitude_band(da, latmax) if latmax is not None else da
     return x.weighted(lat_weights(x)).mean(dim=[d for d in ("latitude", "longitude") if d in x.dims])
 
 def weighted_var(da, dims, weights=None):
@@ -223,12 +223,12 @@ def hemispheric_components(da, lat_dim="latitude"):
 
 def fraction_zonal_asymmetry(da, latmax=10):
     """
-    Fraction of tropical anomaly variance in k>0 components.
+    Fraction of deep-tropical anomaly variance in k>0 components.
 
     The anomaly is formed by removing the local time mean.  The k=0 part is the
     longitude mean of this time-varying anomaly; k>0 is the residual.
     """
-    x = tropics(da, latmax=latmax)
+    x = symmetric_latitude_band(da, latmax=latmax)
     x = x - x.mean(dim="Time", skipna=True)
     xstar = x - x.mean(dim="longitude", skipna=True)
     dims = [d for d in ("Time", "latitude", "longitude") if d in x.dims]
@@ -393,7 +393,7 @@ def strided_matching_samples(*arrays, latmax=30, max_time=24, max_lat=80, max_lo
     This is deliberately applied before calling .values, so histograms and binned
     relationships do not materialise a full compound Dask array.
     """
-    xs = [tropics(a, latmax=latmax) for a in arrays]
+    xs = [symmetric_latitude_band(a, latmax=latmax) for a in arrays]
     indexers = {}
     ref = xs[0]
     limits = {"Time": max_time, "latitude": max_lat, "longitude": max_lon}
@@ -414,7 +414,7 @@ def strided_matching_samples(*arrays, latmax=30, max_time=24, max_lat=80, max_lo
 
 g = 9.80665
 
-def tropical_mean_latlon(da, lat_bounds=(-10, 10)):
+def deep_tropical_mean_latlon(da, lat_bounds=(-10, 10)):
     """Area-weighted latitude mean and arithmetic longitude mean."""
     da = finite_or_nan(da).sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
     w = np.cos(np.deg2rad(da.latitude))
@@ -495,7 +495,7 @@ def atmospheric_radiative_heating_proxy(ds):
 
 # 1. Symmetry-breaking diagnostics.
 # What to look for:
-#   * If tropical k>0 variance for precipitation/OLR is very small, do not use
+#   * If deep-tropical k>0 variance is very small, do not use
 #     propagation-phase composites.
 #   * If nudging increases k>0 or antisymmetric variance, it is changing wave or
 #     instability behaviour rather than just the zonal-mean convective state.
@@ -540,7 +540,7 @@ if should_run_figure(1):
             ax[0].bar(x + (i - (len(dss)-1)/2)*width, sub.zonal_asym_fraction_10S10N, width, color=cols[i], label=name)
             ax[1].bar(x + (i - (len(dss)-1)/2)*width, sub.hemispheric_antisym_fraction_global, width, color=cols[i])
 
-        ax[0].set_ylabel(r"Tropical $k>0$ variance fraction")
+        ax[0].set_ylabel(r"Deep-tropical $k>0$ variance fraction")
         ax[1].set_ylabel("Global antisymmetric variance fraction")
         ax[1].set_xticks(x)
         ax[1].set_xticklabels(variables)
@@ -554,18 +554,18 @@ else:
 
 # In[ ]:
 
-# 2. Zonal wavenumber variance fractions of tropical-mean anomalies.
+# 2. Zonal wavenumber variance fractions of deep-tropical-mean anomalies.
 # What to look for:
 #   * k=0 dominance: mostly zonally symmetric variability.
 #   * enhanced k=1-3 precip/OLR/PW variance: a necessary, but not sufficient,
 #     condition for planetary-scale organisation.
 
-def tropical_zonal_series(da, latmax=10):
-    x = tropics(da, latmax=latmax)
+def deep_tropical_zonal_series(da, latmax=10):
+    x = symmetric_latitude_band(da, latmax=latmax)
     return x.weighted(lat_weights(x)).mean(dim="latitude")
 
-def tropical_meridional_series(da, latmax=10):
-    x = tropics(da, latmax=latmax)
+def deep_tropical_meridional_series(da, latmax=10):
+    x = symmetric_latitude_band(da, latmax=latmax)
     return x.mean(dim="longitude", skipna=True)
 
 def spatial_wavenumber_variance_fraction(x, spatial_dim, max_k=15):
@@ -589,11 +589,11 @@ def spatial_wavenumber_variance_fraction(x, spatial_dim, max_k=15):
     return kk[keep], pk[keep]
 
 def zonal_wavenumber_variance_fraction(da, latmax=10, max_k=15):
-    x = tropical_zonal_series(da, latmax=latmax)
+    x = deep_tropical_zonal_series(da, latmax=latmax)
     return spatial_wavenumber_variance_fraction(x, "longitude", max_k=max_k)
 
 def meridional_wavenumber_variance_fraction(da, latmax=10, max_k=15):
-    x = tropical_meridional_series(da, latmax=latmax)
+    x = deep_tropical_meridional_series(da, latmax=latmax)
     return spatial_wavenumber_variance_fraction(x, "latitude", max_k=max_k)
 
 if should_run_figure(2):
@@ -614,7 +614,7 @@ if should_run_figure(2):
         ax[j].set_xlabel("Zonal wavenumber")
         ax[j].set_xlim(0, 15)
         ax[j].set_yscale("log")
-    ax[0].set_ylabel("Fraction of tropical anomaly variance")
+    ax[0].set_ylabel("Fraction of deep-tropical anomaly variance")
     ax[0].legend(loc="best")
 
     save_figure(2, fig, "zonal_wavenumber_variance")
@@ -622,10 +622,10 @@ if should_run_figure(2):
 
 # In[ ]:
 
-# 21. Meridional wavenumber variance fractions of zonal-mean tropical anomalies.
+# 21. Meridional wavenumber fractions of deep-tropical zonal-mean anomalies.
 # This repeats the figure-2 variance spectrum along latitude rather than longitude.
 # What to look for:
-#   * low meridional-wavenumber dominance: broad tropical meridional structure.
+#   * Low meridional-wavenumber dominance indicates broad meridional structure.
 #   * enhanced higher meridional wavenumbers: narrower or more latitudinally
 #     structured precip/OLR/PW anomalies.
 
@@ -647,7 +647,7 @@ if should_run_figure(21):
         ax[j].set_xlabel("Meridional wavenumber")
         ax[j].set_xlim(0, 15)
         ax[j].set_yscale("log")
-    ax[0].set_ylabel("Fraction of tropical anomaly variance")
+    ax[0].set_ylabel("Fraction of deep-tropical anomaly variance")
     ax[0].legend(loc="best")
 
     save_figure(21, fig, "meridional_wavenumber_variance")
@@ -673,7 +673,7 @@ if should_run_figure(3):
                 da = precipitation_rate_from_dataset(ds)
             else:
                 da = ds[vname]
-            x = tropical_zonal_series(da, latmax=10)
+            x = deep_tropical_zonal_series(da, latmax=10)
             # Remove time mean at each longitude and instantaneous zonal mean.
             x = x - x.mean(dim="Time", skipna=True)
             x = x - x.mean(dim="longitude", skipna=True)
@@ -902,7 +902,7 @@ if should_run_figure(9):
             da = func(ds)
             if da is None:
                 continue
-            vals = tropics(da, latmax=30).values.ravel()
+            vals = symmetric_latitude_band(da, latmax=30).values.ravel()
             vals = vals[np.isfinite(vals)]
             if vals.size == 0:
                 continue
@@ -939,8 +939,8 @@ if should_run_figure(10):
         fields = time_aligned_fields(ds)
         if "OLR" not in fields:
             continue
-        pr = tropics(fields["Precip"], latmax=30)
-        olr = tropics(fields["OLR"], latmax=30)
+        pr = symmetric_latitude_band(fields["Precip"], latmax=30)
+        olr = symmetric_latitude_band(fields["OLR"], latmax=30)
 
         pr_anom = pr - pr.mean(dim="Time", skipna=True)
         olr_anom = olr - olr.mean(dim="Time", skipna=True)
@@ -983,7 +983,7 @@ if should_run_figure(10):
 #
 # Memory note:
 #   R_atm is built from eight full latitude-longitude flux fields.  Do not call
-#   .values on the full tropical field.  The histogram and binned curve below use
+#   .values on the full 30S-30N field.  The histogram and curve below use
 #   a deterministic stride sample before loading data into memory.
 
 if should_run_figure(11):
@@ -1025,7 +1025,7 @@ if should_run_figure(11):
             del ratm, pr, ratm_pr
 
         ax[0].set_xlabel("Time")
-        ax[0].set_ylabel(r"Tropical mean $R_{atm}$ (W m$^{-2}$)")
+        ax[0].set_ylabel(r"30S-30N mean $R_{atm}$ (W m$^{-2}$)")
         ax[0].legend(loc="best")
         ax[1].set_xlabel(r"$R_{atm}$ (W m$^{-2}$)")
         ax[1].set_ylabel("Probability density")
@@ -1038,7 +1038,7 @@ if should_run_figure(11):
 
 # In[ ]:
 
-# 11. Moisture-convection lag correlations using tropical means.
+# 11. Moisture-convection lag correlations using deep-tropical means.
 # What to look for:
 #   * PW leading precipitation is a recharge-discharge signature.
 #   * If nudging changes the lag of maximum correlation, it changes the timing of
@@ -1072,8 +1072,8 @@ if should_run_figure(12):
     ax[1].set_title("PW vs OLR")
     ax[0].legend(loc="best")
 
-    save_figure(12, fig, "tropical_lag_correlations")
-    print("Done with figure: diag_tropical_lag_correlations")
+    save_figure(12, fig, "deep_tropical_lag_correlations")
+    print("Done with figure: diag_deep_tropical_lag_correlations")
 
 
 # ============================================================
@@ -1327,7 +1327,7 @@ if should_run_figure(19):
         print(f"Skipping radiation budget proxy: {e}")
 
 # ============================================================
-# 10. Extended tropical-mean time series
+# 10. Extended latitude-band time series
 # ============================================================
 # What to look for:
 #   - Coherent changes in PW -> rain -> OLR/high-cloud timing indicate changed
@@ -1338,21 +1338,32 @@ if should_run_figure(20):
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
         pr = precip_rate_from_accum(total_precip_accum(ds))
-        pr_trop = tropical_mean_latlon(pr)
-        pw_trop = tropical_mean_latlon(ds.precipw)
-        olr_trop = tropical_mean_latlon(ds.olrtoa)
+        pr_deep_trop = deep_tropical_mean_latlon(pr)
+        pw_deep_trop = deep_tropical_mean_latlon(ds.precipw)
+        olr_deep_trop = deep_tropical_mean_latlon(ds.olrtoa)
 
-        ax[0].plot(get_time_values(pr_trop), pr_trop, color=cols[i], label=sim_names[i])
-        ax[1].plot(get_time_values(pw_trop), pw_trop, color=cols[i])
-        ax[2].plot(get_time_values(olr_trop), olr_trop, color=cols[i])
+        ax[0].plot(
+            get_time_values(pr_deep_trop), pr_deep_trop,
+            color=cols[i], label=sim_names[i],
+        )
+        ax[1].plot(
+            get_time_values(pw_deep_trop), pw_deep_trop, color=cols[i]
+        )
+        ax[2].plot(
+            get_time_values(olr_deep_trop), olr_deep_trop, color=cols[i]
+        )
 
-        high_cld_ts = tropical_mean_latlon(high_cloud_fraction(ds))
+        high_cld_ts = deep_tropical_mean_latlon(high_cloud_fraction(ds))
         ax[3].plot(get_time_values(high_cld_ts), high_cld_ts, color=cols[i])
 
         hydro = [v for v in ["qc", "qr", "qi", "qs", "qg"] if v in ds.data_vars]
         if len(hydro) > 0:
             qtot = sum(finite_or_nan(ds[v]) for v in hydro)
-            qtot_trop = qtot.sel(latitude=slice(-20, 20)).mean(dim=[d for d in qtot.dims if d not in ("Time",)]) * 1000.0
+            qtot = qtot.sel(latitude=slice(-20, 20))
+            qtot_trop = qtot.weighted(lat_weights(qtot)).mean(
+                dim=[d for d in qtot.dims if d != "Time"],
+                skipna=True,
+            ) * 1000.0
             ax[4].plot(get_time_values(qtot_trop), qtot_trop, color=cols[i])
 
     ax[0].set_ylabel(r"Rain\n(mm day$^{-1}$)")
@@ -1364,7 +1375,7 @@ if should_run_figure(20):
     fig.legend(loc="outside lower center", ncol=len(dss))
 
     if save:
-        save_figure(20, fig, "tropical_timeseries_extended")
-    print("Done with figure: comp_tropical_timeseries_extended")
+        save_figure(20, fig, "latitude_band_timeseries_extended")
+    print("Done with figure: comp_latitude_band_timeseries_extended")
 
 print("All combined symmetry/convection diagnostics complete.")

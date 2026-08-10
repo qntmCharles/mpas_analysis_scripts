@@ -14,7 +14,7 @@ import xarray as xr
 from scipy import signal
 
 
-METRICS_VERSION = "wave-metrics-v4-native-omega"
+METRICS_VERSION = "wave-metrics-v6-response-block-bootstrap"
 PREDICTOR_VARIANCE_EPS = 1.0e-12
 
 
@@ -71,9 +71,7 @@ def project_latitude_for_wave_filter(
         weights = np.cos(np.deg2rad(value.latitude))
         return value.weighted(weights).mean("latitude", skipna=True)
 
-    if projection == "direct":
-        projected = subset(lower, upper).mean("latitude", skipna=True)
-    elif projection == "symmetric":
+    if projection in {"direct", "symmetric"}:
         projected = cosine_mean(subset(lower, upper))
     else:
         half_width = max(abs(lower), abs(upper))
@@ -157,7 +155,7 @@ def filtered_wave_phase_diagnostics(
         "phase_angle_degrees": angle,
         "phase_number": phase,
         "normalized_amplitude": amplitude,
-        "strong_amplitude": valid & (amplitude > 1.0),
+        "strong_amplitude": valid & (amplitude >= 1.0),
     }
 
 
@@ -287,6 +285,88 @@ def filtered_wave_metrics(
         "precipitation_variance_mm2_day2": float(variance),
         "covariance": float(covariance),
         "regression_slope": float(sign * covariance / variance),
+    }
+
+
+def circular_time_block_indices(
+    sample_count: int,
+    block_length: int,
+    n_resamples: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Return circular moving-block indices with the original record length."""
+
+    sample_count = int(sample_count)
+    block_length = int(block_length)
+    n_resamples = int(n_resamples)
+    if sample_count < 1:
+        raise ValueError("A block bootstrap requires at least one time sample")
+    if block_length < 1:
+        raise ValueError("Block length must be positive")
+    if n_resamples < 1:
+        raise ValueError("Bootstrap resample count must be positive")
+    block_length = min(block_length, sample_count)
+    blocks_per_resample = int(np.ceil(sample_count / block_length))
+    starts = rng.integers(
+        0,
+        sample_count,
+        size=(n_resamples, blocks_per_resample),
+    )
+    offsets = np.arange(block_length, dtype=np.int64)
+    indices = (starts[..., None] + offsets) % sample_count
+    return indices.reshape(n_resamples, -1)[:, :sample_count]
+
+
+def block_bootstrap_filtered_wave_metrics(
+    precipitation,
+    response,
+    *,
+    response_kind: str,
+    time_indices,
+    variance_epsilon: float = PREDICTOR_VARIANCE_EPS,
+) -> dict[str, np.ndarray]:
+    """Recalculate filtered-wave metrics for supplied time resamples."""
+
+    precip, response = np.broadcast_arrays(
+        np.asarray(precipitation, dtype=float),
+        np.asarray(response, dtype=float),
+    )
+    if precip.ndim < 1:
+        raise ValueError("Block-bootstrap inputs require a time dimension")
+    indices = np.asarray(time_indices, dtype=np.int64)
+    if indices.ndim != 2:
+        raise ValueError("Bootstrap time indices must have two dimensions")
+    if np.any(indices < 0) or np.any(indices >= precip.shape[0]):
+        raise IndexError("Bootstrap time indices exceed the input record")
+
+    valid = np.isfinite(precip) & np.isfinite(response)
+    spatial_axes = tuple(range(1, precip.ndim))
+    time_count = np.sum(valid, axis=spatial_axes, dtype=float)
+    time_x2 = np.sum(
+        np.where(valid, precip * precip, 0.0),
+        axis=spatial_axes,
+    )
+    time_xy = np.sum(
+        np.where(valid, precip * response, 0.0),
+        axis=spatial_axes,
+    )
+
+    count = np.sum(time_count[indices], axis=1)
+    sum_x2 = np.sum(time_x2[indices], axis=1)
+    sum_xy = np.sum(time_xy[indices], axis=1)
+    usable = (count > 0.0) & (sum_x2 > variance_epsilon * count)
+    variance = np.full(indices.shape[0], np.nan, dtype=float)
+    covariance = np.full(indices.shape[0], np.nan, dtype=float)
+    slope = np.full(indices.shape[0], np.nan, dtype=float)
+    variance[usable] = sum_x2[usable] / count[usable]
+    covariance[usable] = sum_xy[usable] / count[usable]
+    sign = -1.0 if response_kind == "toa_longwave" else 1.0
+    slope[usable] = sign * sum_xy[usable] / sum_x2[usable]
+    return {
+        "precipitation_rms_mm_day": np.sqrt(variance),
+        "precipitation_variance_mm2_day2": variance,
+        "covariance": covariance,
+        "regression_slope": slope,
     }
 
 
@@ -515,14 +595,18 @@ def buoyancy_frequency_squared(
     *,
     axis: int = -1,
     gravity_m_s2: float = 9.80665,
+    mask_nonpositive: bool = True,
 ) -> np.ndarray:
-    """N² = g/theta dtheta/dz, with invalid/non-positive values masked."""
+    """Return N², with optional masking of statically unstable values."""
 
     theta = np.asarray(theta, dtype=float)
     height = np.asarray(height_m, dtype=float)
     gradient = np.gradient(theta, height, axis=axis)
     n_squared = gravity_m_s2 * gradient / theta
-    return np.where(np.isfinite(n_squared) & (n_squared > 0), n_squared, np.nan)
+    valid = np.isfinite(n_squared)
+    if mask_nonpositive:
+        valid &= n_squared > 0.0
+    return np.where(valid, n_squared, np.nan)
 
 
 def kelvin_group_velocities(
@@ -543,6 +627,68 @@ def kelvin_group_velocities(
         raise ValueError("vertical_wavenumber_m1 must be non-zero")
     cgx = u - n / vertical_wavenumber_m1
     cgz = n * zonal_wavenumber_m1 / vertical_wavenumber_m1**2
+    slope = np.full(cgx.shape, np.nan, dtype=float)
+    np.divide(
+        cgz,
+        cgx,
+        out=slope,
+        where=np.abs(cgx) > minimum_abs_cgx_m_s,
+    )
+    return {
+        "cgx_m_s": cgx,
+        "cgz_m_s": cgz,
+        "ray_slope": slope,
+        "near_zero_cgx": np.abs(cgx) <= minimum_abs_cgx_m_s,
+    }
+
+
+def mrg_group_velocities(
+    zonal_wind_m_s: np.ndarray,
+    buoyancy_frequency_s1: np.ndarray,
+    *,
+    zonal_wavenumber_m1: float = -2.0 / 6.371e6,
+    vertical_wavenumber_m1: float = -2.0 * np.pi / 10_000.0,
+    beta_m1_s1: float = 2.28e-11,
+    minimum_abs_cgx_m_s: float = 1.0e-3,
+) -> dict[str, np.ndarray]:
+    """Return standard mixed Rossby-gravity group velocities.
+
+    The positive-frequency MRG branch uses
+    ``omega = k*c/2 + sqrt((k*c/2)^2 + beta*c)``.
+    Hydrostatic phase speed is ``c = -N/m`` for the configured negative
+    vertical wavenumber. This sign gives upward group propagation.
+    """
+
+    u, n = np.broadcast_arrays(
+        np.asarray(zonal_wind_m_s, dtype=float),
+        np.asarray(buoyancy_frequency_s1, dtype=float),
+    )
+    if vertical_wavenumber_m1 >= 0.0:
+        raise ValueError(
+            "vertical_wavenumber_m1 must be negative for upward MRG energy"
+        )
+    if beta_m1_s1 <= 0.0:
+        raise ValueError("beta_m1_s1 must be positive")
+    phase_speed = -n / vertical_wavenumber_m1
+    discriminant = np.sqrt(
+        (0.5 * zonal_wavenumber_m1 * phase_speed) ** 2
+        + beta_m1_s1 * phase_speed
+    )
+    intrinsic_cgx = (
+        zonal_wavenumber_m1 * phase_speed**2 / (4.0 * discriminant)
+        + 0.5 * phase_speed
+    )
+    domega_dc = (
+        0.5 * zonal_wavenumber_m1
+        + (
+            zonal_wavenumber_m1**2 * phase_speed
+            + 2.0 * beta_m1_s1
+        )
+        / (4.0 * discriminant)
+    )
+    dc_dm = n / vertical_wavenumber_m1**2
+    cgx = u + intrinsic_cgx
+    cgz = domega_dc * dc_dm
     slope = np.full(cgx.shape, np.nan, dtype=float)
     np.divide(
         cgz,

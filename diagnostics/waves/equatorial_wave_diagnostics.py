@@ -52,18 +52,23 @@ from matplotlib import colors
 from matplotlib.lines import Line2D
 import xarray as xr
 import dask
+from scipy import fft, signal
 
 from diagnostics.diagnostic_helpers import (
     ANALYSIS_END, ANALYSIS_START, FigureSaver, LATLON_PATTERN,
     ZONAL_MEAN_PATTERN, add_period_reference_lines_frequency,
+    align_vertical_velocity_to_reference,
     add_symmetric_colorbar,
     annotate_panel_label,
-    binned_mean_1d, configured_label, diagnostic_cache_dir,
+    binned_mean_1d, configured_label, cosine_weighted_power_input,
+    diagnostic_cache_dir,
     diagnostic_output_dir, difference_cmap, figure_should_run,
     figure_should_run_any, jsonable_value,
     load_latlon_dataset, make_spectrum_cmap, netcdf_safe_dataset,
+    native_midlevel_height,
     numbered_figure_saver, precip_rate_from_accum, read_json_file,
-    progress, safe_name, simulation_colour, standardize_latlon_dataset, symmetric_levels,
+    pressure_to_pa, progress, safe_name, simulation_colour,
+    standardize_latlon_dataset, symmetric_levels,
     total_precip_accum, vertical_dim, write_json_file,
 )
 from diagnostics.waves.equatorial_wave_config import (
@@ -94,6 +99,7 @@ from diagnostics.convection.lpo_tracking import (
     DEFAULT_TEST_MINIMUM_DURATION_DAYS,
     PRODUCT_VERSION as LPO_TRACKING_PRODUCT_VERSION,
     SIMULATION_DIRS as LPO_SIMULATION_DIRS,
+    TROPICAL_CENTROID_LIMIT_DEG,
     require_actual_test_products,
     require_publication_products,
 )
@@ -102,9 +108,16 @@ from diagnostics.convection.high_cloud_classification import (
     HighCloudThresholds,
     cached_classification_is_current,
 )
+from diagnostics.convection.lpo_lifecycle_sections import (
+    RAY_HEIGHT_M,
+    RAY_RELATIVE_LATITUDE_DEGREES,
+    RAY_RELATIVE_LONGITUDE_DEGREES,
+)
 from diagnostics.waves.wave_metrics import (
     METRICS_VERSION as WAVE_METRICS_VERSION,
+    block_bootstrap_filtered_wave_metrics,
     buoyancy_frequency_squared,
+    circular_time_block_indices,
     common_vertical_motion_eofs,
     complex_top_heaviness,
     filtered_wave_metrics,
@@ -117,6 +130,7 @@ from diagnostics.waves.wave_metrics import (
     spectral_coefficients_for_box,
     upward_pressure_velocity,
 )
+from diagnostics.ttl import TTL_BASE_PRESSURE_HPA
 from wavenumber_frequency_functions import spacetime_power, smooth_wavefreq
 from waveFilter import kf_filter
 
@@ -179,6 +193,14 @@ def parse_command_line(argv=None):
             "cache path during this run, then replace them atomically."
         ),
     )
+    parser.add_argument(
+        "--allow-stale-lpo-products",
+        action="store_true",
+        help=(
+            "Use existing publication LPO tables with an older product "
+            "version when rebuilding Figure 14 wave sections."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.test and args.test_days < MINIMUM_WAVE_TEST_DAYS:
         parser.error(
@@ -187,6 +209,8 @@ def parse_command_line(argv=None):
         )
     if not args.test and args.test_start is not None:
         parser.error("--test-start requires --test")
+    if args.test and args.allow_stale_lpo_products:
+        parser.error("--allow-stale-lpo-products supports publication mode only")
     if args.figures:
         args.figures = list(dict.fromkeys(args.figures))
     return args
@@ -229,6 +253,7 @@ save_loc = diagnostic_output_dir(
 #   8:  wave_filtered_eddy_fluxes_HEAVY
 #   9:  symmetric_antisymmetric_wave_spectra
 #       plus period-axis and wavenumber-phase-speed variants
+#       plus standard T100 and u100 frequency-wavenumber spectra
 #  10:  wave_phase_speed_power_distributions
 #   11: wave precipitation amplitude and cloud/OLR response efficiency
 #   12: Sakaeda/Inoue two-EOF top-heaviness
@@ -270,7 +295,17 @@ filter_lat_bounds = (-10, 10)
 filter_avg_lat = True
 
 WAVE_RESPONSE_FIGURE_NUMBER = 11
-WAVE_RESPONSE_PRODUCT_VERSION = "wave-response-efficiency-v1"
+WAVE_RESPONSE_PRODUCT_VERSION = (
+    "wave-response-efficiency-v3-tropics-20deg"
+)
+WAVE_RESPONSE_BOOTSTRAP_RESAMPLES = 2000
+WAVE_RESPONSE_BOOTSTRAP_SEED = 20240602
+WAVE_RESPONSE_CI_PERCENTILES = (2.5, 97.5)
+WAVE_RESPONSE_ROBUST_SIGN_THRESHOLD = 0.95
+WAVE_RESPONSE_SCATTER_SAMPLE = 20000
+WAVE_RESPONSE_BOOTSTRAP_REFERENCE = (
+    "Kunsch (1989), Annals of Statistics, doi:10.1214/aos/1176347265"
+)
 WAVE_RESPONSE_CLOUD_FIELDS = (
     ("total_high_cloud", "Total high cloud", "high_cloud"),
     ("active_high_cloud", "Active deep convection", "active_high_cloud"),
@@ -349,7 +384,7 @@ LPO_SECTION_PRESSURE_HPA = np.asarray(
     [50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 850, 900, 950, 1000],
     dtype=float,
 )
-LPO_SECTION_VERTICAL_FIELDS = ("T", "w", "qv", "RH")
+LPO_SECTION_VERTICAL_FIELDS = ("T", "w", "qv", "RH", "u", "N2")
 LPO_SECTION_SURFACE_FIELDS = ("Precip", "PW", "OLR")
 
 # Figure 8 keeps latitude resolved and applies each wave box directly.
@@ -357,6 +392,18 @@ eddy_flux_waves = list(EDDY_FLUX_FILTERS)
 eddy_flux_levels = [70, 100, 250, 850]
 
 spectrum_field = "Precip"
+spectrum_additional_fields = (
+    (
+        "T100",
+        "Temperature at 100 hPa",
+        "temperature_100hpa_symmetric_antisymmetric_wave_spectra",
+    ),
+    (
+        "u100",
+        "Zonal wind at 100 hPa",
+        "zonal_wind_100hpa_symmetric_antisymmetric_wave_spectra",
+    ),
+)
 spectrum_lat_bounds = filter_lat_bounds
 if test_mode:
     # The default test record is 40 days, while the publication spectrum uses
@@ -419,8 +466,8 @@ FILTER_INPUT_CACHE_VERSION = (
 )
 FILTERED_WAVE_CACHE_VERSION = FILTERED_WAVE_PRODUCT_VERSION
 PRESSURE_FIELD_PREFIXES = ("w", "u", "v", "T", "qv", "RH")
-DERIVED_CACHE_VERSION = "equatorial-wave-derived-v9-filter-power"
-SPECTRUM_CACHE_VERSION = "equatorial-wave-spectrum-v3-strict-config"
+DERIVED_CACHE_VERSION = "equatorial-wave-derived-v10-cosine-latitude"
+SPECTRUM_CACHE_VERSION = "equatorial-wave-spectrum-v4-cosine-latitude"
 
 # Avoid giant chunks when selecting latitude/longitude subsets.
 dask.config.set({"array.slicing.split_large_chunks": True})
@@ -430,7 +477,8 @@ latlon_vars = [
     "cldfrac",
     "uzonal_isobaric", "umeridional_isobaric",
     "rh_isobaric", "t_isobaric", "qv_isobaric", "omg_isobaric",
-    "theta", "pressure", "zgrid", "w",
+    "theta", "pressure", "zgrid", "w", "rho", "qv",
+    "uReconstructZonal",
 ]
 zonal_mean_vars = [
     "cldfrac", "uzonal_isobaric", "umeridional_isobaric", "rh_isobaric",
@@ -706,14 +754,18 @@ def load_wave_cloud_responses(simulation):
                 "nonprecipitating_high_cloud_mask"
             ].fillna(False).astype("float32"),
             "ttl_reaching_high_cloud": (
-                high & (classified.cloud_top_pressure <= 180.0)
+                high
+                & (
+                    classified.cloud_top_pressure
+                    <= TTL_BASE_PRESSURE_HPA
+                )
             ).fillna(False).astype("float32"),
         }
     )
     responses.attrs.update(
         source_classification_path=os.path.abspath(path),
         classification_cache_version=CLASSIFICATION_CACHE_VERSION,
-        ttl_cloud_top_pressure_threshold_hpa=180.0,
+        ttl_cloud_top_pressure_threshold_hpa=TTL_BASE_PRESSURE_HPA,
     )
     return responses
 
@@ -974,6 +1026,16 @@ def filter_input_cache_matches(fname, field_name):
                     or cached.attrs.get("classification_cache_version")
                     == CLASSIFICATION_CACHE_VERSION
                 )
+                and (
+                    field_name != "ttl_reaching_high_cloud"
+                    or float(
+                        cached.attrs.get(
+                            "ttl_cloud_top_pressure_threshold_hpa",
+                            np.nan,
+                        )
+                    )
+                    == TTL_BASE_PRESSURE_HPA
+                )
             )
     except Exception:
         return False
@@ -1013,6 +1075,10 @@ def write_filter_input_if_needed(ds, sim_index, field_name):
         "ttl_reaching_high_cloud",
     }:
         fds.attrs["classification_cache_version"] = CLASSIFICATION_CACHE_VERSION
+    if field_name == "ttl_reaching_high_cloud":
+        fds.attrs["ttl_cloud_top_pressure_threshold_hpa"] = (
+            TTL_BASE_PRESSURE_HPA
+        )
     encoding = {"x": {"dtype": "float32"}}
     tmp_fname = fname + ".tmp"
     fds.to_netcdf(tmp_fname, encoding=encoding)
@@ -1055,6 +1121,22 @@ def normalise_lat_bounds(lat_bounds):
     if lo > hi:
         lo, hi = hi, lo
     return lo, hi
+
+
+def cosine_latitude_mean(
+    field,
+    dimensions="latitude",
+    *,
+    lat_dim="latitude",
+):
+    """Return a cosine-weighted mean over one latitude-bearing reduction."""
+    dimensions = (
+        [dimensions] if isinstance(dimensions, str) else list(dimensions)
+    )
+    if lat_dim not in dimensions:
+        raise ValueError(f"{lat_dim!r} must be one of {dimensions!r}")
+    weights = np.cos(np.deg2rad(field[lat_dim])).clip(min=0.0)
+    return field.weighted(weights).mean(dim=dimensions, skipna=True)
 
 
 def lat_bounds_attr(lat_bounds):
@@ -1129,6 +1211,16 @@ def wave_cache_matches(wave_da, field_name, wave_name, avgLat, lat_bounds, proje
             or wave_da.attrs.get("classification_cache_version")
             == CLASSIFICATION_CACHE_VERSION
         )
+        and (
+            field_name != "ttl_reaching_high_cloud"
+            or float(
+                wave_da.attrs.get(
+                    "ttl_cloud_top_pressure_threshold_hpa",
+                    np.nan,
+                )
+            )
+            == TTL_BASE_PRESSURE_HPA
+        )
     )
 
 
@@ -1184,7 +1276,9 @@ def filter_input_with_wave_box(input_path, obs_var, wave_name, lat_bounds, avgLa
         obs_data = infile[obs_var].sel(lat=slice(*lat_bounds))
 
         if avgLat:
-            obs_data = obs_data.mean("lat")
+            obs_data = cosine_latitude_mean(
+                obs_data, "lat", lat_dim="lat"
+            )
             filt_data = np.asarray(obs_data.values[:, None, :], dtype="f")
             coords = [obs_time, lon]
             dims = ["time", "lon"]
@@ -1277,6 +1371,10 @@ def direct_filtered_wave(ds, sim_index, field_name, wave_name, avgLat, lat_bound
         "ttl_reaching_high_cloud",
     }:
         wave.attrs["classification_cache_version"] = CLASSIFICATION_CACHE_VERSION
+    if field_name == "ttl_reaching_high_cloud":
+        wave.attrs["ttl_cloud_top_pressure_threshold_hpa"] = (
+            TTL_BASE_PRESSURE_HPA
+        )
     write_wave_cache(wave, cache_path)
     return xr.open_dataset(cache_path)["wave"]
 
@@ -1375,7 +1473,9 @@ def get_filtered_wave(ds, sim_index, field_name, wave_name, avgLat=True, lat_bou
     raise ValueError(f"Unhandled latitude projection {projection!r}")
 
 
-def _lpo_wave_tracking_steps(*, test=False):
+def _lpo_wave_tracking_steps(
+    *, test=False, allow_stale_products=False
+):
     """Read only the stable tracking tables needed for compact wave caches."""
 
     mode_directory = (
@@ -1385,7 +1485,9 @@ def _lpo_wave_tracking_steps(*, test=False):
             minimum_duration_days=DEFAULT_TEST_MINIMUM_DURATION_DAYS,
         )
         if test
-        else require_publication_products()
+        else require_publication_products(
+            allow_stale_product_version=allow_stale_products
+        )
     )
     tables = {}
     for simulation in LPO_SIMULATION_DIRS:
@@ -1399,28 +1501,42 @@ def _lpo_wave_tracking_steps(*, test=False):
             & timing.reference_in_record_subset.astype(bool)
             & timing.in_primary_lifecycle_window.astype(bool)
         ].copy()
-        complete = selected.complete_primary_lag_window.astype(bool)
-        if complete.any():
-            selected = selected[complete]
-        elif not test:
-            raise RuntimeError(
-                f"{simulation}: no complete publication LPO sequence for "
-                "compact wave sections"
-            )
         selected = selected.sort_values(
             ["event_id", "lag_hours", "Time"]
         ).drop_duplicates(["event_id", "lag_hours"], keep="last")
+        geometric = pd.read_csv(
+            standard / "lpt_track_steps.csv",
+            usecols=[
+                "event_id", "Time", "centroid_lon", "centroid_lat",
+            ],
+        )
+        geometric["Time"] = pd.to_datetime(geometric.Time)
+        selected = selected.merge(
+            geometric,
+            on=["event_id", "Time"],
+            how="left",
+            validate="one_to_one",
+        )
         required = {
             "event_id",
             "Time",
             "lag_hours",
             "precip_weighted_centroid_lon",
             "precip_weighted_centroid_lat",
+            "centroid_lon",
+            "centroid_lat",
         }
         missing = sorted(required - set(selected.columns))
         if missing:
             raise RuntimeError(
                 f"{standard}: tracking timing table lacks {missing}"
+            )
+        geometric_columns = ["centroid_lon", "centroid_lat"]
+        if selected[geometric_columns].isna().any().any():
+            count = int(selected[geometric_columns].isna().any(axis=1).sum())
+            raise RuntimeError(
+                f"{standard}: {count} selected lifecycle rows lack geometric "
+                "centroids"
             )
         tables[simulation] = selected.reset_index(drop=True)
     return tables
@@ -1442,6 +1558,57 @@ def _filter_2d_wave(values, wave_name):
         box["filter_name"],
     )
     return np.asarray(filtered[: np.shape(values)[0]], dtype=float)
+
+
+_BATCH_FILTER_MASKS = {}
+
+
+def _filter_2d_wave_batch(values, wave_name):
+    """Apply the configured filter to a batch of time-longitude fields."""
+
+    values = np.asarray(values, dtype="f")
+    if values.ndim != 3:
+        raise ValueError("Batch wave filters require level, time, longitude")
+    batch_count, time_count, longitude_count = values.shape
+    key = (time_count, longitude_count, wave_name)
+    mask = _BATCH_FILTER_MASKS.get(key)
+    if mask is None:
+        rng = np.random.default_rng(20260804)
+        reference = rng.standard_normal(
+            (time_count, longitude_count), dtype=np.float32
+        )
+        box = WAVE_BOXES[wave_name]
+        _filtered, mask = kf_filter(
+            reference,
+            obs_per_day,
+            box["period"][0],
+            box["period"][1],
+            box["k"][0],
+            box["k"][1],
+            box["depth"][0],
+            box["depth"][1],
+            box["filter_name"],
+            debug=True,
+        )
+        mask = np.asarray(mask, dtype=bool)
+        _BATCH_FILTER_MASKS[key] = mask
+    original = values[:, :, ::-1].transpose(0, 2, 1)
+    detrended = signal.detrend(original, axis=-1, type="linear")
+    taper = signal.windows.tukey(time_count, 0.05, True)
+    spectrum = fft.rfft2(
+        detrended * taper[None, None, :],
+        axes=(-2, -1),
+        workers=4,
+    )
+    spectrum *= mask[None, :, :]
+    reconstructed = fft.irfft2(
+        spectrum,
+        s=(longitude_count, time_count),
+        axes=(-2, -1),
+        workers=4,
+    )
+    output = reconstructed.transpose(0, 2, 1)[:, :, ::-1]
+    return np.asarray(output[:batch_count], dtype=float)
 
 
 def _tracking_time_indices(source_time, steps):
@@ -1545,14 +1712,17 @@ def _latitude_resolved_lpo_wave_values(
         ),
         np.nan,
     )
-    for latitude_index in np.unique(latitude_indices):
-        positions = np.argwhere(latitude_indices == latitude_index)
-        source = np.asarray(
-            field.isel(latitude=int(latitude_index)).values,
-            dtype="f",
-        )
-        for wave_index, wave_name in enumerate(wave_names):
-            filtered = _filter_2d_wave(source, wave_name)
+    unique_latitude_indices = np.unique(latitude_indices)
+    sources = np.asarray(
+        field.isel(latitude=unique_latitude_indices).load(), dtype="f"
+    ).transpose(1, 0, 2)
+    for wave_index, wave_name in enumerate(wave_names):
+        filtered_batch = _filter_2d_wave_batch(sources, wave_name)
+        for batch_index, latitude_index in enumerate(
+            unique_latitude_indices
+        ):
+            positions = np.argwhere(latitude_indices == latitude_index)
+            filtered = filtered_batch[batch_index]
             step_indices = np.unique(positions[:, 0])
             sampled = _sample_filtered_relative_longitudes(
                 filtered,
@@ -1572,12 +1742,22 @@ def _latitude_resolved_lpo_wave_values(
 
 
 def _latitude_mean_lpo_wave_values(field, steps, wave_names):
-    """Filter a 10S--10N mean and sample it along saved centroid longitudes."""
+    """Filter means within 10 degrees of each saved LPO latitude."""
 
-    field = field.sel(latitude=slice(*filter_lat_bounds)).mean(
-        "latitude", skipna=True
-    ).transpose("Time", "longitude")
-    source = np.asarray(field.values, dtype="f")
+    field = field.transpose("Time", "latitude", "longitude")
+    centroid_latitude = np.asarray(
+        steps.precip_weighted_centroid_lat, dtype=float
+    )
+    latitude_lower = float(np.nanmin(centroid_latitude) - 10.5)
+    latitude_upper = float(np.nanmax(centroid_latitude) + 10.5)
+    field = field.sel(
+        latitude=slice(latitude_lower, latitude_upper)
+    ).load()
+    latitude = np.asarray(field.latitude, dtype=float)
+    centre_indices = np.abs(
+        latitude[None, :]
+        - centroid_latitude[:, None]
+    ).argmin(axis=1)
     time_indices = _tracking_time_indices(field.Time.values, steps)
     output = np.full(
         (
@@ -1588,29 +1768,469 @@ def _latitude_mean_lpo_wave_values(field, steps, wave_names):
         np.nan,
     )
     rms = np.full(len(wave_names), np.nan)
-    for wave_index, wave_name in enumerate(wave_names):
-        filtered = _filter_2d_wave(source, wave_name)
-        output[:, :, wave_index] = _sample_filtered_relative_longitudes(
-            filtered,
-            field.longitude.values,
-            time_indices,
-            steps.precip_weighted_centroid_lon,
-        )
-        finite = np.isfinite(filtered)
-        if finite.any():
-            rms[wave_index] = float(
-                np.sqrt(np.mean(filtered[finite] ** 2))
+    rms_collect = [[] for _wave_name in wave_names]
+    unique_centre_indices = np.unique(centre_indices)
+    sources = np.stack(
+        [
+            np.asarray(
+                cosine_latitude_mean(
+                    field.where(
+                        np.abs(field.latitude - latitude[centre_index])
+                        <= 10.0,
+                        drop=True,
+                    )
+                ),
+                dtype="f",
             )
+            for centre_index in unique_centre_indices
+        ]
+    )
+    for wave_index, wave_name in enumerate(wave_names):
+        filtered_batch = _filter_2d_wave_batch(sources, wave_name)
+        for batch_index, centre_index in enumerate(unique_centre_indices):
+            positions = np.flatnonzero(centre_indices == centre_index)
+            filtered = filtered_batch[batch_index]
+            output[positions, :, wave_index] = (
+                _sample_filtered_relative_longitudes(
+                    filtered,
+                    field.longitude.values,
+                    time_indices[positions],
+                    np.asarray(
+                        steps.precip_weighted_centroid_lon, dtype=float
+                    )[positions],
+                )
+            )
+            finite = np.isfinite(filtered)
+            if finite.any():
+                rms_collect[wave_index].append(
+                    float(np.sqrt(np.mean(filtered[finite] ** 2)))
+                )
+    for wave_index, values in enumerate(rms_collect):
+        if values:
+            rms[wave_index] = float(np.mean(values))
     return output, rms
 
 
-def _precipitation_phase_at_lpo(field, steps, wave_names):
-    """Diagnose phase from 10S--10N filtered precipitation at each LPO."""
+def _latitude_mean_lpo_values(field, steps):
+    """Sample unfiltered means within 10 degrees of each LPO latitude."""
 
-    field = field.sel(latitude=slice(*filter_lat_bounds)).mean(
-        "latitude", skipna=True
-    ).transpose("Time", "longitude")
-    source = np.asarray(field.values, dtype="f")
+    field = field.transpose("Time", "latitude", "longitude")
+    centroid_latitude = np.asarray(
+        steps.precip_weighted_centroid_lat, dtype=float
+    )
+    latitude_lower = float(np.nanmin(centroid_latitude) - 10.5)
+    latitude_upper = float(np.nanmax(centroid_latitude) + 10.5)
+    field = field.sel(
+        latitude=slice(latitude_lower, latitude_upper)
+    ).load()
+    latitude = np.asarray(field.latitude, dtype=float)
+    centre_indices = np.abs(
+        latitude[None, :]
+        - centroid_latitude[:, None]
+    ).argmin(axis=1)
+    time_indices = _tracking_time_indices(field.Time.values, steps)
+    output = np.full(
+        (
+            len(steps),
+            len(LPO_SECTION_RELATIVE_LONGITUDE_DEGREES),
+        ),
+        np.nan,
+    )
+    for centre_index in np.unique(centre_indices):
+        positions = np.flatnonzero(centre_indices == centre_index)
+        centre = latitude[centre_index]
+        source = np.asarray(
+            cosine_latitude_mean(
+                field.where(
+                    np.abs(field.latitude - centre) <= 10.0, drop=True
+                )
+            ),
+            dtype=float,
+        )
+        output[positions] = _sample_filtered_relative_longitudes(
+            source,
+            field.longitude.values,
+            time_indices[positions],
+            np.asarray(
+                steps.precip_weighted_centroid_lon, dtype=float
+            )[positions],
+        )
+    return output
+
+
+def _native_sampling_geometry(
+    field,
+    steps,
+    *,
+    relative_longitude=LPO_SECTION_RELATIVE_LONGITUDE_DEGREES,
+    latitude_column="precip_weighted_centroid_lat",
+    longitude_column="precip_weighted_centroid_lon",
+    additional_latitude_bounds=None,
+    time_independent=False,
+):
+    """Return bounded coordinates and index arrays for native profiles."""
+
+    centroid_latitude = np.asarray(
+        steps[latitude_column], dtype=float
+    )
+    latitude_lower = float(np.nanmin(centroid_latitude) - 10.5)
+    latitude_upper = float(np.nanmax(centroid_latitude) + 10.5)
+    if additional_latitude_bounds is not None:
+        extra_lower, extra_upper = normalise_lat_bounds(
+            additional_latitude_bounds
+        )
+        latitude_lower = min(latitude_lower, extra_lower)
+        latitude_upper = max(latitude_upper, extra_upper)
+    bounded = field.sel(latitude=slice(latitude_lower, latitude_upper))
+    latitude = np.asarray(bounded.latitude, dtype=float)
+    centre_indices = np.abs(
+        latitude[None, :] - centroid_latitude[:, None]
+    ).argmin(axis=1)
+    time_indices = (
+        np.zeros(len(steps), dtype=int)
+        if time_independent
+        else _tracking_time_indices(bounded.Time.values, steps)
+    )
+    longitude = np.asarray(bounded.longitude, dtype=float)
+    centroid_longitude = np.asarray(
+        steps[longitude_column], dtype=float
+    )
+    relative_longitude = np.asarray(relative_longitude, dtype=float)
+    targets = np.mod(
+        centroid_longitude[:, None]
+        + relative_longitude[None, :],
+        360.0,
+    )
+    longitude_indices = np.abs(
+        ((longitude[None, None, :] - targets[:, :, None] + 180.0) % 360.0)
+        - 180.0
+    ).argmin(axis=2)
+    return (
+        bounded,
+        latitude,
+        centre_indices,
+        time_indices,
+        longitude_indices,
+    )
+
+
+def _latitude_mean_native_lpo_wave_values(
+    field,
+    steps,
+    wave_names,
+    *,
+    block_size=25,
+    progress_label="native field",
+    relative_longitude=LPO_SECTION_RELATIVE_LONGITUDE_DEGREES,
+    latitude_column="precip_weighted_centroid_lat",
+    longitude_column="precip_weighted_centroid_lon",
+):
+    """Filter native levels in vectorized blocks around LPO latitudes."""
+
+    native_dimension = vertical_dim(field)
+    field = field.transpose(
+        "Time", "latitude", "longitude", native_dimension
+    )
+    (
+        bounded,
+        latitude,
+        centre_indices,
+        time_indices,
+        longitude_indices,
+    ) = _native_sampling_geometry(
+        field,
+        steps,
+        relative_longitude=relative_longitude,
+        latitude_column=latitude_column,
+        longitude_column=longitude_column,
+        additional_latitude_bounds=(
+            filter_lat_bounds
+            if any(
+                WAVE_LATITUDE_PROJECTION[name] == "antisymmetric"
+                for name in wave_names
+            )
+            else None
+        ),
+    )
+    relative_longitude = np.asarray(relative_longitude, dtype=float)
+    level_count = bounded.sizes[native_dimension]
+    output = np.full(
+        (
+            len(steps),
+            level_count,
+            len(relative_longitude),
+            len(wave_names),
+        ),
+        np.nan,
+    )
+    for start in range(0, level_count, block_size):
+        stop = min(start + block_size, level_count)
+        progress(
+            f"{progress_label}: native levels {start + 1}-{stop}/"
+            f"{level_count}"
+        )
+        slab = bounded.isel(
+            {native_dimension: slice(start, stop)}
+        ).load()
+        for wave_index, wave_name in enumerate(wave_names):
+            if WAVE_LATITUDE_PROJECTION[wave_name] == "antisymmetric":
+                source = np.asarray(
+                    project_latitude_field(
+                        slab, "antisymmetric", filter_lat_bounds
+                    ),
+                    dtype="f",
+                ).transpose(2, 0, 1)
+                filtered = _filter_2d_wave_batch(source, wave_name)
+                sampled = filtered[
+                    :, time_indices[:, None], longitude_indices
+                ].transpose(1, 0, 2)
+                output[:, start:stop, :, wave_index] = sampled
+                continue
+            for centre_index in np.unique(centre_indices):
+                positions = np.flatnonzero(centre_indices == centre_index)
+                centre = latitude[centre_index]
+                source = np.asarray(
+                    cosine_latitude_mean(
+                        slab.where(
+                            np.abs(slab.latitude - centre) <= 10.0,
+                            drop=True,
+                        )
+                    ),
+                    dtype="f",
+                ).transpose(2, 0, 1)
+                filtered = _filter_2d_wave_batch(source, wave_name)
+                sampled = filtered[
+                    :, time_indices[positions, None],
+                    longitude_indices[positions]
+                ].transpose(1, 0, 2)
+                output[positions, start:stop, :, wave_index] = sampled
+    return output
+
+
+def _latitude_mean_native_lpo_values(
+    field,
+    steps,
+    *,
+    block_size=25,
+    relative_longitude=LPO_SECTION_RELATIVE_LONGITUDE_DEGREES,
+    latitude_column="precip_weighted_centroid_lat",
+    longitude_column="precip_weighted_centroid_lon",
+):
+    """Sample unfiltered native levels in bounded vectorized blocks."""
+
+    native_dimension = vertical_dim(field)
+    time_independent = "Time" not in field.dims
+    if time_independent:
+        field = field.expand_dims(Time=np.asarray([0]))
+    field = field.transpose(
+        "Time", "latitude", "longitude", native_dimension
+    )
+    (
+        bounded,
+        latitude,
+        centre_indices,
+        time_indices,
+        longitude_indices,
+    ) = _native_sampling_geometry(
+        field,
+        steps,
+        relative_longitude=relative_longitude,
+        latitude_column=latitude_column,
+        longitude_column=longitude_column,
+        time_independent=time_independent,
+    )
+    relative_longitude = np.asarray(relative_longitude, dtype=float)
+    level_count = bounded.sizes[native_dimension]
+    output = np.full(
+        (
+            len(steps),
+            level_count,
+            len(relative_longitude),
+        ),
+        np.nan,
+    )
+    for start in range(0, level_count, block_size):
+        stop = min(start + block_size, level_count)
+        slab = bounded.isel(
+            {native_dimension: slice(start, stop)}
+        ).load()
+        for centre_index in np.unique(centre_indices):
+            positions = np.flatnonzero(centre_indices == centre_index)
+            centre = latitude[centre_index]
+            source = np.asarray(
+                cosine_latitude_mean(
+                    slab.where(
+                        np.abs(slab.latitude - centre) <= 10.0,
+                        drop=True,
+                    )
+                ),
+                dtype=float,
+            ).transpose(2, 0, 1)
+            sampled = source[
+                :, time_indices[positions, None],
+                longitude_indices[positions]
+            ].transpose(1, 0, 2)
+            output[positions, start:stop, :] = sampled
+    return output
+
+
+def _native_lpo_vertical_fields(ds):
+    """Return native-level fields required by filtered LPO composites."""
+
+    required = {
+        "theta", "pressure", "rho", "w", "qv", "uReconstructZonal"
+    }
+    missing = sorted(required - set(ds.data_vars))
+    if missing:
+        raise RuntimeError(
+            f"Native filtered LPO profiles require fields {missing}"
+        )
+    time = precip_rate(ds).Time
+    pressure_pa = pressure_to_pa(ds.pressure).sel(Time=time)
+    theta = ds.theta.sel(Time=time)
+    height = native_midlevel_height(ds, theta)
+    native_dimension = vertical_dim(theta)
+    static_stability = xr.apply_ufunc(
+        buoyancy_frequency_squared,
+        theta,
+        height,
+        kwargs={"mask_nonpositive": False},
+        input_core_dims=[[native_dimension], [native_dimension]],
+        output_core_dims=[[native_dimension]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[float],
+        dask_gufunc_kwargs={"allow_rechunk": True},
+    )
+    temperature = theta * (pressure_pa / 100_000.0) ** (287.0 / 1004.0)
+    specific_humidity = ds.qv.sel(Time=time) / (
+        1.0 + ds.qv.sel(Time=time)
+    )
+    temperature_c = temperature - 273.15
+    saturation_vapour_pressure = 611.2 * np.exp(
+        17.67 * temperature_c / (temperature_c + 243.5)
+    )
+    saturation_specific_humidity = (
+        0.622 * saturation_vapour_pressure
+        / (pressure_pa - 0.378 * saturation_vapour_pressure)
+    )
+    relative_humidity = (
+        100.0 * specific_humidity / saturation_specific_humidity
+    )
+    return {
+        "T": temperature,
+        "w": (
+            9.80665
+            * ds.rho.sel(Time=time)
+            * align_vertical_velocity_to_reference(
+                ds.w.sel(Time=time), ds.rho.sel(Time=time)
+            )
+        ),
+        "qv": 1000.0 * specific_humidity,
+        "RH": relative_humidity,
+        "u": ds.uReconstructZonal.sel(Time=time),
+        "N2": static_stability,
+        "pressure_hpa": pressure_pa / 100.0,
+        "height_m": height,
+    }
+
+
+def _peak_filtered_temperature_ray_sections(native_fields, steps):
+    """Return geometric lag-zero Kelvin and MRG temperature sections."""
+
+    peak = steps[np.isclose(steps.lag_hours, 0.0)].copy()
+    peak = peak.sort_values(["event_id", "Time"]).drop_duplicates(
+        "event_id", keep="last"
+    ).reset_index(drop=True)
+    wave_names = ("Kelvin", "MRG")
+    filtered_native = _latitude_mean_native_lpo_wave_values(
+        native_fields["T"],
+        peak,
+        wave_names,
+        progress_label="geometric peak filtered temperature",
+        relative_longitude=RAY_RELATIVE_LONGITUDE_DEGREES,
+        latitude_column="centroid_lat",
+        longitude_column="centroid_lon",
+    )
+    native_height = _latitude_mean_native_lpo_values(
+        native_fields["height_m"],
+        peak,
+        relative_longitude=RAY_RELATIVE_LONGITUDE_DEGREES,
+        latitude_column="centroid_lat",
+        longitude_column="centroid_lon",
+    )
+    output = np.full(
+        (
+            len(peak), len(RAY_HEIGHT_M),
+            len(RAY_RELATIVE_LONGITUDE_DEGREES), len(wave_names),
+        ),
+        np.nan,
+        dtype=np.float32,
+    )
+    for event_index in range(len(peak)):
+        for longitude_index in range(len(RAY_RELATIVE_LONGITUDE_DEGREES)):
+            height = np.asarray(
+                native_height[event_index, :, longitude_index], dtype=float
+            )
+            for wave_index in range(len(wave_names)):
+                temperature = np.asarray(
+                    filtered_native[
+                        event_index, :, longitude_index, wave_index
+                    ],
+                    dtype=float,
+                )
+                valid = np.isfinite(height) & np.isfinite(temperature)
+                if valid.sum() < 2:
+                    continue
+                order = np.argsort(height[valid])
+                z = height[valid][order]
+                value = temperature[valid][order]
+                unique = np.r_[True, np.diff(z) > 0.0]
+                z, value = z[unique], value[unique]
+                if len(z) < 2:
+                    continue
+                inside = (RAY_HEIGHT_M >= z[0]) & (RAY_HEIGHT_M <= z[-1])
+                output[
+                    event_index, inside, longitude_index, wave_index
+                ] = np.interp(RAY_HEIGHT_M[inside], z, value)
+    return xr.Dataset(
+        {
+            "ray_filtered_temperature": (
+                (
+                    "peak_event", "ray_height_m",
+                    "ray_relative_longitude", "ray_wave_band",
+                ),
+                output,
+            ),
+            "peak_event_id": (
+                ("peak_event",), peak.event_id.astype(str).values
+            ),
+        },
+        coords={
+            "peak_event": np.arange(len(peak)),
+            "ray_height_m": RAY_HEIGHT_M,
+            "ray_relative_longitude": RAY_RELATIVE_LONGITUDE_DEGREES,
+            "ray_wave_band": np.asarray(wave_names, dtype=str),
+        },
+        attrs={
+            "ray_centroid": "geometric LPT centroid",
+            "MRG_latitude_projection": "antisymmetric 10S-10N",
+            "Kelvin_vertical_wavelength_km": 10.0,
+            "MRG_zonal_wavenumber": -2,
+            "MRG_vertical_wavelength_km": 10.0,
+        },
+    )
+
+
+def _precipitation_phase_at_lpo(field, steps, wave_names):
+    """Diagnose phase from each LPO-centred 20-degree latitude band."""
+
+    field = field.transpose("Time", "latitude", "longitude")
+    latitude = np.asarray(field.latitude, dtype=float)
+    centre_indices = np.abs(
+        latitude[None, :]
+        - np.asarray(steps.precip_weighted_centroid_lat, dtype=float)[:, None]
+    ).argmin(axis=1)
     time_indices = _tracking_time_indices(field.Time.values, steps)
     shape = (len(steps), len(wave_names))
     angle = np.full(shape, np.nan)
@@ -1618,23 +2238,146 @@ def _precipitation_phase_at_lpo(field, steps, wave_names):
     amplitude = np.full(shape, np.nan)
     strong = np.zeros(shape, dtype=bool)
     rms = np.full(len(wave_names), np.nan)
+    rms_collect = [[] for _wave_name in wave_names]
     for wave_index, wave_name in enumerate(wave_names):
+        if WAVE_LATITUDE_PROJECTION[wave_name] != "antisymmetric":
+            continue
+        source = np.asarray(
+            project_latitude_field(
+                field, "antisymmetric", filter_lat_bounds
+            ),
+            dtype="f",
+        )
         filtered = _filter_2d_wave(source, wave_name)
-        (
-            angle[:, wave_index],
-            phase[:, wave_index],
-            amplitude[:, wave_index],
-            strong[:, wave_index],
-        ) = _wave_phase_diagnostics(
+        result = _wave_phase_diagnostics(
             filtered,
             time_indices,
             field.longitude.values,
-            steps.precip_weighted_centroid_lon,
+            np.asarray(
+                steps.precip_weighted_centroid_lon, dtype=float
+            ),
         )
+        angle[:, wave_index] = result[0]
+        phase[:, wave_index] = result[1]
+        amplitude[:, wave_index] = result[2]
+        strong[:, wave_index] = result[3]
         finite = np.isfinite(filtered)
         if finite.any():
-            rms[wave_index] = float(np.sqrt(np.mean(filtered[finite] ** 2)))
+            rms_collect[wave_index].append(
+                float(np.sqrt(np.mean(filtered[finite] ** 2)))
+            )
+    for centre_index in np.unique(centre_indices):
+        positions = np.flatnonzero(centre_indices == centre_index)
+        centre = latitude[centre_index]
+        source = np.asarray(
+            cosine_latitude_mean(
+                field.where(
+                    np.abs(field.latitude - centre) <= 10.0, drop=True
+                )
+            ),
+            dtype="f",
+        )
+        for wave_index, wave_name in enumerate(wave_names):
+            if WAVE_LATITUDE_PROJECTION[wave_name] == "antisymmetric":
+                continue
+            filtered = _filter_2d_wave(source, wave_name)
+            result = _wave_phase_diagnostics(
+                filtered,
+                time_indices[positions],
+                field.longitude.values,
+                np.asarray(
+                    steps.precip_weighted_centroid_lon, dtype=float
+                )[positions],
+            )
+            angle[positions, wave_index] = result[0]
+            phase[positions, wave_index] = result[1]
+            amplitude[positions, wave_index] = result[2]
+            strong[positions, wave_index] = result[3]
+            finite = np.isfinite(filtered)
+            if finite.any():
+                rms_collect[wave_index].append(
+                    float(np.sqrt(np.mean(filtered[finite] ** 2)))
+                )
+    for wave_index, values in enumerate(rms_collect):
+        if values:
+            rms[wave_index] = float(np.mean(values))
     return angle, phase, amplitude, strong, rms
+
+
+def _random_reference_steps(field, steps, simulation):
+    """Create matched random tracks moving at the mean saved LPO speed."""
+
+    zonal_speeds = []
+    for _event_id, event in steps.groupby("event_id", sort=False):
+        event = event.sort_values("Time")
+        if len(event) < 2:
+            continue
+        longitude = np.rad2deg(
+            np.unwrap(
+                np.deg2rad(
+                    np.asarray(
+                        event.precip_weighted_centroid_lon, dtype=float
+                    )
+                )
+            )
+        )
+        elapsed_hours = (
+            pd.to_datetime(event.Time).diff()
+            / pd.Timedelta(hours=1)
+        ).to_numpy(dtype=float)[1:]
+        valid = np.isfinite(elapsed_hours) & (elapsed_hours > 0.0)
+        zonal_speeds.extend(
+            (np.diff(longitude)[valid] / elapsed_hours[valid]).tolist()
+        )
+    mean_speed_degrees_per_hour = (
+        float(np.nanmean(zonal_speeds)) if zonal_speeds else 0.0
+    )
+    source_time = pd.DatetimeIndex(pd.to_datetime(field.Time.values))
+    seed = 20260804 + list(LPO_SIMULATION_DIRS).index(simulation)
+    rng = np.random.default_rng(seed)
+    records = []
+    for event_id, event in steps.groupby("event_id", sort=False):
+        event = event.sort_values("lag_hours")
+        lag_hours = np.asarray(event.lag_hours, dtype=int)
+        earliest = pd.Timedelta(hours=int(lag_hours.min()))
+        latest = pd.Timedelta(hours=int(lag_hours.max()))
+        valid_reference = source_time[
+            (source_time + earliest >= source_time[0])
+            & (source_time + latest <= source_time[-1])
+        ]
+        if not len(valid_reference):
+            raise RuntimeError(
+                "Wave record cannot contain the matched random lifecycle"
+            )
+        reference_time = valid_reference[
+            int(rng.integers(0, len(valid_reference)))
+        ]
+        reference_longitude = float(rng.uniform(0.0, 360.0))
+        reference_latitude = float(
+            rng.uniform(
+                -TROPICAL_CENTROID_LIMIT_DEG,
+                TROPICAL_CENTROID_LIMIT_DEG,
+            )
+        )
+        for lag in lag_hours:
+            records.append(
+                {
+                    "event_id": str(event_id),
+                    "lag_hours": int(lag),
+                    "Time": reference_time + pd.Timedelta(hours=int(lag)),
+                    "precip_weighted_centroid_lon": np.mod(
+                        reference_longitude
+                        + mean_speed_degrees_per_hour * lag,
+                        360.0,
+                    ),
+                    "precip_weighted_centroid_lat": reference_latitude,
+                }
+            )
+    output = pd.DataFrame(records)
+    output.attrs["mean_lpo_speed_degrees_per_hour"] = (
+        mean_speed_degrees_per_hour
+    )
+    return output
 
 
 def build_compact_lpo_wave_sections(ds, simulation, steps):
@@ -1648,9 +2391,13 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
         len(LPO_SECTION_RELATIVE_LONGITUDE_DEGREES),
         len(wave_names),
     )
+    native_fields = _native_lpo_vertical_fields(ds)
+    native_template = native_fields["T"]
+    native_dimension = vertical_dim(native_template)
+    native_level_count = native_template.sizes[native_dimension]
     vertical_shape = (
         step_count,
-        len(LPO_SECTION_PRESSURE_HPA),
+        native_level_count,
         len(LPO_SECTION_RELATIVE_LONGITUDE_DEGREES),
         len(wave_names),
     )
@@ -1667,6 +2414,15 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
     phase_number = np.full((step_count, len(wave_names)), np.nan)
     normalized_amplitude = np.full((step_count, len(wave_names)), np.nan)
     strong_amplitude = np.zeros((step_count, len(wave_names)), dtype=bool)
+    random_phase_angle = np.full((step_count, len(wave_names)), np.nan)
+    random_phase_number = np.full((step_count, len(wave_names)), np.nan)
+    random_normalized_amplitude = np.full(
+        (step_count, len(wave_names)), np.nan
+    )
+    random_strong_amplitude = np.zeros(
+        (step_count, len(wave_names)), dtype=bool
+    )
+    random_reference_speed = np.nan
 
     for field_name in LPO_SECTION_SURFACE_FIELDS:
         progress(
@@ -1688,28 +2444,40 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
                 steps,
                 wave_names,
             )
+            random_steps = _random_reference_steps(
+                field, steps, simulation
+            )
+            random_reference_speed = random_steps.attrs[
+                "mean_lpo_speed_degrees_per_hour"
+            ]
+            (
+                random_phase_angle,
+                random_phase_number,
+                random_normalized_amplitude,
+                random_strong_amplitude,
+                _random_precipitation_rms,
+            ) = _precipitation_phase_at_lpo(
+                field,
+                random_steps,
+                wave_names,
+            )
 
     for field_name in LPO_SECTION_VERTICAL_FIELDS:
-        for level_index, pressure_hpa in enumerate(
-            LPO_SECTION_PRESSURE_HPA
-        ):
-            cache_field = f"{field_name}{pressure_hpa:g}"
-            progress(
-                f"{simulation}: compact LPO {cache_field} wave profile"
-            )
-            field = get_filter_field(ds, cache_field)
-            sampled, _rms = _latitude_mean_lpo_wave_values(
-                field, steps, wave_names
-            )
-            if field_name == "qv":
-                sampled = 1000.0 * sampled
-            vertical[field_name][:, level_index, :] = sampled
+        vertical[field_name] = _latitude_mean_native_lpo_wave_values(
+            native_fields[field_name],
+            steps,
+            wave_names,
+            progress_label=f"{simulation}: compact LPO {field_name}",
+        )
+    native_pressure = _latitude_mean_native_lpo_values(
+        native_fields["pressure_hpa"], steps
+    )
 
     coords = {
         "event_step": np.arange(step_count),
         "relative_latitude": LPO_SECTION_RELATIVE_LATITUDE_DEGREES,
         "relative_longitude": LPO_SECTION_RELATIVE_LONGITUDE_DEGREES,
-        "pressure_hpa": LPO_SECTION_PRESSURE_HPA,
+        "native_level": np.arange(native_level_count),
         "wave_band": np.asarray(wave_names, dtype=str),
     }
     dataset = xr.Dataset(
@@ -1748,31 +2516,52 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
             ),
             "filtered_temperature": (
                 (
-                    "event_step", "pressure_hpa",
+                    "event_step", "native_level",
                     "relative_longitude", "wave_band",
                 ),
                 vertical["T"],
             ),
             "filtered_upward_pressure_velocity": (
                 (
-                    "event_step", "pressure_hpa",
+                    "event_step", "native_level",
                     "relative_longitude", "wave_band",
                 ),
                 vertical["w"],
             ),
             "filtered_specific_humidity": (
                 (
-                    "event_step", "pressure_hpa",
+                    "event_step", "native_level",
                     "relative_longitude", "wave_band",
                 ),
                 vertical["qv"],
             ),
             "filtered_relative_humidity": (
                 (
-                    "event_step", "pressure_hpa",
+                    "event_step", "native_level",
                     "relative_longitude", "wave_band",
                 ),
                 vertical["RH"],
+            ),
+            "filtered_zonal_wind": (
+                (
+                    "event_step", "native_level",
+                    "relative_longitude", "wave_band",
+                ),
+                vertical["u"],
+            ),
+            "filtered_static_stability": (
+                (
+                    "event_step", "native_level",
+                    "relative_longitude", "wave_band",
+                ),
+                vertical["N2"],
+            ),
+            "filtered_native_pressure_hpa": (
+                (
+                    "event_step", "native_level",
+                    "relative_longitude",
+                ),
+                native_pressure,
             ),
             "wave_phase_angle_degrees": (
                 ("event_step", "wave_band"), phase_angle
@@ -1785,6 +2574,18 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
             ),
             "wave_strong_amplitude": (
                 ("event_step", "wave_band"), strong_amplitude
+            ),
+            "random_wave_phase_angle_degrees": (
+                ("event_step", "wave_band"), random_phase_angle
+            ),
+            "random_wave_phase_number": (
+                ("event_step", "wave_band"), random_phase_number
+            ),
+            "random_wave_normalized_amplitude": (
+                ("event_step", "wave_band"), random_normalized_amplitude
+            ),
+            "random_wave_strong_amplitude": (
+                ("event_step", "wave_band"), random_strong_amplitude
             ),
             "precipitation_wave_rms": (
                 ("wave_band",), precipitation_rms
@@ -1799,7 +2600,7 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
             "test_subset": int(test_mode),
             "event_selection": (
                 "saved primary_tropical_sample and reference_in_record_subset; "
-                "complete -72 to +72 hour sequences where available"
+                "every available sample within -72 to +72 hours"
             ),
             "default_longitude_half_width_degrees": (
                 LPO_SECTION_DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES
@@ -1807,7 +2608,14 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
             "longitude_half_width_sensitivity_degrees": json.dumps(
                 LPO_SECTION_LONGITUDE_HALF_WIDTH_SENSITIVITY_DEGREES
             ),
-            "vertical_latitude_projection": "mean from 10S to 10N",
+            "vertical_latitude_projection": (
+                "symmetric/direct bands use +/-10 degrees around each saved "
+                "LPO latitude; antisymmetric bands use 0.5 times the "
+                "10S-10N north-minus-south projection"
+            ),
+            "vertical_coordinate": (
+                "native MPAS levels with sampled pressure in hPa"
+            ),
             "surface_latitude_geometry": (
                 "latitude relative to saved precipitation-weighted centroid"
             ),
@@ -1815,9 +2623,19 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
             "phase_method": (
                 "Rios-Berrios-style eight phases from standardized filtered "
                 "precipitation and its time derivative at the LPO centroid; "
-                "phase 5 is the positive precipitation maximum"
+                "phase 5 is the positive precipitation maximum; MRG uses "
+                "the equatorial antisymmetric precipitation projection"
             ),
             "phase_is_not_lpo_lag": True,
+            "random_phase_reference": (
+                "one matched random trajectory per LPO event within the "
+                f"{TROPICAL_CENTROID_LIMIT_DEG:g}-degree tropical acceptance "
+                "range; trajectories use the "
+                "simulation mean LPO zonal speed"
+            ),
+            "random_reference_mean_lpo_speed_degrees_per_hour": (
+                random_reference_speed
+            ),
         },
     )
     for name, units in (
@@ -1828,12 +2646,20 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
         ("filtered_upward_pressure_velocity", "Pa s-1"),
         ("filtered_specific_humidity", "g kg-1"),
         ("filtered_relative_humidity", "%"),
+        ("filtered_zonal_wind", "m s-1"),
+        ("filtered_static_stability", "s-2"),
+        ("filtered_native_pressure_hpa", "hPa"),
         ("precipitation_wave_rms", "mm day-1"),
     ):
         dataset[name].attrs["units"] = units
     dataset.filtered_upward_pressure_velocity.attrs[
         "sign_convention"
     ] = "positive values represent ascent (-omega)"
+    ray_sections = _peak_filtered_temperature_ray_sections(
+        native_fields, steps
+    )
+    dataset = xr.merge([dataset, ray_sections], compat="no_conflicts")
+    dataset.attrs.update(ray_sections.attrs)
     return dataset
 
 
@@ -1846,10 +2672,14 @@ def project_latitude_field(da, projection, lat_bounds=None):
 
     if projection in ("symmetric", "direct"):
         x = da.sel(latitude=slice(lat_bounds[0], lat_bounds[1]))
-        return x.mean(dim="latitude", skipna=True)
+        return cosine_latitude_mean(x)
     south_bounds, north_bounds = hemisphere_bounds_from_lat_bounds(lat_bounds)
-    north = da.sel(latitude=slice(north_bounds[0], north_bounds[1])).mean(dim="latitude", skipna=True)
-    south = da.sel(latitude=slice(south_bounds[0], south_bounds[1])).mean(dim="latitude", skipna=True)
+    north = cosine_latitude_mean(
+        da.sel(latitude=slice(north_bounds[0], north_bounds[1]))
+    )
+    south = cosine_latitude_mean(
+        da.sel(latitude=slice(south_bounds[0], south_bounds[1]))
+    )
     north, south = xr.align(north, south, join="exact")
     if projection == "antisymmetric":
         return 0.5 * (north - south)
@@ -1872,13 +2702,21 @@ def anomaly_variance_latmean(ds, field_name, lat_bounds=None, projection="symmet
 
 def wave_variance(wave_da):
     dims = [d for d in ("Time", "latitude", "longitude") if d in wave_da.dims]
-    return float((wave_da**2).mean(dim=dims, skipna=True).values)
+    if "latitude" in dims:
+        variance = cosine_latitude_mean(wave_da**2, dims)
+    else:
+        variance = (wave_da**2).mean(dim=dims, skipna=True)
+    return float(variance.values)
 
 
 def wave_amplitude_index(wave_da):
     """RMS wave amplitude as a function of time."""
     dims = [d for d in ("latitude", "longitude") if d in wave_da.dims]
-    amp = np.sqrt((wave_da**2).mean(dim=dims, skipna=True))
+    if "latitude" in dims:
+        variance = cosine_latitude_mean(wave_da**2, dims)
+    else:
+        variance = (wave_da**2).mean(dim=dims, skipna=True)
+    amp = np.sqrt(variance)
     amp.name = "wave_amplitude"
     return amp
 
@@ -2007,6 +2845,74 @@ def _wave_response_effective_segment_count(sample_count, interval_hours):
     return 1 + (sample_count - segment) // max(step, 1)
 
 
+def _wave_response_block_days(wave_name):
+    """Use the geometric midpoint of each wave period range."""
+
+    period = np.asarray(WAVE_BOXES[wave_name]["period"], dtype=float)
+    return float(np.sqrt(np.prod(period)))
+
+
+def _wave_response_bootstrap_indices(wave_name, subset_name, sample_count):
+    """Create reproducible indices shared across simulations and responses."""
+
+    subset_offset = {
+        "full_record": 0,
+        "first_half": 1,
+        "second_half": 2,
+    }[subset_name]
+    wave_offset = WAVE_RESPONSE_FILTERS.index(wave_name)
+    rng = np.random.default_rng(
+        WAVE_RESPONSE_BOOTSTRAP_SEED + 10 * wave_offset + subset_offset
+    )
+    requested_days = _wave_response_block_days(wave_name)
+    block_length = max(1, int(round(requested_days * obs_per_day)))
+    block_length = min(block_length, int(sample_count))
+    indices = circular_time_block_indices(
+        sample_count,
+        block_length,
+        WAVE_RESPONSE_BOOTSTRAP_RESAMPLES,
+        rng,
+    )
+    return indices, block_length / obs_per_day
+
+
+def _wave_response_bootstrap_summary(estimate, draws):
+    """Summarise one central percentile interval and sign consistency."""
+
+    draws = np.asarray(draws, dtype=float)
+    draws = draws[np.isfinite(draws)]
+    if draws.size == 0 or not np.isfinite(estimate):
+        return {
+            "ci_low": np.nan,
+            "ci_high": np.nan,
+            "bootstrap_noise": np.nan,
+            "sign_robustness": np.nan,
+            "ci_excludes_zero": False,
+            "robust": False,
+        }
+    ci_low, ci_high = np.percentile(
+        draws, WAVE_RESPONSE_CI_PERCENTILES
+    )
+    sign = np.sign(estimate)
+    sign_robustness = (
+        np.nan
+        if sign == 0.0
+        else float(np.mean(np.sign(draws) == sign))
+    )
+    excludes_zero = bool(ci_low > 0.0 or ci_high < 0.0)
+    return {
+        "ci_low": float(ci_low),
+        "ci_high": float(ci_high),
+        "bootstrap_noise": float(np.std(draws, ddof=1)),
+        "sign_robustness": sign_robustness,
+        "ci_excludes_zero": excludes_zero,
+        "robust": bool(
+            excludes_zero
+            and sign_robustness >= WAVE_RESPONSE_ROBUST_SIGN_THRESHOLD
+        ),
+    }
+
+
 def _wave_response_metric_row(
     simulation,
     wave_name,
@@ -2016,6 +2922,8 @@ def _wave_response_metric_row(
     response_kind,
     predictor,
     response,
+    bootstrap_indices,
+    bootstrap_block_days,
 ):
     """One same-band precipitation/response regression estimate."""
 
@@ -2042,6 +2950,9 @@ def _wave_response_metric_row(
             "covariance": np.nan,
             "regression_slope": np.nan,
         }
+        bootstrap_draws = np.full(
+            WAVE_RESPONSE_BOOTSTRAP_RESAMPLES, np.nan
+        )
         status = "insufficient_record_for_filter"
     else:
         metrics = filtered_wave_metrics(
@@ -2049,7 +2960,16 @@ def _wave_response_metric_row(
             y.values,
             response_kind=response_kind,
         )
+        bootstrap_draws = block_bootstrap_filtered_wave_metrics(
+            x.values,
+            y.values,
+            response_kind=response_kind,
+            time_indices=bootstrap_indices,
+        )["regression_slope"]
         status = "ok"
+    bootstrap = _wave_response_bootstrap_summary(
+        metrics["regression_slope"], bootstrap_draws
+    )
     units = (
         "W m-2 per mm day-1"
         if response_kind == "toa_longwave"
@@ -2080,24 +3000,45 @@ def _wave_response_metric_row(
                 x.sizes["Time"], dt
             )
         ),
-        "ordinary_block_interval_applicable": (
-            wave_name != EASTWARD_INTRASEASONAL_FILTER
+        "regression_slope_ci_low": bootstrap["ci_low"],
+        "regression_slope_ci_high": bootstrap["ci_high"],
+        "regression_slope_bootstrap_noise": bootstrap["bootstrap_noise"],
+        "regression_slope_sign_robustness": bootstrap["sign_robustness"],
+        "regression_slope_ci_excludes_zero": bootstrap[
+            "ci_excludes_zero"
+        ],
+        "regression_slope_robust": bootstrap["robust"],
+        "bootstrap_method": (
+            "circular moving-block bootstrap of complete longitude fields"
+        ),
+        "bootstrap_reference": WAVE_RESPONSE_BOOTSTRAP_REFERENCE,
+        "bootstrap_interval": "central 95% percentile interval",
+        "bootstrap_resamples": WAVE_RESPONSE_BOOTSTRAP_RESAMPLES,
+        "bootstrap_block_days": bootstrap_block_days,
+        "bootstrap_blocks_per_resample": int(
+            np.ceil(
+                x.sizes["Time"]
+                / max(int(round(bootstrap_block_days * obs_per_day)), 1)
+            )
         ),
         "finite_record_caution": (
-            "20-100-day band has few independent periods; compare the "
-            "full-record and half-record estimates"
+            "20-100-day band has few representative-period blocks; compare "
+            "the full-record and half-record estimates"
             if wave_name == EASTWARD_INTRASEASONAL_FILTER
             else ""
         ),
         "sample_count": int(x.size),
+        "time_sample_count": int(x.sizes["Time"]),
         "status": status,
-    }
+    }, bootstrap_draws
 
 
 def compute_wave_response_metric_table():
     """Separate rainfall amplitude, cloud efficiency and TOA-LW response."""
 
     rows = []
+    bootstrap_draws = {}
+    reference_times = {}
     for simulation_index, ds in enumerate(dss):
         simulation = sim_names[simulation_index]
         for wave_name in WAVE_RESPONSE_FILTERS:
@@ -2140,29 +3081,65 @@ def compute_wave_response_metric_table():
                     ),
                 )
             for subset_name in subsets:
+                subset_mask = record_subsets(
+                    predictor.Time.values,
+                    include_halves=(
+                        wave_name == EASTWARD_INTRASEASONAL_FILTER
+                    ),
+                )[subset_name]
+                subset_times = predictor.Time.values[subset_mask]
+                time_key = (wave_name, subset_name)
+                if time_key in reference_times:
+                    if not np.array_equal(reference_times[time_key], subset_times):
+                        raise RuntimeError(
+                            f"{wave_label(wave_name)} {subset_name}: simulation "
+                            "times do not support paired block resampling"
+                        )
+                else:
+                    reference_times[time_key] = subset_times.copy()
+                bootstrap_indices, bootstrap_block_days = (
+                    _wave_response_bootstrap_indices(
+                        wave_name,
+                        subset_name,
+                        subset_times.size,
+                    )
+                )
                 for response_key, (
                     response_label,
                     response_kind,
                     response,
                 ) in responses.items():
-                    rows.append(
-                        _wave_response_metric_row(
+                    row, draws = _wave_response_metric_row(
+                        simulation,
+                        wave_name,
+                        subset_name,
+                        response_key,
+                        response_label,
+                        response_kind,
+                        predictor,
+                        response,
+                        bootstrap_indices,
+                        bootstrap_block_days,
+                    )
+                    rows.append(row)
+                    bootstrap_draws[
+                        (
                             simulation,
                             wave_name,
                             subset_name,
                             response_key,
-                            response_label,
-                            response_kind,
-                            predictor,
-                            response,
+                            "regression_slope",
                         )
-                    )
-    return pd.DataFrame(rows)
+                    ] = draws
+    table = pd.DataFrame(rows)
+    table.attrs["wave_response_bootstrap_draws"] = bootstrap_draws
+    return table
 
 
 def wave_response_direct_contrasts(table):
     """Direct experiment differences without thermal scaling or attribution."""
 
+    bootstrap_draws = table.attrs.get("wave_response_bootstrap_draws", {})
     index_columns = ["wave", "sensitivity_subset", "response_variable"]
     metadata = table.drop_duplicates(index_columns).set_index(index_columns)
     rows = []
@@ -2199,6 +3176,33 @@ def wave_response_direct_contrasts(table):
                     sim_names[2],
                 ),
             ):
+                bootstrap = {
+                    "ci_low": np.nan,
+                    "ci_high": np.nan,
+                    "bootstrap_noise": np.nan,
+                    "sign_robustness": np.nan,
+                    "ci_excludes_zero": np.nan,
+                    "robust": np.nan,
+                }
+                lhs_key = (
+                    lhs,
+                    common["wave"],
+                    common["sensitivity_subset"],
+                    common["response_variable"],
+                    metric,
+                )
+                rhs_key = (
+                    rhs,
+                    common["wave"],
+                    common["sensitivity_subset"],
+                    common["response_variable"],
+                    metric,
+                )
+                if lhs_key in bootstrap_draws and rhs_key in bootstrap_draws:
+                    bootstrap = _wave_response_bootstrap_summary(
+                        values[lhs] - values[rhs],
+                        bootstrap_draws[lhs_key] - bootstrap_draws[rhs_key],
+                    )
                 rows.append(
                     {
                         **common,
@@ -2207,6 +3211,23 @@ def wave_response_direct_contrasts(table):
                         "metric": metric,
                         "response_change": values[lhs] - values[rhs],
                         "units": metadata.loc[index, "units"],
+                        **bootstrap,
+                        "bootstrap_method": (
+                            "paired circular moving-block bootstrap of "
+                            "complete longitude fields"
+                            if metric == "regression_slope"
+                            else ""
+                        ),
+                        "bootstrap_interval": (
+                            "central 95% percentile interval"
+                            if metric == "regression_slope"
+                            else ""
+                        ),
+                        "bootstrap_resamples": (
+                            WAVE_RESPONSE_BOOTSTRAP_RESAMPLES
+                            if metric == "regression_slope"
+                            else 0
+                        ),
                     }
                 )
     return pd.DataFrame(rows)
@@ -2228,6 +3249,32 @@ def _wave_response_panel_values(table, wave_name, metric):
         ]
         metric = "regression_slope"
     return subset.set_index("simulation")[metric].reindex(sim_names)
+
+
+def _draw_wave_response_errorbars(axis, x, values, lower, upper):
+    """Draw central percentile intervals using the project bar style."""
+
+    values = np.asarray(values, dtype=float)
+    lower = np.asarray(lower, dtype=float)
+    upper = np.asarray(upper, dtype=float)
+    valid = np.isfinite(values) & np.isfinite(lower) & np.isfinite(upper)
+    if not valid.any():
+        return
+    axis.errorbar(
+        np.asarray(x)[valid],
+        values[valid],
+        yerr=np.vstack(
+            (
+                np.maximum(values[valid] - lower[valid], 0.0),
+                np.maximum(upper[valid] - values[valid], 0.0),
+            )
+        ),
+        color="0.15",
+        fmt="none",
+        lw=1.1,
+        capsize=2,
+        zorder=4,
+    )
 
 
 def plot_wave_response_metrics(table, contrasts):
@@ -2260,6 +3307,24 @@ def plot_wave_response_metrics(table, contrasts):
                 color=cols,
                 width=0.72,
             )
+            if metric != "precipitation_rms_mm_day":
+                response_variable = (
+                    "toa_longwave_response"
+                    if metric == "toa_longwave_response"
+                    else "total_high_cloud"
+                )
+                interval = table[
+                    (table.wave == wave_name)
+                    & (table.sensitivity_subset == "full_record")
+                    & (table.response_variable == response_variable)
+                ].set_index("simulation").reindex(sim_names)
+                _draw_wave_response_errorbars(
+                    axis,
+                    np.arange(len(sim_names)),
+                    values.values,
+                    interval.regression_slope_ci_low.values,
+                    interval.regression_slope_ci_high.values,
+                )
             axis.axhline(0, color="0.6", lw=0.7)
             axis.grid(axis="y", alpha=0.2)
             if row == 0:
@@ -2273,7 +3338,8 @@ def plot_wave_response_metrics(table, contrasts):
             else:
                 axis.set_xticks([])
     fig.suptitle(
-        "Wave precipitation amplitude and response per unit precipitation"
+        "Wave precipitation amplitude and response per unit precipitation\n"
+        "Error bars show 95% block-bootstrap intervals for regressions"
     )
     save_figure(
         WAVE_RESPONSE_FIGURE_NUMBER,
@@ -2319,6 +3385,15 @@ def plot_wave_response_metrics(table, contrasts):
                 color=(cols[1], cols[2], "0.35"),
                 width=0.72,
             )
+            if contrast_metric == "regression_slope":
+                interval = subset.reindex(contrast_keys)
+                _draw_wave_response_errorbars(
+                    axis,
+                    np.arange(len(contrast_keys)),
+                    values.values,
+                    interval.ci_low.values,
+                    interval.ci_high.values,
+                )
             axis.axhline(0, color="0.6", lw=0.7)
             axis.grid(axis="y", alpha=0.2)
             if row == 0:
@@ -2334,12 +3409,130 @@ def plot_wave_response_metrics(table, contrasts):
                 )
             else:
                 axis.set_xticks([])
-    fig.suptitle("Direct wave-response differences; no thermal scaling")
+    fig.suptitle(
+        "Direct wave-response differences; no thermal scaling\n"
+        "Error bars show paired 95% block-bootstrap intervals"
+    )
     save_figure(
         WAVE_RESPONSE_FIGURE_NUMBER,
         fig,
         "wave_precipitation_cloud_olr_response_differences",
     )
+
+
+def _plot_wave_response_scatter(
+    table,
+    response_field,
+    response_variable,
+    response_kind,
+    output_stem,
+):
+    """Plot the filtered values used by each Figure 11 regression."""
+
+    is_longwave = response_kind == "toa_longwave"
+    response_symbol = r"$L_f$" if is_longwave else r"$H_f$"
+    response_units = r"W m$^{-2}$" if is_longwave else "cloud fraction"
+    fig, axes = plt.subplots(
+        len(WAVE_RESPONSE_FILTERS),
+        len(sim_names),
+        figsize=(11.5, 2.6 * len(WAVE_RESPONSE_FILTERS)),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    for row_index, wave_name in enumerate(WAVE_RESPONSE_FILTERS):
+        for simulation_index, ds in enumerate(dss):
+            axis = axes[row_index, simulation_index]
+            predictor = get_filtered_wave(
+                ds,
+                simulation_index,
+                "Precip",
+                wave_name,
+                avgLat=True,
+            )
+            response = get_filtered_wave(
+                ds,
+                simulation_index,
+                response_field,
+                wave_name,
+                avgLat=True,
+            )
+            predictor, response = xr.align(
+                predictor, response, join="exact"
+            )
+            x = np.asarray(predictor.load().values, dtype=float).ravel()
+            y = np.asarray(response.load().values, dtype=float).ravel()
+            finite = np.isfinite(x) & np.isfinite(y)
+            x = x[finite]
+            y = y[finite]
+            if x.size == 0:
+                raise RuntimeError(
+                    f"{sim_names[simulation_index]} {wave_label(wave_name)}: "
+                    "scatter regression has no finite values"
+                )
+            sample_count = min(WAVE_RESPONSE_SCATTER_SAMPLE, x.size)
+            rng = np.random.default_rng(
+                WAVE_RESPONSE_BOOTSTRAP_SEED
+                + 100
+                + 10 * row_index
+                + simulation_index
+            )
+            sample = rng.choice(x.size, size=sample_count, replace=False)
+            axis.scatter(
+                x[sample],
+                y[sample],
+                s=3,
+                alpha=0.08,
+                color=cols[simulation_index],
+                edgecolors="none",
+                rasterized=True,
+            )
+            metric_row = table[
+                (table.simulation == sim_names[simulation_index])
+                & (table.wave == wave_name)
+                & (table.sensitivity_subset == "full_record")
+                & (table.response_variable == response_variable)
+            ].iloc[0]
+            efficiency = float(metric_row.regression_slope)
+            raw_slope = -efficiency if is_longwave else efficiency
+            line_limit = float(np.nanpercentile(np.abs(x), 99.0))
+            line_x = np.asarray([-line_limit, line_limit])
+            axis.plot(line_x, raw_slope * line_x, color="0.1", lw=1.2)
+            interval_label = (
+                f"[{metric_row.regression_slope_ci_low:.3g}, "
+                f"{metric_row.regression_slope_ci_high:.3g}]"
+            )
+            coefficient_label = r"$-\beta_L$" if is_longwave else r"$\beta_H$"
+            axis.text(
+                0.03,
+                0.97,
+                f"{coefficient_label} = {efficiency:.3g}\n"
+                f"95% block interval {interval_label}\n"
+                f"{sample_count:,} of {x.size:,} points shown",
+                transform=axis.transAxes,
+                va="top",
+                ha="left",
+                fontsize=7.5,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.75),
+            )
+            axis.axhline(0.0, color="0.6", lw=0.7)
+            axis.axvline(0.0, color="0.6", lw=0.7)
+            axis.grid(alpha=0.2)
+            if row_index == 0:
+                axis.set_title(sim_names[simulation_index])
+            if simulation_index == 0:
+                axis.set_ylabel(
+                    f"{wave_label(wave_name)}\n{response_symbol} "
+                    f"({response_units})"
+                )
+            if row_index == len(WAVE_RESPONSE_FILTERS) - 1:
+                axis.set_xlabel(r"$P_f$ (mm day$^{-1}$)")
+    relation = (
+        r"$L_f$ versus $P_f$; Figure 11 reports $-\beta_L$"
+        if is_longwave
+        else r"$H_f$ versus $P_f$; Figure 11 reports $\beta_H$"
+    )
+    fig.suptitle(f"Wave-filtered regression values: {relation}")
+    save_figure(WAVE_RESPONSE_FIGURE_NUMBER, fig, output_stem)
 
 
 def wave_phase_speed_range(wave_name):
@@ -2654,13 +3847,13 @@ def spectrum_input_field(ds, field_name, lat_bounds):
     return da
 
 
-def spectrum_cache_signature(sim_index):
+def spectrum_cache_signature(sim_index, field_name=spectrum_field):
     return cache_signature(
         "normalised_wave_spectrum",
         extra=dict(
             cache_version=SPECTRUM_CACHE_VERSION,
             simulation=sim_names[sim_index],
-            spectrum_field=spectrum_field,
+            spectrum_field=field_name,
             spectrum_lat_bounds=jsonable_value(spectrum_lat_bounds),
             spectrum_segment_days=spectrum_segment_days,
             spectrum_overlap_days=spectrum_overlap_days,
@@ -2670,9 +3863,19 @@ def spectrum_cache_signature(sim_index):
     )
 
 
-def load_cached_spectra(sim_index):
-    cache_name = f"normalised_wave_spectrum_{safe_name(sim_names[sim_index])}"
-    cached = load_cached_dataset(cache_name, spectrum_cache_signature(sim_index))
+def spectrum_cache_name(sim_index, field_name):
+    simulation_name = safe_name(sim_names[sim_index])
+    if field_name == spectrum_field:
+        return f"normalised_wave_spectrum_{simulation_name}"
+    return f"normalised_wave_spectrum_{safe_name(field_name)}_{simulation_name}"
+
+
+def load_cached_spectra(sim_index, field_name=spectrum_field):
+    cache_name = spectrum_cache_name(sim_index, field_name)
+    cached = load_cached_dataset(
+        cache_name,
+        spectrum_cache_signature(sim_index, field_name),
+    )
     if cached is None or "normalised_power" not in cached:
         return None
     return {
@@ -2681,7 +3884,7 @@ def load_cached_spectra(sim_index):
     }
 
 
-def write_cached_spectra(sim_index, spectra):
+def write_cached_spectra(sim_index, spectra, field_name=spectrum_field):
     components = list(spectra)
     spectrum_stack = xr.concat(
         [spectra[component] for component in components],
@@ -2691,21 +3894,26 @@ def write_cached_spectra(sim_index, spectra):
     ds_out.attrs.update(
         description="Cached normalised symmetric/antisymmetric wave spectrum",
         simulation=sim_names[sim_index],
-        field=spectrum_field,
+        field=field_name,
     )
-    cache_name = f"normalised_wave_spectrum_{safe_name(sim_names[sim_index])}"
-    write_cached_dataset(cache_name, ds_out, spectrum_cache_signature(sim_index))
+    cache_name = spectrum_cache_name(sim_index, field_name)
+    write_cached_dataset(
+        cache_name,
+        ds_out,
+        spectrum_cache_signature(sim_index, field_name),
+    )
 
 
-def compute_normalised_spectra_for_sim(ds, sim_index):
-    spectra = load_cached_spectra(sim_index)
+def compute_normalised_spectra_for_sim(ds, sim_index, field_name=spectrum_field):
+    spectra = load_cached_spectra(sim_index, field_name)
     if spectra is not None:
         return spectra
 
-    sp_input = spectrum_input_field(ds, spectrum_field, spectrum_lat_bounds)
+    sp_input = spectrum_input_field(ds, field_name, spectrum_lat_bounds)
+    sp_input = cosine_weighted_power_input(sp_input, lat_dim="lat")
     raw_spectrum = spacetime_power(
         sp_input,
-        lataggreg="mean",
+        lataggreg="sum",
         latitude_bounds=normalise_lat_bounds(spectrum_lat_bounds),
         dosymmetries=True,
         segsize=spectrum_segment_days,
@@ -2718,13 +3926,13 @@ def compute_normalised_spectra_for_sim(ds, sim_index):
         raw_component = raw_spectrum.sel(component=component)
         background = smooth_wavefreq(raw_component, freq_name="frequency")
         spectra[component] = xr.where(background > 0, raw_component / background, np.nan).load()
-    write_cached_spectra(sim_index, spectra)
+    write_cached_spectra(sim_index, spectra, field_name)
     return spectra
 
 
-def load_or_compute_normalised_spectra_by_sim():
+def load_or_compute_normalised_spectra_by_sim(field_name=spectrum_field):
     return [
-        compute_normalised_spectra_for_sim(ds, i)
+        compute_normalised_spectra_for_sim(ds, i, field_name)
         for i, ds in enumerate(dss)
     ]
 
@@ -3088,7 +4296,7 @@ def compute_top_heaviness_products():
 
 
 def native_kelvin_background_profile(zds):
-    required = {"uReconstructZonal", "theta"}
+    required = {"uReconstructZonal", "theta", "pressure"}
     missing = sorted(required - set(zds.data_vars))
     if missing:
         raise RuntimeError(
@@ -3113,6 +4321,9 @@ def native_kelvin_background_profile(zds):
         wind = wind.rename({vertical_dim(wind): zdim})
     theta_subset = theta.sel(latitude=slice(*filter_lat_bounds))
     wind_subset = wind.sel(latitude=slice(*filter_lat_bounds))
+    pressure_subset = pressure_to_pa(zds.pressure).sel(
+        latitude=slice(*filter_lat_bounds)
+    ) / 100.0
     n2 = xr.apply_ufunc(
         buoyancy_frequency_squared,
         theta_subset,
@@ -3123,25 +4334,38 @@ def native_kelvin_background_profile(zds):
         dask="parallelized",
         output_dtypes=[float],
     )
-    n_mean = np.asarray(
-        np.sqrt(n2).mean(
-            [dim for dim in n2.dims if dim != zdim], skipna=True
-        ).values,
-        dtype=float,
-    )
+    def deep_tropical_mean(field):
+        latitude_weights = np.cos(np.deg2rad(field.latitude))
+        reduced = field.weighted(latitude_weights).mean(
+            "latitude", skipna=True
+        )
+        remaining = [dim for dim in reduced.dims if dim != zdim]
+        return reduced.mean(remaining, skipna=True) if remaining else reduced
+
+    n2_mean = np.asarray(deep_tropical_mean(n2).values, dtype=float)
+    n_mean = np.sqrt(n2_mean)
     wind_mean = np.asarray(
-        wind_subset.mean(
-            [dim for dim in wind_subset.dims if dim != zdim], skipna=True
-        ).values,
-        dtype=float,
+        deep_tropical_mean(wind_subset).values, dtype=float
+    )
+    pressure_mean = np.asarray(
+        deep_tropical_mean(pressure_subset).values, dtype=float
     )
     order = np.argsort(height)
-    height, n_mean, wind_mean = (
-        height[order], n_mean[order], wind_mean[order]
+    height, n2_mean, n_mean, wind_mean, pressure_mean = (
+        height[order], n2_mean[order], n_mean[order], wind_mean[order],
+        pressure_mean[order],
     )
-    valid = np.isfinite(height) & np.isfinite(n_mean) & np.isfinite(wind_mean)
-    height, n_mean, wind_mean = (
-        height[valid], n_mean[valid], wind_mean[valid]
+    valid = (
+        np.isfinite(height)
+        & np.isfinite(n2_mean)
+        & np.isfinite(n_mean)
+        & np.isfinite(wind_mean)
+        & np.isfinite(pressure_mean)
+        & (pressure_mean > 0.0)
+    )
+    height, n2_mean, n_mean, wind_mean, pressure_mean = (
+        height[valid], n2_mean[valid], n_mean[valid], wind_mean[valid],
+        pressure_mean[valid],
     )
     if height.size < 3:
         raise RuntimeError("Insufficient native-height levels for Kelvin dispersion")
@@ -3152,6 +4376,14 @@ def native_kelvin_background_profile(zds):
         ),
         "n": np.interp(
             kelvin_profile_height_m, height, n_mean, left=np.nan, right=np.nan
+        ),
+        "n2": np.interp(
+            kelvin_profile_height_m, height, n2_mean,
+            left=np.nan, right=np.nan,
+        ),
+        "pressure_hpa": np.interp(
+            kelvin_profile_height_m, height, pressure_mean,
+            left=np.nan, right=np.nan,
         ),
     }
 
@@ -3165,7 +4397,7 @@ def compute_kelvin_dispersion_products():
     )
     variables = {
         name: np.full(shape, np.nan)
-        for name in ("u", "n", "cgx", "cgz", "slope")
+        for name in ("u", "n", "n2", "pressure", "cgx", "cgz", "slope")
     }
     for si, background in enumerate(backgrounds):
         for ki, zonal_wavenumber in enumerate(kelvin_sensitivity_wavenumbers):
@@ -3182,6 +4414,10 @@ def compute_kelvin_dispersion_products():
                 )
                 variables["u"][si, ki, mi] = background["u"]
                 variables["n"][si, ki, mi] = background["n"]
+                variables["n2"][si, ki, mi] = background["n2"]
+                variables["pressure"][si, ki, mi] = background[
+                    "pressure_hpa"
+                ]
                 variables["cgx"][si, ki, mi] = result["cgx_m_s"]
                 variables["cgz"][si, ki, mi] = result["cgz_m_s"]
                 variables["slope"][si, ki, mi] = result["ray_slope"]
@@ -3200,13 +4436,15 @@ def compute_kelvin_dispersion_products():
         {
             "background_zonal_wind": (dims, variables["u"]),
             "buoyancy_frequency": (dims, variables["n"]),
+            "static_stability": (dims, variables["n2"]),
+            "background_pressure_hpa": (dims, variables["pressure"]),
             "horizontal_group_velocity": (dims, variables["cgx"]),
             "vertical_group_velocity": (dims, variables["cgz"]),
             "ray_slope": (dims, variables["slope"]),
         },
         coords=coords,
         attrs={
-            "diagnostic": "Lim-Son Kelvin-wave reference energy dispersion",
+            "diagnostic": "Kelvin-wave reference energy dispersion",
             "primary_zonal_wavenumber": 1,
             "primary_k_m-1": kelvin_reference_k_m1,
             "primary_vertical_wavelength_km": 10.0,
@@ -3217,11 +4455,14 @@ def compute_kelvin_dispersion_products():
             ),
             "near_zero_cgx_mask_m_s": 0.1,
             "wave_metrics_version": WAVE_METRICS_VERSION,
+            "wave_config_version": WAVE_CONFIG_VERSION,
         },
     )
     for name, units, long_name in (
-        ("background_zonal_wind", "m s-1", "tropical-mean background zonal wind"),
-        ("buoyancy_frequency", "s-1", "tropical-mean buoyancy frequency"),
+        ("background_zonal_wind", "m s-1", "deep-tropical-mean background zonal wind"),
+        ("buoyancy_frequency", "s-1", "deep-tropical-mean buoyancy frequency"),
+        ("static_stability", "s-2", "deep-tropical-mean static stability"),
+        ("background_pressure_hpa", "hPa", "deep-tropical-mean pressure"),
         ("horizontal_group_velocity", "m s-1", "Kelvin reference horizontal group velocity"),
         ("vertical_group_velocity", "m s-1", "Kelvin reference vertical group velocity"),
         ("ray_slope", "1", "Kelvin reference vertical-to-horizontal ray slope"),
@@ -4066,7 +5307,12 @@ if should_build_figure(7, "critical_level_phase_speed_profiles"):
 
     for i, zds in enumerate(dss_zm):
         a = profile_ax[i]
-        u = zds.uzonal_isobaric.sel(latitude=slice(filter_lat_bounds[0], filter_lat_bounds[1])).mean(dim=("Time", "latitude"))
+        u = cosine_latitude_mean(
+            zds.uzonal_isobaric.sel(
+                latitude=slice(filter_lat_bounds[0], filter_lat_bounds[1])
+            ),
+            ("Time", "latitude"),
+        )
         a.plot(u.values, u.pres.values, color=cols[i], lw=1.8, label=sim_names[i])
         for wname in critical_level_wave_names:
             # This simulation's power-weighted mean phase speed for the band,
@@ -4113,7 +5359,7 @@ if should_build_figure(7, "critical_level_phase_speed_profiles"):
     if len(phase_speed_dist) > 0:
         dist_ax[0].legend(loc="best", fontsize=7, ncol=2)
     fig.suptitle(
-        f"Tropical mean wind profile with power-weighted mean phase speeds (dashed) and "
+        f"Deep-tropical mean wind profile with power-weighted mean phase speeds (dashed) and "
         f"phase-speed distributions over {filter_lat_bounds[0]}--{filter_lat_bounds[1]}°"
     )
     figsave.save(fig, "critical_level_phase_speed_profiles", number=7)
@@ -4246,30 +5492,23 @@ if should_build_figure(8, "wave_filtered_eddy_momentum_fluxes"):
         print("Done with figure: wave_filtered_eddy_momentum_fluxes")
 
 
-# -----------------------------------------------------------------------------
-# 9. Symmetric and antisymmetric wavenumber-frequency spectra
-# -----------------------------------------------------------------------------
-# WHAT TO LOOK FOR:
-#   * Do the configured filter regions sit over coherent spectral peaks?
-#   * Are nudged-run changes concentrated in symmetric/even or antisymmetric/odd
-#     power, or are they broad changes to the convective background?
-
-if should_build_figure(
-    9,
-    [
-        "symmetric_antisymmetric_wave_spectra",
-        "symmetric_antisymmetric_wave_spectra_period",
-        "symmetric_antisymmetric_wave_spectra_phase_speed",
-    ],
+def plot_frequency_wavenumber_spectra(
+    spectra_by_sim,
+    field_title,
+    output_stem,
+    spectrum_cmap,
+    spectrum_norm,
 ):
-    spec_levels = np.linspace(0, 3.0, 26)
-    spec_cmap, spec_norm = make_spectrum_cmap(spec_levels)
-
+    """Plot the standard Figure-9 frequency-versus-wavenumber presentation."""
     components = spectrum_components
-    spectra_by_sim = load_or_compute_normalised_spectra_by_sim()
-
-    fig, ax = plt.subplots(len(dss), 2, figsize=(9.0, 2.8 * len(dss)),
-                           constrained_layout=True, sharex=True, sharey=True)
+    fig, ax = plt.subplots(
+        len(dss),
+        2,
+        figsize=(9.0, 2.8 * len(dss)),
+        constrained_layout=True,
+        sharex=True,
+        sharey=True,
+    )
     if len(dss) == 1:
         ax = np.array([ax])
 
@@ -4285,8 +5524,12 @@ if should_build_figure(
             wn = spectrum.wavenumber.values
             freq = spectrum.frequency.values
             spec_im = ax[i, cj].pcolormesh(
-                wn, freq, spectrum.values.T,
-                cmap=spec_cmap, norm=spec_norm, shading="auto",
+                wn,
+                freq,
+                spectrum.values.T,
+                cmap=spectrum_cmap,
+                norm=spectrum_norm,
+                shading="auto",
             )
             add_wave_filter_region_outlines(ax[i, cj], wn, freq, component)
             ax[i, cj].axvline(0, color="0.4", lw=0.7, ls="--")
@@ -4297,27 +5540,78 @@ if should_build_figure(
             if i == 0:
                 ax[i, cj].set_title(component.capitalize())
             if cj == 0:
-                ax[i, cj].set_ylabel(f"{sim_names[i]}\nFrequency (day$^{{-1}}$)")
+                ax[i, cj].set_ylabel(
+                    f"{sim_names[i]}\nFrequency (day$^{{-1}}$)"
+                )
             else:
                 ax[i, cj].tick_params(labelleft=False)
             if i == len(dss) - 1:
                 ax[i, cj].set_xlabel("Zonal wavenumber")
             annotate_panel_label(ax[i, cj], sim_names[i])
 
-    if spec_im is not None:
-        fig.colorbar(spec_im, ax=ax.ravel(), location="right", shrink=0.85, label="Normalised power")
-        fig.legend(
-            handles=wave_filter_region_legend_handles(),
-            loc="outside lower center",
-            ncol=min(4, len(wave_names)),
-            title="Filter regions",
+    if spec_im is None:
+        return
+    fig.colorbar(
+        spec_im,
+        ax=ax.ravel(),
+        location="right",
+        shrink=0.85,
+        label="Normalised power",
+    )
+    fig.legend(
+        handles=wave_filter_region_legend_handles(),
+        loc="outside lower center",
+        ncol=min(4, len(wave_names)),
+        title="Filter regions",
+    )
+    fig.suptitle(
+        f"{field_title} symmetric/antisymmetric spectra over "
+        f"{spectrum_lat_bounds[0]}--{spectrum_lat_bounds[1]}°"
+    )
+    figsave.save(fig, output_stem, number=9)
+    print(f"Done with figure: {output_stem}")
+
+
+# -----------------------------------------------------------------------------
+# 9. Symmetric and antisymmetric wavenumber-frequency spectra
+# -----------------------------------------------------------------------------
+# WHAT TO LOOK FOR:
+#   * Do the configured filter regions sit over coherent spectral peaks?
+#   * Are nudged-run changes concentrated in symmetric/even or antisymmetric/odd
+#     power, or are they broad changes to the convective background?
+
+if should_build_figure(
+    9,
+    [
+        "symmetric_antisymmetric_wave_spectra",
+        "symmetric_antisymmetric_wave_spectra_period",
+        "symmetric_antisymmetric_wave_spectra_phase_speed",
+        *[field[2] for field in spectrum_additional_fields],
+    ],
+):
+    spec_levels = np.linspace(0, 3.0, 26)
+    spec_cmap, spec_norm = make_spectrum_cmap(spec_levels)
+
+    components = spectrum_components
+    spectra_by_sim = load_or_compute_normalised_spectra_by_sim()
+    plot_frequency_wavenumber_spectra(
+        spectra_by_sim,
+        spectrum_field,
+        "symmetric_antisymmetric_wave_spectra",
+        spec_cmap,
+        spec_norm,
+    )
+    for field_name, field_title, output_stem in spectrum_additional_fields:
+        field_spectra_by_sim = load_or_compute_normalised_spectra_by_sim(
+            field_name
         )
-        fig.suptitle(
-            f"{spectrum_field} symmetric/antisymmetric spectra over "
-            f"{spectrum_lat_bounds[0]}--{spectrum_lat_bounds[1]}°"
+        plot_frequency_wavenumber_spectra(
+            field_spectra_by_sim,
+            field_title,
+            output_stem,
+            spec_cmap,
+            spec_norm,
         )
-        figsave.save(fig, "symmetric_antisymmetric_wave_spectra", number=9)
-        print("Done with figure: symmetric_antisymmetric_wave_spectra")
 
     period_fig, period_ax = plt.subplots(len(dss), 2, figsize=(9.0, 2.8 * len(dss)),
                                          constrained_layout=True, sharex=True, sharey=True)
@@ -4521,10 +5815,14 @@ if should_build_figure(10, "wave_phase_speed_power_distributions"):
 # Rainfall amplitude, high-cloud production per unit rainfall, and TOA
 # longwave response per unit rainfall are separate physical quantities. Cloud
 # and OLR responses are filtered in exactly the same band as precipitation.
+# P_f is filtered precipitation. H_f is filtered total-high-cloud occurrence.
+# L_f is filtered outgoing longwave radiation.
 
 wave_response_figure_stems = [
     "wave_precipitation_cloud_olr_response",
     "wave_precipitation_cloud_olr_response_differences",
+    "wave_precipitation_high_cloud_scatter",
+    "wave_precipitation_olr_scatter",
 ]
 wave_response_signature = cache_signature(
     "wave_response_efficiency_metrics",
@@ -4539,6 +5837,18 @@ wave_response_signature = cache_signature(
         "toa_longwave_sign": (
             "positive slope means OLR reduction per unit precipitation"
         ),
+        "bootstrap_method": (
+            "paired circular moving-block bootstrap of complete longitude "
+            "fields"
+        ),
+        "bootstrap_resamples": WAVE_RESPONSE_BOOTSTRAP_RESAMPLES,
+        "bootstrap_seed": WAVE_RESPONSE_BOOTSTRAP_SEED,
+        "bootstrap_ci_percentiles": list(WAVE_RESPONSE_CI_PERCENTILES),
+        "bootstrap_block_length": (
+            "geometric midpoint of each wave period range"
+        ),
+        "bootstrap_reference": WAVE_RESPONSE_BOOTSTRAP_REFERENCE,
+        "scatter_sample_count": WAVE_RESPONSE_SCATTER_SAMPLE,
         "eastward_intraseasonal_subsets": [
             "full_record",
             "first_half",
@@ -4562,16 +5872,39 @@ if should_build_versioned_figure(
             "precipitation_rms_mm_day",
             "regression_slope",
             "sensitivity_subset",
+            "regression_slope_ci_low",
+            "regression_slope_ci_high",
         ),
     )
-    if wave_response is None:
+    wave_response_contrasts = load_cached_table(
+        "wave_response_efficiency_contrasts",
+        wave_response_signature,
+        output_filename="wave_response_efficiency_contrasts.csv",
+        required_columns=(
+            "wave",
+            "response_variable",
+            "contrast_key",
+            "metric",
+            "response_change",
+            "ci_low",
+            "ci_high",
+        ),
+    )
+    if wave_response is None or wave_response_contrasts is None:
         wave_response = compute_wave_response_metric_table()
+        wave_response_contrasts = wave_response_direct_contrasts(
+            wave_response
+        )
         write_cached_table(
             "wave_response_efficiency_metrics",
             wave_response,
             wave_response_signature,
         )
-    wave_response_contrasts = wave_response_direct_contrasts(wave_response)
+        write_cached_table(
+            "wave_response_efficiency_contrasts",
+            wave_response_contrasts,
+            wave_response_signature,
+        )
     if save:
         wave_response.to_csv(
             wave_response_metrics_product_path(test=test_mode),
@@ -4582,6 +5915,20 @@ if should_build_versioned_figure(
             index=False,
         )
     plot_wave_response_metrics(wave_response, wave_response_contrasts)
+    _plot_wave_response_scatter(
+        wave_response,
+        "high_cloud",
+        "total_high_cloud",
+        "cloud",
+        "wave_precipitation_high_cloud_scatter",
+    )
+    _plot_wave_response_scatter(
+        wave_response,
+        "OLR",
+        "toa_longwave_response",
+        "toa_longwave",
+        "wave_precipitation_olr_scatter",
+    )
     write_figure_output_metadata(
         WAVE_RESPONSE_FIGURE_NUMBER,
         wave_response_figure_stems,
@@ -4694,7 +6041,9 @@ if should_build_figure(12, "two_eof_top_heaviness"):
     for simulation, color in zip(sim_names, cols):
         selected = primary[primary.simulation == simulation]
         for wave_name, linestyle in zip(
-            TOP_HEAVINESS_FILTERS, ("-", "--", "-.", ":")
+            TOP_HEAVINESS_FILTERS,
+            ("-", "--", "-.", ":", (0, (3, 1, 1, 1))),
+            strict=True,
         ):
             row = selected[selected.wave == wave_name]
             if len(row) != 1 or not np.isfinite(row.iloc[0].tau_r):
@@ -4810,43 +6159,46 @@ if should_build_figure(13, "kelvin_reference_energy_dispersion"):
             index=False,
         )
 
-    primary = kelvin_dataset.sel(
-        zonal_wavenumber=1, vertical_wavelength_km=10.0
-    )
     variables = (
+        ("background_zonal_wind", r"$U$ (m s$^{-1}$)"),
+        ("static_stability", r"$N^2$ (s$^{-2}$)"),
         ("horizontal_group_velocity", r"$C_{gx}$ (m s$^{-1}$)"),
         ("vertical_group_velocity", r"$C_{gz}$ (m s$^{-1}$)"),
         ("ray_slope", r"$C_{gz}/C_{gx}$"),
     )
     fig, axes = plt.subplots(
-        2, len(variables), figsize=(11.8, 7.2),
+        2, len(variables), figsize=(15.5, 7.2),
         constrained_layout=True, sharey=True,
     )
-    height_km = primary.height_m / 1000.0
-    for column, (variable, label) in enumerate(variables):
-        for simulation, color in zip(sim_names, cols):
-            axes[0, column].plot(
-                primary[variable].sel(simulation=simulation),
-                height_km, color=color, label=simulation,
-            )
-        control = primary[variable].sel(simulation=sim_names[0])
-        for simulation, color in zip(sim_names[1:], cols[1:]):
-            axes[1, column].plot(
-                primary[variable].sel(simulation=simulation) - control,
-                height_km, color=color, label=f"{simulation} - control",
-            )
-        for row in range(2):
+    for row, zonal_wavenumber in enumerate((1, 2)):
+        selected = kelvin_dataset.sel(
+            zonal_wavenumber=zonal_wavenumber,
+            vertical_wavelength_km=10.0,
+        )
+        for column, (variable, label) in enumerate(variables):
+            for simulation, color in zip(sim_names, cols):
+                source = selected.sel(simulation=simulation)
+                axes[row, column].plot(
+                    source[variable], source.background_pressure_hpa,
+                    color=color, label=simulation,
+                )
             axes[row, column].axvline(0.0, color="0.6", lw=0.8)
-            axes[row, column].axhspan(14.0, 20.0, color="0.85", alpha=0.35)
             axes[row, column].grid(alpha=0.2)
-            axes[row, column].set_xlabel(label if row == 0 else f"Difference in {label}")
-        axes[0, column].set_title(label)
-    axes[0, 0].set_ylabel("Height (km)")
-    axes[1, 0].set_ylabel("Height (km)")
+            axes[row, column].set_xlabel(label)
+            axes[row, column].set_yscale("log")
+            axes[row, column].set_ylim(1000.0, 50.0)
+            if row == 0:
+                axes[row, column].set_title(label)
+        axes[row, 0].set_ylabel(
+            f"k={zonal_wavenumber}\nPressure (hPa)"
+        )
     axes[0, 0].legend(frameon=False, fontsize=8)
-    axes[1, 0].legend(frameon=False, fontsize=8)
+    latitude_title = (
+        f"{abs(filter_lat_bounds[0]):g}°S–{filter_lat_bounds[1]:g}°N"
+    )
     fig.suptitle(
-        "Kelvin-wave reference energy dispersion (Lim-Son k=1, 10-km vertical wavelength)"
+        "Kelvin-wave reference energy dispersion; k=1 and 2; "
+        f"10-km vertical wavelength; {latitude_title}"
     )
     figsave.save(fig, "kelvin_reference_energy_dispersion", number=13)
     print("Done with figure: kelvin_reference_energy_dispersion")
@@ -4861,8 +6213,26 @@ if should_build_figure(13, "kelvin_reference_energy_dispersion"):
 # event-level stencils.
 
 if 14 in figures_to_run:
-    tracking_steps = _lpo_wave_tracking_steps(test=test_mode)
-    for simulation, dataset in zip(LPO_SIMULATION_DIRS, dss):
+    tracking_steps = _lpo_wave_tracking_steps(
+        test=test_mode,
+        allow_stale_products=runtime_args.allow_stale_lpo_products,
+    )
+    lifecycle_cache_fields = ("Precip", "PW", "OLR", "T100", "u100")
+    for simulation_index, (simulation, dataset) in enumerate(
+        zip(LPO_SIMULATION_DIRS, dss)
+    ):
+        progress(
+            f"{simulation}: validating lifecycle filtered-wave caches"
+        )
+        for wave_name in LPO_LIFECYCLE_FILTERS:
+            for field_name in lifecycle_cache_fields:
+                get_filtered_wave(
+                    dataset,
+                    simulation_index,
+                    field_name,
+                    wave_name,
+                    avgLat=True,
+                )
         output_path = lpo_wave_section_cache_path(
             simulation, test=test_mode
         )
@@ -4879,6 +6249,11 @@ if 14 in figures_to_run:
                         == int(test_mode)
                         and "relative_longitude" in existing.sizes
                         and "wave_phase_number" in existing
+                        and "MRG" in set(
+                            existing.wave_band.values.astype(str)
+                        )
+                        and "filtered_static_stability" in existing
+                        and "ray_filtered_temperature" in existing
                     )
             except (OSError, ValueError):
                 reuse = False

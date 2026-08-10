@@ -24,27 +24,24 @@ beside the MPAS simulation data. Only rendered figures are written below the
 usual ``~/tmp/mpas/crf_on/final/organisation_lpt`` figure tree. The tracking
 script does not expose an alternative data-location option.
 
-Publication Figure 1 also writes a small, deterministic gallery with one
-identified envelope per file below a labelled subdirectory. Figure 2 writes a
-separate full-record overview for each simulation and a 15-day sliding-window
-MP4 using 15S--15N mean, 72-hour filtered rainfall. Test mode writes the same
-movie for its short subset and an identification figure for every retained
-test envelope. Each publication tracking-overview PNG is split into simulation
-days 1--100 and 101--200. Figure 3 separates event-equal property CDFs from
-compact population summaries. All are regenerated from standard event products
-and do not rerun tracking.
+Publication Figure 1 writes one envelope-evolution file for every retained LPO.
+Each file also shows concurrent LPO boundaries. Figure 2 writes one overview
+per simulation with side-by-side 100-day panels. It shows every threshold and
+size-qualified candidate envelope, but only retained LPOs receive centroid
+tracks. A 15-day sliding-window MP4 uses the same presentation. Test mode uses
+one panel for its short subset. Figure 3 separates property CDFs from compact
+population summaries. All figures use saved standard products.
 
 Publication mode is the default. It applies one configuration to all three
 simulations: six-hourly precipitation, a complete 72-hour running mean,
 Gaussian sigma 5 degrees, 12 mm/day threshold, 100 contiguous cells on the
-0.5-degree MPAS grid, periodic longitude, the published overlap linking and
-three-day below-threshold allowance, merger/split families with the published
-three-day short-branch pruning, and seven-day minimum duration. Validation
-mode separately runs 9, 12, and 15 mm/day threshold tests, 48-, 60-, and
-72-hour temporal-mean tests, Gaussian-sigma 3-, 5-, and 7-degree tests, plus
-the controlled sampling-phase and record-half sensitivities. The primary
-12 mm/day, 72-hour, 5-degree run is reused as the common reference rather than
-calculated repeatedly.
+0.5-degree MPAS grid, periodic longitude, and seven-day minimum duration. It
+uses the Kerns--Chen object definition with two dataset-motivated linking
+adaptations. Below-threshold reconnection is limited to 24 hours. Ambiguous
+merger and split paths retain a largest-area lineage. Validation uses the first
+100 tracking days from control only. It checks 11, 12, and 13 mm/day thresholds,
+0-, 24-, and 72-hour gaps, 0.0, 0.1, and 0.2 mutual-overlap floors, and both
+merger/split settings. The primary run supplies every shared reference value.
 
 ``--test`` is a quick visual check on a short, contiguous subset of the actual
 MPAS records. It retains the publication threshold, filters, grid-cell
@@ -137,10 +134,10 @@ UPSTREAM_SOURCE = Path(
 )
 UPSTREAM_CITATION = "Kerns and Chen (2020), doi:10.1029/2019JD032142"
 TRACK_FIGURE_CITATION = "Kerns and Chen (2016), doi:10.1002/2015JD024661, Figure 4"
-PRODUCT_VERSION = "mpas-lpt-precipitation-envelope-v14-event-context"
-TRACKING_CACHE_VERSION = "mpas-upstream-lpt-tracking-v2-grid-cell-minimum"
+PRODUCT_VERSION = "mpas-lpt-precipitation-envelope-v17-tropics-20deg"
+TRACKING_CACHE_VERSION = "mpas-upstream-lpt-tracking-v3-strict-linking"
 TRACKING_OVERVIEW_LATITUDE_BAND = (
-    "15S-15N cosine-latitude weighted mean"
+    "20S-20N cosine-latitude weighted mean"
 )
 UPSTREAM_TRACKING_METADATA_FILENAME = "upstream_tracking_metadata.json"
 DISABLED_ABSOLUTE_OVERLAP_POINT_THRESHOLD = 2**63 - 1
@@ -177,17 +174,38 @@ TRACKING_FIGURES = (1, 2, 3)
 PUBLICATION_FIGURES = TRACKING_FIGURES
 VALIDATION_FIGURES = (8,)
 VALIDATION_RUN_NAMES = (
-    "threshold_9",
+    "threshold_11",
     "threshold_12",
-    "threshold_15",
-    "running_mean_48",
-    "running_mean_60",
-    "gaussian_sigma_3",
-    "gaussian_sigma_7",
-    "sampling_00_12",
-    "sampling_06_18",
-    "record_first_half",
-    "record_second_half",
+    "threshold_13",
+    "gap_0",
+    "gap_72",
+    "overlap_0",
+    "overlap_0p2",
+    "merge_split_false",
+)
+VALIDATION_SIMULATIONS = ("control",)
+VALIDATION_RECORD_DAYS = 100
+VALIDATION_PARAMETER_FAMILIES = (
+    (
+        "Precipitation threshold",
+        "mm day$^{-1}$",
+        (("threshold_11", "11"), ("threshold_12", "12"), ("threshold_13", "13")),
+    ),
+    (
+        "Gap allowance",
+        "hours",
+        (("gap_0", "0"), ("threshold_12", "24"), ("gap_72", "72")),
+    ),
+    (
+        "Mutual-overlap floor",
+        "fraction",
+        (("overlap_0", "0.0"), ("threshold_12", "0.1"), ("overlap_0p2", "0.2")),
+    ),
+    (
+        "Largest-area lineage",
+        "setting",
+        (("merge_split_false", "off"), ("threshold_12", "on")),
+    ),
 )
 VALIDATION_MATCH_COLUMNS = (
     "default_event_id",
@@ -208,11 +226,10 @@ TEST_LIFECYCLE_LAGS_HOURS = LIFECYCLE_LAGS_HOURS = tuple(
     range(-72, 73, 6)
 )
 METHOD_EXAMPLE_LAGS_HOURS = (-72, -48, -24, 0, 24, 48, 72)
-METHOD_GALLERY_EVENTS_PER_SIMULATION = 5
 TRACKING_MOVIE_WINDOW_DAYS = 15
 TRACKING_MOVIE_FRAME_STEP_HOURS = 24
 TRACKING_MOVIE_FRAMES_PER_SECOND = 6
-TROPICAL_CENTROID_LIMIT_DEG = 15.0
+TROPICAL_CENTROID_LIMIT_DEG = 20.0
 TROPICAL_MIN_CONSECUTIVE_HOURS = 24.0
 DEFAULT_ROOT = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on"
 DEFAULT_LPT_CACHE_ROOT = os.path.join(DEFAULT_ROOT, "lpt_cache")
@@ -233,19 +250,17 @@ class LPTConfiguration:
     minimum_object_grid_cells: int = MPAS_MINIMUM_OBJECT_GRID_CELLS
     periodic_longitude: bool = True
     minimum_overlap_fraction: float = 0.5
-    # The current upstream defaults also permit a grid-cell-count shortcut
-    # after imposing a 10% bare overlap. Kerns and Chen (2020) specify overlap
-    # of half of either object, so disable that resolution-dependent shortcut
-    # through options while leaving the upstream linker unmodified.
-    bare_minimum_overlap_fraction: float = 0.0
+    # Require the configured mutual-overlap floor. Disable the upstream
+    # resolution-dependent grid-cell-count shortcut separately.
+    bare_minimum_overlap_fraction: float = 0.10
     minimum_overlap_points: int = DISABLED_ABSOLUTE_OVERLAP_POINT_THRESHOLD
     minimum_overlap_area_km2: float = 0.0
     allow_merge_split: bool = True
-    break_up_merge_split: bool = False
+    break_up_merge_split: bool = True
     split_merger_min_hours: int = 3 * 24
     minimum_duration_hours: int = 7 * 24
     allow_test_duration_below_seven_days: bool = False
-    fall_below_threshold_max_hours: int = 3 * 24
+    fall_below_threshold_max_hours: int = 24
     tracking_latitude_bounds: tuple[float, float] = DEFAULT_TRACKING_DOMAIN
     lifecycle_lags_hours: tuple[int, ...] = LIFECYCLE_LAGS_HOURS
     tropical_centroid_limit_degrees: float = TROPICAL_CENTROID_LIMIT_DEG
@@ -383,10 +398,10 @@ def actual_data_test_run_specifications(
 
 
 def validation_run_specifications() -> list[RunSpecification]:
-    """Return the non-overwriting, controlled sensitivity suite."""
+    """Return the control-only 100-day sensitivity suite."""
 
     specs: list[RunSpecification] = []
-    for threshold in (9.0, 12.0, 15.0):
+    for threshold in (11.0, 12.0, 13.0):
         name = f"threshold_{threshold:g}"
         specs.append(
             RunSpecification(
@@ -395,52 +410,47 @@ def validation_run_specifications() -> list[RunSpecification]:
                     PRIMARY_CONFIGURATION,
                     precipitation_threshold_mm_day=threshold,
                 ),
-                reference_run=None if threshold == 12.0 else "threshold_12",
+                record_subset="first_100_days",
+                reference_run=(
+                    None if threshold == 12.0 else "threshold_12"
+                ),
             )
         )
-    for hours in (48, 60):
+    for hours in (0, 72):
         specs.append(
             RunSpecification(
-                f"running_mean_{hours}",
+                f"gap_{hours}",
                 dataclasses.replace(
                     PRIMARY_CONFIGURATION,
-                    running_mean_hours=hours,
+                    fall_below_threshold_max_hours=hours,
                 ),
+                record_subset="first_100_days",
                 reference_run="threshold_12",
             )
         )
-    for sigma_degrees in (3.0, 7.0):
+    for overlap, suffix in ((0.0, "0"), (0.2, "0p2")):
         specs.append(
             RunSpecification(
-                f"gaussian_sigma_{sigma_degrees:g}",
+                f"overlap_{suffix}",
                 dataclasses.replace(
                     PRIMARY_CONFIGURATION,
-                    gaussian_sigma_degrees=sigma_degrees,
+                    bare_minimum_overlap_fraction=overlap,
                 ),
+                record_subset="first_100_days",
                 reference_run="threshold_12",
             )
         )
-    for name, hours in (("sampling_00_12", (0, 12)), ("sampling_06_18", (6, 18))):
-        specs.append(
-            RunSpecification(
-                name,
-                dataclasses.replace(
-                    PRIMARY_CONFIGURATION,
-                    input_interval_hours=12,
-                    sampling_hours_utc=hours,
-                ),
-                reference_run="threshold_12",
-            )
-        )
-    for subset in ("first_half", "second_half"):
-        specs.append(
-            RunSpecification(
-                f"record_{subset}",
+    specs.append(
+        RunSpecification(
+            "merge_split_false",
+            dataclasses.replace(
                 PRIMARY_CONFIGURATION,
-                record_subset=subset,
-                reference_run="threshold_12",
-            )
+                break_up_merge_split=False,
+            ),
+            record_subset="first_100_days",
+            reference_run="threshold_12",
         )
+    )
     return specs
 
 
@@ -485,6 +495,33 @@ def configuration_metadata(
             "temporal sampling changed from all six-hourly times to "
             + ", ".join(f"{hour:02d} UTC" for hour in configuration.sampling_hours_utc)
         )
+    if (
+        configuration.fall_below_threshold_max_hours
+        != PRIMARY_CONFIGURATION.fall_below_threshold_max_hours
+    ):
+        validation_departures.append(
+            "below-threshold gap allowance changed from "
+            f"{PRIMARY_CONFIGURATION.fall_below_threshold_max_hours} to "
+            f"{configuration.fall_below_threshold_max_hours} hours"
+        )
+    if (
+        configuration.bare_minimum_overlap_fraction
+        != PRIMARY_CONFIGURATION.bare_minimum_overlap_fraction
+    ):
+        validation_departures.append(
+            "mutual-overlap floor changed from "
+            f"{PRIMARY_CONFIGURATION.bare_minimum_overlap_fraction:g} to "
+            f"{configuration.bare_minimum_overlap_fraction:g}"
+        )
+    if (
+        configuration.break_up_merge_split
+        != PRIMARY_CONFIGURATION.break_up_merge_split
+    ):
+        validation_departures.append(
+            "largest-area merger/split lineage handling changed from "
+            f"{PRIMARY_CONFIGURATION.break_up_merge_split} to "
+            f"{configuration.break_up_merge_split}"
+        )
     try:
         project_commit = subprocess.run(
             ["git", "-C", str(Path(__file__).resolve().parents[2]), "rev-parse", "HEAD"],
@@ -513,23 +550,38 @@ def configuration_metadata(
         "xarray_version": xr.__version__,
         "citation": UPSTREAM_CITATION,
         "track_figure_presentation_citation": TRACK_FIGURE_CITATION,
+        "track_figure_centroid_source": (
+            "upstream centroid_lon, centroid_lat, and area_km2 from "
+            "lpt_track_steps.csv"
+        ),
+        "lifecycle_centroid_source": (
+            "precipitation-weighted envelope centroids remain saved in "
+            "lpt_event_relative_diagnostics.csv"
+        ),
         "configuration": configuration.as_dict(),
         "validation_departures_from_primary": validation_departures,
         "selection": {
             "retain_all_valid_lpt_tracks": True,
             "primary_tropical_sample": (
-                "precipitation-weighted envelope centroid within 15 degrees "
-                "of the equator for at least 24 consecutive hours"
+                "precipitation-weighted envelope centroid within "
+                f"{configuration.tropical_centroid_limit_degrees:g} degrees "
+                "of the equator for at least "
+                f"{configuration.tropical_min_consecutive_hours:g} "
+                "consecutive hours"
             ),
             "dynamical_selection_criteria": [],
             "lifecycle_reference": (
-                "maximum area-integrated trailing-24-hour precipitation "
-                "inside the tracked envelope"
+                "maximum trailing-24-hour integrated rain volume inside "
+                "the tracked envelope"
             ),
             "primary_composite_requires_complete_lag_window": True,
             "event_weighting": "one equal weight per LPT event",
         },
         "kerns_chen_2020_methodology": {
+            "method_summary": (
+                "Kerns--Chen object definition with dataset-motivated "
+                "linking adaptations"
+            ),
             "matching_elements": [
                 f"complete trailing {configuration.running_mean_hours}-hour "
                 "precipitation mean",
@@ -547,20 +599,45 @@ def configuration_metadata(
                 "periodic longitude",
                 "half-of-either-object fractional overlap linking; the "
                 "upstream absolute-grid-cell alternative is disabled",
-                "three-day below-threshold reconnection by endpoint overlap",
-                "overlapping merger/split families with three-day short-branch "
-                "pruning",
+                f"{configuration.bare_minimum_overlap_fraction:g} "
+                "mutual-overlap floor",
                 "minimum retained duration of seven days after reconnection",
                 "tracking over 50S-50N",
             ],
+            "dataset_motivated_linking_adaptations": [
+                (
+                    "below-threshold reconnection is limited to "
+                    f"{configuration.fall_below_threshold_max_hours} hours "
+                    "because the model record is complete and rainfall is "
+                    "already averaged over 72 hours"
+                ),
+                (
+                    "ambiguous merger/split paths are reduced to a "
+                    "largest-area lineage so retained events do not duplicate "
+                    "shared branches"
+                    if configuration.break_up_merge_split
+                    else "ambiguous merger/split paths remain joined for this "
+                    "controlled sensitivity run"
+                ),
+            ],
             "deliberate_project_differences": [
                 "six-hourly MPAS input rather than three-hourly TMPA input",
-                "the complete approximately 200-day simulation is tracked in "
-                "one run rather than overlapping annual tracking windows",
+                (
+                    "the first 100 complete tracking days are used for each "
+                    "controlled sensitivity"
+                    if specification.record_subset == "first_100_days"
+                    else "the complete approximately 200-day simulation is "
+                    "tracked in one run rather than overlapping annual "
+                    "tracking windows"
+                ),
                 "no eastward-propagation or other MJO classification is used "
                 "to select tracks",
                 "the primary tropical sample requires a precipitation-weighted "
-                "centroid within 15 degrees latitude for 24 consecutive hours",
+                "centroid within "
+                f"{configuration.tropical_centroid_limit_degrees:g} degrees "
+                "latitude for "
+                f"{configuration.tropical_min_consecutive_hours:g} "
+                "consecutive hours",
                 "project diagnostics use the instantaneous threshold-envelope "
                 "mask; paper rainfall attribution also used a one-sigma "
                 "peripheral zone and the preceding three-day accumulation",
@@ -896,7 +973,7 @@ def periodic_longitude_field(field: xr.DataArray) -> xr.DataArray:
 
 def equatorial_envelope_for_plot(
     envelope: xr.DataArray,
-    latitude_limit_degrees: float = 15.0,
+    latitude_limit_degrees: float = TROPICAL_CENTROID_LIMIT_DEG,
 ) -> xr.DataArray:
     """Project an LPO mask into a 0--360 longitude--time boundary field."""
 
@@ -912,6 +989,84 @@ def equatorial_envelope_for_plot(
         )
     ).any("latitude")
     return periodic_longitude_field(projected)
+
+
+def _periodic_candidate_objects_2d(
+    above_threshold: np.ndarray,
+    *,
+    minimum_grid_cells: int,
+) -> np.ndarray:
+    """Retain size-qualified four-neighbour objects across the longitude seam."""
+
+    mask = np.asarray(above_threshold, dtype=bool)
+    structure = np.asarray(
+        ((0, 1, 0), (1, 1, 1), (0, 1, 0)),
+        dtype=np.int8,
+    )
+    labels, label_count = ndimage.label(mask, structure=structure)
+    if label_count == 0:
+        return np.zeros_like(mask, dtype=bool)
+    parents = np.arange(label_count + 1)
+
+    def root(label: int) -> int:
+        while parents[label] != label:
+            parents[label] = parents[parents[label]]
+            label = parents[label]
+        return int(label)
+
+    for first, last in zip(labels[:, 0], labels[:, -1]):
+        if first == 0 or last == 0:
+            continue
+        first_root = root(int(first))
+        last_root = root(int(last))
+        if first_root != last_root:
+            parents[last_root] = first_root
+    roots = np.asarray([root(label) for label in range(label_count + 1)])
+    merged_labels = roots[labels]
+    cell_counts = np.bincount(merged_labels.ravel())
+    retained = cell_counts >= minimum_grid_cells
+    retained[0] = False
+    return retained[merged_labels]
+
+
+def candidate_envelope_mask(
+    filtered_precipitation: xr.DataArray,
+    configuration: LPTConfiguration = PRIMARY_CONFIGURATION,
+) -> xr.DataArray:
+    """Return every threshold and size-qualified instantaneous LPO candidate."""
+
+    required_dims = {"Time", "latitude", "longitude"}
+    if not required_dims.issubset(filtered_precipitation.dims):
+        raise ValueError(
+            "Candidate envelopes require Time, latitude, and longitude dimensions"
+        )
+    candidates = xr.apply_ufunc(
+        _periodic_candidate_objects_2d,
+        filtered_precipitation
+        > configuration.precipitation_threshold_mm_day,
+        input_core_dims=[["latitude", "longitude"]],
+        output_core_dims=[["latitude", "longitude"]],
+        kwargs={
+            "minimum_grid_cells": configuration.minimum_object_grid_cells,
+        },
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[bool],
+        dask_gufunc_kwargs={"allow_rechunk": True},
+    ).transpose(*filtered_precipitation.dims)
+    candidates = candidates.rename("candidate_lpo_envelope_mask")
+    candidates.attrs.update(
+        {
+            "long_name": "instantaneous threshold and size-qualified LPO candidates",
+            "precipitation_threshold_mm_day": (
+                configuration.precipitation_threshold_mm_day
+            ),
+            "minimum_object_grid_cells": configuration.minimum_object_grid_cells,
+            "connectivity": "four-neighbour with periodic longitude",
+            "retention": "independent of later track duration and linking",
+        }
+    )
+    return candidates
 
 
 def full_running_mean(
@@ -1016,9 +1171,20 @@ def filtered_running_mean(
 def _subset_reference_bounds(
     times: pd.DatetimeIndex,
     subset: str,
+    *,
+    running_mean_hours: int = 0,
 ) -> tuple[pd.Timestamp, pd.Timestamp]:
     if subset == "complete":
         return times[0], times[-1]
+    if subset == "first_100_days":
+        start = times[0] + pd.Timedelta(hours=running_mean_hours)
+        end = start + pd.Timedelta(days=VALIDATION_RECORD_DAYS)
+        if end > times[-1]:
+            raise ValueError(
+                "Validation requires 100 complete tracking days after the "
+                f"{running_mean_hours}-hour preprocessing window"
+            )
+        return start, end
     midpoint_index = len(times) // 2
     if midpoint_index == 0:
         raise ValueError("Record is too short to divide into two subsets")
@@ -1037,8 +1203,18 @@ def tracking_and_input_bounds(
 
     index = pd.DatetimeIndex(pd.to_datetime(times))
     reference_start, reference_end = _subset_reference_bounds(
-        index, specification.record_subset
+        index,
+        specification.record_subset,
+        running_mean_hours=specification.configuration.running_mean_hours,
     )
+    if specification.record_subset == "first_100_days":
+        return {
+            "input_start": index[0],
+            "tracking_start": reference_start,
+            "tracking_end": reference_end,
+            "reference_start": reference_start,
+            "reference_end": reference_end,
+        }
     # Record-half validation assigns full-record tracks by lifecycle-reference
     # time. Tracking the complete record is the only finite buffer that cannot
     # truncate an event merely because it lasts longer than the seven-day
@@ -1275,6 +1451,10 @@ def run_upstream_lpt(
     begin = pd.Timestamp(preprocessing_metadata["tracking_start"])
     end = pd.Timestamp(preprocessing_metadata["tracking_end"])
     argv = ["mpas_lpt", begin.strftime("%Y%m%d%H"), end.strftime("%Y%m%d%H")]
+    systems_filename = (
+        f"lpt_systems_{options[0]['label']}_{argv[1]}_{argv[2]}.nc"
+    )
+    systems_text_filename = Path(systems_filename).with_suffix(".txt").name
     # Upstream atomically replaces systems NetCDF files through a relative
     # temporary name. Run on the output filesystem so POSIX rename remains
     # atomic even when the analysis checkout and data cache are different
@@ -1292,10 +1472,7 @@ def run_upstream_lpt(
                 # empty-track IndexError into an actionable project-side error
                 # without modifying upstream source.
                 systems_directory = Path(options[4]["outdir"])
-                system_text = list(
-                    systems_directory.glob("lpt_systems_*.txt")
-                )
-                if system_text:
+                if (systems_directory / systems_text_filename).is_file():
                     raise RuntimeError(
                         "No LPT envelope satisfied the unchanged seven-day "
                         "duration criterion in this record window. Choose a "
@@ -1305,13 +1482,13 @@ def run_upstream_lpt(
     finally:
         os.chdir(previous_directory)
     systems_directory = Path(options[4]["outdir"])
-    systems = sorted(systems_directory.glob("lpt_systems_*.nc"))
-    if len(systems) != 1:
+    systems_file = systems_directory / systems_filename
+    if not systems_file.is_file():
         raise RuntimeError(
-            f"Expected one upstream LPT systems file for the current "
-            f"configuration in {systems_directory}, found {len(systems)}"
+            "Upstream LPT did not create the systems file for the requested "
+            f"tracking interval: {systems_file}"
         )
-    return systems[0]
+    return systems_file
 
 
 def consecutive_true_hours(values: Sequence[bool], step_hours: float) -> float:
@@ -1335,7 +1512,7 @@ def propagation_metrics(
 
     stamps = pd.DatetimeIndex(pd.to_datetime(time))
     hours = np.asarray((stamps - stamps[0]) / pd.Timedelta(hours=1), dtype=float)
-    lon = unwrap_longitude(longitude)
+    lon = np.asarray(longitude, dtype=float)
     lat = np.asarray(latitude, dtype=float)
     valid = np.isfinite(hours) & np.isfinite(lon) & np.isfinite(lat)
     if valid.sum() < 2 or np.ptp(hours[valid]) == 0:
@@ -1343,14 +1520,20 @@ def propagation_metrics(
             "Propagation requires at least two finite, distinct track times "
             "with precipitation-weighted centroids"
         )
-    lat_mean = np.nanmean(lat[valid])
-    zonal_km_hour = np.polyfit(hours[valid], lon[valid], 1)[0] * 111.195 * np.cos(
+    # LPT permits short below-threshold gaps within one tracked system.  These
+    # steps have empty masks and undefined centroids.  Remove them before
+    # unwrapping because one NaN otherwise contaminates every later longitude.
+    lon = unwrap_longitude(lon[valid])
+    hours = hours[valid]
+    lat = lat[valid]
+    lat_mean = np.nanmean(lat)
+    zonal_km_hour = np.polyfit(hours, lon, 1)[0] * 111.195 * np.cos(
         np.deg2rad(lat_mean)
     )
-    meridional_km_hour = np.polyfit(hours[valid], lat[valid], 1)[0] * 111.195
+    meridional_km_hour = np.polyfit(hours, lat, 1)[0] * 111.195
     zonal_speed = zonal_km_hour / 3.6
     displacement = (
-        (lon[valid][-1] - lon[valid][0])
+        (lon[-1] - lon[0])
         * 111.195
         * np.cos(np.deg2rad(lat_mean))
     )
@@ -1606,9 +1789,9 @@ def diagnose_envelope_steps(
         Time=slice(first_position, last_position),
         **spatial_indexers,
     ).load()
-    precip_24h = buffered_precipitation.rolling(
+    precipitation_depth_24h = buffered_precipitation.rolling(
         Time=window_24h, min_periods=window_24h
-    ).mean()
+    ).sum() * (dt_hours / 24.0)
     precipitation = buffered_precipitation.sel(Time=event_times.values)
     precipitation, event_mask, area = xr.align(
         precipitation,
@@ -1620,13 +1803,13 @@ def diagnose_envelope_steps(
     for time_value in pd.to_datetime(event_mask.Time.values):
         mask = event_mask.sel(Time=time_value)
         precip = precipitation.sel(Time=time_value)
-        precip24 = precip_24h.sel(Time=time_value)
+        precipitation_depth = precipitation_depth_24h.sel(Time=time_value)
         envelope_area = _area_sum(mask, area)
         precipitation_statistics = sample_masked_field(
             precip, mask, area
         )
-        precip24_volume = sample_masked_field(
-            precip24, mask, area
+        rain_volume_24h = sample_masked_field(
+            precipitation_depth, mask, area
         )["area_integral"]
         lon, lat = precipitation_weighted_centroid(mask, precip, area)
         valid_precipitation = mask & np.isfinite(precip)
@@ -1644,7 +1827,8 @@ def diagnose_envelope_steps(
                 "area_integrated_precip_km2_mm_day": (
                     precipitation_statistics["area_integral"]
                 ),
-                "area_integrated_24h_precip_km2_mm_day": precip24_volume,
+                # Keep the historical column name for cache compatibility.
+                "area_integrated_24h_precip_km2_mm_day": rain_volume_24h,
                 "mean_precip_mm_day": precipitation_statistics["mean"],
                 "maximum_precip_mm_day": maximum_precipitation,
                 "precip_weighted_centroid_lon": lon,
@@ -1670,13 +1854,29 @@ def tracking_domain_area_km2(
 
 
 def read_upstream_event_masks(
-    systems_directory: str | os.PathLike[str],
+    upstream_systems_file: str | os.PathLike[str],
     events: pd.DataFrame,
 ) -> dict[str, xr.DataArray]:
     """Read original individual LPT masks and expose project-standard geometry."""
 
+    systems_file = Path(upstream_systems_file)
+    filename_parts = systems_file.stem.rsplit("_", 2)
+    if len(filename_parts) != 3 or not systems_file.name.startswith(
+        "lpt_systems_"
+    ):
+        raise RuntimeError(
+            f"Cannot identify the tracking interval from {systems_file}"
+        )
+    systems_directory = systems_file.parent / (
+        f"{filename_parts[-2]}_{filename_parts[-1]}"
+    )
+    if not systems_directory.is_dir():
+        raise FileNotFoundError(
+            "Missing upstream individual-mask directory for the selected "
+            f"systems file: {systems_directory}"
+        )
     files = sorted(
-        Path(systems_directory).glob("*/lpt_system_mask_*.nc")
+        systems_directory.glob("lpt_system_mask_*.nc")
     )
     by_upstream_id: dict[float, Path] = {}
     for path in files:
@@ -1747,16 +1947,12 @@ def postprocess_event_masks(
         product="shared high-cloud classification",
     )
     masks = read_upstream_event_masks(
-        Path(upstream_systems_file).parent,
+        upstream_systems_file,
         events,
     )
     method_event_ids: set[str] = set()
-    if tracking_figure_test:
+    if tracking_figure_test or specification.name == "primary":
         envelope_figure_event_ids = set(events.event_id.astype(str))
-    elif specification.name == "primary":
-        envelope_figure_event_ids = set(
-            publication_method_gallery_events(events).event_id.astype(str)
-        )
     else:
         envelope_figure_event_ids = set()
     if tracking_figure_test:
@@ -1824,6 +2020,10 @@ def postprocess_event_masks(
     )
     if tracking_figure_test:
         filtered_precipitation = filtered_precipitation.load()
+    candidate_envelopes = candidate_envelope_mask(
+        filtered_precipitation,
+        specification.configuration,
+    )
     event_count = len(events)
     for event_number, event in enumerate(events.itertuples(), start=1):
         event_start = time.perf_counter()
@@ -2043,31 +2243,34 @@ def postprocess_event_masks(
     pd.DataFrame(mask_index_rows).to_csv(
         standard_directory / "lpt_event_mask_index.csv", index=False
     )
+    tropical_limit = (
+        specification.configuration.tropical_centroid_limit_degrees
+    )
     tropical_filtered = periodic_longitude_field(
         filtered_precipitation.sel(
             latitude=slice(
-                -15.0
+                -tropical_limit
                 if filtered_precipitation.latitude[0]
                 < filtered_precipitation.latitude[-1]
-                else 15.0,
-                15.0
+                else tropical_limit,
+                tropical_limit
                 if filtered_precipitation.latitude[0]
                 < filtered_precipitation.latitude[-1]
-                else -15.0,
+                else -tropical_limit,
             )
         )
     )
     tropical_unfiltered = periodic_longitude_field(
         unfiltered_running_precipitation.sel(
             latitude=slice(
-                -15.0
+                -tropical_limit
                 if unfiltered_running_precipitation.latitude[0]
                 < unfiltered_running_precipitation.latitude[-1]
-                else 15.0,
-                15.0
+                else tropical_limit,
+                tropical_limit
                 if unfiltered_running_precipitation.latitude[0]
                 < unfiltered_running_precipitation.latitude[-1]
-                else -15.0,
+                else -tropical_limit,
             )
         )
     )
@@ -2093,6 +2296,9 @@ def postprocess_event_masks(
         np.deg2rad(tropical_unfiltered.latitude)
     )
     raw_latitude_weights = np.cos(np.deg2rad(tropical_raw.latitude))
+    equatorial_candidates = equatorial_envelope_for_plot(
+        candidate_envelopes
+    )
     xr.Dataset(
         {
             "equatorial_raw_precipitation_mm_day": tropical_raw.weighted(
@@ -2105,7 +2311,8 @@ def postprocess_event_masks(
             ),
             "equatorial_filtered_precipitation_mm_day": tropical_filtered.weighted(
                 filtered_latitude_weights
-            ).mean("latitude")
+            ).mean("latitude"),
+            "equatorial_candidate_lpo_envelope": equatorial_candidates,
         },
         attrs={
             "raw_precipitation_latitude_band": (
@@ -2135,6 +2342,11 @@ def postprocess_event_masks(
             "gaussian_sigma_degrees": (
                 specification.configuration.gaussian_sigma_degrees
             ),
+            "candidate_envelope_definition": (
+                "filtered precipitation exceeds the configured threshold, "
+                "meets the instantaneous grid-cell minimum, and does not "
+                "require later track retention"
+            ),
         },
     ).to_netcdf(
         standard_directory / "lpt_time_longitude_overview.nc",
@@ -2153,7 +2365,12 @@ def postprocess_event_masks(
                 "dtype": "float32",
                 "zlib": True,
                 "complevel": 2,
-            }
+            },
+            "equatorial_candidate_lpo_envelope": {
+                "dtype": "int8",
+                "zlib": True,
+                "complevel": 4,
+            },
         },
     )
     diagnostics = (
@@ -2173,6 +2390,7 @@ def postprocess_event_masks(
     reference_start, reference_end = _subset_reference_bounds(
         pd.DatetimeIndex(pd.to_datetime(precipitation.Time.values)),
         specification.record_subset,
+        running_mean_hours=specification.configuration.running_mean_hours,
     )
     events["reference_assignment_start"] = reference_start
     events["reference_assignment_end"] = reference_end
@@ -2295,7 +2513,7 @@ def assign_lifecycle_reference(
     steps: pd.DataFrame,
     configuration: LPTConfiguration = PRIMARY_CONFIGURATION,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Assign peak-precipitation t=0 and fixed physical lags to every event."""
+    """Assign precipitation-peak t=0 and fixed physical lags to every event."""
 
     output: list[pd.DataFrame] = []
     summaries: list[dict] = []
@@ -2305,8 +2523,8 @@ def assign_lifecycle_reference(
         valid = np.isfinite(event.area_integrated_24h_precip_km2_mm_day)
         if not valid.any():
             raise RuntimeError(
-                f"{event_id}: no finite area-integrated trailing-24-hour "
-                "precipitation is available for the lifecycle reference"
+                f"{event_id}: no finite trailing-24-hour integrated rain "
+                "volume is available for the lifecycle reference"
             )
         peak_index = event.loc[
             valid, "area_integrated_24h_precip_km2_mm_day"
@@ -2531,7 +2749,7 @@ def build_validation_matches(validation_directory: str | os.PathLike[str]) -> No
             raise FileNotFoundError(
                 f"Missing configured validation run: {sensitivity}"
             )
-        for simulation in SIMULATION_DIRS:
+        for simulation in VALIDATION_SIMULATIONS:
             default_standard = reference / simulation / "standard"
             sensitivity_standard = sensitivity / simulation / "standard"
             default_path = default_standard / "lpt_events.csv"
@@ -2682,6 +2900,7 @@ def _load_simulation_dataset(
         "qs",
         "rho",
         "theta",
+        "qv",
         "w",
         "pressure",
         "zgrid",
@@ -2910,7 +3129,12 @@ def run_specification(
         event_files = sorted(
             mode_directory.glob("*/standard/lpt_events.csv")
         )
-        if len(event_files) != len(SIMULATION_DIRS):
+        expected_file_count = (
+            len(VALIDATION_SIMULATIONS)
+            if specification.record_subset == "first_100_days"
+            else len(SIMULATION_DIRS)
+        )
+        if len(event_files) != expected_file_count:
             progress(
                 f"{specification.name}: selective postprocessing complete; "
                 "cross-simulation population summary is deferred until all "
@@ -3018,6 +3242,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     if args.test and args.mode != "publication":
         parser.error("--test uses the publication configuration; omit --mode validation")
+    if args.mode == "validation" and args.simulation not in {"all", "control"}:
+        parser.error("validation uses the first 100 days from control only")
     if (
         args.test
         and args.simulation != "all"
@@ -3076,7 +3302,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         else validation_run_specifications()
     )
     simulations = (
-        tuple(SIMULATION_DIRS)
+        VALIDATION_SIMULATIONS
+        if args.mode == "validation"
+        else tuple(SIMULATION_DIRS)
         if args.simulation == "all"
         else (args.simulation,)
     )
@@ -3142,7 +3370,9 @@ def read_standard_event_tables(
     return events, lifecycle
 
 
-def require_publication_products() -> Path:
+def require_publication_products(
+    *, allow_stale_product_version: bool = False
+) -> Path:
     """Validate the stable publication interface used by downstream scripts."""
 
     mode_directory = publication_output_directory()
@@ -3164,11 +3394,23 @@ def require_publication_products() -> Path:
                 continue
             if filename == "lpt_configuration.json":
                 metadata = json.loads(path.read_text(encoding="utf-8"))
-                if metadata.get("product_version") != PRODUCT_VERSION:
+                if (
+                    metadata.get("product_version") != PRODUCT_VERSION
+                    and not allow_stale_product_version
+                ):
                     raise RuntimeError(
                         f"{path} has product_version "
                         f"{metadata.get('product_version')!r}; expected "
                         f"{PRODUCT_VERSION!r}. Rebuild the LPO publication run."
+                    )
+                if (
+                    metadata.get("product_version") != PRODUCT_VERSION
+                    and allow_stale_product_version
+                ):
+                    progress(
+                        "Allowing stale LPO publication product version "
+                        f"{metadata.get('product_version')!r} from {path}; "
+                        f"current version is {PRODUCT_VERSION!r}"
                     )
                 schema = metadata.get("standard_schema")
                 if not isinstance(schema, dict):
@@ -3277,7 +3519,7 @@ def _require_validation_figure_products(output: Path) -> None:
     missing: list[str] = []
     for run_name in VALIDATION_RUN_NAMES:
         run_directory = output / run_name
-        for simulation in SIMULATION_DIRS:
+        for simulation in VALIDATION_SIMULATIONS:
             standard = run_directory / simulation / "standard"
             for filename in (
                 "lpt_configuration.json",
@@ -3296,8 +3538,8 @@ def _require_validation_figure_products(output: Path) -> None:
     if missing:
         preview = "\n".join(f"  {path}" for path in missing[:12])
         raise FileNotFoundError(
-            "Validation Figure 8 requires the complete threshold, temporal-"
-            "mean, Gaussian-scale, sampling-phase, record-half, and matching "
+            "Validation Figure 8 requires the complete threshold, gap, "
+            "overlap, merger/split, and matching "
             "products:\n"
             f"{preview}"
         )
@@ -3368,11 +3610,6 @@ def build_tracking_figures_from_saved_outputs(
             _require_validation_figure_products(output)
             progress("Starting Figure 8: LPO validation sensitivities")
             save(8, "lpo_validation_sensitivity", _plot_validation_figure(output))
-            save(
-                8,
-                "lpo_filter_sensitivity_summary",
-                _plot_filter_validation_figure(output),
-            )
             for stem, figure in _plot_validation_track_figures(output):
                 save(8, stem, figure)
         return
@@ -3397,11 +3634,7 @@ def build_tracking_figures_from_saved_outputs(
         )
         progress(
             "Starting Figure 1 envelope gallery: "
-            + (
-                "all retained test LPOs"
-                if tracking_figure_test
-                else "selected publication LPOs"
-            )
+            "all retained LPOs in every simulation"
         )
         _write_lpo_envelope_gallery(
             primary,
@@ -3422,30 +3655,16 @@ def build_tracking_figures_from_saved_outputs(
             )
         )
         for simulation in SIMULATION_DIRS:
-            overview_segments = (
-                (None,)
-                if tracking_figure_test
-                else ((1, 100), (101, 200))
+            save(
+                2,
+                f"lpo_tracking_overview_{simulation}",
+                _plot_tracking_overview(
+                    primary,
+                    events,
+                    simulation=simulation,
+                    tracking_figure_test=tracking_figure_test,
+                ),
             )
-            for day_range in overview_segments:
-                day_suffix = (
-                    ""
-                    if day_range is None
-                    else (
-                        f"_days_{day_range[0]:03d}_{day_range[1]:03d}"
-                    )
-                )
-                save(
-                    2,
-                    f"lpo_tracking_overview_{simulation}{day_suffix}",
-                    _plot_tracking_overview(
-                        primary,
-                        events,
-                        simulation=simulation,
-                        day_range=day_range,
-                        tracking_figure_test=tracking_figure_test,
-                    ),
-                )
             movie_filename = (
                 f"02_lpo_tracking_{simulation}_test_period.mp4"
                 if tracking_figure_test
@@ -3549,18 +3768,10 @@ def _tracking_test_example_events(
 
 def publication_method_gallery_events(
     events: pd.DataFrame,
-    count_per_simulation: int = METHOD_GALLERY_EVENTS_PER_SIMULATION,
 ) -> pd.DataFrame:
-    """Choose a small deterministic lifecycle-event sample per simulation."""
+    """Return every retained LPO in deterministic gallery order."""
 
-    if count_per_simulation < 1:
-        raise ValueError("count_per_simulation must be positive")
-    required = {
-        "simulation",
-        "event_id",
-        "maximum_area_km2",
-        "primary_tropical_sample",
-    }
+    required = {"simulation", "event_id"}
     missing = sorted(required - set(events.columns))
     if missing:
         raise RuntimeError(
@@ -3573,42 +3784,11 @@ def publication_method_gallery_events(
             "Figure 1 gallery contains unknown simulations: "
             f"{sorted(unknown_simulations)}"
         )
-    eligible = events[events.primary_tropical_sample.astype(bool)].copy()
-    selected = []
-    for simulation in (
-        name for name in SIMULATION_DIRS if name in present_simulations
-    ):
-        candidates = (
-            eligible[eligible.simulation == simulation]
-            .sort_values(["maximum_area_km2", "event_id"])
-            .reset_index(drop=True)
-        )
-        count = min(count_per_simulation, len(candidates))
-        if not count:
-            progress(
-                f"Figure 1 gallery: {simulation} has no primary tropical "
-                "event"
-            )
-            continue
-        positions = np.linspace(
-            0,
-            len(candidates) - 1,
-            count + 2,
-        )[1:-1]
-        indices = np.unique(np.rint(positions).astype(int))
-        if len(indices) != count:
-            indices = np.linspace(
-                0,
-                len(candidates) - 1,
-                count,
-                dtype=int,
-            )
-        selected.append(candidates.iloc[indices])
-    if not selected:
-        raise RuntimeError(
-            "Figure 1 gallery has no primary tropical events"
-        )
-    return pd.concat(selected, ignore_index=True)
+    sort_columns = ["simulation"]
+    if "start_time" in events:
+        sort_columns.append("start_time")
+    sort_columns.append("event_id")
+    return events.sort_values(sort_columns).reset_index(drop=True)
 
 
 def tracking_movie_windows(
@@ -3930,6 +4110,50 @@ def _plot_lpo_envelope_check(
     return fig
 
 
+def _concurrent_lpo_envelopes(
+    primary: Path,
+    events: pd.DataFrame,
+    chosen: pd.Series,
+    target_times: Sequence,
+) -> dict[pd.Timestamp, list[xr.DataArray]]:
+    """Load other retained LPO masks present at the displayed times."""
+
+    targets = pd.DatetimeIndex(pd.to_datetime(target_times))
+    output = {pd.Timestamp(time): [] for time in targets}
+    others = events[
+        (events.simulation == chosen.simulation)
+        & (events.event_id != chosen.event_id)
+    ].copy()
+    if others.empty:
+        return output
+    others["start_time"] = pd.to_datetime(others.start_time)
+    others["end_time"] = pd.to_datetime(others.end_time)
+    others = others[
+        (others.start_time <= targets.max())
+        & (others.end_time >= targets.min())
+    ]
+    standard = primary / chosen.simulation / "standard"
+    mask_index = pd.read_csv(
+        standard / "lpt_event_mask_index.csv"
+    ).set_index("event_id")
+    for other in others.itertuples():
+        if other.event_id not in mask_index.index:
+            raise RuntimeError(
+                f"{standard}: mask index lacks {other.event_id}"
+            )
+        mask_path = standard / mask_index.loc[other.event_id, "mask_file"]
+        with xr.open_dataset(mask_path) as product:
+            available = pd.DatetimeIndex(pd.to_datetime(product.Time.values))
+            available_values = set(available.asi8)
+            for target in targets:
+                if target.value not in available_values:
+                    continue
+                output[pd.Timestamp(target)].append(
+                    product.lpt_envelope_mask.sel(Time=target).load()
+                )
+    return output
+
+
 def _plot_method_example(
     primary: Path,
     events: pd.DataFrame,
@@ -4025,6 +4249,12 @@ def _plot_method_example(
         % 360.0
         - 180.0
     )
+    concurrent_envelopes = _concurrent_lpo_envelopes(
+        primary,
+        events,
+        chosen,
+        target_times,
+    )
     fig, axes = plt.subplots(
         3,
         len(target_times),
@@ -4085,6 +4315,18 @@ def _plot_method_example(
             centre_longitude=centre_longitude,
             centre_latitude=centre_latitude,
         )
+        concurrent_regional = []
+        for other_envelope in concurrent_envelopes[pd.Timestamp(time_value)]:
+            try:
+                regional_other = _regional_event_field(
+                    other_envelope,
+                    centre_longitude=centre_longitude,
+                    centre_latitude=centre_latitude,
+                )
+            except RuntimeError:
+                continue
+            if bool(regional_other.any()):
+                concurrent_regional.append(regional_other)
         raw_mappable = axes[0, column].pcolormesh(
             raw.longitude,
             raw.latitude,
@@ -4125,6 +4367,18 @@ def _plot_method_example(
             shading="auto",
         )
         for row in range(3):
+            for other_envelope in concurrent_regional:
+                axes[row, column].contour(
+                    other_envelope.longitude,
+                    other_envelope.latitude,
+                    other_envelope,
+                    levels=[0.5],
+                    colors=LPO_ENVELOPE_COLOUR,
+                    linewidths=1.1,
+                    linestyles="--",
+                    alpha=0.35,
+                    zorder=3.5,
+                )
             axes[row, column].contour(
                 mask.longitude,
                 mask.latitude,
@@ -4203,6 +4457,15 @@ def _plot_method_example(
             Line2D(
                 [0],
                 [0],
+                color=LPO_ENVELOPE_COLOUR,
+                lw=1.1,
+                ls="--",
+                alpha=0.35,
+                label="Other concurrent LPOs",
+            ),
+            Line2D(
+                [0],
+                [0],
                 color=CENTROID_TRACK_COLOUR,
                 lw=CENTROID_TRACK_LINEWIDTH,
                 label="Centroid path",
@@ -4238,19 +4501,9 @@ def _write_lpo_envelope_gallery(
     metadata_output_directory: Path | None = None,
     tracking_figure_test: bool,
 ) -> None:
-    """Write one Kerns--Chen-style identification figure per selected LPO."""
+    """Write one Kerns--Chen-style identification figure per retained LPO."""
 
-    selected = (
-        events.sort_values(["simulation", "start_time", "event_id"]).copy()
-        if tracking_figure_test
-        else (
-            events[events.figure_envelope_example.astype(bool)]
-            .sort_values(["simulation", "start_time", "event_id"])
-            .copy()
-            if "figure_envelope_example" in events
-            else publication_method_gallery_events(events)
-        )
-    )
+    selected = publication_method_gallery_events(events)
     output_directory.mkdir(parents=True, exist_ok=True)
     metadata_output_directory = (
         output_directory
@@ -4279,12 +4532,7 @@ def _write_lpo_envelope_gallery(
         np.arange(1, len(selection_table) + 1),
     )
     selection_table["selection_method"] = (
-        (
-            "all retained LPOs in the actual-data test subset"
-            if tracking_figure_test
-            else "area-ordered interior quantiles of primary tropical LPOs, "
-            "independently for each simulation"
-        )
+        "all retained LPOs in every available simulation"
     )
     selection_table["product_version"] = PRODUCT_VERSION
     selection_table.to_csv(
@@ -4343,31 +4591,31 @@ def periodic_track_segments(
 
 
 def _read_plot_track_steps(standard: Path) -> pd.DataFrame:
-    """Read the standard precipitation-weighted envelope-centroid tracks."""
+    """Read upstream geometric centroids for tracking-overview plots."""
 
-    lifecycle_path = standard / "lpt_event_relative_diagnostics.csv"
-    if not lifecycle_path.is_file():
+    track_path = standard / "lpt_track_steps.csv"
+    if not track_path.is_file():
         raise FileNotFoundError(
-            f"Missing standard lifecycle tracks: {lifecycle_path}"
+            f"Missing standard upstream track steps: {track_path}"
         )
-    lifecycle = pd.read_csv(lifecycle_path, parse_dates=["Time"])
+    steps = pd.read_csv(track_path, parse_dates=["Time"])
     required = (
         "event_id",
         "Time",
-        "precip_weighted_centroid_lon",
-        "precip_weighted_centroid_lat",
-        "envelope_area_km2",
+        "centroid_lon",
+        "centroid_lat",
+        "area_km2",
     )
-    missing = sorted(set(required) - set(lifecycle.columns))
+    missing = sorted(set(required) - set(steps.columns))
     if missing:
         raise RuntimeError(
-            f"{lifecycle_path} lacks required plotting fields: {missing}"
+            f"{track_path} lacks required plotting fields: {missing}"
         )
-    return lifecycle[list(required)].rename(
+    return steps[list(required)].rename(
         columns={
-            "precip_weighted_centroid_lon": "plot_centroid_lon",
-            "precip_weighted_centroid_lat": "plot_centroid_lat",
-            "envelope_area_km2": "plot_area_km2",
+            "centroid_lon": "plot_centroid_lon",
+            "centroid_lat": "plot_centroid_lat",
+            "area_km2": "plot_area_km2",
         }
     )
 
@@ -4405,14 +4653,21 @@ def _plot_saved_track_panel(
     show_envelope_edges: bool = False,
     annotate_ids: bool = False,
     time_origin: pd.Timestamp | None = None,
+    time_bounds: tuple[pd.Timestamp, pd.Timestamp] | None = None,
 ):
     """Draw one Kerns--Chen-style panel from the stable saved products."""
 
     with xr.open_dataset(standard / "lpt_time_longitude_overview.nc") as overview:
         variable = "equatorial_filtered_precipitation_mm_day"
-        if variable not in overview:
+        candidate_variable = "equatorial_candidate_lpo_envelope"
+        missing_variables = [
+            name
+            for name in (variable, candidate_variable)
+            if name not in overview
+        ]
+        if missing_variables:
             raise RuntimeError(
-                f"{standard}: Figure 2 requires {variable!r}. Rebuild the "
+                f"{standard}: Figure 2 requires {missing_variables}. Rebuild the "
                 f"standard products with {PRODUCT_VERSION}."
             )
         cached_latitude_band = overview.attrs.get(
@@ -4428,6 +4683,19 @@ def _plot_saved_track_panel(
         field = periodic_longitude_field(
             overview[variable].load()
         )
+        candidate_envelopes = periodic_longitude_field(
+            overview[candidate_variable].astype(bool).load()
+        )
+    if time_bounds is not None:
+        field = field.sel(Time=slice(*time_bounds))
+        candidate_envelopes = candidate_envelopes.sel(
+            Time=slice(*time_bounds)
+        )
+        if field.sizes.get("Time", 0) == 0:
+            raise RuntimeError(
+                f"{standard}: saved overview does not intersect figure time "
+                f"bounds {time_bounds[0]} to {time_bounds[1]}"
+            )
     if time_origin is None:
         time_origin = pd.Timestamp(pd.to_datetime(field.Time.values[0]))
     precipitation_cmap, precipitation_norm = (
@@ -4442,7 +4710,22 @@ def _plot_saved_track_panel(
         shading="auto",
         rasterized=True,
     )
+    axis.contour(
+        candidate_envelopes.longitude,
+        simulation_day_values(candidate_envelopes.Time.values, time_origin),
+        candidate_envelopes,
+        levels=[0.5],
+        colors=LPO_ENVELOPE_COLOUR,
+        linewidths=0.55,
+        linestyles="--",
+        alpha=0.35,
+        zorder=2.2,
+    )
     steps = _read_plot_track_steps(standard)
+    if time_bounds is not None:
+        steps = steps[
+            pd.to_datetime(steps.Time).between(*time_bounds)
+        ].copy()
     mask_index = None
     if show_envelope_edges:
         index_path = standard / "lpt_event_mask_index.csv"
@@ -4563,9 +4846,12 @@ def _plot_saved_track_panel(
                 )
             mask_path = standard / mask_index.loc[event.event_id, "mask_file"]
             with xr.open_dataset(mask_path) as product:
-                envelope = equatorial_envelope_for_plot(
-                    product.lpt_envelope_mask
-                )
+                envelope_mask = product.lpt_envelope_mask
+                if time_bounds is not None:
+                    envelope_mask = envelope_mask.sel(
+                        Time=slice(*time_bounds)
+                    )
+                envelope = equatorial_envelope_for_plot(envelope_mask)
                 axis.contour(
                     envelope.longitude,
                     simulation_day_values(envelope.Time.values, time_origin),
@@ -4586,6 +4872,15 @@ def _plot_saved_track_panel(
 
 def _track_legend_handles() -> list[Line2D]:
     return [
+        Line2D(
+            [0],
+            [0],
+            color=LPO_ENVELOPE_COLOUR,
+            alpha=0.35,
+            lw=0.8,
+            ls="--",
+            label="Candidate envelope",
+        ),
         Line2D(
             [0],
             [0],
@@ -4634,58 +4929,70 @@ def _plot_tracking_overview(
 ):
     if simulation not in SIMULATION_DIRS:
         raise ValueError(f"Unknown simulation {simulation!r}")
-    fig, axis = plt.subplots(
+    panel_ranges = (
+        (day_range,)
+        if day_range is not None
+        else (None,)
+        if tracking_figure_test
+        else ((1, 100), (101, 200))
+    )
+    fig, axes = plt.subplots(
         1,
-        figsize=(12, 9),
+        len(panel_ranges),
+        figsize=(12, 9) if len(panel_ranges) == 1 else (17, 8.5),
         constrained_layout=True,
+        sharex=True,
+        squeeze=False,
     )
     standard = primary / simulation / "standard"
     sim_events = events[events.simulation == simulation]
-    mappable = _plot_saved_track_panel(
-        axis,
-        standard,
-        sim_events,
-        show_envelope_edges=True,
-        annotate_ids=True,
-    )
-    axis.set_xlabel("Longitude (°E)")
-    axis.set_ylabel("Simulation day")
-    if day_range is not None:
-        day_start, day_end = day_range
-        axis.set_ylim(float(day_start), float(day_end + 1))
-        ticks = [day_start]
-        ticks.extend(
-            value
-            for value in range(
-                20 * int(np.ceil(day_start / 20.0)),
-                day_end + 1,
-                20,
-            )
-            if value != day_start
+    mappable = None
+    for column, panel_range in enumerate(panel_ranges):
+        axis = axes[0, column]
+        mappable = _plot_saved_track_panel(
+            axis,
+            standard,
+            sim_events,
+            show_envelope_edges=True,
+            annotate_ids=True,
         )
-        if ticks[-1] != day_end:
-            ticks.append(day_end)
-        axis.set_yticks(ticks)
-    axis.legend(
+        axis.set_xlabel("Longitude (°E)")
+        axis.set_ylabel("Simulation day")
+        if panel_range is not None:
+            day_start, day_end = panel_range
+            axis.set_ylim(float(day_start), float(day_end + 1))
+            ticks = [day_start]
+            ticks.extend(
+                value
+                for value in range(
+                    20 * int(np.ceil(day_start / 20.0)),
+                    day_end + 1,
+                    20,
+                )
+                if value != day_start
+            )
+            if ticks[-1] != day_end:
+                ticks.append(day_end)
+            axis.set_yticks(ticks)
+            axis.set_title(f"Simulation days {day_start}–{day_end}")
+    axes[0, 0].legend(
         handles=_track_legend_handles(),
         loc="upper left",
         fontsize=8,
         frameon=True,
     )
+    if mappable is None:
+        raise RuntimeError(f"No Figure 2 panels were drawn for {simulation}")
     fig.colorbar(
         mappable,
-        ax=axis,
+        ax=axes,
         pad=0.015,
         label=r"Filtered rain (mm day$^{-1}$)",
     )
     record_label = (
         "Actual-data test subset"
         if tracking_figure_test
-        else (
-            f"Days {day_range[0]}–{day_range[1]}"
-            if day_range is not None
-            else "Full record"
-        )
+        else "Full record"
     )
     fig.suptitle(
         f"{record_label}: {SIMULATION_LABELS[simulation]} "
@@ -4839,14 +5146,7 @@ def _write_tracking_overview_movie(
         "product_version": PRODUCT_VERSION,
         "upstream_repository": UPSTREAM_REPOSITORY,
         "upstream_commit": UPSTREAM_COMMIT,
-        "source_figures": (
-            [f"02_lpo_tracking_overview_{simulation}.png"]
-            if tracking_figure_test
-            else [
-                f"02_lpo_tracking_overview_{simulation}_days_001_100.png",
-                f"02_lpo_tracking_overview_{simulation}_days_101_200.png",
-            ]
-        ),
+        "source_figures": [f"02_lpo_tracking_overview_{simulation}.png"],
         "output_file": output_path.name,
         "simulation": simulation,
         "record_start": movie_times[0].isoformat(),
@@ -4857,6 +5157,8 @@ def _write_tracking_overview_movie(
         "frames_per_second": TRACKING_MOVIE_FRAMES_PER_SECOND,
         "frame_count": len(windows),
         "rain_field": "equatorial_filtered_precipitation_mm_day",
+        "candidate_envelope_field": "equatorial_candidate_lpo_envelope",
+        "candidate_centroids_drawn": False,
         "rain_latitude_band": TRACKING_OVERVIEW_LATITUDE_BAND,
         "time_axis": (
             "elapsed simulation days numbered from 1 at the first saved "
@@ -4882,7 +5184,7 @@ def _write_tracking_overview_movie(
 
 
 def lpo_population_summary(events: pd.DataFrame) -> pd.DataFrame:
-    """Return event-equal population statistics for each simulation."""
+    """Return population statistics for each simulation."""
 
     selected = events[events.primary_tropical_sample.astype(bool)]
     if "reference_in_record_subset" in selected:
@@ -4935,7 +5237,7 @@ def lpo_population_summary(events: pd.DataFrame) -> pd.DataFrame:
 
 
 def _selected_population_events(events: pd.DataFrame) -> pd.DataFrame:
-    """Return the event-equal primary tropical population."""
+    """Return the primary tropical event population."""
 
     selected = events[events.primary_tropical_sample.astype(bool)].copy()
     if "reference_in_record_subset" in selected:
@@ -4957,7 +5259,7 @@ def _plot_event_distributions(
     *,
     tracking_figure_test: bool = False,
 ):
-    """Plot readable event-equal property CDFs."""
+    """Plot readable event-property CDFs."""
 
     selected = _selected_population_events(events)
     selected = selected.assign(
@@ -5033,9 +5335,7 @@ def _plot_event_distributions(
         if tracking_figure_test
         else ""
     )
-    fig.suptitle(
-        f"{prefix}event-equal tropical LPO property CDFs"
-    )
+    fig.suptitle(f"{prefix}tropical LPO property CDFs")
     return fig
 
 
@@ -5133,7 +5433,7 @@ def default_event_recovery(
     rows = []
     selected = matching[matching.sensitivity_run.isin(sensitivity_runs)]
     for sensitivity_run in sensitivity_runs:
-        for simulation in SIMULATION_DIRS:
+        for simulation in VALIDATION_SIMULATIONS:
             subset = selected[
                 (selected.sensitivity_run == sensitivity_run)
                 & (selected.simulation == simulation)
@@ -5155,425 +5455,284 @@ def default_event_recovery(
     return pd.DataFrame(rows)
 
 
-def _area_time_coverage(
+def _median_iqr(values: pd.Series, scale: float = 1.0) -> tuple[float, ...]:
+    """Return a scaled median and interquartile limits."""
+
+    finite = pd.to_numeric(values, errors="coerce").dropna() / scale
+    if finite.empty:
+        return np.nan, np.nan, np.nan
+    lower, median, upper = finite.quantile((0.25, 0.5, 0.75))
+    return float(median), float(lower), float(upper)
+
+
+def validation_sensitivity_summary(
     events: pd.DataFrame,
-    parameter: str,
-) -> pd.Series:
-    grouped = events.groupby(parameter)
-    return (
-        100.0
-        * grouped.envelope_area_time_km2_h.sum()
-        / (
-            grouped.tracking_domain_area_km2.first()
-            * grouped.analysed_record_days.first()
-            * 24.0
-        )
+    matching: pd.DataFrame,
+) -> pd.DataFrame:
+    """Summarise each validation setting for the compact six-panel figure."""
+
+    sensitivity_runs = tuple(
+        name for name in VALIDATION_RUN_NAMES if name != "threshold_12"
     )
+    recovery = default_event_recovery(
+        matching,
+        sensitivity_runs,
+    ).set_index(["sensitivity_run", "simulation"])
+    rows = []
+    position = 0
+    for family_index, (family, unit, settings) in enumerate(
+        VALIDATION_PARAMETER_FAMILIES
+    ):
+        for run_name, parameter_label in settings:
+            subset = events[
+                (events.run_name == run_name)
+                & (events.simulation == "control")
+            ]
+            duration = _median_iqr(subset.duration_hours, scale=24.0)
+            speed = _median_iqr(subset.zonal_speed_m_s)
+            precipitation = _median_iqr(
+                subset.event_integrated_precipitation,
+                scale=1.0e9,
+            )
+            merger_or_split = (
+                subset.merger_occurred.astype(bool)
+                | subset.split_occurred.astype(bool)
+            )
+            recovered = (
+                1.0
+                if run_name == "threshold_12"
+                else recovery.loc[(run_name, "control"), "recovery_fraction"]
+            )
+            rows.append(
+                {
+                    "family": family,
+                    "family_index": family_index,
+                    "parameter_unit": unit,
+                    "parameter_label": parameter_label,
+                    "run_name": run_name,
+                    "position": position,
+                    "event_count": len(subset),
+                    "duration_median_days": duration[0],
+                    "duration_q25_days": duration[1],
+                    "duration_q75_days": duration[2],
+                    "speed_median_m_s": speed[0],
+                    "speed_q25_m_s": speed[1],
+                    "speed_q75_m_s": speed[2],
+                    "recovery_fraction": recovered,
+                    "precipitation_median_billion_km2_mm": precipitation[0],
+                    "precipitation_q25_billion_km2_mm": precipitation[1],
+                    "precipitation_q75_billion_km2_mm": precipitation[2],
+                    "merger_split_fraction": (
+                        float(merger_or_split.mean())
+                        if len(merger_or_split)
+                        else np.nan
+                    ),
+                }
+            )
+            position += 1
+        position += 1
+    return pd.DataFrame(rows)
+
+
+def _plot_iqr_metric(
+    axis,
+    summary: pd.DataFrame,
+    median_column: str,
+    lower_column: str,
+    upper_column: str,
+) -> None:
+    for _family_index, group in summary.groupby("family_index", sort=True):
+        median = group[median_column].to_numpy(dtype=float)
+        lower = group[lower_column].to_numpy(dtype=float)
+        upper = group[upper_column].to_numpy(dtype=float)
+        axis.errorbar(
+            group.position,
+            median,
+            yerr=np.vstack((median - lower, upper - median)),
+            marker="o",
+            capsize=3,
+            color=SIMULATION_COLOURS["control"],
+        )
+
+
+def _plot_grouped_metric(axis, summary: pd.DataFrame, column: str) -> None:
+    """Plot independent lines for each sensitivity family."""
+
+    for _family_index, group in summary.groupby("family_index", sort=True):
+        axis.plot(
+            group.position,
+            group[column],
+            marker="o",
+            color=SIMULATION_COLOURS["control"],
+        )
 
 
 def _plot_validation_figure(output: Path):
-    """Summarise threshold and sampling-phase sensitivity without mixed axes."""
+    """Plot the grouped control-only sensitivity summary."""
 
     events = _read_validation_events(output)
-    threshold_events = events[
-        events.run_name.str.startswith("threshold_")
-    ].copy()
-    threshold_events["threshold"] = (
-        threshold_events.run_name.str.split("_").str[-1].astype(float)
-    )
     matching = pd.read_csv(output / "validation_event_matching.csv")
-    sampling_runs = ("sampling_00_12", "sampling_06_18")
-    recovered = default_event_recovery(matching, sampling_runs)
-
-    fig, axes = plt.subplots(2, 3, figsize=(12, 8), constrained_layout=True)
-    simulation_offsets = {
-        simulation: offset
-        for simulation, offset in zip(SIMULATION_DIRS, (-0.12, 0.0, 0.12))
-    }
-    for simulation in SIMULATION_DIRS:
-        subset = threshold_events[
-            threshold_events.simulation == simulation
-        ]
-        grouped = subset.groupby("threshold")
-        colour = SIMULATION_COLOURS[simulation]
-        label = SIMULATION_LABELS[simulation]
-        axes[0, 0].plot(
-            grouped.size().index,
-            grouped.size().values,
-            marker="o",
-            color=colour,
-            label=label,
-        )
-        coverage = _area_time_coverage(subset, "threshold")
-        axes[0, 1].plot(
-            coverage.index,
-            coverage.values,
-            marker="o",
-            color=colour,
-        )
-        x = subset.threshold + simulation_offsets[simulation]
-        axes[0, 2].scatter(
-            x,
-            subset.duration_hours / 24.0,
-            s=14,
-            alpha=0.45,
-            color=colour,
-        )
-        axes[1, 0].scatter(
-            x,
-            subset.zonal_speed_m_s,
-            s=14,
-            alpha=0.45,
-            color=colour,
-        )
-        axes[1, 1].scatter(
-            x,
-            subset.event_integrated_precipitation / 1.0e9,
-            s=14,
-            alpha=0.45,
-            color=colour,
-        )
-
-    axes[0, 0].set(title="Tropical event count", ylabel="Events")
-    axes[0, 0].legend(frameon=False)
-    axes[0, 1].set(
-        title="Envelope area–time coverage",
-        ylabel="Coverage (%)",
+    summary = validation_sensitivity_summary(events, matching)
+    fig, axes = plt.subplots(2, 3, figsize=(13, 8), constrained_layout=True)
+    x = summary.position
+    _plot_grouped_metric(axes[0, 0], summary, "event_count")
+    _plot_iqr_metric(
+        axes[0, 1],
+        summary,
+        "duration_median_days",
+        "duration_q25_days",
+        "duration_q75_days",
     )
-    axes[0, 2].set(title="Event duration", ylabel="Duration (days)")
-    axes[1, 0].set(
-        title="Zonal propagation speed",
-        ylabel=r"Speed (m s$^{-1}$)",
+    _plot_iqr_metric(
+        axes[0, 2],
+        summary,
+        "speed_median_m_s",
+        "speed_q25_m_s",
+        "speed_q75_m_s",
     )
-    axes[1, 0].axhline(0.0, color="0.45", lw=0.7)
-    axes[1, 1].set(
-        title="Event-integrated precipitation",
-        ylabel=r"Precipitation ($10^9$ km$^2$ mm)",
+    _plot_grouped_metric(axes[1, 0], summary, "recovery_fraction")
+    _plot_iqr_metric(
+        axes[1, 1],
+        summary,
+        "precipitation_median_billion_km2_mm",
+        "precipitation_q25_billion_km2_mm",
+        "precipitation_q75_billion_km2_mm",
     )
-
-    bar_width = 0.24
-    x_positions = np.arange(len(sampling_runs), dtype=float)
-    for index, simulation in enumerate(SIMULATION_DIRS):
-        subset = recovered[recovered.simulation == simulation].set_index(
-            "sensitivity_run"
-        )
-        axes[1, 2].bar(
-            x_positions + (index - 1) * bar_width,
-            subset.loc[list(sampling_runs), "recovery_fraction"],
-            width=bar_width,
-            color=SIMULATION_COLOURS[simulation],
-            label=SIMULATION_LABELS[simulation],
-        )
-    axes[1, 2].set(
-        title="Default events recovered",
-        ylabel="Recovered fraction",
-        xticks=x_positions,
-        xticklabels=("00/12 UTC", "06/18 UTC"),
-        ylim=(0.0, 1.05),
+    _plot_grouped_metric(
+        axes[1, 2],
+        summary,
+        "merger_split_fraction",
     )
-
-    for axis in axes.flat:
+    titles_and_labels = (
+        ("Tropical event count", "Events"),
+        ("Median event duration (IQR)", "Duration (days)"),
+        ("Median zonal speed (IQR)", r"Speed (m s$^{-1}$)"),
+        ("Primary events recovered", "Recovered fraction"),
+        (
+            "Median integrated precipitation (IQR)",
+            r"Precipitation ($10^9$ km$^2$ mm)",
+        ),
+        ("Events involving merger or split", "Event fraction"),
+    )
+    tick_labels = summary.parameter_label.tolist()
+    family_groups = list(summary.groupby("family_index", sort=True))
+    for axis, (title, ylabel) in zip(axes.flat, titles_and_labels):
+        axis.set(title=title, ylabel=ylabel)
+        axis.set_xticks(x, tick_labels)
         axis.grid(alpha=0.2)
-    for axis in (*axes[0, :], *axes[1, :2]):
-        axis.set_xlabel(r"Threshold (mm day$^{-1}$)")
-        axis.set_xticks((9.0, 12.0, 15.0))
-    fig.suptitle("LPO threshold and temporal-sampling sensitivity")
+        for group_index, (_family_index, group) in enumerate(family_groups):
+            if group_index % 2:
+                axis.axvspan(
+                    group.position.min() - 0.45,
+                    group.position.max() + 0.45,
+                    color="0.94",
+                    zorder=-2,
+                )
+            axis.text(
+                group.position.mean(),
+                -0.16,
+                group.family.iloc[0],
+                transform=axis.get_xaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=8,
+            )
+    axes[0, 2].axhline(0.0, color="0.45", lw=0.7)
+    axes[1, 0].set_ylim(0.0, 1.05)
+    axes[1, 2].set_ylim(0.0, 1.05)
+    fig.suptitle("Control LPO tracking sensitivity: first 100 days")
     return fig
 
 
-def _plot_filter_validation_figure(output: Path):
-    """Summarise temporal-mean and Gaussian-filter-scale sensitivity."""
+def _validation_figure_time_bounds(
+    output: Path,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Read the exact calculation period used by validation figures."""
 
-    events = _read_validation_events(output)
-    families = (
-        (
-            "Temporal running mean",
-            (
-                ("running_mean_48", 48.0),
-                ("running_mean_60", 60.0),
-                ("threshold_12", 72.0),
-            ),
-            "Running mean (h)",
-        ),
-        (
-            "Gaussian spatial filter",
-            (
-                ("gaussian_sigma_3", 3.0),
-                ("threshold_12", 5.0),
-                ("gaussian_sigma_7", 7.0),
-            ),
-            "Gaussian σ (°)",
-        ),
+    reference_metadata_path = (
+        output
+        / "threshold_12"
+        / "control"
+        / "preprocessing_metadata.json"
     )
-    fig, axes = plt.subplots(2, 4, figsize=(12, 7), constrained_layout=True)
-    offsets = {
-        simulation: offset
-        for simulation, offset in zip(SIMULATION_DIRS, (-0.08, 0.0, 0.08))
-    }
-    for row, (family_title, runs, xlabel) in enumerate(families):
-        run_to_value = dict(runs)
-        family = events[events.run_name.isin(run_to_value)].copy()
-        family["parameter"] = family.run_name.map(run_to_value).astype(float)
-        parameter_values = [value for _run, value in runs]
-        parameter_spacing = min(np.diff(parameter_values))
-        for simulation in SIMULATION_DIRS:
-            subset = family[family.simulation == simulation]
-            grouped = subset.groupby("parameter")
-            colour = SIMULATION_COLOURS[simulation]
-            axes[row, 0].plot(
-                grouped.size().index,
-                grouped.size().values,
-                marker="o",
-                color=colour,
-                label=SIMULATION_LABELS[simulation],
-            )
-            coverage = _area_time_coverage(subset, "parameter")
-            axes[row, 1].plot(
-                coverage.index,
-                coverage.values,
-                marker="o",
-                color=colour,
-            )
-            jittered = (
-                subset.parameter
-                + offsets[simulation] * parameter_spacing
-            )
-            axes[row, 2].scatter(
-                jittered,
-                subset.duration_hours / 24.0,
-                s=13,
-                alpha=0.4,
-                color=colour,
-            )
-            axes[row, 3].scatter(
-                jittered,
-                subset.zonal_speed_m_s,
-                s=13,
-                alpha=0.4,
-                color=colour,
-            )
-        axes[row, 0].set_ylabel(f"{family_title}\nEvents")
-        axes[row, 1].set_ylabel("Coverage (%)")
-        axes[row, 2].set_ylabel("Duration (days)")
-        axes[row, 3].set_ylabel(r"Speed (m s$^{-1}$)")
-        axes[row, 3].axhline(0.0, color="0.45", lw=0.7)
-        for axis in axes[row]:
-            axis.set_xlabel(xlabel)
-            axis.set_xticks(parameter_values)
-            axis.grid(alpha=0.2)
-    for axis, title in zip(
-        axes[0],
-        (
-            "Tropical event count",
-            "Envelope area–time coverage",
-            "Event duration",
-            "Zonal propagation speed",
-        ),
-    ):
-        axis.set_title(title)
-    axes[0, 0].legend(frameon=False, fontsize=8)
-    fig.suptitle("LPO temporal- and spatial-filter sensitivity")
-    return fig
+    reference_metadata = json.loads(reference_metadata_path.read_text())
+    try:
+        time_bounds = (
+            pd.Timestamp(reference_metadata["reference_start"]),
+            pd.Timestamp(reference_metadata["reference_end"]),
+        )
+    except KeyError as exc:
+        raise RuntimeError(
+            f"{reference_metadata_path} lacks validation reference bounds"
+        ) from exc
+    if time_bounds[1] <= time_bounds[0]:
+        raise RuntimeError(
+            f"{reference_metadata_path} has invalid validation reference "
+            f"bounds {time_bounds[0]} to {time_bounds[1]}"
+        )
+    return time_bounds
 
 
 def _plot_validation_track_figures(
     output: Path,
 ) -> list[tuple[str, object]]:
-    """Show every validation track using the Kerns--Chen Figure 4a design."""
+    """Show each control sensitivity using the saved upstream centroids."""
 
     figures: list[tuple[str, object]] = []
-    figure_groups = {
-        "threshold": (
-            "Threshold sensitivity",
-            (
-                ("threshold_9", "9 mm day$^{-1}$"),
-                ("threshold_12", "12 mm day$^{-1}$"),
-                ("threshold_15", "15 mm day$^{-1}$"),
-            ),
-        ),
-        "temporal_mean": (
-            "Temporal running-mean sensitivity",
-            (
-                ("running_mean_48", "48 h"),
-                ("running_mean_60", "60 h"),
-                ("threshold_12", "72 h"),
-            ),
-        ),
-        "gaussian_scale": (
-            "Gaussian spatial-filter sensitivity",
-            (
-                ("gaussian_sigma_3", "σ = 3°"),
-                ("threshold_12", "σ = 5°"),
-                ("gaussian_sigma_7", "σ = 7°"),
-            ),
-        ),
-        "sampling_phase": (
-            "Temporal-sampling sensitivity (physical 72-hour mean retained)",
-            (
-                ("threshold_12", "all six-hourly times"),
-                ("sampling_00_12", "00 and 12 UTC"),
-                ("sampling_06_18", "06 and 18 UTC"),
-            ),
-        ),
-        "record_subset": (
-            (
-                "Record-subset sensitivity: primary tropical events are "
-                "assigned by lifecycle peak"
-            ),
-            (
-                ("threshold_12", "complete record"),
-                ("record_first_half", "first half"),
-                ("record_second_half", "second half"),
-            ),
-        ),
-    }
-    for filename_suffix, (title, runs) in figure_groups.items():
-        record_subset_figure = filename_suffix == "record_subset"
+    suffixes = ("threshold", "gap", "overlap", "merge_split")
+    time_bounds = _validation_figure_time_bounds(output)
+    time_origin = time_bounds[0]
+    for suffix, (title, unit, runs) in zip(
+        suffixes,
+        VALIDATION_PARAMETER_FAMILIES,
+    ):
         fig, axes = plt.subplots(
-            len(SIMULATION_DIRS),
+            1,
             len(runs),
-            figsize=(12, 10),
+            figsize=(4.1 * len(runs), 5.2),
             constrained_layout=True,
             sharex=True,
-            sharey=not record_subset_figure,
+            sharey=True,
+            squeeze=False,
         )
         mappable = None
-        legend_axis = None
-        reference_origins = {}
-        for simulation in SIMULATION_DIRS:
-            reference_path = (
-                output
-                / "threshold_12"
-                / simulation
-                / "standard"
-                / "lpt_time_longitude_overview.nc"
-            )
-            with xr.open_dataset(reference_path) as reference:
-                reference_origins[simulation] = pd.Timestamp(
-                    pd.to_datetime(reference.Time.values[0])
-                )
         for column, (run_name, run_label) in enumerate(runs):
-            for row, simulation in enumerate(SIMULATION_DIRS):
-                axis = axes[row, column]
-                standard = output / run_name / simulation / "standard"
-                required = (
-                    standard / "lpt_time_longitude_overview.nc",
-                    standard / "lpt_events.csv",
-                    standard / "lpt_track_steps.csv",
-                    standard / "lpt_event_relative_diagnostics.csv",
-                    standard / "lpt_event_mask_index.csv",
-                )
-                if not all(path.exists() for path in required):
-                    raise FileNotFoundError(
-                        "Validation track panel lacks required products: "
-                        + ", ".join(
-                            str(path)
-                            for path in required
-                            if not path.exists()
-                        )
-                    )
-                events = pd.read_csv(standard / "lpt_events.csv")
-                if record_subset_figure:
-                    events = events[
-                        events.primary_tropical_sample.astype(bool)
-                    ]
-                    if run_name.startswith("record_"):
-                        events = events[
-                            events.reference_in_record_subset.astype(bool)
-                        ]
-                mappable = _plot_saved_track_panel(
-                    axis,
-                    standard,
-                    events,
-                    show_envelope_edges=True,
-                    time_origin=reference_origins[simulation],
-                )
-                if record_subset_figure:
-                    with xr.open_dataset(
-                        standard / "lpt_time_longitude_overview.nc"
-                    ) as overview:
-                        field_times = pd.DatetimeIndex(
-                            pd.to_datetime(overview.Time.values)
-                        )
-                    if run_name.startswith("record_"):
-                        midpoint = len(field_times) // 2
-                        if run_name == "record_first_half":
-                            visible_times = field_times[:midpoint]
-                        else:
-                            visible_times = field_times[midpoint:]
-                        visible_start, visible_end = (
-                            visible_times[0],
-                            visible_times[-1],
-                        )
-                    else:
-                        visible_start, visible_end = (
-                            field_times[0],
-                            field_times[-1],
-                        )
-                    day_limits = simulation_day_values(
-                        [visible_start, visible_end],
-                        reference_origins[simulation],
-                    )
-                    axis.set_ylim(day_limits[0], day_limits[1])
-                    axis.text(
-                        0.98,
-                        0.02,
-                        f"n={len(events)}",
-                        transform=axis.transAxes,
-                        ha="right",
-                        va="bottom",
-                        fontsize=8,
-                        bbox={
-                            "facecolor": "white",
-                            "edgecolor": "none",
-                            "alpha": 0.75,
-                            "pad": 1.5,
-                        },
-                        zorder=6,
-                    )
-                if legend_axis is None:
-                    legend_axis = axis
-                if row == 0:
-                    axis.set_title(run_label)
-                if column == 0:
-                    axis.set_ylabel(
-                        f"{SIMULATION_LABELS[simulation]}\nSimulation day"
-                    )
-                elif record_subset_figure:
-                    axis.set_ylabel("Simulation day")
-                if row == len(SIMULATION_DIRS) - 1:
-                    axis.set_xlabel("Longitude (°E)")
-        if mappable is None or legend_axis is None:
-            raise RuntimeError(
-                f"No validation track panels were drawn for {filename_suffix}"
+            axis = axes[0, column]
+            standard = output / run_name / "control" / "standard"
+            events = pd.read_csv(standard / "lpt_events.csv")
+            mappable = _plot_saved_track_panel(
+                axis,
+                standard,
+                events,
+                show_envelope_edges=True,
+                time_origin=time_origin,
+                time_bounds=time_bounds,
             )
+            axis.set_title(
+                run_label if unit == "setting" else f"{run_label} {unit}"
+            )
+            axis.set_xlabel("Longitude (°E)")
+            if column == 0:
+                axis.set_ylabel("Simulation day")
+        if mappable is None:
+            raise RuntimeError(f"No validation track panels were drawn for {suffix}")
         fig.colorbar(
             mappable,
             ax=axes,
             pad=0.015,
             label=r"Filtered rain (mm day$^{-1}$)",
         )
-        legend_axis.legend(
+        axes[0, 0].legend(
             handles=_track_legend_handles(),
             loc="upper left",
             fontsize=6.5,
             frameon=True,
         )
         fig.suptitle(
-            f"{title}\n"
-            + (
-                "Half-record columns show only assigned events and are "
-                "zoomed to the corresponding half"
-                if record_subset_figure
-                else (
-                    "All calculated tracks; Kerns–Chen (2016) Figure 4a "
-                    "presentation"
-                )
-            )
+            f"Control {title.lower()} sensitivity: first 100 days\n"
+            "Kerns–Chen (2016) Figure 4a presentation"
         )
-        figures.append(
-            (f"validation_lpo_tracks_{filename_suffix}", fig)
-        )
+        figures.append((f"validation_lpo_tracks_{suffix}", fig))
     return figures
 
 

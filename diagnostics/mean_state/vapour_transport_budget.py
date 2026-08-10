@@ -68,7 +68,7 @@ LV = 2.5e6
 SECONDS_PER_DAY = 86_400.0
 EARTH_RADIUS_M = 6_371_000.0
 FIXED_TOP_PA = 20_000.0
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 17
 EXECUTION_LAYOUT_VERSION = 2
 MAX_TROPOPAUSE_SURFACE_JUMP_M = 2_000.0
 PLOT_LATITUDE_BOUNDS = (-40.0, 40.0)
@@ -865,7 +865,7 @@ def derive_products(ds, simulation):
     if "Time" in native_height.dims:
         native_height = trapezoidal_time_mean(native_height)
     native_height_zonal = native_height.mean("longitude", skipna=True)
-    zmid = native_height_zonal.mean("latitude", skipna=True)
+    zmid = lat_mean(native_height_zonal)
 
     rates = xr.Dataset(
         {
@@ -1589,9 +1589,7 @@ def _products_and_state_from_statistics(
                         means["pressure"].mean("longitude", skipna=True)
                     ),
                     "native_midlevel_height_zonal_mean": native_height_zonal,
-                    "native_midlevel_height": native_height_zonal.mean(
-                        "latitude", skipna=True
-                    ),
+                    "native_midlevel_height": lat_mean(native_height_zonal),
                     "top_flux_valid_fraction": (
                         statistics.top_flux_valid_count / sample_count
                     ),
@@ -1677,10 +1675,8 @@ def _combine_product_latitude_batches(batches):
         compat="override",
         join="exact",
     ).sortby("latitude")
-    combined["native_midlevel_height"] = (
-        combined.native_midlevel_height_zonal_mean.mean(
-            "latitude", skipna=True
-        )
+    combined["native_midlevel_height"] = lat_mean(
+        combined.native_midlevel_height_zonal_mean
     )
     combined.native_midlevel_height.attrs.update(height_attrs)
     return combined
@@ -2264,7 +2260,7 @@ def compute_cached_transport_attribution(products, test=False):
     return attribution
 
 
-def tropical_mean(da, bounds=(-10.0, 10.0)):
+def deep_tropical_mean(da, bounds=(-10.0, 10.0)):
     subset = da.sel(latitude=slice(*bounds))
     dims = [dim for dim in ("latitude", "longitude") if dim in subset.dims]
     weights = np.cos(np.deg2rad(subset.latitude))
@@ -2337,7 +2333,9 @@ def summary_table(products, attribution):
                         "boundary": boundary,
                         "term": term,
                         "global_mean_mm_day": float(lat_mean(field.mean("longitude"))),
-                        "tropical_mean_mm_day": float(tropical_mean(field)),
+                        "deep_tropical_mean_mm_day": float(
+                            deep_tropical_mean(field)
+                        ),
                     }
                 )
 
@@ -2363,15 +2361,15 @@ def summary_table(products, attribution):
                         "global_mean_mm_day": float(
                             lat_mean(response_field.mean("longitude"))
                         ),
-                        "tropical_mean_mm_day": float(
-                            tropical_mean(response_field)
+                        "deep_tropical_mean_mm_day": float(
+                            deep_tropical_mean(response_field)
                         ),
                     }
                 )
         for component in COMPONENT_NAMES:
             values = {
                 comparison: float(
-                    tropical_mean(
+                    deep_tropical_mean(
                         attribution.convergence_change.sel(
                             comparison=comparison,
                             boundary=boundary,
@@ -2396,7 +2394,7 @@ def summary_table(products, attribution):
                         "boundary": boundary,
                         "term": f"convergence_{component}",
                         "global_mean_mm_day": np.nan,
-                        "tropical_mean_mm_day": value,
+                        "deep_tropical_mean_mm_day": value,
                     }
                 )
     return pd.DataFrame(rows)
@@ -2912,7 +2910,7 @@ def plot_attribution(attribution, figsave):
     plt.close(fig)
 
 
-def plot_native_tropical_profiles(products, figsave):
+def plot_native_deep_tropical_profiles(products, figsave):
     fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True, sharey=True)
     variables = (
         (
@@ -2923,9 +2921,11 @@ def plot_native_tropical_profiles(products, figsave):
         ("native_relative_humidity_zonal_mean", 100.0, "Relative humidity (%)"),
     )
     for simulation, color, product in zip(SIM_NAMES, SIM_COLORS, products):
-        pressure = tropical_mean(product.native_pressure_zonal_mean) / 100.0
+        pressure = (
+            deep_tropical_mean(product.native_pressure_zonal_mean) / 100.0
+        )
         for ax, (variable, scale, label) in zip(axes, variables):
-            profile = tropical_mean(product[variable]) * scale
+            profile = deep_tropical_mean(product[variable]) * scale
             if variable == "native_relative_humidity_zonal_mean":
                 profile = profile.clip(0.0, 100.0)
             valid_layer = (
@@ -2952,7 +2952,7 @@ def plot_native_tropical_profiles(products, figsave):
         )
     for simulation, color, product in zip(SIM_NAMES, SIM_COLORS, products):
         cold_point_pressure = float(
-            tropical_mean(
+            deep_tropical_mean(
                 product.boundary_pressure_mean.sel(
                     boundary="cold_point", drop=True
                 )
@@ -2990,11 +2990,11 @@ def plot_native_tropical_profiles(products, figsave):
         r"10$^\circ$S-10$^\circ$N native-level moisture and thermal structure; "
         r"lines show each simulation's mean cold-point $p_t$"
     )
-    figsave.save(fig, "native_tropical_moisture_profiles", number=5)
+    figsave.save(fig, "native_deep_tropical_moisture_profiles", number=5)
     plt.close(fig)
 
 
-def plot_tropical_summary(products, figsave):
+def plot_deep_tropical_summary(products, figsave):
     terms = BUDGET_PLOT_TERMS
     fig, axes = plt.subplots(1, len(BOUNDARIES), figsize=(13, 4), constrained_layout=True)
     x = np.arange(len(terms))
@@ -3004,7 +3004,11 @@ def plot_tropical_summary(products, figsave):
             zip(SIM_NAMES, SIM_COLORS, products)
         ):
             values = [
-                float(tropical_mean(_budget_field(product, term, boundary, sign)))
+                float(
+                    deep_tropical_mean(
+                        _budget_field(product, term, boundary, sign)
+                    )
+                )
                 for term, sign, _symbol, _description in terms
             ]
             ax.bar(
@@ -3021,7 +3025,7 @@ def plot_tropical_summary(products, figsave):
         r"10$^\circ$S-10$^\circ$N mean signed budget contributions: "
         r"$\partial_tW=E-P-\nabla_h\!\cdot\mathbf{IVT}+F_t+R$"
     )
-    figsave.save(fig, "tropical_budget_summary", number=6)
+    figsave.save(fig, "deep_tropical_budget_summary", number=6)
     plt.close(fig)
 
 
@@ -3257,7 +3261,11 @@ def plot_poleward_ivt_overview(products, figsave):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--force-cache", action="store_true")
-    parser.add_argument("--test", action="store_true", help="Run a small tropical/time subset")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run a small deep-tropical/time subset",
+    )
     parser.add_argument("--test-times", type=int, default=5)
     parser.add_argument("--no-save", action="store_true")
     parser.add_argument("--figures", nargs="+", type=int)
@@ -3300,8 +3308,8 @@ def main():
         shared_vmax=shared_budget_vmax,
     )
     plot_attribution(attribution, figsave)
-    plot_native_tropical_profiles(products, figsave)
-    plot_tropical_summary(products, figsave)
+    plot_native_deep_tropical_profiles(products, figsave)
+    plot_deep_tropical_summary(products, figsave)
     plot_top_exchange_components(products, figsave)
     plot_ivt_overview(products, figsave)
     plot_poleward_ivt_overview(products, figsave)

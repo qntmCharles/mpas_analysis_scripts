@@ -100,7 +100,7 @@ hemisphere_jet_bounds = {
     "SH": (-85.0, -5.0),
     "NH": (5.0, 85.0),
 }
-subtropical_jet_lat_bounds = {
+subtropical_jet_search_lat_bounds = {
     "SH": (-45.0, -10.0),
     "NH": (10.0, 45.0),
 }
@@ -208,7 +208,7 @@ def subtropical_jet_core(field, lat_bounds, z_bounds=subtropical_jet_height_boun
 def draw_subtropical_search_boxes(ax):
     z0 = subtropical_jet_height_bounds[0] / 1000.0
     z1 = subtropical_jet_height_bounds[1] / 1000.0
-    for bounds in subtropical_jet_lat_bounds.values():
+    for bounds in subtropical_jet_search_lat_bounds.values():
         x0, x1 = bounds
         ax.plot(
             [x0, x1, x1, x0, x0],
@@ -589,7 +589,13 @@ def orient_annular_mode(eof, index, hemisphere):
         poleward = vertical_mean.where(vertical_mean.latitude <= split_lat, drop=True)
         equatorward = vertical_mean.where(vertical_mean.latitude > split_lat, drop=True)
 
-    contrast = float(poleward.mean(skipna=True).values - equatorward.mean(skipna=True).values)
+    poleward_mean = poleward.weighted(
+        latitude_weights(poleward.latitude)
+    ).mean("latitude", skipna=True)
+    equatorward_mean = equatorward.weighted(
+        latitude_weights(equatorward.latitude)
+    ).mean("latitude", skipna=True)
+    contrast = float(poleward_mean.values - equatorward_mean.values)
     if np.isfinite(contrast) and contrast < 0:
         eof_attrs = eof.attrs.copy()
         index_attrs = index.attrs.copy()
@@ -804,7 +810,7 @@ if should_run_figure(6):
             field = model_height_time_mean_zonal_u(zds)
             jet_structure_fields[i] = field
 
-            for hemisphere, bounds in subtropical_jet_lat_bounds.items():
+            for hemisphere, bounds in subtropical_jet_search_lat_bounds.items():
                 core = subtropical_jet_core(field, bounds)
                 jet_core_lookup[(i, hemisphere)] = core
                 if core is None:
@@ -1146,7 +1152,7 @@ if should_run_figure(6) and jet_structure_fields:
                 if row == 0:
                     axis.tick_params(labelbottom=False)
 
-            for hemisphere in subtropical_jet_lat_bounds:
+            for hemisphere in subtropical_jet_search_lat_bounds:
                 run_core = jet_core_lookup.get((i, hemisphere))
                 control_core = jet_core_lookup.get((0, hemisphere))
                 plot_jet_core_marker(ax[0, i], run_core, color="gold", marker="o")

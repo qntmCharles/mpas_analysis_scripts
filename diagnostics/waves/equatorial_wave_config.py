@@ -6,9 +6,9 @@ rectangular TD/easterly-wave filter, not a shallow-water normal-mode filter.
 """
 
 MISSING_EQUIVALENT_DEPTH = -999.0
-WAVE_CONFIG_VERSION = "equatorial-wave-bands-v3-strict-schema"
+WAVE_CONFIG_VERSION = "equatorial-wave-bands-v4-mrg"
 FILTERED_WAVE_PRODUCT_VERSION = (
-    "equatorial-wave-filtered-v6-corrected-t-nudge-omega"
+    "equatorial-wave-filtered-v7-cosine-latitude"
 )
 EASTWARD_INTRASEASONAL_FILTER = "Eastward_intraseasonal"
 
@@ -46,6 +46,11 @@ WAVE_BOXES = {
         k=(1, 14), period=(2.5, 20.0), depth=(8, 90),
         label="Kelvin", filter_name="Kelvin", components=("symmetric",),
     ),
+    "MRG": dict(
+        k=(-10, -1), period=(3.0, 8.0), depth=(8, 90),
+        label="Mixed Rossby-gravity", filter_name="MRG",
+        components=("antisymmetric",),
+    ),
     "EIG": dict(
         k=(1, 14), period=(1.8, 4.5), depth=(8, 90),
         label="EIG", filter_name="IG0", components=("antisymmetric",),
@@ -69,6 +74,7 @@ WAVE_BOXES = {
 WAVE_LATITUDE_PROJECTION = {
     EASTWARD_INTRASEASONAL_FILTER: "symmetric",
     "Kelvin": "symmetric",
+    "MRG": "antisymmetric",
     "EIG": "antisymmetric",
     "IG_antisym": "antisymmetric",
     # Published easterly-wave filtering uses rainfall averaged across the
@@ -84,6 +90,7 @@ ALL_CACHED_FILTERS = tuple(WAVE_BOXES)
 WAVE_RESPONSE_FILTERS = (
     EASTWARD_INTRASEASONAL_FILTER,
     "Kelvin",
+    "MRG",
     "Easterly",
     "ER",
 )
@@ -91,12 +98,14 @@ VERTICAL_STRUCTURE_FILTERS = ALL_CACHED_FILTERS
 TOP_HEAVINESS_FILTERS = (
     EASTWARD_INTRASEASONAL_FILTER,
     "Kelvin",
+    "MRG",
     "ER",
     "Easterly",
 )
-SHORT_LAG_FILTERS = ("Kelvin", "Easterly", "ER")
+SHORT_LAG_FILTERS = ("Kelvin", "MRG", "Easterly", "ER")
 SHORT_PERIOD_CRITICAL_LEVEL_FILTERS = (
     "Kelvin",
+    "MRG",
     "EIG",
     "IG_antisym",
     "Easterly",

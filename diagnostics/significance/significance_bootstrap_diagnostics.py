@@ -49,6 +49,7 @@ from diagnostics.diagnostic_helpers import (
     total_precip_accum, vertical_dim, vertical_velocity_from_zm,
     write_json_file,
 )
+from diagnostics.ttl import TTL_HEIGHT_BOUNDS_M
 from diagnostics.convection.high_cloud_classification import (
     CLASSIFICATION_CACHE_VERSION,
     HighCloudThresholds,
@@ -153,7 +154,7 @@ TROPICAL_LAT_BOUNDS = (-20.0, 20.0)
 DEEP_TROPICS_LAT_BOUNDS = (-10.0, 10.0)
 WAVE_FILTER_LAT_BOUNDS = (-10.0, 10.0)
 
-TTL_Z_BOUNDS_M = (14000.0, 18000.0)
+TTL_Z_BOUNDS_M = TTL_HEIGHT_BOUNDS_M
 UPPER_TROPOSPHERE_Z_BOUNDS_M = (12000.0, 18000.0)
 
 PRECIP_STRONG_THRESHOLD = 5.0
@@ -231,8 +232,8 @@ COMPARISONS = [
 ]
 
 LATHEIGHT_DOMAINS = {
-    "DeepTropics_TTL_14_18km": dict(lat_bounds=DEEP_TROPICS_LAT_BOUNDS, z_bounds=TTL_Z_BOUNDS_M),
-    "Tropics_TTL_14_18km": dict(lat_bounds=TROPICAL_LAT_BOUNDS, z_bounds=TTL_Z_BOUNDS_M),
+    "DeepTropics_TTL": dict(lat_bounds=DEEP_TROPICS_LAT_BOUNDS, z_bounds=TTL_Z_BOUNDS_M),
+    "Tropics_TTL": dict(lat_bounds=TROPICAL_LAT_BOUNDS, z_bounds=TTL_Z_BOUNDS_M),
     "Tropics_upper_troposphere_12_18km": dict(lat_bounds=TROPICAL_LAT_BOUNDS, z_bounds=UPPER_TROPOSPHERE_Z_BOUNDS_M),
 }
 
@@ -1346,7 +1347,10 @@ def plot_wavenumber_bootstrap_differences(diff_by_direction_field):
             if ci == 0:
                 ax.set_ylabel("Variance-fraction response")
     axes[0, 0].legend(frameon=False, fontsize=8)
-    fig.suptitle("Tropical wavenumber variance-fraction block-consistency responses")
+    fig.suptitle(
+        "Deep-tropical wavenumber variance-fraction "
+        "block-consistency responses"
+    )
     figsave.save(fig, "wavenumber_variance_fraction_bootstrap_response", number=9)
     plt.close(fig)
 

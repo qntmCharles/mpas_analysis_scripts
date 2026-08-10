@@ -12,6 +12,8 @@ from matplotlib.patches import Patch
 import scipy.interpolate as intp
 import xarray as xr
 
+from diagnostics.ttl import TTL_HEIGHT_BOUNDS_M
+
 
 DEFAULT_SIMULATION_PARENT_DIR = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on"
 DEFAULT_DIAGNOSTIC_OUTPUT_ROOT = "/home/cwp29/tmp/mpas/crf_on"
@@ -87,7 +89,9 @@ def standardize_cldfrac_vertical_coordinate(ds):
     if "zgrid" not in ds.data_vars:
         raise ValueError("Cannot assign geometric z coordinate to cldfrac: zgrid is missing")
 
-    zgrid_mean = ds.zgrid.mean(dim=("latitude", "longitude"))
+    zgrid_mean = lat_mean(
+        ds.zgrid.mean(dim="longitude", skipna=True)
+    )
     zmid = 0.5 * (
         zgrid_mean.isel(nVertLevelsP1=slice(0, -1)).values
         + zgrid_mean.isel(nVertLevelsP1=slice(1, None)).values
@@ -208,7 +212,7 @@ def midlevel_height_from_latlon(ds, latitude_sel=None, mean_latitude=False):
         zgrid = zgrid.sel(latitude=latitude_sel)
     zgrid = zgrid.mean(dim="longitude")
     if mean_latitude:
-        zgrid = zgrid.mean(dim="latitude")
+        zgrid = lat_mean(zgrid)
 
     zmid_values = 0.5 * (
         zgrid.isel(nVertLevelsP1=slice(0, -1)).values
@@ -229,11 +233,25 @@ def align_vertical_velocity_to_reference(w, reference):
     w_dim = vertical_dim(w)
     target_dim = vertical_dim(reference)
 
-    if w.sizes[w_dim] != reference.sizes[target_dim]:
+    source_levels = w.sizes[w_dim]
+    target_levels = reference.sizes[target_dim]
+    if source_levels == target_levels + 1:
+        lower = w.isel({w_dim: slice(0, -1)}).rename(
+            {w_dim: target_dim}
+        )
+        upper = w.isel({w_dim: slice(1, None)}).rename(
+            {w_dim: target_dim}
+        )
+        target_coordinate = reference[target_dim]
+        lower = lower.assign_coords({target_dim: target_coordinate})
+        upper = upper.assign_coords({target_dim: target_coordinate})
+        w = 0.5 * (lower + upper)
+        w_dim = target_dim
+    elif source_levels != target_levels:
         raise ValueError(
-            "Standard vertical velocity and its reference field must use the "
-            "same native mid-level grid; got "
-            f"{w.sizes[w_dim]} and {reference.sizes[target_dim]} levels"
+            "Vertical velocity must use the same native mid-level grid or "
+            "bounding interfaces; got "
+            f"{source_levels} velocity levels and {target_levels} targets"
         )
 
     if w_dim != target_dim:
@@ -504,7 +522,45 @@ def standardize_latlon_dataset(ds, needed_vars=None):
 
 
 def lat_mean(da, lat_dim="latitude"):
-    return da.weighted(np.cos(np.deg2rad(da[lat_dim]))).mean(dim=lat_dim)
+    return da.weighted(np.cos(np.deg2rad(da[lat_dim]))).mean(
+        dim=lat_dim, skipna=True
+    )
+
+
+def cosine_weighted_latitude_coarsen(
+    da,
+    window,
+    lat_dim="latitude",
+    boundary="trim",
+):
+    """Coarsen latitude with cosine weights and a finite-data denominator."""
+    coarse_dim = f"{lat_dim}_coarse"
+    window_dim = f"{lat_dim}_window"
+    constructed = da.coarsen(
+        {lat_dim: int(window)}, boundary=boundary
+    ).construct(**{lat_dim: (coarse_dim, window_dim)})
+    weights = np.cos(np.deg2rad(constructed[lat_dim])).clip(min=0.0)
+    coarse_latitude = constructed[lat_dim].mean(window_dim)
+    result = constructed.weighted(weights).mean(window_dim, skipna=True)
+    return result.rename({coarse_dim: lat_dim}).assign_coords(
+        {lat_dim: coarse_latitude.values}
+    )
+
+
+def cosine_weighted_power_input(da, lat_dim="latitude"):
+    """Scale paired latitudes so a spectral latitude sum is area-weighted."""
+    latitude = da[lat_dim]
+    weights = np.cos(np.deg2rad(latitude)).clip(min=0.0)
+    north_total = weights.where(latitude > 0.0, drop=True).sum()
+    south_total = weights.where(latitude < 0.0, drop=True).sum()
+    if not np.isclose(
+        float(north_total), float(south_total), rtol=1.0e-7, atol=1.0e-12
+    ):
+        raise ValueError(
+            "Cosine-weighted symmetric spectra require paired hemispheres"
+        )
+    normalised = weights.where(latitude != 0.0, 0.0) / north_total
+    return da * np.sqrt(normalised)
 
 
 def latitude_is_hemispherically_symmetric(latitude, rtol=1e-7, atol=1e-8):
@@ -1437,7 +1493,7 @@ def median_time_step_days(da):
     return float(np.median(np.diff(values) / np.timedelta64(1, "D")))
 
 
-def weighted_tropical_mean(da, lat_bounds):
+def weighted_latitude_band_mean(da, lat_bounds):
     """Return a cosine-latitude-weighted horizontal mean."""
     field = subset_latitude(finite_or_nan(da), lat_bounds=lat_bounds)
     dims = [dim for dim in ("latitude", "longitude") if dim in field.dims]
@@ -1601,10 +1657,11 @@ def stride_indexers(
 
 
 def compute_ttl_diagnostics(zonal_dataset, precip_reference):
-    """Derive 14--18 km static stability and shear from the fixed zm schema."""
+    """Derive TTL static stability and shear from the fixed zonal schema."""
     z_coord = zonal_dataset.z
     ttl_mask = xr.DataArray(
-        (z_coord >= 14_000.0) & (z_coord <= 18_000.0),
+        (z_coord >= TTL_HEIGHT_BOUNDS_M[0])
+        & (z_coord <= TTL_HEIGHT_BOUNDS_M[1]),
         dims=("z",),
         coords={"z": z_coord},
     )
@@ -1739,7 +1796,7 @@ def symmetric_percentile_levels_for_fields(
 # -----------------------------------------------------------------------------
 
 
-DEFAULT_TROPICAL_LAT_BOUNDS = (-10.0, 10.0)
+DEFAULT_DEEP_TROPICAL_LAT_BOUNDS = (-10.0, 10.0)
 
 
 def accumulated_precipitation_components(ds):
@@ -1750,13 +1807,18 @@ def accumulated_precipitation_components(ds):
     return (convective + resolved).astype(np.float32), convective, resolved
 
 
-def domain_fields(field, tropical_lat_bounds=DEFAULT_TROPICAL_LAT_BOUNDS):
-    """Return lazy global and tropical views without loading either view."""
+def domain_fields(
+    field,
+    deep_tropical_lat_bounds=DEFAULT_DEEP_TROPICAL_LAT_BOUNDS,
+):
+    """Return lazy global and deep-tropical views without loading either."""
     lat_name = "latitude" if "latitude" in field.dims else "lat"
-    lo, hi = tropical_lat_bounds
+    lo, hi = deep_tropical_lat_bounds
     latitude = field[lat_name]
-    tropical = field.where((latitude >= lo) & (latitude <= hi), drop=True)
-    return field, tropical
+    deep_tropical = field.where(
+        (latitude >= lo) & (latitude <= hi), drop=True
+    )
+    return field, deep_tropical
 
 
 def _histogram_task(field, bins, value_range):
@@ -1770,12 +1832,12 @@ def domain_histograms(
     field,
     bins,
     value_range=None,
-    tropical_lat_bounds=DEFAULT_TROPICAL_LAT_BOUNDS,
+    deep_tropical_lat_bounds=DEFAULT_DEEP_TROPICAL_LAT_BOUNDS,
 ):
-    """Compute global and tropical histograms without materialising the field."""
+    """Compute global and deep-tropical histograms without loading the field."""
     tasks = [
         _histogram_task(domain, bins=bins, value_range=value_range)
-        for domain in domain_fields(field, tropical_lat_bounds)
+        for domain in domain_fields(field, deep_tropical_lat_bounds)
     ]
     count_tasks = [task[0] for task in tasks]
     counts = (
@@ -1804,20 +1866,20 @@ def duration_domain_histograms(
     threshold,
     bins,
     value_range,
-    tropical_lat_bounds=DEFAULT_TROPICAL_LAT_BOUNDS,
+    deep_tropical_lat_bounds=DEFAULT_DEEP_TROPICAL_LAT_BOUNDS,
     time_block=8,
 ):
-    """Return global/tropical wet-spell histograms with bounded peak memory."""
+    """Return global/deep-tropical wet-spell histograms with bounded memory."""
     lat_name = "latitude" if "latitude" in field.dims else "lat"
     lon_name = "longitude" if "longitude" in field.dims else "lon"
     time_name = "Time" if "Time" in field.dims else "time"
     ordered = field.transpose(time_name, lat_name, lon_name)
     edges = np.histogram_bin_edges([], bins=bins, range=value_range)
     global_counts = np.zeros(edges.size - 1, dtype=np.int64)
-    tropical_counts = np.zeros_like(global_counts)
+    deep_tropical_counts = np.zeros_like(global_counts)
     latitudes = np.asarray(ordered[lat_name].values)
-    lo, hi = tropical_lat_bounds
-    tropical_mask = (latitudes >= lo) & (latitudes <= hi)
+    lo, hi = deep_tropical_lat_bounds
+    deep_tropical_mask = (latitudes >= lo) & (latitudes <= hi)
     run_dtype = np.int16 if ordered.sizes[time_name] <= np.iinfo(np.int16).max else np.int32
     run_lengths = np.zeros(
         (ordered.sizes[lat_name], ordered.sizes[lon_name]),
@@ -1833,8 +1895,10 @@ def duration_domain_histograms(
             if not ended.any():
                 continue
             global_counts += np.histogram(run_lengths[ended], bins=edges)[0]
-            tropical_ended = ended & tropical_mask[:, None]
-            if tropical_ended.any():
-                tropical_counts += np.histogram(run_lengths[tropical_ended], bins=edges)[0]
+            deep_tropical_ended = ended & deep_tropical_mask[:, None]
+            if deep_tropical_ended.any():
+                deep_tropical_counts += np.histogram(
+                    run_lengths[deep_tropical_ended], bins=edges
+                )[0]
             run_lengths[ended] = 0
-    return (global_counts, edges), (tropical_counts, edges)
+    return (global_counts, edges), (deep_tropical_counts, edges)

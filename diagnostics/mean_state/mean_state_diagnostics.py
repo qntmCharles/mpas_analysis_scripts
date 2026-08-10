@@ -29,6 +29,7 @@ from diagnostics.diagnostic_helpers import (
     add_split_difference_colorbars, add_symmetric_colorbar,
     annotate_panel_label, contourf_split_difference,
     control_diff_label, diagnostic_output_dir, difference_cmap,
+    cosine_weighted_latitude_coarsen, cosine_weighted_power_input,
     domain_histograms, duration_domain_histograms, figure_should_run,
     figure_should_run_any, get_time_values,
     hemispheric_fold, isobaric_lat_mean,
@@ -577,14 +578,20 @@ if should_run_figure(1):
 
 
 if should_run_figure(2):
-    # Vertical profiles of tropical-mean potential temperature (theta) and zonal-mean wind (uReconstructZonal)
+    # Deep-tropical-mean potential-temperature and zonal-wind profiles.
 
     fig, ax = plt.subplots(1, 4, figsize=(8, 4), sharey=True, constrained_layout=True)
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        theta = zds.theta.sel(latitude=slice(-10, 10)).mean(dim=("Time", "latitude"))
-        pressure = zds.pressure.sel(latitude=slice(-10, 10)).mean(dim=("Time", "latitude"))
-        u = zds.uReconstructZonal.sel(latitude=slice(-10, 10)).mean(dim=("Time", "latitude"))
+        theta = lat_mean(
+            zds.theta.sel(latitude=slice(-10, 10)).mean(dim="Time")
+        )
+        pressure = lat_mean(
+            zds.pressure.sel(latitude=slice(-10, 10)).mean(dim="Time")
+        )
+        u = lat_mean(
+            zds.uReconstructZonal.sel(latitude=slice(-10, 10)).mean(dim="Time")
+        )
 
         T = theta * (pressure / P0_PA) ** (RD / CP)
 
@@ -767,11 +774,15 @@ imerg_pr = None
 if should_run_any([5, 6]):
     imerg_ds = xr.open_mfdataset(list(sorted(glob.glob('/data/phh1-hosted/cwp29/imerg/*3IMERG.*.nc4')))[:300], concat_dim='time', combine='nested', engine="netcdf4")
 
-    imerg_pr = imerg_ds.precipitation.coarsen(lat=5, boundary="trim").mean().coarsen(lon=5, boundary="trim").mean()
+    imerg_pr = cosine_weighted_latitude_coarsen(
+        imerg_ds.precipitation,
+        5,
+        lat_dim="lat",
+    ).coarsen(lon=5, boundary="trim").mean()
 
 
 
-DISTRIBUTION_TROPICAL_LAT_BOUNDS = (-10.0, 10.0)
+DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS = (-10.0, 10.0)
 DISTRIBUTION_DOMAIN_STYLES = (("Global", "-"), ("10S-10N", "--"))
 
 
@@ -781,7 +792,7 @@ if should_run_figure(5):
 
     imerg_histograms = domain_histograms(
         imerg_pr, bins=300, value_range=(0, 300),
-        tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
+        deep_tropical_lat_bounds=DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS,
     )
     for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, imerg_histograms):
         x, h = relative_frequency_from_histogram(counts, edges, smooth=10)
@@ -795,7 +806,7 @@ if should_run_figure(5):
             rate = precip_rate_from_accum(precip_var)
             histograms = domain_histograms(
                 rate, bins=300, value_range=(0, 300),
-                tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
+                deep_tropical_lat_bounds=DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS,
             )
             for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, histograms):
                 x, h = relative_frequency_from_histogram(counts, edges, smooth=10)
@@ -824,7 +835,7 @@ if should_run_figure(6):
 
     imerg_histograms = duration_domain_histograms(
         imerg_pr, threshold=5, bins=59, value_range=(1, 60),
-        tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
+        deep_tropical_lat_bounds=DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS,
     )
     for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, imerg_histograms):
         x, h = relative_frequency_from_histogram(counts, edges, smooth=5)
@@ -838,7 +849,7 @@ if should_run_figure(6):
             rate = precip_rate_from_accum(precip_var)
             histograms = duration_domain_histograms(
                 rate, threshold=5, bins=59, value_range=(1, 60),
-                tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
+                deep_tropical_lat_bounds=DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS,
             )
             for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, histograms):
                 x, h = relative_frequency_from_histogram(counts, edges, smooth=5)
@@ -892,17 +903,18 @@ if should_run_figure(7):
         # The spectrum only uses 10S-10N. Subset while the field is lazy so
         # load() materialises about one ninth of the former global array.
         pr = rate.sel(
-            latitude=slice(*DISTRIBUTION_TROPICAL_LAT_BOUNDS)
+            latitude=slice(*DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS)
         ).rename({'latitude':'lat', 'longitude':'lon'})
+        pr = cosine_weighted_power_input(pr, lat_dim="lat")
         pr = pr.load()
         print(
-            f"Loaded tropical precipitation rate for {sim_names[d]}: "
+            f"Loaded deep-tropical precipitation rate for {sim_names[d]}: "
             f"shape={pr.shape}, dtype={pr.dtype}, size={pr.nbytes / 2**20:.1f} MiB"
         )
 
         spd = 4
 
-        raw_spectrum = spacetime_power(pr, lataggreg='mean', latitude_bounds=(-10, 10), dosymmetries=True,
+        raw_spectrum = spacetime_power(pr, lataggreg='sum', latitude_bounds=(-10, 10), dosymmetries=True,
                                        segsize=96, noverlap=60, spd=spd)
 
         sym_smooth_spectrum = smooth_wavefreq(raw_spectrum.sel(component='symmetric'), freq_ax = 1)
@@ -1026,7 +1038,7 @@ if should_run_figure(8):
 
     for d, ds in enumerate(dss):
         precip, _, _ = accumulated_precipitation_components(ds)
-        precip = precip.sel(latitude=slice(-10, 10)).mean(dim='latitude')
+        precip = lat_mean(precip.sel(latitude=slice(-10, 10)))
 
         pr = precip_rate_from_accum(precip)
 
@@ -1065,13 +1077,19 @@ if should_run_figure(9):
         zmid = 0.5 * (z_lower + z_upper)   # (z, latitude, longitude)
 
         # Horizontal diagnostics
-        zmean = np.nanmean(zmid, axis=(1, 2))         # global mean profile
+        z_zonal = np.nanmean(zmid, axis=2)            # (z, latitude)
+        zmean = lat_mean(
+            xr.DataArray(
+                z_zonal,
+                dims=("z", "latitude"),
+                coords={"latitude": ds.latitude},
+            )
+        ).values                                      # global mean profile
         zmin = np.nanmin(zmid, axis=(1, 2))           # global min at each level
         zmax = np.nanmax(zmid, axis=(1, 2))           # global max at each level
         zstd = np.nanstd(zmid, axis=(1, 2))           # global std at each level
 
         # Zonal mean and anomaly from global mean
-        z_zonal = np.nanmean(zmid, axis=2)            # (z, latitude)
         z_anom = z_zonal - zmean[:, None]
 
         # ---- left: profile with spread ----
@@ -1319,7 +1337,7 @@ if should_run_figure(12):
 
         histograms = domain_histograms(
             olr, bins=bins,
-            tropical_lat_bounds=DISTRIBUTION_TROPICAL_LAT_BOUNDS,
+            deep_tropical_lat_bounds=DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS,
         )
         for (domain, linestyle), (h, b) in zip(DISTRIBUTION_DOMAIN_STYLES, histograms):
             ax3.plot(
