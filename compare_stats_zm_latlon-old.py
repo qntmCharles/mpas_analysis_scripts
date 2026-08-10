@@ -16,6 +16,8 @@ from tropopause import *
 from diagnostics.diagnostic_helpers import (
     FigureSaver,
     all_figures_requested,
+    cosine_weighted_latitude_coarsen,
+    cosine_weighted_power_input,
     figure_should_run,
     figure_should_run_any,
     standardize_latlon_dataset as standardize_in_file_pressure_axis,
@@ -142,6 +144,9 @@ check_vars = ['t_isobaric']
 def mean_if_present(da, dims):
     """Mean over dims that exist; useful for full lat/lon and pre-zonal-mean files."""
     dims = [d for d in dims if d in da.dims]
+    if "latitude" in dims:
+        weights = np.cos(np.deg2rad(da.latitude))
+        return da.weighted(weights).mean(dim=dims, skipna=True)
     return da.mean(dim=dims) if dims else da
 
 def vertical_dim(da):
@@ -311,7 +316,7 @@ figsave.save(fig, "rain_stats", number=1)
 # In[7]:
 
 
-# Vertical profiles of tropical-mean potential temperature (theta) and zonal-mean wind (uReconstructZonal)
+# Deep-tropical-mean potential-temperature and zonal-wind profiles.
 
 fig, ax = plt.subplots(1, 3, figsize=(8, 4), sharey=True, constrained_layout=True)
 
@@ -494,7 +499,9 @@ figsave.save(fig, "eddy_fluxes", number=4)
 
 imerg_ds = xr.open_mfdataset(list(sorted(glob.glob('/data/phh1-hosted/cwp29/imerg/*3IMERG.*.nc4')))[:100], concat_dim='time', combine='nested')
 
-imerg_pr = imerg_ds.precipitation.coarsen(lat=10).mean().coarsen(lon=10).mean()
+imerg_pr = cosine_weighted_latitude_coarsen(
+    imerg_ds.precipitation, 10, lat_dim="lat"
+).coarsen(lon=10).mean()
 
 
 # In[ ]:
@@ -629,13 +636,16 @@ for d, ds in enumerate(dss):
         )
         precip_rate = precip.diff("Time") / dt_days
         
-    pr = precip_rate.rename({'latitude':'lat', 'longitude':'lon'})
+    pr = precip_rate.sel(latitude=slice(-10, 10)).rename(
+        {'latitude':'lat', 'longitude':'lon'}
+    )
     pr = pr.load()
     print(pr)
 
     spd = 4
         
-    raw_spectrum = spacetime_power(pr, lataggreg='mean', latitude_bounds=(-10, 10), dosymmetries=True,
+    pr = cosine_weighted_power_input(pr, lat_dim="lat")
+    raw_spectrum = spacetime_power(pr, lataggreg='sum', latitude_bounds=(-10, 10), dosymmetries=True,
                                    segsize=32, noverlap=16, spd=spd)
 
     sym_smooth_spectrum = smooth_wavefreq(raw_spectrum.sel(component='symmetric'), freq_ax = 1)
@@ -732,7 +742,7 @@ fig, ax = plt.subplots(1, len(dss), figsize=(8, 3), constrained_layout=True)
 
 for d, ds in enumerate(dss):
     precip = ds.rainc + ds.i_rainc*100. + ds.rainnc + ds.i_rainnc*100.
-    precip = precip.sel(latitude=slice(-10, 10)).mean(dim='latitude')
+    precip = lat_mean(precip.sel(latitude=slice(-10, 10)))
     
     if time_format == 'int':
         pr = precip.diff("Time") / (dt / 24.0)

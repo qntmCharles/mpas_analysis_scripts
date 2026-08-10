@@ -22,6 +22,7 @@ from tropopause import *
 from diagnostics.diagnostic_helpers import (
     FigureSaver,
     all_figures_requested,
+    cosine_weighted_power_input,
     figure_should_run,
     figure_should_run_any,
     standardize_latlon_dataset as standardize_in_file_pressure_axis,
@@ -185,7 +186,10 @@ def midlevel_height_from_latlon(ds, latitude_sel=None, mean_latitude=False):
 
     zgrid = zgrid.mean(dim="longitude")
     if mean_latitude:
-        zgrid = zgrid.mean(dim="latitude")
+        weights = np.cos(np.deg2rad(zgrid.latitude))
+        zgrid = zgrid.weighted(weights).mean(
+            dim="latitude", skipna=True
+        )
 
     # Use raw arrays for the midpoint so xarray does not align face-level
     # coordinates (0..N-1 with 1..N), which would silently drop the first
@@ -427,13 +431,16 @@ for d, ds in enumerate(dss):
         )
         precip_rate = precip.diff("Time") / dt_days
         
-    pr = precip_rate.rename({'latitude':'lat', 'longitude':'lon'})
+    pr = precip_rate.sel(latitude=slice(-10, 10)).rename(
+        {'latitude':'lat', 'longitude':'lon'}
+    )
     pr = pr.load()
     print(pr)
 
     spd = 4
         
-    raw_spectrum = spacetime_power(pr, lataggreg='mean', latitude_bounds=(-10, 10), dosymmetries=True,
+    pr = cosine_weighted_power_input(pr, lat_dim="lat")
+    raw_spectrum = spacetime_power(pr, lataggreg='sum', latitude_bounds=(-10, 10), dosymmetries=True,
                                    segsize=48, noverlap=30, spd=spd)
 
     sym_smooth_spectrum = smooth_wavefreq(raw_spectrum.sel(component='symmetric'), freq_ax = 1)
@@ -604,13 +611,19 @@ for i, ds in enumerate(dss):
     zmid = 0.5 * (z_lower + z_upper)   # (z, latitude, longitude)
 
     # Horizontal diagnostics
-    zmean = np.nanmean(zmid, axis=(1, 2))         # global mean profile
+    z_zonal = np.nanmean(zmid, axis=2)            # (z, latitude)
+    zmean = lat_mean(
+        xr.DataArray(
+            z_zonal,
+            dims=("z", "latitude"),
+            coords={"latitude": ds.latitude},
+        )
+    ).values                                      # global mean profile
     zmin = np.nanmin(zmid, axis=(1, 2))           # global min at each level
     zmax = np.nanmax(zmid, axis=(1, 2))           # global max at each level
     zstd = np.nanstd(zmid, axis=(1, 2))           # global std at each level
 
     # Zonal mean and anomaly from global mean
-    z_zonal = np.nanmean(zmid, axis=2)            # (z, latitude)
     z_anom = z_zonal - zmean[:, None]
 
     # ---- left: profile with spread ----
