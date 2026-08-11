@@ -17,6 +17,8 @@ workflows at module top level.
 
 from __future__ import annotations
 
+import argparse
+import glob
 import json
 import os
 import sys
@@ -45,6 +47,7 @@ from diagnostics.diagnostic_helpers import (
     native_midlevel_height, pressure_layer_weights, pressure_to_pa,
     read_json_file, safe_name,
     simulation_colour, standardize_latlon_dataset, subset_between,
+    source_file_signature,
     subset_latitude, symmetric_levels, time_block_slices, time_step_days,
     total_precip_accum, vertical_dim, vertical_velocity_from_zm,
     write_json_file,
@@ -85,6 +88,33 @@ from waveFilter import kf_filter
 # Configuration
 # -----------------------------------------------------------------------------
 
+def parse_command_line(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--figures",
+        nargs="+",
+        type=int,
+        choices=range(1, 10),
+        default=None,
+    )
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument(
+        "--figures-only",
+        action="store_true",
+        help="Build selected figures only from current bootstrap caches.",
+    )
+    cache_mode.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Rebuild selected bootstrap caches before plotting.",
+    )
+    args = parser.parse_args(argv)
+    if args.figures:
+        args.figures = list(dict.fromkeys(args.figures))
+    return args
+
+
+runtime_args = parse_command_line()
 save = True
 save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/significance_bootstrap/")
 
@@ -109,8 +139,9 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/significance
 #     shared thermal/static-stability/cloud-depth structures favour a
 #     temperature-driven pathway, while U-only wind/wave differences favour a
 #     wind-driven pathway.
-figures_to_run = [2, 3, 4, 5]
+figures_to_run = runtime_args.figures or [2, 3, 4, 5]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
+FIGURES_ONLY = bool(runtime_args.figures_only)
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
 data_locs = ["control_new", "u_nudge", "T_nudge"]
@@ -134,8 +165,13 @@ _rebuilt_wave_cache_paths = set()
 USE_BOOTSTRAP_CACHE = USE_BOOTSTRAP_CACHE and not env_flag("DISABLE_BOOTSTRAP_CACHE")
 FORCE_RECOMPUTE_BOOTSTRAP_CACHE = (
     FORCE_RECOMPUTE_BOOTSTRAP_CACHE
+    or runtime_args.rebuild_cache
     or env_flag("FORCE_RECOMPUTE_BOOTSTRAP_CACHE")
 )
+if FIGURES_ONLY and FORCE_RECOMPUTE_BOOTSTRAP_CACHE:
+    raise SystemExit(
+        "Figure-only mode cannot run with forced bootstrap cache rebuilding"
+    )
 BOOTSTRAP_CACHE_DIR = diagnostic_cache_dir("significance_bootstrap_cache")
 
 BOOTSTRAP_BLOCK_DAYS = 10.0
@@ -313,6 +349,44 @@ def bootstrap_cache_path(filename):
     return os.path.join(ensure_bootstrap_cache_dir(), filename)
 
 
+_bootstrap_source_signatures = {}
+
+
+def bootstrap_source_signature(family):
+    """Return the source signature required by one bootstrap family."""
+
+    if family in _bootstrap_source_signatures:
+        return _bootstrap_source_signatures[family]
+    if family == "lpo_envelope_event_properties":
+        paths = sorted(
+            glob.glob(
+                os.path.join(ORGANISATION_TRACKS_FILE, "**", "*.csv"),
+                recursive=True,
+            )
+        )
+    else:
+        paths = sorted(
+            path
+            for directory in data_locs
+            for pattern in (LATLON_PATTERN, ZONAL_MEAN_PATTERN)
+            for path in glob.glob(os.path.join(root_dir, directory, pattern))
+        )
+        if family == "cloud_response":
+            paths.extend(
+                sorted(
+                    glob.glob(
+                        os.path.join(
+                            CLOUD_CLASSIFICATION_CACHE_DIR,
+                            "*_classified_high_cloud.nc",
+                        )
+                    )
+                )
+            )
+    signature = source_file_signature(paths)
+    _bootstrap_source_signatures[family] = signature
+    return signature
+
+
 def base_bootstrap_cache_signature(family, extra=None):
     signature = dict(
         cache_version=BOOTSTRAP_CACHE_VERSION,
@@ -335,6 +409,7 @@ def base_bootstrap_cache_signature(family, extra=None):
         robust_sign_threshold=float(ROBUST_SIGN_THRESHOLD),
         comparisons=jsonable_value(COMPARISONS),
         wave_config_version=WAVE_CONFIG_VERSION,
+        source_files=bootstrap_source_signature(family),
     )
     if extra:
         signature.update(jsonable_value(extra))
@@ -371,9 +446,17 @@ def bootstrap_cache_matches(cache_name, signature):
 
 def load_cached_table(cache_name, signature):
     if not bootstrap_cache_matches(cache_name, signature):
+        if FIGURES_ONLY:
+            raise FileNotFoundError(
+                f"Figure-only mode requires current cache {cache_name}"
+            )
         return None
     path = bootstrap_cache_path(f"{cache_name}.csv")
     if not os.path.exists(path):
+        if FIGURES_ONLY:
+            raise FileNotFoundError(
+                f"Figure-only mode requires cache file {path}"
+            )
         return None
     df = pd.read_csv(path)
     print(f"Using cached bootstrap table {path}")
@@ -398,20 +481,36 @@ def cached_diff_dataset_filename(cache_name, comp_name):
 
 def load_cached_diff_datasets(cache_name, signature):
     if not bootstrap_cache_matches(cache_name, signature):
+        if FIGURES_ONLY:
+            raise FileNotFoundError(
+                f"Figure-only mode requires current cache {cache_name}"
+            )
         return None
     metadata = read_cache_metadata(
         bootstrap_cache_path(f"{cache_name}.metadata.json")
     )
     if metadata is None or "comparison_names" not in metadata:
+        if FIGURES_ONLY:
+            raise FileNotFoundError(
+                f"Figure-only mode requires comparison metadata {cache_name}"
+            )
         return None
     comp_names = metadata["comparison_names"]
     expected_names = [name for name, *_ in COMPARISONS]
     if comp_names != expected_names:
+        if FIGURES_ONLY:
+            raise RuntimeError(
+                f"Figure-only cache has wrong comparisons: {cache_name}"
+            )
         return None
     out = {}
     for comp_name in comp_names:
         path = bootstrap_cache_path(cached_diff_dataset_filename(cache_name, comp_name))
         if not os.path.exists(path):
+            if FIGURES_ONLY:
+                raise FileNotFoundError(
+                    f"Figure-only mode requires cache file {path}"
+                )
             return None
         with xr.open_dataset(path) as ds:
             out[comp_name] = ds.load()
@@ -679,27 +778,37 @@ def bootstrap_field_difference(a_blocks, b_blocks, rng, n_boot=FIELD_N_BOOTSTRAP
 # -----------------------------------------------------------------------------
 
 
-print("Loading lat-lon and zonal-mean datasets")
 dss = []
 dss_zm = []
-for i, d in enumerate(data_locs):
-    ds = load_latlon_dataset(
-        os.path.join(root_dir, d),
-        latlon_pattern=LATLON_PATTERN,
-        chunks=latlon_chunks,
-    )
-    ds = standardize_latlon_dataset(ds, latlon_vars)
 
-    zds = load_latlon_dataset(
-        os.path.join(root_dir, d),
-        latlon_pattern=ZONAL_MEAN_PATTERN,
-        chunks=zm_chunks,
-    )
-    zds = standardize_latlon_dataset(zds, zonal_mean_vars)
 
-    print(f"{sim_names[i]}: latlon vars={len(ds.data_vars)}, zm vars={len(zds.data_vars)}")
-    dss.append(ds)
-    dss_zm.append(zds)
+def ensure_datasets_loaded():
+    """Open raw histories only after a selected cache misses validation."""
+
+    if dss:
+        return
+    print("Loading lat-lon and zonal-mean datasets")
+    for i, directory in enumerate(data_locs):
+        ds = load_latlon_dataset(
+            os.path.join(root_dir, directory),
+            latlon_pattern=LATLON_PATTERN,
+            chunks=latlon_chunks,
+        )
+        ds = standardize_latlon_dataset(ds, latlon_vars)
+
+        zds = load_latlon_dataset(
+            os.path.join(root_dir, directory),
+            latlon_pattern=ZONAL_MEAN_PATTERN,
+            chunks=zm_chunks,
+        )
+        zds = standardize_latlon_dataset(zds, zonal_mean_vars)
+
+        print(
+            f"{sim_names[i]}: latlon vars={len(ds.data_vars)}, "
+            f"zm vars={len(zds.data_vars)}"
+        )
+        dss.append(ds)
+        dss_zm.append(zds)
 
 
 # -----------------------------------------------------------------------------
@@ -936,6 +1045,7 @@ def run_mean_state_pathway():
                 record_implemented(f"cached mean-state lat-height bootstrap for {spec['name']}")
                 continue
 
+            ensure_datasets_loaded()
             row_start = len(scalar_metric_rows)
             blocks_by_run = {}
             for i in range(len(dss)):
@@ -1083,7 +1193,6 @@ def plot_precip_pdf_differences(pdf_diffs):
 
 def run_precipitation_response():
     try:
-        precip_by_run = {i: get_precip_rate(ds) for i, ds in enumerate(dss)}
         cache_signature = base_bootstrap_cache_signature(
             "precipitation_response",
             extra=dict(
@@ -1100,8 +1209,12 @@ def run_precipitation_response():
             save_table(cached_pdf, "precipitation_pdf_bootstrap_response.csv")
             plot_precip_pdf_differences(precip_pdf_diffs_from_table(cached_pdf))
             record_implemented("cached precipitation response block-consistency metrics")
-            return precip_by_run
+            return {}
 
+        ensure_datasets_loaded()
+        precip_by_run = {
+            i: get_precip_rate(ds) for i, ds in enumerate(dss)
+        }
         row_start = len(scalar_metric_rows)
         metric_by_run = {i: precip_metric_values(precip_by_run[i]) for i in range(len(dss))}
         metric_names = sorted(metric_by_run[0])
@@ -1221,6 +1334,7 @@ def run_basic_convection_pdf_bootstrap():
             record_implemented("cached basic convection PDF block-consistency metrics")
             return
 
+        ensure_datasets_loaded()
         rows = []
         pdf_diffs_by_field = {}
         rng = np.random.default_rng(BOOTSTRAP_SEED + 222)
@@ -1372,6 +1486,7 @@ def run_wavenumber_variance_bootstrap():
             record_implemented("cached wavenumber variance-fraction block-consistency metrics")
             return
 
+        ensure_datasets_loaded()
         rows = []
         diffs_by_direction_field = {}
         rng = np.random.default_rng(BOOTSTRAP_SEED + 333)
@@ -1560,6 +1675,11 @@ def run_cloud_response(precip_by_run):
         record_implemented("cached cloud profile/depth/type block-consistency metrics")
         return
 
+    ensure_datasets_loaded()
+    if not precip_by_run:
+        precip_by_run = {
+            i: get_precip_rate(ds) for i, ds in enumerate(dss)
+        }
     row_start = len(scalar_metric_rows)
     profile_rows = pd.DataFrame()
     try:
@@ -1641,11 +1761,6 @@ def conditional_area_mean_blocks(target, condition):
 
 
 def run_conditional_precipitation_states(precip_by_run):
-    if not precip_by_run:
-        raise RuntimeError(
-            "Strong/weak precipitation diagnostics require precipitation for "
-            "every simulation"
-        )
     try:
         cache_signature = base_bootstrap_cache_signature(
             "conditional_precipitation_states",
@@ -1661,6 +1776,11 @@ def run_conditional_precipitation_states(precip_by_run):
             record_implemented("cached strong-versus-weak precipitation conditional block-consistency metrics")
             return
 
+        ensure_datasets_loaded()
+        if not precip_by_run:
+            precip_by_run = {
+                i: get_precip_rate(ds) for i, ds in enumerate(dss)
+            }
         row_start = len(scalar_metric_rows)
         targets = {
             "precip": {i: precip_by_run[i] for i in range(len(dss))},
@@ -1867,7 +1987,6 @@ def plot_lpo_envelope_bootstrap_summary(org_df, org_source_labels):
 
 def run_lpo_envelope_bootstrap():
     try:
-        tracks = load_lpo_envelope_events()
         cache_signature = base_bootstrap_cache_signature(
             "lpo_envelope_event_properties",
             extra=dict(
@@ -1896,6 +2015,7 @@ def run_lpo_envelope_bootstrap():
             record_implemented("cached LPO-envelope event bootstrap")
             return
 
+        tracks = load_lpo_envelope_events()
         source_labels = {}
         row_start = len(scalar_metric_rows)
         for source in ordered_lpo_sources(tracks):
@@ -2117,6 +2237,7 @@ def run_wave_pathway():
             record_implemented("cached integrated CCEW wave-power and variance-fraction block-consistency metrics")
             return
 
+        ensure_datasets_loaded()
         wave_rows = []
         for field_name in WAVE_FIELDS:
             projected_by_run_by_wave = {}
@@ -2341,6 +2462,7 @@ def run_vertical_wave_power_profile_bootstrap():
             record_implemented("cached vertical wave-power profile block-consistency metrics")
             return
 
+        ensure_datasets_loaded()
         rows = []
         for wave_name in WAVE_PROFILE_WAVES:
             for field_spec in WAVE_PROFILE_FIELDS:
@@ -2483,6 +2605,7 @@ def run_wave_lag_correlation_bootstrap():
             record_implemented("cached wave-amplitude lag-correlation block-consistency metrics")
             return
 
+        ensure_datasets_loaded()
         rows = []
         lag_diffs = {}
         rng = np.random.default_rng(BOOTSTRAP_SEED + 444)
@@ -2640,17 +2763,27 @@ def print_final_summary(metrics_df):
 # -----------------------------------------------------------------------------
 
 print("\nRunning block-resampling consistency diagnostics")
-run_mean_state_pathway()
-precip_by_run = run_precipitation_response()
-run_basic_convection_pdf_bootstrap()
-run_wavenumber_variance_bootstrap()
-run_cloud_response(precip_by_run)
-run_conditional_precipitation_states(precip_by_run)
-run_lpo_envelope_bootstrap()
-consume_wave_response_metrics()
-run_wave_pathway()
-run_vertical_wave_power_profile_bootstrap()
-run_wave_lag_correlation_bootstrap()
+precip_by_run = {}
+if should_run_figure(1):
+    run_mean_state_pathway()
+if should_run_figure(2):
+    precip_by_run = run_precipitation_response()
+if should_run_figure(3):
+    run_cloud_response(precip_by_run)
+    run_conditional_precipitation_states(precip_by_run)
+if should_run_figure(4):
+    consume_wave_response_metrics()
+    run_wave_pathway()
+if should_run_figure(5):
+    run_lpo_envelope_bootstrap()
+if should_run_figure(6):
+    run_basic_convection_pdf_bootstrap()
+if should_run_figure(7):
+    run_vertical_wave_power_profile_bootstrap()
+if should_run_figure(8):
+    run_wave_lag_correlation_bootstrap()
+if should_run_figure(9):
+    run_wavenumber_variance_bootstrap()
 
 metrics_df = pd.DataFrame(scalar_metric_rows)
 save_table(metrics_df, "bootstrap_scalar_metrics.csv")
