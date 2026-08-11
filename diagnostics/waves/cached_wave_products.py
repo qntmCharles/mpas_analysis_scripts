@@ -18,7 +18,7 @@ import json
 
 
 LPO_WAVE_SECTION_CACHE_VERSION = (
-    "lpo-wave-sections-v9-tropics-20deg"
+    "lpo-wave-sections-v11-moist-density"
 )
 LPO_WAVE_SECTION_FILENAME_TEMPLATE = "lpo_wave_sections_{simulation}.nc"
 KELVIN_DISPERSION_FILENAME = "kelvin_reference_energy_dispersion.nc"
@@ -140,7 +140,12 @@ def lpo_wave_section_cache_path(simulation, *, test=False):
     )
 
 
-def load_existing_lpo_wave_sections(simulation, *, test=False):
+def load_existing_lpo_wave_sections(
+    simulation,
+    *,
+    tracking_product_version,
+    test=False,
+):
     """Load validated, prefiltered LPO-section values without filtering."""
 
     path = lpo_wave_section_cache_path(simulation, test=test)
@@ -158,6 +163,7 @@ def load_existing_lpo_wave_sections(simulation, *, test=False):
         expected = {
             "cache_version": LPO_WAVE_SECTION_CACHE_VERSION,
             "wave_config_version": WAVE_CONFIG_VERSION,
+            "tracking_product_version": tracking_product_version,
             "source_simulation": simulation,
             "test_subset": int(test),
         }

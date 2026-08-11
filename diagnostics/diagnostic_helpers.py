@@ -1,7 +1,9 @@
 import glob
+import hashlib
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 
 import dask
 import dask.array as dsa
@@ -19,6 +21,8 @@ DEFAULT_SIMULATION_PARENT_DIR = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/c
 DEFAULT_DIAGNOSTIC_OUTPUT_ROOT = "/home/cwp29/tmp/mpas/crf_on"
 DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
 DIAGNOSTIC_FIGURE_ROOT_ENV = "MPAS_DIAGNOSTIC_FIGURE_ROOT"
+DIAGNOSTIC_FIGURE_VERSION_ENV = "MPAS_DIAGNOSTIC_FIGURE_VERSION"
+DEFAULT_DIAGNOSTIC_FIGURE_VERSION = "v1"
 ANALYSIS_START = "2000-05-05 06:00:00"
 ANALYSIS_END = "2000-11-21 00:00:00"
 LATLON_PATTERN = "latlon.2000-*.nc"
@@ -321,6 +325,30 @@ def pressure_to_pa(pressure):
     return out
 
 
+MPAS_MOISTURE_SCALARS = ("qv", "qc", "qr", "qi", "qs", "qg")
+
+
+def mpas_moist_air_density(dataset):
+    """Return MPAS moist density from dry density and all moisture scalars."""
+
+    required = ("rho", *MPAS_MOISTURE_SCALARS)
+    missing = [name for name in required if name not in dataset.data_vars]
+    if missing:
+        raise ValueError(f"MPAS moist density requires fields {missing}")
+    total_moisture = sum(
+        (finite_or_nan(dataset[name]) for name in MPAS_MOISTURE_SCALARS),
+        start=xr.zeros_like(finite_or_nan(dataset.rho)),
+    )
+    density = finite_or_nan(dataset.rho) * (1.0 + total_moisture)
+    density.name = "moist_air_density"
+    density.attrs.update(
+        units="kg m-3",
+        dry_density_source="rho",
+        formulation="rho_m = rho_d * (1 + qv + qc + qr + qi + qs + qg)",
+    )
+    return density
+
+
 def vertical_velocity_from_zm(zds):
     """Return standard zonal-mean vertical velocity from a zm dataset."""
     missing = [name for name in ("w", "pressure") if name not in zds.data_vars]
@@ -457,7 +485,12 @@ def lat_height_mesh(field, zmid, lat):
 
 def N2_latheight(zds, g=9.80665):
     """Time-mean static stability on model height levels as (z, latitude)."""
-    theta = model_lat_field(zds.theta.mean(dim="Time"))
+    theta_source = (
+        zds.theta.mean(dim="Time")
+        if "Time" in zds.theta.dims
+        else zds.theta
+    )
+    theta = model_lat_field(theta_source)
     z = zds.z.values
     dtheta_dz = np.gradient(theta.values, z, axis=0)
     n2 = xr.DataArray(
@@ -518,6 +551,14 @@ def standardize_latlon_dataset(ds, needed_vars=None):
             raise ValueError(f"Unexpected pressure axis length: {ds.sizes['pres']} (expected {len(file_pres_values)})")
         ds = ds.assign_coords(pres=("pres", file_pres_values))
         ds["pres"].attrs.update(units="hPa", positive="down", axis="Z")
+    if "rh_isobaric" in ds.data_vars:
+        relative_humidity = ds.rh_isobaric.copy(deep=False)
+        archived_units = relative_humidity.attrs.get("units")
+        if archived_units and archived_units not in {"%", "percent"}:
+            relative_humidity.attrs["archived_units"] = archived_units
+        relative_humidity.attrs["units"] = "%"
+        relative_humidity.attrs["quantity"] = "relative humidity"
+        ds = ds.assign(rh_isobaric=relative_humidity)
     return standardize_cldfrac_vertical_coordinate(ds)
 
 
@@ -616,18 +657,16 @@ def plot_Tu_latpres(a, lats, pres, Tbar, ubar):
     return T_im, u_im_neg, u_im_zero, u_im_pos
 
 
-def plot_rhw_latpres(a, lats, pres, rhbar, vbar, wbar, tbar, rd=287.0, g=9.80665):
+def plot_rhw_latpres(a, lats, pres, rhbar, vbar, omega_hpa_s):
+    """Plot RH and circulation using archived pressure velocity."""
+
     rh_im = a.contourf(lats, pres, rhbar, levels=np.arange(0, 105, 5), cmap="BrBG")
     xi = np.linspace(lats.min(), lats.max(), len(lats))
     yi = np.linspace(pres.min(), pres.max(), len(pres))
     X, Y = np.meshgrid(xi, yi)
 
     V_meridional = intp.interpn((lats, pres), vbar.T, (X, Y))
-    W_vertical = intp.interpn((lats, pres), wbar.T, (X, Y))
-    T_interp = intp.interpn((lats, pres), tbar.T, (X, Y))
-    pressure_pa = Y * 100.0
-    rho = pressure_pa / (rd * T_interp)
-    dpdt_hpa_s = -rho * g * W_vertical / 100.0
+    dpdt_hpa_s = intp.interpn((lats, pres), omega_hpa_s.T, (X, Y))
 
     medcirc_im = a.streamplot(
         X,
@@ -981,7 +1020,7 @@ def all_figures_requested(figures_to_run):
 
 
 class FigureSaver:
-    """Save numbered figures beneath a date-stamped output directory."""
+    """Save numbered figures beneath a versioned output directory."""
 
     def __init__(
         self,
@@ -990,11 +1029,25 @@ class FigureSaver:
         start=1,
         dpi=300,
         figures_to_run=None,
+        version=None,
         date_stamp=None,
     ):
         self.target_dir = diagnostic_output_dir(save_loc)
-        self.date_stamp = date_stamp or datetime.now().strftime("%Y-%m-%d")
-        self.save_loc = os.path.join(self.target_dir, self.date_stamp)
+        selected_version = str(
+            version
+            or date_stamp
+            or os.environ.get(DIAGNOSTIC_FIGURE_VERSION_ENV)
+            or DEFAULT_DIAGNOSTIC_FIGURE_VERSION
+        )
+        if (
+            selected_version in {".", ".."}
+            or os.path.basename(selected_version) != selected_version
+        ):
+            raise ValueError("Figure version must be one directory name")
+        self.version = selected_version
+        # Retain the historical attribute for callers that inspect it.
+        self.date_stamp = selected_version
+        self.save_loc = os.path.join(self.target_dir, selected_version)
         self.enabled = enabled
         self.index = start
         self.dpi = dpi
@@ -1083,6 +1136,62 @@ def write_json_file(path, payload):
         json.dump(jsonable_value(payload), handle, indent=2, sort_keys=True)
         handle.write("\n")
     os.replace(tmp_path, path)
+
+
+def source_file_signature(paths):
+    """Return a stable signature for one source-file collection."""
+
+    records = []
+    for value in sorted({os.path.abspath(os.fspath(path)) for path in paths}):
+        path = Path(value)
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing cache source file: {path}")
+        stat = path.stat()
+        records.append(
+            {
+                "path": value,
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    if not records:
+        raise ValueError("Cache source-file collection is empty")
+    encoded = json.dumps(records, sort_keys=True, separators=(",", ":"))
+    return {
+        "sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+        "files": records,
+    }
+
+
+def cache_manifest(
+    producer,
+    *,
+    schema,
+    configuration=None,
+    dependencies=None,
+    source_paths=None,
+):
+    """Build one shared cache manifest with explicit dependencies."""
+
+    manifest = {
+        "producer": str(producer),
+        "schema": str(schema),
+        "configuration": jsonable_value(configuration or {}),
+        "dependencies": jsonable_value(dependencies or {}),
+    }
+    if source_paths is not None:
+        manifest["sources"] = source_file_signature(source_paths)
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    manifest["manifest_sha256"] = hashlib.sha256(encoded.encode()).hexdigest()
+    return manifest
+
+
+def cache_manifest_matches(saved, expected):
+    """Return whether two complete cache manifests match exactly."""
+
+    if not isinstance(saved, dict):
+        return False
+    return jsonable_value(saved) == jsonable_value(expected)
 
 
 def metadata_reader(path_resolver):
