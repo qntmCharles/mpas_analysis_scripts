@@ -87,8 +87,8 @@ default_save_loc = save_loc
 #
 # Figure numbers:
 #   1: high-cloud occurrence, response, and precipitating-cloud attribution
-#   2: tropical/subtropical OLR distributions
-#   3: tropical/subtropical cloud-top-pressure distributions
+#   2: tropical/deep-tropical/subtropical OLR distributions
+#   3: tropical/deep-tropical/subtropical cloud-top-pressure distributions
 #   4: classification validation maps (a-c identify simulations)
 #   5: classification validation vertical slices
 #   6: high-cloud vertical contribution profiles
@@ -110,6 +110,7 @@ HIGH_CLOUD_TEST_LAT_BOUNDS = (-40.0, 40.0)
 CLOUD_STRUCTURE_DOMAIN_SPECS = (
     ("tropical", (0.0, 20.0), "tropics, 20°S–20°N"),
     ("subtropical", (20.0, 40.0), "subtropics, 20–40°"),
+    ("deep_tropical", (0.0, 10.0), "deep tropics, 10°S–10°N"),
 )
 CLOUD_TOP_HEIGHT_BIN_WIDTH_KM = 0.25
 CLOUD_TOP_HEIGHT_BIN_BOUNDS_KM = (5.0, 22.0)
@@ -123,7 +124,9 @@ P_HIGH_HPA = 440.0
 P_PRECIP_MIN = 12.0  # 0.5 mm h-1 PF threshold (Feng et al. 2021)
 WRITE_CLASSIFICATION_PRODUCT = True
 classification_cache_dir = diagnostic_cache_dir("classification_cache")
-DERIVED_CACHE_VERSION = "high-cloud-derived-diagnostics-v4-height-histograms"
+DERIVED_CACHE_VERSION = (
+    "high-cloud-derived-diagnostics-v5-deep-tropical-distributions"
+)
 derived_cache_dir = diagnostic_cache_dir("high_cloud_diagnostics_cache")
 DERIVED_CACHE_SIGNATURE = None
 REBUILD_DERIVED_CACHE = False
@@ -4054,7 +4057,7 @@ def plot_literature_high_cloud_structure(
     """Class-specific cloud-top-pressure and OLR distributions."""
     if not (should_run_figure(2) or should_run_figure(3)):
         return
-    progress("Starting Figure 2: literature_high_cloud_structure")
+    progress("Starting Figures 2–3: literature_high_cloud_structure")
     class_specs = REGIME_SPECS
     if structure is None:
         structure = compute_cloud_structure_product(
@@ -4294,7 +4297,7 @@ def plot_literature_high_cloud_structure(
             )
         plt.close(vertical_fig)
         plt.close(olr_fig)
-    progress("Done with Figure 2 cloud structure and OLR distributions")
+    progress("Done with Figures 2–3 cloud structure and OLR distributions")
 
 
 def main(argv=None):
