@@ -3,7 +3,8 @@
 
 
 
-import os, glob, sys
+import argparse
+import os, sys
 from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,37 +16,58 @@ for _rel_path in ("..", "../..", "../../.."):
 import numpy as np
 from matplotlib import pyplot as plt
 import xarray as xr
-from dask import compute as dask_compute
 from matplotlib import colors
 from tropopause import tropopause_profile, tropopause_profile_single
 from wavenumber_frequency_functions import (
     genDispersionCurves,
-    smooth_wavefreq,
-    spacetime_power,
 )
 from diagnostics.diagnostic_helpers import (
-    FigureSaver, LATLON_PATTERN, ZONAL_MEAN_PATTERN,
-    accumulated_precipitation_components, add_period_reference_lines_frequency,
+    FigureSaver, add_period_reference_lines_frequency,
     add_split_difference_colorbars, add_symmetric_colorbar,
     annotate_panel_label, contourf_split_difference,
     control_diff_label, diagnostic_output_dir, difference_cmap,
-    cosine_weighted_latitude_coarsen, cosine_weighted_power_input,
-    domain_histograms, duration_domain_histograms, figure_should_run,
+    figure_should_run,
     figure_should_run_any, get_time_values,
     hemispheric_fold, isobaric_lat_mean,
-    isobaric_vertical_velocity_from_zm, lat_height_mesh, lat_mean,
-    load_latlon_dataset, make_spectrum_cmap, midlevel_height_from_latlon,
+    lat_height_mesh, lat_mean,
+    make_spectrum_cmap, midlevel_height_from_latlon,
     model_lat_field, nice_levels, plot_Tu_latpres, plot_rhw_latpres,
-    positive_levels, precip_rate_from_accum, region_symmetric_levels,
+    positive_levels, region_symmetric_levels,
     relative_frequency_from_histogram, safe_nanpercentile,
     set_latheight_labels, set_latpres_axis,
-    simulation_colour, split_scales_warranted, standardize_latlon_dataset,
+    simulation_colour, split_scales_warranted,
     symmetric_levels,
     tropopause_on_latitudes, tropopause_region_masks,
     vertical_velocity_from_zm,
 )
+from diagnostics.mean_state.mean_state_cache import prepare_products, split_simulations
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Build mean-state diagnostics.")
+    parser.add_argument(
+        "--figures",
+        nargs="+",
+        type=int,
+        choices=[*range(1, 15), 16, 17, 18],
+        default=None,
+        help="Build only these numbered figures.",
+    )
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument(
+        "--figures-only",
+        action="store_true",
+        help="Build figures only from current compact mean-state caches.",
+    )
+    cache_mode.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Rebuild selected compact mean-state caches before plotting.",
+    )
+    return parser.parse_args(argv)
+
+
+runtime_args = parse_args()
 save = True
 save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/mean_state/')
 
@@ -80,7 +102,7 @@ save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/mean_state/'
 #   * Treat cloud and OLR changes together with temperature/static-stability
 #     and vertical-motion changes; high cloud alone is mechanistically
 #     ambiguous.
-figures_to_run = []
+figures_to_run = runtime_args.figures or []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 
@@ -493,9 +515,6 @@ cols = [simulation_colour(name) for name in sim_names]
 
 
 
-dss = []
-dss_zm = []
-
 latlon_vars = [
     "rainnc", "i_rainnc", "rainc", "i_rainc", "precipw",
     "qv", "qc", "qr", "qi", "qs", "qg", "relhum", "w",
@@ -508,7 +527,8 @@ latlon_vars = [
 zonal_mean_vars = [
     "qv_isobaric", "relhum", "rh_isobaric", "t_isobaric", "theta",
     "uReconstructZonal", "uReconstructMeridional", "uzonal_isobaric",
-    "umeridional_isobaric", "cldfrac", "pressure", "vorticity", "ke", "w",
+    "umeridional_isobaric", "omg_isobaric", "cldfrac", "pressure",
+    "vorticity", "ke", "w",
 ]
 
 # Match the native 4-D isobaric chunks spatially. The previous 60x120 chunks
@@ -517,46 +537,44 @@ zonal_mean_vars = [
 latlon_chunks = {"Time": 4, "latitude": 180, "longitude": 360}
 zm_chunks = {"Time": -1}
 
+cached_products = prepare_products(
+    root_dir,
+    data_locs,
+    sim_names,
+    figures_to_run,
+    latlon_vars,
+    zonal_mean_vars,
+    latlon_chunks,
+    zm_chunks,
+    figures_only=runtime_args.figures_only,
+    rebuild=runtime_args.rebuild_cache,
+)
 
-for i, d in enumerate(data_locs):
-    ds = load_latlon_dataset(
-        os.path.join(root_dir, d),
-        latlon_pattern=LATLON_PATTERN,
-        chunks=latlon_chunks
-    )
-    ds = standardize_latlon_dataset(ds, latlon_vars)
+if "means" in cached_products:
+    means_latlon, means_zonal = cached_products["means"]
+    dss = split_simulations(means_latlon, sim_names)
+    dss_zm = split_simulations(means_zonal, sim_names)
+else:
+    dss = [xr.Dataset() for _ in sim_names]
+    dss_zm = [xr.Dataset() for _ in sim_names]
 
-    zds = load_latlon_dataset(
-        os.path.join(root_dir, d),
-        latlon_pattern=ZONAL_MEAN_PATTERN,
-        chunks=zm_chunks,
-    )
-    zds = standardize_latlon_dataset(zds, zonal_mean_vars)
-
-    # cheaper if data are exactly 6-hourly and aligned
-    #ds = ds.coarsen(Time=4, boundary="trim").mean()
-    #zds = zds.coarsen(Time=4, boundary="trim").mean()
-
-    print(ds)
-    print(zds)
-    dss.append(ds)
-    dss_zm.append(zds)
+rain_cache = cached_products.get("rain")
+distribution_cache = cached_products.get("distributions")
+spectrum_cache = cached_products.get("spectra")
+eddy_cache = cached_products.get("eddy")
 
 if should_run_figure(1):
     # rainc, rainnc contain accumulated rainfall from simulation start to given timestep
     fig, ax = plt.subplots(2, 1, figsize=(8, 4.5), constrained_layout=True)
 
-    for i, ds in enumerate(dss):
-        precip, _, _ = accumulated_precipitation_components(ds)
-
-        precip_mean = lat_mean(precip.mean(dim="longitude"))
-        precip_water = lat_mean(ds.precipw.mean(dim="longitude"))
+    for i, simulation in enumerate(sim_names):
+        product = rain_cache.sel(simulation=simulation)
+        precip_water = product.precip_water
 
         # Use this dataset's own time coordinate
         t_pw = get_time_values(precip_water)
 
-        # Rainfall rate has one fewer Time point, so use diff() and its own Time coord
-        precip_rate = precip_rate_from_accum(precip_mean)
+        precip_rate = product.precip_rate_global
 
         t_rate = get_time_values(precip_rate)
 
@@ -666,18 +684,26 @@ if should_run_figure(3):
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
         ubar_da = isobaric_lat_mean(zds.uzonal_isobaric, hemispheric_parity="even")
         vbar_da = isobaric_lat_mean(zds.umeridional_isobaric, hemispheric_parity="odd")
-        wbar_da = isobaric_vertical_velocity_from_zm(zds)
+        omega_bar_da = isobaric_lat_mean(
+            zds.omg_isobaric, hemispheric_parity="even"
+        ) / 100.0
+        omega_bar_da.attrs.update(
+            units="hPa s-1", source_variable="omg_isobaric"
+        )
         Tbar_da = isobaric_lat_mean(zds.t_isobaric, hemispheric_parity="even")
         rhbar_da = isobaric_lat_mean(zds.rh_isobaric, hemispheric_parity="even")
 
         ubar = ubar_da.values
         vbar = vbar_da.values
-        wbar = wbar_da.values
+        omega_bar = omega_bar_da.values
         Tbar = Tbar_da.values
         rhbar = rhbar_da.values
 
         T_im, _, _, _ = plot_Tu_latpres(ax[i, 0], zds.latitude.values, zds.pres.values, Tbar, ubar)
-        rh_im, _ = plot_rhw_latpres(ax[i, 1], zds.latitude.values, zds.pres.values, rhbar, vbar, wbar, Tbar)
+        rh_im, _ = plot_rhw_latpres(
+            ax[i, 1], zds.latitude.values, zds.pres.values,
+            rhbar, vbar, omega_bar,
+        )
 
         annotate_panel_label(ax[i, 0], sim_names[i])
         annotate_panel_label(ax[i, 1], sim_names[i])
@@ -710,45 +736,25 @@ if should_run_figure(4):
 
     fig, ax = plt.subplots(4, 4, figsize=(8, 8), constrained_layout='True')
 
-    for i, ds in enumerate(dss):
-        pressure_levels = [100, 250, 700, 850]
-        u = ds.uzonal_isobaric.sel(pres=pressure_levels).astype(np.float64)
-        v = ds.umeridional_isobaric.sel(pres=pressure_levels).astype(np.float64)
-        temperature = ds.t_isobaric.sel(pres=pressure_levels).astype(np.float64)
-        water_vapour = ds.qv_isobaric.sel(pres=pressure_levels).astype(np.float64)
-        mean_dims = ('longitude', 'Time')
-        u_mean = u.mean(dim=mean_dims)
-        v_mean = v.mean(dim=mean_dims)
-        temperature_mean = temperature.mean(dim=mean_dims)
-        water_vapour_mean = water_vapour.mean(dim=mean_dims)
-
-        # Covariance identities let Dask stream all required moments in one
-        # pass rather than first forming four full anomaly fields. Float64
-        # reductions avoid cancellation in mean(x*y) - mean(x)*mean(y).
-        eke = 0.5 * (
-            (u*u).mean(dim=mean_dims) - u_mean*u_mean
-            + (v*v).mean(dim=mean_dims) - v_mean*v_mean
-        )
-        memf = (u*v).mean(dim=mean_dims) - u_mean*v_mean
-        mehf = (v*temperature).mean(dim=mean_dims) - v_mean*temperature_mean
-        mewvf = (v*water_vapour).mean(dim=mean_dims) - v_mean*water_vapour_mean
+    for i, simulation in enumerate(sim_names):
+        product = eddy_cache.sel(simulation=simulation)
+        eke = product.eke
+        memf = product.momentum_flux
+        mehf = product.heat_flux
+        mewvf = product.vapour_flux
         eke = hemispheric_fold(eke, parity="even")
         memf = hemispheric_fold(memf, parity="odd")
         mehf = hemispheric_fold(mehf, parity="odd")
         mewvf = hemispheric_fold(mewvf, parity="odd")
 
-        # Compute all four reductions in one shared Dask graph so source chunks
-        # fan out to every required moment before being released.
-        eke, memf, mehf, mewvf = dask_compute(eke, memf, mehf, mewvf)
-
         for j, var in enumerate([eke, memf, mehf, mewvf]):
             if j == 0:
-                ax[j, 0].plot(ds.latitude.values, var[0], color=cols[i], label=sim_names[i])
+                ax[j, 0].plot(var.latitude.values, var[0], color=cols[i], label=sim_names[i])
             else:
-                ax[j, 0].plot(ds.latitude.values, var[0], color=cols[i])
-            ax[j, 1].plot(ds.latitude.values, var[1], color=cols[i])
-            ax[j, 2].plot(ds.latitude.values, var[2], color=cols[i])
-            ax[j, 3].plot(ds.latitude.values, var[3], color=cols[i])
+                ax[j, 0].plot(var.latitude.values, var[0], color=cols[i])
+            ax[j, 1].plot(var.latitude.values, var[1], color=cols[i])
+            ax[j, 2].plot(var.latitude.values, var[2], color=cols[i])
+            ax[j, 3].plot(var.latitude.values, var[3], color=cols[i])
 
     for a in ax.ravel():
         a.set_xlim(-90, 90)
@@ -769,19 +775,6 @@ if should_run_figure(4):
     print("Done with figure: comp_eddy_fluxes")
 
 
-imerg_ds = None
-imerg_pr = None
-if should_run_any([5, 6]):
-    imerg_ds = xr.open_mfdataset(list(sorted(glob.glob('/data/phh1-hosted/cwp29/imerg/*3IMERG.*.nc4')))[:300], concat_dim='time', combine='nested', engine="netcdf4")
-
-    imerg_pr = cosine_weighted_latitude_coarsen(
-        imerg_ds.precipitation,
-        5,
-        lat_dim="lat",
-    ).coarsen(lon=5, boundary="trim").mean()
-
-
-
 DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS = (-10.0, 10.0)
 DISTRIBUTION_DOMAIN_STYLES = (("Global", "-"), ("10S-10N", "--"))
 
@@ -790,25 +783,22 @@ if should_run_figure(5):
     # Normalised rainfall intensity distribution
     fig, ax = plt.subplots(1, 3, figsize=(8, 3), constrained_layout=True, sharey=True)
 
-    imerg_histograms = domain_histograms(
-        imerg_pr, bins=300, value_range=(0, 300),
-        deep_tropical_lat_bounds=DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS,
-    )
-    for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, imerg_histograms):
+    rain_edges = distribution_cache.rain_bin_edges.values
+    imerg_histograms = distribution_cache.imerg_rain_histogram
+    for domain_index, (domain, linestyle) in enumerate(DISTRIBUTION_DOMAIN_STYLES):
+        counts = imerg_histograms.isel(domain=domain_index).values
+        edges = rain_edges
         x, h = relative_frequency_from_histogram(counts, edges, smooth=10)
         ax[0].plot(x, h, color='k', ls=linestyle, label=f'IMERG (Obs), {domain}')
     ax[0].set_yscale('log')
 
-    for s, ds in enumerate(dss):
-        precip, precip_con, precip_res = accumulated_precipitation_components(ds)
-
-        for i, precip_var in enumerate([precip, precip_con, precip_res]):
-            rate = precip_rate_from_accum(precip_var)
-            histograms = domain_histograms(
-                rate, bins=300, value_range=(0, 300),
-                deep_tropical_lat_bounds=DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS,
-            )
-            for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, histograms):
+    for s, simulation in enumerate(sim_names):
+        product = distribution_cache.sel(simulation=simulation)
+        for i, component in enumerate(["total", "convective", "resolved"]):
+            histograms = product.rain_histogram.sel(component=component)
+            for domain_index, (domain, linestyle) in enumerate(DISTRIBUTION_DOMAIN_STYLES):
+                counts = histograms.isel(domain=domain_index).values
+                edges = rain_edges
                 x, h = relative_frequency_from_histogram(counts, edges, smooth=10)
                 label = f"{sim_names[s]}, {domain}" if i == 0 else None
                 ax[i].plot(x, h, color=cols[s], ls=linestyle, label=label)
@@ -833,25 +823,22 @@ if should_run_figure(5):
 if should_run_figure(6):
     fig, ax = plt.subplots(1, 3, figsize=(8, 3), constrained_layout=True, sharey=True)
 
-    imerg_histograms = duration_domain_histograms(
-        imerg_pr, threshold=5, bins=59, value_range=(1, 60),
-        deep_tropical_lat_bounds=DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS,
-    )
-    for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, imerg_histograms):
+    duration_edges = distribution_cache.duration_bin_edges.values
+    imerg_histograms = distribution_cache.imerg_duration_histogram
+    for domain_index, (domain, linestyle) in enumerate(DISTRIBUTION_DOMAIN_STYLES):
+        counts = imerg_histograms.isel(domain=domain_index).values
+        edges = duration_edges
         x, h = relative_frequency_from_histogram(counts, edges, smooth=5)
         ax[0].plot(x, h, color='k', ls=linestyle, label=f'IMERG (Obs), {domain}')
     ax[0].set_yscale('log')
 
-    for s, ds in enumerate(dss):
-        precip, precip_con, precip_res = accumulated_precipitation_components(ds)
-
-        for i, precip_var in enumerate([precip, precip_con, precip_res]):
-            rate = precip_rate_from_accum(precip_var)
-            histograms = duration_domain_histograms(
-                rate, threshold=5, bins=59, value_range=(1, 60),
-                deep_tropical_lat_bounds=DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS,
-            )
-            for (domain, linestyle), (counts, edges) in zip(DISTRIBUTION_DOMAIN_STYLES, histograms):
+    for s, simulation in enumerate(sim_names):
+        product = distribution_cache.sel(simulation=simulation)
+        for i, component in enumerate(["total", "convective", "resolved"]):
+            histograms = product.duration_histogram.sel(component=component)
+            for domain_index, (domain, linestyle) in enumerate(DISTRIBUTION_DOMAIN_STYLES):
+                counts = histograms.isel(domain=domain_index).values
+                edges = duration_edges
                 x, h = relative_frequency_from_histogram(counts, edges, smooth=5)
                 label = f"{sim_names[s]}, {domain}" if i == 0 else None
                 ax[i].plot(x, h, color=cols[s], ls=linestyle, label=label)
@@ -872,11 +859,6 @@ if should_run_figure(6):
     print("Done with figure: comp_duration_dist")
 
 
-if imerg_ds is not None:
-    imerg_ds.close()
-    imerg_ds = None
-    imerg_pr = None
-
 if should_run_figure(7):
     spec_levels = np.linspace(0, 5, 26)
     spec_cmap, spec_norm = make_spectrum_cmap(spec_levels)
@@ -896,32 +878,10 @@ if should_run_figure(7):
     sym_spec_im = asym_spec_im = None
     sym_diff_im = asym_diff_im = None
 
-    for d, ds in enumerate(dss):
-        precip, _, _ = accumulated_precipitation_components(ds)
-        rate = precip_rate_from_accum(precip)
-
-        # The spectrum only uses 10S-10N. Subset while the field is lazy so
-        # load() materialises about one ninth of the former global array.
-        pr = rate.sel(
-            latitude=slice(*DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS)
-        ).rename({'latitude':'lat', 'longitude':'lon'})
-        pr = cosine_weighted_power_input(pr, lat_dim="lat")
-        pr = pr.load()
-        print(
-            f"Loaded deep-tropical precipitation rate for {sim_names[d]}: "
-            f"shape={pr.shape}, dtype={pr.dtype}, size={pr.nbytes / 2**20:.1f} MiB"
-        )
-
-        spd = 4
-
-        raw_spectrum = spacetime_power(pr, lataggreg='sum', latitude_bounds=(-10, 10), dosymmetries=True,
-                                       segsize=96, noverlap=60, spd=spd)
-
-        sym_smooth_spectrum = smooth_wavefreq(raw_spectrum.sel(component='symmetric'), freq_ax = 1)
-        asym_smooth_spectrum = smooth_wavefreq(raw_spectrum.sel(component='antisymmetric'), freq_ax = 1)
-
-        sym_sig_spectrum = raw_spectrum.sel(component='symmetric')/sym_smooth_spectrum
-        asym_sig_spectrum = raw_spectrum.sel(component='antisymmetric')/asym_smooth_spectrum
+    for d, simulation in enumerate(sim_names):
+        product = spectrum_cache.sel(simulation=simulation)
+        sym_sig_spectrum = product.symmetric_normalised_power
+        asym_sig_spectrum = product.antisymmetric_normalised_power
 
         wn = sym_sig_spectrum.wavenumber
         f = sym_sig_spectrum.frequency
@@ -991,8 +951,6 @@ if should_run_figure(7):
                 axes[d, 1].annotate('IG', (-5, 0.43), bbox=dict(facecolor='w', edgecolor='k', alpha=0.7))
                 axes[d, 1].annotate('EIG', (11, 0.32), bbox=dict(facecolor='w', edgecolor='k', alpha=0.7))
 
-    del pr, rate, precip
-
     ax[0, 0].set_title('Symmetric')
     ax[0, 1].set_title('Anti-symmetric')
     ax2[0, 0].set_title('Symmetric')
@@ -1036,13 +994,9 @@ if should_run_figure(8):
 
     fig, ax = plt.subplots(1, len(dss), figsize=(8, 3), constrained_layout=True)
 
-    for d, ds in enumerate(dss):
-        precip, _, _ = accumulated_precipitation_components(ds)
-        precip = lat_mean(precip.sel(latitude=slice(-10, 10)))
-
-        pr = precip_rate_from_accum(precip)
-
-        hovmoller_im = ax[d].contourf(precip.longitude, pr.Time, pr.values, levels=levels, norm=precip_norm, cmap=precip_cmap, extend='max')
+    for d, simulation in enumerate(sim_names):
+        pr = rain_cache.precip_rate_hovmoller.sel(simulation=simulation)
+        hovmoller_im = ax[d].contourf(pr.longitude, pr.Time, pr.values, levels=levels, norm=precip_norm, cmap=precip_cmap, extend='max')
 
         annotate_panel_label(ax[d], sim_names[d])
         if d > 0:
@@ -1050,7 +1004,7 @@ if should_run_figure(8):
 
     ax[0].set_ylabel("time (days)")
 
-    fig.colorbar(hovmoller_im, ax=ax[-1], location='right', label="Precipitation rate (mm/h)")
+    fig.colorbar(hovmoller_im, ax=ax[-1], location='right', label="Precipitation rate (mm/day)")
 
     for a in ax:
         a.set_xlabel("Longitude")
@@ -1068,26 +1022,11 @@ if should_run_figure(9):
         ax = np.array([ax])
 
     for i, ds in enumerate(dss):
-        # zgrid: (nVertLevelsP1, latitude, longitude)
-        zgrid = ds.zgrid
-
-        # Midpoint heights from interface heights
-        z_lower = zgrid.isel(nVertLevelsP1=slice(0, -1)).values
-        z_upper = zgrid.isel(nVertLevelsP1=slice(1, None)).values
-        zmid = 0.5 * (z_lower + z_upper)   # (z, latitude, longitude)
-
-        # Horizontal diagnostics
-        z_zonal = np.nanmean(zmid, axis=2)            # (z, latitude)
-        zmean = lat_mean(
-            xr.DataArray(
-                z_zonal,
-                dims=("z", "latitude"),
-                coords={"latitude": ds.latitude},
-            )
-        ).values                                      # global mean profile
-        zmin = np.nanmin(zmid, axis=(1, 2))           # global min at each level
-        zmax = np.nanmax(zmid, axis=(1, 2))           # global max at each level
-        zstd = np.nanstd(zmid, axis=(1, 2))           # global std at each level
+        z_zonal = ds.zgrid_zonal_mean.values
+        zmean = ds.zgrid_global_mean.values
+        zmin = ds.zgrid_global_min.values
+        zmax = ds.zgrid_global_max.values
+        zstd = ds.zgrid_global_std.values
 
         # Zonal mean and anomaly from global mean
         z_anom = z_zonal - zmean[:, None]
@@ -1335,11 +1274,11 @@ if should_run_figure(12):
         ax_profile.plot(olr_zonal_mean.values, olr_zonal_mean.latitude.values,
                         color=olr_cols[i], label=sim_names[i])
 
-        histograms = domain_histograms(
-            olr, bins=bins,
-            deep_tropical_lat_bounds=DISTRIBUTION_DEEP_TROPICAL_LAT_BOUNDS,
-        )
-        for (domain, linestyle), (h, b) in zip(DISTRIBUTION_DOMAIN_STYLES, histograms):
+        histograms = ds.olr_histogram
+        olr_edges = ds.olr_bin_edges.values
+        for domain_index, (domain, linestyle) in enumerate(DISTRIBUTION_DOMAIN_STYLES):
+            h = histograms.isel(domain=domain_index).values
+            b = olr_edges
             ax3.plot(
                 0.5 * (b[1:] + b[:-1]),
                 h / h.sum(),
@@ -1793,7 +1732,7 @@ if should_run_figure(18):
     zmid_cache = {}
     for i, ds in enumerate(dss):
         try:
-            zmid_cache[i] = midlevel_height_from_latlon(ds)
+            zmid_cache[i] = ds.zmid_latitude
         except Exception as e:
             print(f"Skipping scalar constituent height cache for {sim_names[i]}: {e}")
 
@@ -2061,7 +2000,10 @@ if should_run_figure(14):
     eke_entries = []
 
     for i, ds in enumerate(dss):
-        eke_entries.append((i, isobaric_eddy_kinetic_energy(ds).load()))
+        eke = hemispheric_fold(
+            ds.eke_isobaric.transpose("pres", "latitude"), parity="even"
+        ).load()
+        eke_entries.append((i, eke))
 
     if eke_entries:
         nrows = len(eke_entries)

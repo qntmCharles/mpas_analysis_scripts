@@ -7,17 +7,20 @@ Jet variability diagnostics for the 200-day MPAS aquaplanet integrations.
 The script provides two complementary checks for jets becoming trapped in
 particular configurations:
 
-  * fixed-level zonal-mean wind, by default u at 700 hPa, with latitude-time
+  * fixed-level zonal-mean wind, by default u at 250 hPa, with latitude-time
     wind fields, hemispheric jet-latitude tracks, and latitude-resolved
     autocorrelation of the wind fluctuations;
   * leading EOFs of zonal-mean u in each hemisphere, interpreted as annular-mode
     zonal indices, with EOF patterns, index time series, and autocorrelation.
-  * model-height latitude-height jet structure, with nudged-control differences
-    and subtropical jet-core markers.
+
+Time-mean jet profiles and jet-core structure belong to
+``circulation_diagnostics.py``.
 
 The default configuration mirrors the other diagnostics in this directory.
 """
 
+import argparse
+import glob
 import os
 import sys
 from functools import partial
@@ -35,13 +38,15 @@ import xarray as xr
 import dask
 
 from diagnostics.diagnostic_helpers import (
-    FigureSaver, LATLON_PATTERN, ZONAL_MEAN_PATTERN, add_symmetric_colorbar,
-    annotate_panel_label, control_diff_label, diagnostic_output_dir,
+    FigureSaver, LATLON_PATTERN,
+    annotate_panel_label, cache_manifest, cache_manifest_matches,
+    diagnostic_cache_dir, diagnostic_output_dir,
     difference_cmap, figure_should_run, figure_should_run_any,
-    latitude_weights, load_latlon_dataset, model_lat_field,
-    pressure_layer_weights, safe_name, set_latheight_labels, set_latpres_axis,
+    latitude_weights, load_latlon_dataset,
+    pressure_layer_weights, safe_name, set_latpres_axis,
     simulation_colour, standardize_latlon_dataset, subset_between, symmetric_levels,
-    symmetric_percentile_levels_for_fields, time_step_days,
+    time_step_days, read_json_file,
+    write_json_file,
 )
 
 
@@ -49,6 +54,31 @@ from diagnostics.diagnostic_helpers import (
 # Configuration
 # -----------------------------------------------------------------------------
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--figures",
+        nargs="+",
+        type=int,
+        choices=range(1, 5),
+        default=None,
+        help="Build only these numbered figures.",
+    )
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument(
+        "--figures-only",
+        action="store_true",
+        help="Build figures only from current compact jet caches.",
+    )
+    cache_mode.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Rebuild selected compact jet caches before plotting.",
+    )
+    return parser.parse_args(argv)
+
+
+runtime_args = parse_args()
 save = True
 save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/jet_variability/")
 
@@ -59,8 +89,6 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/jet_variabil
 #   2: fixed_level_zonal_wind_autocorrelation
 #   3: annular_mode_eof_patterns
 #   4: annular_mode_indices_and_autocorrelation
-#   5: time_mean_zonal_wind_profiles
-#   6: subtropical_jet_latheight_structure
 #
 # WHAT TO LOOK FOR:
 #   * Long jet autocorrelation or persistent jet-latitude anomalies indicate
@@ -70,7 +98,7 @@ save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/jet_variabil
 #     hemispheric circulation shifts or local tropical/UTLS responses.
 #   * If U-nudged changes jet variability without a matching T-nudged change,
 #     that supports a wind-driven or shear-mediated pathway.
-figures_to_run = [6]
+figures_to_run = runtime_args.figures or []
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 
@@ -85,7 +113,6 @@ cols = [simulation_colour(name) for name in sim_names]
 
 
 fixed_pressure_level = 250.0
-jet_profile_pressure_levels = [700.0, 200.0]
 time_average_days = 1.0
 max_autocorr_lag_days = 80.0
 autocorr_efold_threshold = np.exp(-1.0)
@@ -100,20 +127,105 @@ hemisphere_jet_bounds = {
     "SH": (-85.0, -5.0),
     "NH": (5.0, 85.0),
 }
-subtropical_jet_search_lat_bounds = {
-    "SH": (-45.0, -10.0),
-    "NH": (10.0, 45.0),
-}
-subtropical_jet_height_bounds = (8000.0, 18000.0)
-jet_structure_plot_height_bounds = (0.0, 25000.0)
 eof_pressure_bounds = (1000.0, 100.0)
 eof_min_valid_fraction = 0.95
 
 latlon_chunks = {"Time": -1, "latitude": 60, "longitude": 120}
 needed_vars = ["uzonal_isobaric"]
-needed_vars_zm = ["uReconstructZonal"]
 
 dask.config.set({"array.slicing.split_large_chunks": True})
+
+JET_CACHE_ROOT = diagnostic_cache_dir("jet_variability_cache")
+JET_CACHE_SCHEMA = "jet-variability-v1"
+if not runtime_args.figures_only:
+    os.makedirs(JET_CACHE_ROOT, exist_ok=True)
+
+JET_CACHE_FILES = {
+    "fixed": (
+        f"u{safe_name(f'{fixed_pressure_level:g}')}_zonal_mean_timeseries.nc",
+        f"u{safe_name(f'{fixed_pressure_level:g}')}_zonal_mean_autocorrelation.nc",
+        f"u{safe_name(f'{fixed_pressure_level:g}')}_persistence_summary.csv",
+        f"u{safe_name(f'{fixed_pressure_level:g}')}_jet_latitude_summary.csv",
+    ),
+    "annular": (
+        "annular_mode_eof_patterns.nc",
+        "annular_mode_indices_autocorrelation.nc",
+        "annular_mode_summary.csv",
+        "annular_mode_zonal_indices.csv",
+    ),
+}
+
+
+def requested_cache_families():
+    selected = set(figures_to_run or range(1, 5))
+    families = set()
+    if selected & {1, 2}:
+        families.add("fixed")
+    if selected & {3, 4}:
+        families.add("annular")
+    return families
+
+
+def jet_source_paths(family):
+    return [
+        path
+        for data_loc in data_locs
+        for path in sorted(glob.glob(os.path.join(root_dir, data_loc, LATLON_PATTERN)))
+    ]
+
+
+def jet_cache_manifest(family):
+    configuration = {
+        "family": family,
+        "simulations": list(sim_names),
+        "fixed_pressure_level_hpa": fixed_pressure_level,
+        "time_average_days": time_average_days,
+        "max_autocorr_lag_days": max_autocorr_lag_days,
+        "hemisphere_lat_bounds": hemisphere_lat_bounds,
+        "hemisphere_jet_bounds": hemisphere_jet_bounds,
+        "eof_pressure_bounds_hpa": eof_pressure_bounds,
+        "eof_min_valid_fraction": eof_min_valid_fraction,
+    }
+    return cache_manifest(
+        "jet_variability_diagnostics.py",
+        schema=JET_CACHE_SCHEMA,
+        configuration=configuration,
+        source_paths=jet_source_paths(family),
+    )
+
+
+def jet_cache_path(filename):
+    return os.path.join(JET_CACHE_ROOT, filename)
+
+
+def jet_manifest_path(family):
+    return jet_cache_path(f"{family}.manifest.json")
+
+
+def jet_cache_is_current(family):
+    if runtime_args.rebuild_cache:
+        return False
+    if not all(os.path.isfile(jet_cache_path(name)) for name in JET_CACHE_FILES[family]):
+        return False
+    try:
+        expected = jet_cache_manifest(family)
+        saved = read_json_file(jet_manifest_path(family))
+    except (OSError, ValueError):
+        return False
+    return cache_manifest_matches(saved, expected)
+
+
+requested_families = requested_cache_families()
+current_cache_families = {
+    family for family in requested_families if jet_cache_is_current(family)
+}
+stale_cache_families = requested_families - current_cache_families
+if runtime_args.figures_only and stale_cache_families:
+    stale = ", ".join(sorted(stale_cache_families))
+    raise RuntimeError(
+        f"Figure-only mode requires current jet caches for: {stale}. "
+        "Run without --figures-only to rebuild them."
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -171,82 +283,6 @@ def weighted_pressure_mean(field):
     numerator = (field * weights).where(valid).sum(dim="pres", skipna=True)
     denominator = weights.where(valid).sum(dim="pres", skipna=True)
     return numerator / denominator
-
-
-def model_height_time_mean_zonal_u(zds):
-    if "uReconstructZonal" not in zds.data_vars:
-        raise ValueError("uReconstructZonal is required for model-height jet structure")
-
-    u = zds.uReconstructZonal
-    mean_dims = [dim for dim in ("Time", "longitude") if dim in u.dims]
-    if mean_dims:
-        u = u.mean(dim=mean_dims, skipna=True)
-    u = model_lat_field(u).load()
-    u.name = "u_time_mean_zonal_mean"
-    u.attrs.update(units="m s-1", long_name="time-mean zonal-mean zonal wind")
-    return u
-
-
-def subtropical_jet_core(field, lat_bounds, z_bounds=subtropical_jet_height_bounds):
-    domain = subset_between(field, "latitude", lat_bounds)
-    domain = subset_between(domain, "z", z_bounds)
-    if domain.sizes.get("latitude", 0) == 0 or domain.sizes.get("z", 0) == 0:
-        return None
-
-    values = np.asarray(domain.transpose("z", "latitude").values, dtype=float)
-    if not np.isfinite(values).any():
-        return None
-
-    z_index, lat_index = np.unravel_index(np.nanargmax(values), values.shape)
-    return {
-        "latitude": float(domain.latitude.values[lat_index]),
-        "height_m": float(domain.z.values[z_index]),
-        "u_ms-1": float(values[z_index, lat_index]),
-    }
-
-
-def draw_subtropical_search_boxes(ax):
-    z0 = subtropical_jet_height_bounds[0] / 1000.0
-    z1 = subtropical_jet_height_bounds[1] / 1000.0
-    for bounds in subtropical_jet_search_lat_bounds.values():
-        x0, x1 = bounds
-        ax.plot(
-            [x0, x1, x1, x0, x0],
-            [z0, z0, z1, z1, z0],
-            color="0.15",
-            lw=0.7,
-            ls=":",
-            alpha=0.8,
-        )
-
-
-def plot_jet_core_marker(ax, core, color, marker="o", label=None, zorder=4):
-    if core is None:
-        return
-    if marker == "x":
-        ax.scatter(
-            core["latitude"],
-            core["height_m"] / 1000.0,
-            s=38,
-            marker=marker,
-            color=color,
-            linewidth=1.0,
-            label=label,
-            zorder=zorder,
-        )
-        return
-
-    ax.scatter(
-        core["latitude"],
-        core["height_m"] / 1000.0,
-        s=34,
-        marker=marker,
-        facecolor=color,
-        edgecolor="0.05",
-        linewidth=0.8,
-        label=label,
-        zorder=zorder,
-    )
 
 
 def autocorrelation_1d(values, max_lag_steps, min_pairs=8):
@@ -361,37 +397,35 @@ def longest_same_sign_run_days(values, step_days):
 
 def save_dataset(ds, filename):
     if save:
-        ds.to_netcdf(os.path.join(save_loc, filename))
+        path = jet_cache_path(filename)
+        temporary = path + ".tmp"
+        ds.to_netcdf(temporary)
+        os.replace(temporary, path)
+
+
+def save_table(table, filename):
+    if save:
+        path = jet_cache_path(filename)
+        temporary = path + ".tmp"
+        table.to_csv(temporary, index=False)
+        os.replace(temporary, path)
 
 
 # -----------------------------------------------------------------------------
 # Data loading and wind diagnostics
 # -----------------------------------------------------------------------------
 
-dss = []
-for i, d in enumerate(data_locs):
-    ds = load_latlon_dataset(
-        os.path.join(root_dir, d),
-        latlon_pattern=LATLON_PATTERN,
-        chunks=latlon_chunks,
-    )
-    ds = standardize_latlon_dataset(ds, needed_vars)
-    print(ds)
-    dss.append(ds)
-
-
-dss_zm = []
-if should_run_figure(6):
+dss = [None] * len(data_locs)
+if stale_cache_families & {"fixed", "annular"}:
     for i, d in enumerate(data_locs):
-        zds = load_latlon_dataset(
+        ds = load_latlon_dataset(
             os.path.join(root_dir, d),
-            latlon_pattern=ZONAL_MEAN_PATTERN,
-            chunks={"Time": -1},
+            latlon_pattern=LATLON_PATTERN,
+            chunks=latlon_chunks,
         )
-        zds = standardize_latlon_dataset(zds, needed_vars_zm)
-        print(zds)
-        dss_zm.append(zds)
-
+        ds = standardize_latlon_dataset(ds, needed_vars)
+        print(ds)
+        dss[i] = ds
 
 def zonal_mean_u_at_level(ds, plev=fixed_pressure_level):
     if "uzonal_isobaric" not in ds.data_vars:
@@ -408,15 +442,6 @@ def zonal_mean_u_at_level(ds, plev=fixed_pressure_level):
         time_average_days=time_average_days,
     )
     return u
-
-
-def time_mean_zonal_mean_u_at_level(ds, plev):
-    u = zonal_mean_u_at_level(ds, plev=plev)
-    u_mean = u.mean(dim="Time", skipna=True).load()
-    u_mean.name = "u_time_mean_zonal_mean"
-    u_mean.attrs.update(u.attrs)
-    u_mean.attrs["long_name"] = "time-mean zonal-mean zonal wind"
-    return u_mean
 
 
 def zonal_mean_u_profile(ds):
@@ -485,7 +510,34 @@ jet_latitudes = {}
 fixed_summary_rows = []
 jet_summary_rows = []
 
-if should_run_any([1, 2]):
+if "fixed" in current_cache_families:
+    with xr.open_dataset(
+        jet_cache_path(
+            f"u{pressure_name(fixed_pressure_level)}_zonal_mean_timeseries.nc"
+        )
+    ) as cached:
+        fixed_cache = cached.load()
+    with xr.open_dataset(
+        jet_cache_path(
+            f"u{pressure_name(fixed_pressure_level)}_zonal_mean_autocorrelation.nc"
+        )
+    ) as cached:
+        autocorr_cache = cached.load()
+    for i, simulation in enumerate(sim_names):
+        if simulation not in fixed_cache.simulation.values:
+            continue
+        fixed_level[i] = fixed_cache.u_zonal_mean.sel(simulation=simulation)
+        fixed_level_anomaly[i] = fixed_cache.u_anomaly.sel(simulation=simulation)
+        fixed_level_autocorr[i] = autocorr_cache.autocorrelation.sel(
+            simulation=simulation
+        )
+        fixed_level_efold[i] = autocorr_cache.efolding_time_days.sel(
+            simulation=simulation
+        )
+        jet_latitudes[i] = hemisphere_jet_latitudes(fixed_level[i])
+    print(f"Using current fixed-level jet cache in {JET_CACHE_ROOT}")
+
+if should_run_any([1, 2]) and "fixed" in stale_cache_families:
     for i, ds in enumerate(dss):
         try:
             u700 = zonal_mean_u_at_level(ds)
@@ -561,14 +613,15 @@ if should_run_any([1, 2]):
         )
         save_dataset(ac_ds, f"u{pressure_name(fixed_pressure_level)}_zonal_mean_autocorrelation.nc")
 
-        pd.DataFrame(fixed_summary_rows).to_csv(
-            os.path.join(save_loc, f"u{pressure_name(fixed_pressure_level)}_persistence_summary.csv"),
-            index=False,
+        save_table(
+            pd.DataFrame(fixed_summary_rows),
+            f"u{pressure_name(fixed_pressure_level)}_persistence_summary.csv",
         )
-        pd.DataFrame(jet_summary_rows).to_csv(
-            os.path.join(save_loc, f"u{pressure_name(fixed_pressure_level)}_jet_latitude_summary.csv"),
-            index=False,
+        save_table(
+            pd.DataFrame(jet_summary_rows),
+            f"u{pressure_name(fixed_pressure_level)}_jet_latitude_summary.csv",
         )
+        write_json_file(jet_manifest_path("fixed"), jet_cache_manifest("fixed"))
 
 
 # -----------------------------------------------------------------------------
@@ -684,7 +737,40 @@ annular_results = {}
 annular_summary_rows = []
 annular_index_rows = []
 
-if should_run_any([3, 4]):
+if "annular" in current_cache_families:
+    with xr.open_dataset(jet_cache_path("annular_mode_eof_patterns.nc")) as cached:
+        pattern_cache = cached.load()
+    with xr.open_dataset(
+        jet_cache_path("annular_mode_indices_autocorrelation.nc")
+    ) as cached:
+        index_cache = cached.load()
+    for member in pattern_cache.mode_member.values:
+        pattern_member = pattern_cache.sel(mode_member=member)
+        simulation = str(pattern_member.simulation.item())
+        hemisphere = str(pattern_member.hemisphere.item())
+        if simulation not in sim_names:
+            continue
+        i = sim_names.index(simulation)
+        index_member = index_cache.sel(mode_member=member)
+        eof = pattern_member.eof.drop_vars(
+            ["mode_member", "simulation", "hemisphere"], errors="ignore"
+        )
+        index = index_member.zonal_index.drop_vars(
+            ["mode_member", "simulation", "hemisphere"], errors="ignore"
+        )
+        autocorrelation = index_member.autocorrelation.drop_vars(
+            ["mode_member", "simulation", "hemisphere"], errors="ignore"
+        )
+        annular_results[(i, hemisphere)] = {
+            "eof": eof,
+            "index": index,
+            "autocorrelation": autocorrelation,
+            "efolding_time_days": float(efolding_time(autocorrelation).values),
+            "variance_fraction": float(eof.attrs["variance_fraction"]),
+        }
+    print(f"Using current annular-mode jet cache in {JET_CACHE_ROOT}")
+
+if should_run_any([3, 4]) and "annular" in stale_cache_families:
     for i, ds in enumerate(dss):
         try:
             zm_u = zonal_mean_u_profile(ds)
@@ -769,94 +855,12 @@ if should_run_any([3, 4]):
         )
         save_dataset(ac_ds, "annular_mode_indices_autocorrelation.nc")
 
-        pd.DataFrame(annular_summary_rows).to_csv(os.path.join(save_loc, "annular_mode_summary.csv"), index=False)
-        pd.DataFrame(annular_index_rows).to_csv(os.path.join(save_loc, "annular_mode_zonal_indices.csv"), index=False)
-
-
-jet_mean_profiles = {}
-if should_run_figure(5):
-    for i, ds in enumerate(dss):
-        for plev in jet_profile_pressure_levels:
-            try:
-                jet_mean_profiles[(i, plev)] = time_mean_zonal_mean_u_at_level(ds, plev)
-            except Exception as exc:
-                print(f"Skipping {plev:g} hPa jet profile for {sim_names[i]}: {exc}")
-
-    if save and jet_mean_profiles:
-        members = list(jet_mean_profiles)
-        profile_da = xr.concat(
-            [jet_mean_profiles[member].rename("u_zonal_mean") for member in members],
-            dim=xr.IndexVariable("profile_member", np.arange(len(members))),
-            join="outer",
+        save_table(pd.DataFrame(annular_summary_rows), "annular_mode_summary.csv")
+        save_table(
+            pd.DataFrame(annular_index_rows),
+            "annular_mode_zonal_indices.csv",
         )
-        profile_ds = profile_da.to_dataset()
-        profile_ds = profile_ds.assign_coords(
-            simulation=("profile_member", [sim_names[i] for i, _ in members]),
-            requested_pressure_hpa=("profile_member", [plev for _, plev in members]),
-            selected_pressure_hpa=(
-                "profile_member",
-                [jet_mean_profiles[member].attrs["selected_pressure_hpa"] for member in members],
-            ),
-        )
-        save_dataset(profile_ds, "u700_u200_time_mean_zonal_profiles.nc")
-
-
-jet_structure_fields = {}
-jet_core_lookup = {}
-jet_core_rows = []
-if should_run_figure(6):
-    for i, zds in enumerate(dss_zm):
-        try:
-            field = model_height_time_mean_zonal_u(zds)
-            jet_structure_fields[i] = field
-
-            for hemisphere, bounds in subtropical_jet_search_lat_bounds.items():
-                core = subtropical_jet_core(field, bounds)
-                jet_core_lookup[(i, hemisphere)] = core
-                if core is None:
-                    continue
-                control_core = jet_core_lookup.get((0, hemisphere))
-                row = {
-                    "simulation": sim_names[i],
-                    "hemisphere": hemisphere,
-                    "core_latitude": core["latitude"],
-                    "core_height_km": core["height_m"] / 1000.0,
-                    "core_u_ms-1": core["u_ms-1"],
-                }
-                if i == 0 or control_core is None:
-                    row.update(
-                        {
-                            "delta_core_latitude_vs_control": 0.0 if i == 0 else np.nan,
-                            "delta_core_height_km_vs_control": 0.0 if i == 0 else np.nan,
-                            "delta_core_u_ms-1_vs_control": 0.0 if i == 0 else np.nan,
-                        }
-                    )
-                else:
-                    row.update(
-                        {
-                            "delta_core_latitude_vs_control": core["latitude"] - control_core["latitude"],
-                            "delta_core_height_km_vs_control": (core["height_m"] - control_core["height_m"]) / 1000.0,
-                            "delta_core_u_ms-1_vs_control": core["u_ms-1"] - control_core["u_ms-1"],
-                        }
-                    )
-                jet_core_rows.append(row)
-        except Exception as exc:
-            print(f"Skipping model-height jet-structure diagnostics for {sim_names[i]}: {exc}")
-
-    if save and jet_structure_fields:
-        members = list(jet_structure_fields)
-        structure_da = xr.concat(
-            [jet_structure_fields[i].rename("u_zonal_mean") for i in members],
-            dim=xr.IndexVariable("simulation", [sim_names[i] for i in members]),
-            join="outer",
-        )
-        save_dataset(structure_da.to_dataset(), "subtropical_jet_latheight_structure.nc")
-
-        if jet_core_rows:
-            pd.DataFrame(jet_core_rows).to_csv(
-                os.path.join(save_loc, "subtropical_jet_core_summary.csv"),
-                index=False,
-            )
+        write_json_file(jet_manifest_path("annular"), jet_cache_manifest("annular"))
 
 
 # -----------------------------------------------------------------------------
@@ -1010,182 +1014,3 @@ if should_run_figure(4) and annular_results:
     tight_layout_with_right_margin(fig, right=0.98)
     figsave.save(fig, "annular_mode_indices_and_autocorrelation", number=4)
     print("Done with figure: annular_mode_indices_and_autocorrelation")
-
-
-if should_run_figure(5) and jet_mean_profiles:
-    fig, ax = plt.subplots(
-        1,
-        len(jet_profile_pressure_levels),
-        figsize=(5.0 * len(jet_profile_pressure_levels), 3.8),
-        sharey=True,
-        constrained_layout=True,
-        squeeze=False,
-    )
-    ax = ax[0]
-
-    for col, plev in enumerate(jet_profile_pressure_levels):
-        axis = ax[col]
-        selected_pressures = [
-            jet_mean_profiles[(i, plev)].attrs["selected_pressure_hpa"]
-            for i in range(len(dss))
-            if (i, plev) in jet_mean_profiles
-        ]
-        title_pressure = np.nanmedian(selected_pressures) if selected_pressures else plev
-
-        for i in range(len(dss)):
-            profile = jet_mean_profiles.get((i, plev))
-            if profile is None:
-                continue
-            axis.plot(profile.latitude.values, profile.values, color=cols[i], lw=1.5, label=sim_names[i])
-            for bounds in hemisphere_jet_bounds.values():
-                hemi = subset_between(profile, "latitude", bounds)
-                if hemi.sizes.get("latitude", 0) == 0 or not np.isfinite(hemi.values).any():
-                    continue
-                jet_lat = float(hemi.idxmax(dim="latitude", skipna=True).values)
-                jet_u = float(hemi.sel(latitude=jet_lat).values)
-                axis.scatter(jet_lat, jet_u, color=cols[i], s=22, edgecolor="w", linewidth=0.5, zorder=3)
-
-        axis.axhline(0, color="0.3", lw=0.7)
-        axis.axvline(0, color="0.3", lw=0.7, ls=":")
-        axis.set_title(f"{title_pressure:g} hPa")
-        axis.set_xlabel("Latitude")
-        axis.grid(True, lw=0.4, alpha=0.5)
-
-    ax[0].set_ylabel(r"Zonal-mean u (m s$^{-1}$)")
-    ax[0].legend(loc="best", frameon=False)
-    fig.suptitle("Time-mean zonal-mean u")
-    figsave.save(fig, "u700_u200_time_mean_zonal_profiles", number=5)
-    print("Done with figure: time_mean_zonal_wind_profiles")
-
-
-if should_run_figure(6) and jet_structure_fields:
-    if 0 not in jet_structure_fields:
-        print("Skipping subtropical jet latitude-height structure: control field is missing")
-    else:
-        control_field = jet_structure_fields[0]
-        diff_fields = {}
-        for i, field in jet_structure_fields.items():
-            field, control_interp = xr.align(field, control_field, join="exact")
-            diff_fields[i] = (field - control_interp).load()
-
-        raw_levels = symmetric_percentile_levels_for_fields(
-            list(jet_structure_fields.values()),
-            percentile=99.0,
-            ndiv=16,
-            zero_field_scale=25.0,
-        )
-        diff_levels = symmetric_percentile_levels_for_fields(
-            [field for i, field in diff_fields.items() if i != 0],
-            percentile=99.0,
-            ndiv=12,
-            zero_field_scale=3.0,
-        )
-
-        ncols = len(dss_zm)
-        fig, ax = plt.subplots(
-            2,
-            ncols,
-            figsize=(3.9 * ncols, 6.2),
-            constrained_layout=True,
-            squeeze=False,
-            sharex=True,
-            sharey=True,
-        )
-
-        raw_im = diff_im = None
-        for i in range(ncols):
-            field = jet_structure_fields.get(i)
-            if field is None:
-                ax[0, i].set_visible(False)
-                ax[1, i].set_visible(False)
-                continue
-
-            raw_im = ax[0, i].contourf(
-                field.latitude.values,
-                field.z.values / 1000.0,
-                field.values,
-                levels=raw_levels,
-                cmap=difference_cmap(raw_levels),
-                extend="both",
-            )
-            if np.nanmin(field.values) < 0.0 < np.nanmax(field.values):
-                ax[0, i].contour(
-                    field.latitude.values,
-                    field.z.values / 1000.0,
-                    field.values,
-                    levels=[0.0],
-                    colors="0.15",
-                    linewidths=0.7,
-                )
-
-            diff = diff_fields[i]
-            diff_im = ax[1, i].contourf(
-                diff.latitude.values,
-                diff.z.values / 1000.0,
-                diff.values,
-                levels=diff_levels,
-                cmap=difference_cmap(diff_levels),
-                extend="both",
-            )
-            if i != 0 and np.nanmin(diff.values) < 0.0 < np.nanmax(diff.values):
-                ax[1, i].contour(
-                    diff.latitude.values,
-                    diff.z.values / 1000.0,
-                    diff.values,
-                    levels=[0.0],
-                    colors="0.15",
-                    linewidths=0.7,
-                )
-
-            for row in range(2):
-                axis = ax[row, i]
-                draw_subtropical_search_boxes(axis)
-                annotate_panel_label(axis, sim_names[i] if row == 0 else control_diff_label(sim_names, i))
-                set_latheight_labels(axis, xlabel=(row == 1), ylabel=(i == 0))
-                axis.set_xlim(-70, 70)
-                axis.set_ylim(
-                    jet_structure_plot_height_bounds[0] / 1000.0,
-                    jet_structure_plot_height_bounds[1] / 1000.0,
-                )
-                if i != 0:
-                    axis.tick_params(labelleft=False)
-                if row == 0:
-                    axis.tick_params(labelbottom=False)
-
-            for hemisphere in subtropical_jet_search_lat_bounds:
-                run_core = jet_core_lookup.get((i, hemisphere))
-                control_core = jet_core_lookup.get((0, hemisphere))
-                plot_jet_core_marker(ax[0, i], run_core, color="gold", marker="o")
-
-                if i == 0:
-                    plot_jet_core_marker(ax[1, i], control_core, color="gold", marker="o")
-                else:
-                    plot_jet_core_marker(ax[1, i], control_core, color="0.05", marker="x")
-                    plot_jet_core_marker(ax[1, i], run_core, color="gold", marker="o")
-                    if control_core is not None and run_core is not None:
-                        ax[1, i].plot(
-                            [control_core["latitude"], run_core["latitude"]],
-                            [control_core["height_m"] / 1000.0, run_core["height_m"] / 1000.0],
-                            color="0.05",
-                            lw=0.8,
-                            alpha=0.9,
-                            zorder=3,
-                        )
-
-        ax[0, 0].set_ylabel("Zonal wind\nHeight (km)")
-        ax[1, 0].set_ylabel("Difference\nHeight (km)")
-        if raw_im is not None:
-            fig.colorbar(raw_im, ax=ax[0, :], location="right", label=r"u (m s$^{-1}$)")
-        if diff_im is not None:
-            add_symmetric_colorbar(
-                fig,
-                diff_im,
-                ax[1, :],
-                diff_levels,
-                label=r"u difference from control (m s$^{-1}$)",
-            )
-
-        fig.suptitle("Subtropical jet latitude-height structure")
-        figsave.save(fig, "subtropical_jet_latheight_structure", number=6)
-        print("Done with figure: subtropical_jet_latheight_structure")
-        print("WHAT TO LOOK FOR: top panels show each run's time-mean jet structure; bottom panels isolate nudged-control differences. Boxes define the subtropical jet-core search region, filled markers are each panel's core, and x markers in nudged panels show the control core.")

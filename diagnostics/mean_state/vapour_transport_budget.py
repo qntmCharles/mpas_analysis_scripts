@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import gc
+import glob
+import json
 import os
 import shutil
 import sys
@@ -43,6 +45,7 @@ from diagnostics.diagnostic_helpers import (
     ANALYSIS_START,
     FigureSaver,
     LATLON_PATTERN,
+    cache_manifest,
     diagnostic_cache_dir,
     diagnostic_output_dir,
     finite_or_nan,
@@ -68,7 +71,7 @@ LV = 2.5e6
 SECONDS_PER_DAY = 86_400.0
 EARTH_RADIUS_M = 6_371_000.0
 FIXED_TOP_PA = 20_000.0
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 EXECUTION_LAYOUT_VERSION = 2
 MAX_TROPOPAUSE_SURFACE_JUMP_M = 2_000.0
 PLOT_LATITUDE_BOUNDS = (-40.0, 40.0)
@@ -99,7 +102,7 @@ CACHE_ROOT = diagnostic_cache_dir("vapour_transport_budget_cache")
 DATA_LOC = diagnostic_cache_dir("vapour_transport_budget_data")
 
 NEEDED_VARS = (
-    "theta", "pressure", "zgrid", "rho", "qv", "w",
+    "theta", "pressure", "zgrid", "rho", "qv", "relhum", "w",
     "qc", "qr", "qi", "qs", "qg",
     "uReconstructZonal", "uReconstructMeridional",
     "mslp", "precipw", "lh",
@@ -167,6 +170,24 @@ def saturation_mixing_ratio(temperature, pressure_pa):
     result.name = "saturation_mixing_ratio"
     result.attrs["units"] = "kg kg-1"
     return result
+
+
+def archived_relative_humidity_fraction(ds):
+    """Return the native MPAS relative-humidity field as a fraction."""
+
+    relative_humidity = finite_or_nan(ds.relhum)
+    units = str(ds.relhum.attrs.get("units", "")).strip().lower()
+    if units in {"%", "percent", "percentage"}:
+        relative_humidity = relative_humidity / 100.0
+    elif units not in {"1", "fraction", "dimensionless"}:
+        raise ValueError(f"Unsupported relhum units: {units!r}")
+    relative_humidity.name = "relative_humidity"
+    relative_humidity.attrs.update(
+        units="1",
+        source_variable="relhum",
+        source_definition="native MPAS archived relative humidity",
+    )
+    return relative_humidity
 
 
 def _parabolic_vertex(x1, x2, x3, y1, y2, y3):
@@ -846,9 +867,7 @@ def derive_products(ds, simulation):
     native_specific_humidity = mixing_ratio_to_specific_humidity(
         finite_or_nan(ds.qv)
     )
-    native_relative_humidity = native_specific_humidity / (
-        saturation_specific_humidity(native_temperature, finite_or_nan(ds.pressure))
-    )
+    native_relative_humidity = archived_relative_humidity_fraction(ds)
     native_temperature_zonal = trapezoidal_time_mean(
         native_temperature
     ).mean("longitude", skipna=True)
@@ -974,6 +993,9 @@ def derive_products(ds, simulation):
     products.native_temperature_zonal_mean.attrs["units"] = "K"
     products.native_specific_humidity_zonal_mean.attrs["units"] = "kg kg-1"
     products.native_relative_humidity_zonal_mean.attrs["units"] = "1"
+    products.native_relative_humidity_zonal_mean.attrs[
+        "source_variable"
+    ] = "relhum"
     products.native_pressure_zonal_mean.attrs["units"] = "Pa"
     products.native_midlevel_height_zonal_mean.attrs["units"] = "m"
     products.top_flux_valid_fraction.attrs["units"] = "1"
@@ -1038,7 +1060,72 @@ def state_cache_path(simulation, test=False):
     return os.path.join(CACHE_ROOT, f"{safe}{suffix}_native_mean_state.nc")
 
 
-def cache_is_current(path, simulation, cache_kind):
+def attribution_cache_path(test=False):
+    suffix = "_test" if test else ""
+    return os.path.join(
+        CACHE_ROOT, f"vapour_transport_attribution{suffix}.nc"
+    )
+
+
+def attribution_cache_manifest(test=False):
+    source_paths = []
+    for simulation in SIM_NAMES:
+        source_paths.extend(
+            [
+                cache_path(simulation, test=test),
+                state_cache_path(simulation, test=test),
+            ]
+        )
+    return cache_manifest(
+        "vapour_transport_budget.transport_attribution",
+        schema=SCHEMA_VERSION,
+        configuration={"test": bool(test)},
+        source_paths=source_paths,
+    )
+
+
+def attribution_cache_is_current(path, test=False):
+    if not os.path.exists(path):
+        return False
+    try:
+        expected = attribution_cache_manifest(test=test)
+        with xr.open_dataset(path) as cached:
+            return (
+                int(cached.attrs.get("schema_version", -1))
+                == SCHEMA_VERSION
+                and cached.attrs.get("cache_kind")
+                == "transport_attribution"
+                and cached.attrs.get("manifest_sha256")
+                == expected["manifest_sha256"]
+            )
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+
+
+def simulation_cache_manifest(data_loc, simulation, test=False, test_times=5):
+    source_paths = sorted(
+        glob.glob(os.path.join(ROOT_DIR, data_loc, LATLON_PATTERN))
+    )
+    return cache_manifest(
+        "vapour_transport_budget.simulation_products",
+        schema=f"{SCHEMA_VERSION}.{EXECUTION_LAYOUT_VERSION}",
+        configuration={
+            "simulation": simulation,
+            "data_loc": data_loc,
+            "analysis_start": ANALYSIS_START,
+            "analysis_end": ANALYSIS_END,
+            "needed_vars": list(NEEDED_VARS),
+            "test": bool(test),
+            "test_times": int(test_times) if test else None,
+            "test_latitude_bounds": list(TEST_LATITUDE_BOUNDS) if test else None,
+        },
+        source_paths=source_paths,
+    )
+
+
+def cache_is_current(
+    path, simulation, cache_kind, expected_manifest_sha256=None
+):
     if not os.path.exists(path):
         return False
     try:
@@ -1049,6 +1136,11 @@ def cache_is_current(path, simulation, cache_kind):
                 and cached.attrs.get("analysis_start") == ANALYSIS_START
                 and cached.attrs.get("analysis_end") == ANALYSIS_END
                 and cached.attrs.get("cache_kind") == cache_kind
+                and (
+                    expected_manifest_sha256 is None
+                    or cached.attrs.get("source_manifest_sha256")
+                    == expected_manifest_sha256
+                )
             )
     except (OSError, ValueError):
         return False
@@ -1065,14 +1157,17 @@ def write_dataset_cache(dataset, path, description):
     os.replace(temporary, path)
 
 
-def write_final_data_products(attribution, products, data_loc=DATA_LOC):
+def write_final_data_products(
+    attribution, products, data_loc=DATA_LOC, test=False
+):
     """Write retained data products beside the simulations, not the figures."""
     os.makedirs(data_loc, exist_ok=True)
+    suffix = "_test" if test else ""
     attribution_path = os.path.join(
-        data_loc, "vapour_transport_attribution.nc"
+        data_loc, f"vapour_transport_attribution{suffix}.nc"
     )
     summary_path = os.path.join(
-        data_loc, "vapour_transport_budget_summary.csv"
+        data_loc, f"vapour_transport_budget_summary{suffix}.csv"
     )
     write_dataset_cache(
         attribution, attribution_path, "vapour-transport attribution"
@@ -1219,9 +1314,7 @@ def _time_batch_statistics(
         * (analysis_subset.pressure / P0_PA) ** (RD / CP)
     )
     specific_humidity = mixing_ratio_to_specific_humidity(mixing_ratio)
-    relative_humidity = specific_humidity / saturation_specific_humidity(
-        temperature, finite_or_nan(analysis_subset.pressure)
-    )
+    relative_humidity = archived_relative_humidity_fraction(analysis_subset)
 
     statistics = xr.Dataset()
     sources = {
@@ -1376,6 +1469,9 @@ def _set_product_metadata(products, ds, simulation, elapsed_seconds):
     products.native_temperature_zonal_mean.attrs["units"] = "K"
     products.native_specific_humidity_zonal_mean.attrs["units"] = "kg kg-1"
     products.native_relative_humidity_zonal_mean.attrs["units"] = "1"
+    products.native_relative_humidity_zonal_mean.attrs[
+        "source_variable"
+    ] = "relhum"
     products.native_pressure_zonal_mean.attrs["units"] = "Pa"
     products.native_midlevel_height_zonal_mean.attrs["units"] = "m"
     products.top_flux_valid_fraction.attrs["units"] = "1"
@@ -1813,6 +1909,7 @@ def build_simulation_caches_on_disk(
     need_products=True, need_state=True,
     latitude_batch_size=LATITUDE_BATCH_SIZE,
     time_batch_size=TIME_BATCH_SIZE,
+    source_manifest_sha256=None,
 ):
     """Spill completed latitude slabs and assemble final caches from disk."""
     working_root = os.path.dirname(
@@ -1918,6 +2015,10 @@ def build_simulation_caches_on_disk(
                     f"disk-backed {latitude_batch_size}-point latitude "
                     f"batches and {time_batch_size}-sample time batches"
                 )
+                if source_manifest_sha256 is not None:
+                    combined_products.attrs["source_manifest_sha256"] = (
+                        source_manifest_sha256
+                    )
                 write_dataset_cache(
                     combined_products,
                     product_path,
@@ -1947,6 +2048,10 @@ def build_simulation_caches_on_disk(
                     f"disk-backed {latitude_batch_size}-point latitude "
                     f"batches and {time_batch_size}-sample time batches"
                 )
+                if source_manifest_sha256 is not None:
+                    combined_state.attrs["source_manifest_sha256"] = (
+                        source_manifest_sha256
+                    )
                 write_dataset_cache(
                     combined_state,
                     state_path,
@@ -1962,19 +2067,52 @@ def build_simulation_caches_on_disk(
             shutil.rmtree(temporary_dir)
 
 
-def prepare_simulation(data_loc, simulation, force=False, test=False,
-                       test_times=5):
+def prepare_simulation(
+    data_loc,
+    simulation,
+    force=False,
+    test=False,
+    test_times=5,
+    require_current=False,
+):
     """Build one simulation's compact caches, then release its raw history."""
     product_path = cache_path(simulation, test=test)
     state_path = state_cache_path(simulation, test=test)
+    manifest = simulation_cache_manifest(
+        data_loc,
+        simulation,
+        test=test,
+        test_times=test_times,
+    )
+    manifest_sha256 = manifest["manifest_sha256"]
     product_current = (
         not force
-        and cache_is_current(product_path, simulation, "mean_products")
+        and cache_is_current(
+            product_path,
+            simulation,
+            "mean_products",
+            expected_manifest_sha256=manifest_sha256,
+        )
     )
     state_current = (
         not force
-        and cache_is_current(state_path, simulation, "native_mean_state")
+        and cache_is_current(
+            state_path,
+            simulation,
+            "native_mean_state",
+            expected_manifest_sha256=manifest_sha256,
+        )
     )
+    if require_current and not (product_current and state_current):
+        missing = []
+        if not product_current:
+            missing.append(product_path)
+        if not state_current:
+            missing.append(state_path)
+        raise FileNotFoundError(
+            "Figure-only mode requires current vapour caches:\n"
+            + "\n".join(f"  {path}" for path in missing)
+        )
 
     if product_current:
         progress(f"{simulation}: using product cache {product_path}")
@@ -2002,6 +2140,7 @@ def prepare_simulation(data_loc, simulation, force=False, test=False,
             state_path,
             need_products=not product_current,
             need_state=not state_current,
+            source_manifest_sha256=manifest_sha256,
         )
         if not product_current:
             products = computed_products
@@ -2247,6 +2386,14 @@ def compute_cached_transport_attribution(products, test=False):
     attribution.convergence_change.attrs["units"] = "mm day-1"
     attribution.column_vapour_change.attrs["units"] = "kg m-2"
     attribution.attrs.update(
+        schema_version=SCHEMA_VERSION,
+        cache_kind="transport_attribution",
+        manifest_sha256=attribution_cache_manifest(test=test)[
+            "manifest_sha256"
+        ],
+        cache_manifest=json.dumps(
+            attribution_cache_manifest(test=test), sort_keys=True
+        ),
         vertical_grid="native MPAS model levels",
         decomposition=(
             "exact symmetric decomposition of time-mean rho_d*r_v*wind; "
@@ -3258,9 +3405,21 @@ def plot_poleward_ivt_overview(products, figsave):
     )
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--force-cache", action="store_true")
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument(
+        "--figures-only",
+        action="store_true",
+        help="Build figures only from current compact caches.",
+    )
+    cache_mode.add_argument(
+        "--rebuild-cache",
+        "--force-cache",
+        dest="rebuild_cache",
+        action="store_true",
+        help="Rebuild compact products, mean states, and attribution.",
+    )
     parser.add_argument(
         "--test",
         action="store_true",
@@ -3269,21 +3428,41 @@ def parse_args():
     parser.add_argument("--test-times", type=int, default=5)
     parser.add_argument("--no-save", action="store_true")
     parser.add_argument("--figures", nargs="+", type=int)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     products = [
         prepare_simulation(
-            data_loc, simulation, force=args.force_cache,
+            data_loc, simulation, force=args.rebuild_cache,
             test=args.test, test_times=args.test_times,
+            require_current=args.figures_only,
         )
         for data_loc, simulation in zip(DATA_LOCS, SIM_NAMES)
     ]
-    attribution = compute_cached_transport_attribution(
-        products, test=args.test
+    attribution_path = attribution_cache_path(test=args.test)
+    attribution_current = attribution_cache_is_current(
+        attribution_path, test=args.test
     )
+    if attribution_current and not args.rebuild_cache:
+        progress(f"using transport-attribution cache {attribution_path}")
+        with xr.open_dataset(attribution_path) as cached:
+            attribution = cached.load()
+    elif args.figures_only:
+        raise FileNotFoundError(
+            "Figure-only mode requires a current attribution cache: "
+            f"{attribution_path}"
+        )
+    else:
+        attribution = compute_cached_transport_attribution(
+            products, test=args.test
+        )
+        write_dataset_cache(
+            attribution,
+            attribution_path,
+            "vapour-transport attribution",
+        )
     attribution["budget_term_response"] = direct_budget_responses(products)
 
     os.makedirs(SAVE_LOC, exist_ok=True)
@@ -3292,7 +3471,9 @@ def main():
         "differences; no scalar thermal-residual attribution"
     )
     if not args.no_save:
-        write_final_data_products(attribution, products)
+        write_final_data_products(
+            attribution, products, test=args.test
+        )
 
     figsave = FigureSaver(
         SAVE_LOC, enabled=not args.no_save, figures_to_run=args.figures

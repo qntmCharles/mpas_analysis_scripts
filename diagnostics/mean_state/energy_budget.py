@@ -15,6 +15,9 @@ only as internal latent-to-dry-static bookkeeping, not added again to the total
 atmospheric forcing.
 """
 
+import argparse
+import glob
+import json
 import os
 import sys
 from functools import partial
@@ -31,9 +34,10 @@ from matplotlib import pyplot as plt
 import xarray as xr
 
 from diagnostics.diagnostic_helpers import (
-    FigureSaver, LATLON_PATTERN, annotate_panel_label, diagnostic_output_dir,
-    figure_should_run,
-    load_latlon_dataset, precip_rate_from_accum,
+    ANALYSIS_END, ANALYSIS_START, FigureSaver, LATLON_PATTERN,
+    annotate_panel_label, cache_manifest, diagnostic_cache_dir,
+    diagnostic_output_dir, figure_should_run, load_latlon_dataset,
+    netcdf_safe_dataset, precip_rate_from_accum,
     standardize_latlon_dataset, total_precip_accum, vertical_dim,
 )
 
@@ -68,6 +72,8 @@ P0_PA = 100000.0
 G = 9.80665
 LV = 2.5e6
 DT_HOURS = 6
+ENERGY_CACHE_SCHEMA = "energy-budget-v2-mpas-moist-density"
+ENERGY_CACHE_ROOT = diagnostic_cache_dir("global_atmospheric_energy_budget")
 
 
 root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
@@ -82,8 +88,10 @@ latlon_chunks = {
     "longitude": 120,
 }
 
+MOISTURE_MIXING_RATIO_VARIABLES = ("qv", "qc", "qr", "qi", "qs", "qg")
+
 needed_vars = [
-    "theta", "pressure", "qv", "zgrid",
+    "theta", "pressure", "rho", *MOISTURE_MIXING_RATIO_VARIABLES, "zgrid",
     "ke", "uReconstructZonal", "uReconstructMeridional",
     "rainnc", "i_rainnc", "rainc", "i_rainc",
     "lwdnt", "lwdnb", "lwupb", "lwupt",
@@ -109,6 +117,13 @@ TERM_LABELS = {
     "residual_dry_latent_only": "Residual if KE storage omitted",
     "residual_no_storage": "Residual if all storage omitted",
 }
+
+SERIES_NAMES = tuple(TERM_LABELS)
+STORAGE_NAMES = (
+    "dry_static_energy",
+    "latent_energy",
+    "kinetic_energy",
+)
 
 
 def global_area_mean(obj, lat_dim="latitude", lon_dim="longitude"):
@@ -183,13 +198,57 @@ def air_temperature(ds):
     return temperature
 
 
-def layer_mass_per_area(ds, temperature):
+def total_moisture_mixing_ratio(ds):
+    """Return total moist-species mass per unit dry-air mass."""
+
+    total = xr.zeros_like(ds.qv)
+    for name in MOISTURE_MIXING_RATIO_VARIABLES:
+        total = total + ds[name]
+    total.name = "total_moisture_mixing_ratio"
+    total.attrs.update(
+        units="kg kg-1",
+        basis="moist-species mass per unit dry-air mass",
+    )
+    return total
+
+
+def moist_air_density(ds, total_moisture=None):
+    """Apply the MPAS-A relation rho_m = rho_d * (1 + sum(q_m))."""
+
+    if total_moisture is None:
+        total_moisture = total_moisture_mixing_ratio(ds)
+    density = ds.rho * (1.0 + total_moisture)
+    density.name = "moist_air_density"
+    density.attrs.update(
+        units="kg m-3",
+        dry_density_source="rho",
+        formulation="rho_m = rho_d * (1 + qv + qc + qr + qi + qs + qg)",
+    )
+    return density
+
+
+def water_vapour_mass_fraction(ds, total_moisture=None):
+    """Return water-vapour mass per unit total moist-air mass."""
+
+    if total_moisture is None:
+        total_moisture = total_moisture_mixing_ratio(ds)
+    fraction = ds.qv / (1.0 + total_moisture)
+    fraction.name = "water_vapour_mass_fraction"
+    fraction.attrs.update(
+        units="kg kg-1",
+        basis="water-vapour mass per unit total moist-air mass",
+    )
+    return fraction
+
+
+def layer_mass_per_area(ds, temperature, total_moisture=None):
     dz, zmid = layer_geometry(ds, temperature)
-    virtual_temperature = temperature * (1.0 + 0.61 * ds.qv)
-    rho = ds.pressure / (RD * virtual_temperature)
-    layer_mass = rho * dz
+    layer_mass = moist_air_density(ds, total_moisture) * dz
     layer_mass.name = "layer_mass_per_area"
-    layer_mass.attrs["units"] = "kg m-2"
+    layer_mass.attrs.update(
+        units="kg m-2",
+        mass_basis="total moist air, including all MPAS moisture scalars",
+    )
     return layer_mass, zmid
 
 
@@ -202,14 +261,22 @@ def kinetic_energy_specific(ds, template):
 
 def atmospheric_column_storage(ds):
     temperature = air_temperature(ds)
-    layer_mass, zmid = layer_mass_per_area(ds, temperature)
+    total_moisture = total_moisture_mixing_ratio(ds)
+    layer_mass, zmid = layer_mass_per_area(
+        ds, temperature, total_moisture
+    )
+    vapour_mass_fraction = water_vapour_mass_fraction(ds, total_moisture)
     z_dim = vertical_dim(temperature)
 
-    dry_static_column = ((CP * temperature + G * zmid) * layer_mass).sum(dim=z_dim, skipna=True)
+    dry_static_column = ((CP * temperature + G * zmid) * layer_mass).sum(
+        dim=z_dim, skipna=True
+    )
     dry_static_column.name = "dry_static_energy"
     dry_static_column.attrs["units"] = "J m-2"
 
-    latent_column = (LV * ds.qv * layer_mass).sum(dim=z_dim, skipna=True)
+    latent_column = (LV * vapour_mass_fraction * layer_mass).sum(
+        dim=z_dim, skipna=True
+    )
     latent_column.name = "latent_energy"
     latent_column.attrs.update(units="J m-2", note="water-vapour latent storage")
 
@@ -589,44 +656,154 @@ def plot_decomposition(entries, figsave):
     print("Done with figure: global_atmospheric_budget_decomposition")
 
 
-def load_simulations():
-    dss = []
-    for i, d in enumerate(data_locs):
+def energy_cache_path(simulation):
+    safe = simulation.replace(" ", "_")
+    return os.path.join(ENERGY_CACHE_ROOT, f"{safe}_energy_budget.nc")
+
+
+def energy_cache_manifest(data_loc, simulation):
+    source_paths = glob.glob(os.path.join(root_dir, data_loc, LATLON_PATTERN))
+    return cache_manifest(
+        "mean_state.energy_budget",
+        schema=ENERGY_CACHE_SCHEMA,
+        configuration={
+            "simulation": simulation,
+            "analysis_start": ANALYSIS_START,
+            "analysis_end": ANALYSIS_END,
+            "variables": needed_vars,
+            "constants": {
+                "rd": RD,
+                "cp": CP,
+                "gravity": G,
+                "latent_heat": LV,
+            },
+            "density_formulation": (
+                "rho_m = rho_d * (1 + qv + qc + qr + qi + qs + qg)"
+            ),
+            "storage_mass_basis": "total moist air",
+        },
+        source_paths=source_paths,
+    )
+
+
+def energy_cache_is_current(path, expected_manifest):
+    if not os.path.isfile(path):
+        return False
+    try:
+        with xr.open_dataset(path) as cached:
+            return (
+                cached.attrs.get("cache_schema") == ENERGY_CACHE_SCHEMA
+                and cached.attrs.get("manifest_sha256")
+                == expected_manifest["manifest_sha256"]
+            )
+    except (OSError, ValueError):
+        return False
+
+
+def write_energy_cache(path, series, storage_energy, manifest):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dataset = xr.Dataset({**series, **dict(storage_energy.data_vars)})
+    dataset.attrs.update(
+        cache_schema=ENERGY_CACHE_SCHEMA,
+        manifest_sha256=manifest["manifest_sha256"],
+        cache_manifest=json.dumps(manifest, sort_keys=True),
+    )
+    temporary = path + ".tmp"
+    netcdf_safe_dataset(dataset).to_netcdf(temporary)
+    os.replace(temporary, path)
+
+
+def read_energy_cache(path):
+    with xr.open_dataset(path) as cached:
+        dataset = cached.load()
+    series = {name: dataset[name] for name in SERIES_NAMES if name in dataset}
+    storage_energy = dataset[list(STORAGE_NAMES)]
+    return series, storage_energy
+
+
+def prepare_energy_entry(
+    data_loc, simulation, *, figures_only=False, rebuild_cache=False
+):
+    path = energy_cache_path(simulation)
+    manifest = energy_cache_manifest(data_loc, simulation)
+    current = energy_cache_is_current(path, manifest)
+    if current and not rebuild_cache:
+        print(f"{simulation}: using energy-budget cache {path}")
+        series, storage_energy = read_energy_cache(path)
+    elif figures_only:
+        raise FileNotFoundError(
+            "Figure-only mode requires a current energy-budget cache: "
+            f"{path}"
+        )
+    else:
         ds = load_latlon_dataset(
-            os.path.join(root_dir, d),
+            os.path.join(root_dir, data_loc),
             latlon_pattern=LATLON_PATTERN,
             chunks=latlon_chunks,
         )
-        ds = standardize_latlon_dataset(ds, needed_vars)
-        print(ds)
-        dss.append(ds)
-    return dss
+        try:
+            ds = standardize_latlon_dataset(ds, needed_vars)
+            series, storage_energy = derive_budget_series(ds)
+            write_energy_cache(path, series, storage_energy, manifest)
+        finally:
+            ds.close()
+    origin = storage_energy.Time.values[0]
+    return {
+        "simulation": simulation,
+        "series": series,
+        "storage_energy": storage_energy,
+        "origin": origin,
+    }
 
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--figures",
+        nargs="+",
+        type=int,
+        choices=(1, 2, 3),
+        default=None,
+    )
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument(
+        "--figures-only",
+        action="store_true",
+        help="Build figures only from current energy-budget caches.",
+    )
+    cache_mode.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Rebuild all energy-budget caches before plotting.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    global figures_to_run, should_run_figure
+    args = parse_args(argv)
+    figures_to_run = args.figures or []
+    should_run_figure = partial(figure_should_run, figures_to_run)
     figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
-    dss = load_simulations()
-
-    entries = []
+    entries = [
+        prepare_energy_entry(
+            data_loc,
+            simulation,
+            figures_only=args.figures_only,
+            rebuild_cache=args.rebuild_cache,
+        )
+        for data_loc, simulation in zip(data_locs, sim_names)
+    ]
     summary_rows = []
     ts_rows = []
 
-    for i, ds in enumerate(dss):
-        series, storage_energy = derive_budget_series(ds)
-
-        origin = ds.Time.values[0]
-        entries.append(
-            {
-                "simulation": sim_names[i],
-                "series": series,
-                "storage_energy": storage_energy,
-                "origin": origin,
-            }
-        )
-
+    for entry in entries:
+        simulation = entry["simulation"]
+        origin = entry["origin"]
+        series = entry["series"]
         for term, ts in series.items():
-            summary_rows.append(term_summary(sim_names[i], term, ts, origin))
-            ts_rows.extend(timeseries_rows(sim_names[i], term, ts, origin))
+            summary_rows.append(term_summary(simulation, term, ts, origin))
+            ts_rows.extend(timeseries_rows(simulation, term, ts, origin))
 
     if not entries:
         print("Skipping global atmospheric energy budget: no simulations could be processed")

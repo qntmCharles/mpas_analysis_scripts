@@ -19,6 +19,8 @@ temperature change, and no scalar thermal-residual analysis is performed.
 from __future__ import annotations
 
 import argparse
+import glob
+import json
 import os
 import sys
 from collections.abc import Sequence
@@ -41,26 +43,33 @@ for _parent in (
 from tropopause import tropopause_profile
 
 from diagnostics.diagnostic_helpers import (
+    ANALYSIS_END,
+    ANALYSIS_START,
     FigureSaver,
     LATLON_PATTERN,
     N2_latheight,
     ZONAL_MEAN_PATTERN,
     add_symmetric_colorbar,
     annotate_panel_label,
+    cache_manifest,
     control_diff_label,
+    diagnostic_cache_dir,
     diagnostic_output_dir,
     difference_cmap,
     hemispheric_fold,
     load_latlon_dataset,
     model_lat_field,
+    netcdf_safe_dataset,
     precip_rate_from_accum,
     progress,
+    read_json_file,
     set_latheight_labels,
     standardize_latlon_dataset,
     subset_between,
     symmetric_levels,
     symmetric_percentile_levels_for_fields,
     total_precip_accum,
+    write_json_file,
 )
 from diagnostics.ttl import TTL_HEIGHT_BOUNDS_M
 
@@ -75,6 +84,8 @@ FIGURES = (1, 2, 13, 14)
 SAVE_LOCATION = diagnostic_output_dir(
     "/home/cwp29/tmp/mpas/crf_on/final/thermal_wind/"
 )
+THERMAL_WIND_CACHE_SCHEMA = "thermal-wind-v1"
+THERMAL_WIND_CACHE_ROOT = diagnostic_cache_dir("thermal_wind_cache")
 
 RD = 287.0
 CP = 1004.0
@@ -248,11 +259,14 @@ def latheight_time_mean_field(
 ) -> xr.DataArray:
     """Return a folded time-mean zonal-mean field as (z, latitude)."""
 
-    field = (
-        model_level_temperature(dataset)
-        if variable == "temperature"
-        else dataset[variable]
-    )
+    if variable == "temperature":
+        field = (
+            dataset.temperature
+            if "temperature" in dataset
+            else model_level_temperature(dataset)
+        )
+    else:
+        field = dataset[variable]
     if "Time" in field.dims:
         field = field.mean("Time", skipna=True)
     field = model_lat_field(field)
@@ -423,17 +437,180 @@ def load_inputs(
     return latlon_datasets, zonal_datasets
 
 
+def thermal_wind_source_paths(directory: str, pattern: str) -> list[str]:
+    return sorted(glob.glob(str(ROOT_DIR / directory / pattern)))
+
+
+def thermal_wind_manifest(kind: str, *, directory: str | None = None):
+    patterns = (
+        (LATLON_PATTERN, ZONAL_MEAN_PATTERN)
+        if kind == "realised_state_summary"
+        else (ZONAL_MEAN_PATTERN,)
+    )
+    directories = (
+        [directory]
+        if directory is not None
+        else [simulation[1] for simulation in SIMULATIONS]
+    )
+    source_paths = [
+        path
+        for source_directory in directories
+        for pattern in patterns
+        for path in thermal_wind_source_paths(source_directory, pattern)
+    ]
+    return cache_manifest(
+        "mean_state.thermal_wind",
+        schema=THERMAL_WIND_CACHE_SCHEMA,
+        configuration={
+            "kind": kind,
+            "directory": directory,
+            "analysis_start": ANALYSIS_START,
+            "analysis_end": ANALYSIS_END,
+            "simulations": [simulation[:2] for simulation in SIMULATIONS],
+            "ttl_bounds_m": TTL_Z_BOUNDS,
+            "equator_mask_degrees": EQUATOR_MASK_DEGREES,
+        },
+        source_paths=source_paths,
+    )
+
+
+def thermal_wind_cache_is_current(path: Path, manifest: dict) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with xr.open_dataset(path) as cached:
+            return (
+                cached.attrs.get("cache_schema")
+                == THERMAL_WIND_CACHE_SCHEMA
+                and cached.attrs.get("manifest_sha256")
+                == manifest["manifest_sha256"]
+            )
+    except (OSError, ValueError):
+        return False
+
+
+def write_thermal_wind_cache(
+    dataset: xr.Dataset, path: Path, manifest: dict
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dataset = dataset.copy()
+    dataset.attrs.update(
+        cache_schema=THERMAL_WIND_CACHE_SCHEMA,
+        manifest_sha256=manifest["manifest_sha256"],
+        cache_manifest=json.dumps(manifest, sort_keys=True),
+    )
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    netcdf_safe_dataset(dataset).to_netcdf(temporary)
+    os.replace(temporary, path)
+
+
+def prepare_zonal_mean_caches(
+    *, figures_only: bool = False, rebuild_cache: bool = False
+) -> list[xr.Dataset]:
+    datasets = []
+    for label, directory, _colour in SIMULATIONS:
+        path = Path(THERMAL_WIND_CACHE_ROOT) / f"{directory}_zonal_mean.nc"
+        manifest = thermal_wind_manifest(
+            "zonal_time_mean", directory=directory
+        )
+        current = thermal_wind_cache_is_current(path, manifest)
+        if current and not rebuild_cache:
+            progress(f"{label}: using thermal-wind cache {path}")
+            with xr.open_dataset(path) as cached:
+                datasets.append(cached.load())
+            continue
+        if figures_only:
+            raise FileNotFoundError(
+                "Figure-only mode requires a current thermal-wind cache: "
+                f"{path}"
+            )
+        raw = load_latlon_dataset(
+            ROOT_DIR / directory,
+            latlon_pattern=ZONAL_MEAN_PATTERN,
+            chunks={"Time": -1},
+        )
+        try:
+            raw = standardize_latlon_dataset(raw, ZONAL_MEAN_VARIABLES)
+            temperature_mean = model_level_temperature(raw).mean(
+                "Time", skipna=True
+            ).load()
+            mean = raw.mean("Time", skipna=True).load()
+            mean["temperature"] = temperature_mean
+        finally:
+            raw.close()
+        write_thermal_wind_cache(mean, path, manifest)
+        datasets.append(mean)
+    return datasets
+
+
+def realised_summary_cache_paths() -> tuple[Path, Path]:
+    root = Path(THERMAL_WIND_CACHE_ROOT)
+    return (
+        root / "realised_state_summary.csv",
+        root / "realised_state_summary.metadata.json",
+    )
+
+
+def prepare_realised_state_summary(
+    zonal_datasets: Sequence[xr.Dataset],
+    *,
+    figures_only: bool = False,
+    rebuild_cache: bool = False,
+) -> pd.DataFrame:
+    table_path, metadata_path = realised_summary_cache_paths()
+    manifest = thermal_wind_manifest("realised_state_summary")
+    current = (
+        table_path.is_file()
+        and read_json_file(metadata_path) == manifest
+    )
+    if current and not rebuild_cache:
+        progress(f"using realised-state cache {table_path}")
+        return pd.read_csv(table_path)
+    if figures_only:
+        raise FileNotFoundError(
+            "Figure-only mode requires a current realised-state cache: "
+            f"{table_path}"
+        )
+    latlon_datasets = []
+    for label, directory, _colour in SIMULATIONS:
+        progress(f"{label}: loading realised-state inputs")
+        raw = load_latlon_dataset(
+            ROOT_DIR / directory,
+            latlon_pattern=LATLON_PATTERN,
+            chunks={"Time": -1},
+        )
+        latlon_datasets.append(
+            standardize_latlon_dataset(raw, LATLON_VARIABLES)
+        )
+    try:
+        table = realised_state_summary(latlon_datasets, zonal_datasets)
+    finally:
+        for dataset in latlon_datasets:
+            dataset.close()
+    table_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = table_path.with_suffix(table_path.suffix + ".tmp")
+    table.to_csv(temporary, index=False)
+    os.replace(temporary, table_path)
+    write_json_file(metadata_path, manifest)
+    return table
+
+
 def cold_point_heights(zonal_datasets: Sequence[xr.Dataset]) -> list[np.ndarray]:
     """Calculate the time-mean cold-point height profile for each simulation."""
 
     profiles: list[np.ndarray] = []
     for dataset in zonal_datasets:
+        time_mean = (
+            dataset.mean("Time", skipna=True)
+            if "Time" in dataset.dims
+            else dataset
+        )
         theta = hemispheric_fold(
-            dataset.theta.mean("Time"),
+            time_mean.theta,
             parity="even",
         )
         pressure = hemispheric_fold(
-            dataset.pressure.mean("Time"),
+            time_mean.pressure,
             parity="even",
         )
         temperature = model_lat_field(
@@ -924,6 +1101,17 @@ def parse_command_line(
         default=None,
         help="Figures to regenerate; omit to build all retained figures.",
     )
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument(
+        "--figures-only",
+        action="store_true",
+        help="Build figures only from current compact thermal-wind caches.",
+    )
+    cache_mode.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Rebuild compact thermal-wind caches before plotting.",
+    )
     args = parser.parse_args(argv)
     if args.figures:
         args.figures = list(dict.fromkeys(args.figures))
@@ -937,8 +1125,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Starting thermal-wind diagnostics "
         f"(figures={','.join(str(number) for number in sorted(figures))})"
     )
-    latlon_datasets, zonal_datasets = load_inputs(
-        need_latlon=2 in figures,
+    zonal_datasets = prepare_zonal_mean_caches(
+        figures_only=args.figures_only,
+        rebuild_cache=args.rebuild_cache,
     )
     saver = FigureSaver(
         SAVE_LOCATION,
@@ -968,9 +1157,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if 2 in figures:
             progress("Starting Figure 2: realised-state differences")
-            summary = realised_state_summary(
-                latlon_datasets,
+            summary = prepare_realised_state_summary(
                 zonal_datasets,
+                figures_only=args.figures_only,
+                rebuild_cache=args.rebuild_cache,
             )
             summary.to_csv(
                 os.path.join(SAVE_LOCATION, "realised_state_summary.csv"),
@@ -1015,7 +1205,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             plt.close(figure)
     finally:
-        for dataset in (*latlon_datasets, *zonal_datasets):
+        for dataset in zonal_datasets:
             dataset.close()
     progress("Thermal-wind diagnostics complete")
     return 0
