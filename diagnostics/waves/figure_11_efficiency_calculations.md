@@ -2,7 +2,9 @@
 
 ## Filtered variables
 
-Let $P$ denote precipitation rate, $H$ denote total-high-cloud occurrence, and $L$ denote outgoing longwave radiation.
+Let $P$ denote precipitation rate, $H_c$ denote cloud-class occurrence, and $L$ denote outgoing longwave radiation.
+
+The index $c$ identifies total, active, stratiform, non-precipitating, or TTL-reaching high cloud.
 
 Let $\mathcal{F}_w$ denote the latitude projection and wavenumber-frequency filter for wave band $w$.
 
@@ -10,25 +12,27 @@ The filtered fields are
 
 \[
 P_f = \mathcal{F}_w[P], \qquad
-H_f = \mathcal{F}_w[H], \qquad
+H_{f,c} = \mathcal{F}_w[H_c], \qquad
 L_f = \mathcal{F}_w[L].
 \]
 
 Each field has dimensions time by longitude after latitude projection.
 
-$H_f$ is continuous and signed because filtering acts on the high-cloud occurrence field.
+$H_{f,c}$ is continuous and signed because filtering acts on each cloud occurrence field.
 
 ## Regression coefficients
 
 Figure 11 uses through-origin regressions over every joint finite time-longitude sample.
 
-The total-high-cloud efficiency is
+The cloud-class efficiency is
 
 \[
-\beta_H =
-\frac{\sum_{t,\lambda} P_f(t,\lambda)H_f(t,\lambda)}
+\beta_{H,c} =
+\frac{\sum_{t,\lambda} P_f(t,\lambda)H_{f,c}(t,\lambda)}
      {\sum_{t,\lambda} P_f(t,\lambda)^2}.
 \]
+
+The original total-high-cloud coefficient is $\beta_H=\beta_{H,\mathrm{total}}$.
 
 Its units are cloud fraction per mm day$^{-1}$.
 
@@ -95,7 +99,9 @@ The intraseasonal interval needs caution because the record contains few represe
 
 ## Scatter figures
 
-The high-cloud scatter figure plots $H_f$ against $P_f$ with line $H_f=\beta_H P_f$.
+Each cloud scatter figure plots $H_{f,c}$ against $P_f$.
+
+Its regression line is $H_{f,c}=\beta_{H,c}P_f$.
 
 The longwave scatter figure plots $L_f$ against $P_f$ with line $L_f=\beta_L P_f=-E_LP_f$.
 
