@@ -65,7 +65,7 @@ from diagnostics.diagnostic_helpers import (
     diagnostic_output_dir, difference_cmap, figure_should_run,
     figure_should_run_any, jsonable_value,
     load_latlon_dataset, make_spectrum_cmap, netcdf_safe_dataset,
-    native_midlevel_height,
+    mpas_moist_air_density, native_midlevel_height,
     numbered_figure_saver, precip_rate_from_accum, read_json_file,
     pressure_to_pa, progress, safe_name, simulation_colour,
     standardize_latlon_dataset, symmetric_levels,
@@ -185,12 +185,23 @@ def parse_command_line(argv=None):
         default=None,
         help="Build only these numbered figures.",
     )
-    parser.add_argument(
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument(
+        "--rebuild-cache",
         "--force-recompute-caches",
+        dest="force_recompute_caches",
         action="store_true",
         help=(
             "Ignore reusable wave, intermediate and product caches once per "
             "cache path during this run, then replace them atomically."
+        ),
+    )
+    cache_mode.add_argument(
+        "--figures-only",
+        action="store_true",
+        help=(
+            "Build selected figures without opening raw model histories. "
+            "Fail when a required reusable product is absent or stale."
         ),
     )
     parser.add_argument(
@@ -477,7 +488,8 @@ latlon_vars = [
     "cldfrac",
     "uzonal_isobaric", "umeridional_isobaric",
     "rh_isobaric", "t_isobaric", "qv_isobaric", "omg_isobaric",
-    "theta", "pressure", "zgrid", "w", "rho", "qv",
+    "theta", "pressure", "zgrid", "w", "rho", "qv", "qc", "qr",
+    "qi", "qs", "qg", "relhum",
     "uReconstructZonal",
 ]
 zonal_mean_vars = [
@@ -496,7 +508,7 @@ zm_chunks = {"Time": -1}
 should_run_figure = partial(figure_should_run, figures_to_run)
 should_run_any = partial(figure_should_run_any, figures_to_run)
 def numbered_figure_path(number, stem):
-    return os.path.join(save_loc, f"{number:02d}_{stem}.png")
+    return os.path.join(figsave.save_loc, f"{number:02d}_{stem}.png")
 
 
 def figure_outputs_exist(number, stems):
@@ -772,45 +784,50 @@ def load_wave_cloud_responses(simulation):
 
 dss = []
 dss_zm = []
-for i, d in enumerate(data_locs):
-    ds = load_latlon_dataset(
-        os.path.join(root_dir, d),
-        latlon_pattern=LATLON_PATTERN,
-        chunks=latlon_chunks,
-        start=ANALYSIS_START,
-        end=ANALYSIS_END,
-    )
-    ds = standardize_latlon_dataset(ds, latlon_vars)
-    expected_time = precip_rate_from_accum(total_precip_accum(ds)).Time
-    cloud_responses = load_wave_cloud_responses(sim_names[i]).sel(
-        Time=expected_time
-    )
-    if not np.array_equal(
-        cloud_responses.Time.values, expected_time.values
-    ):
-        raise RuntimeError(
-            f"{sim_names[i]}: shared high-cloud classification Time "
-            "coordinate does not exactly match the precipitation-rate record"
+if runtime_args.figures_only:
+    dss = [None] * len(data_locs)
+    dss_zm = [None] * len(data_locs)
+    progress("Figure-only mode: raw model histories remain closed.")
+else:
+    for i, d in enumerate(data_locs):
+        ds = load_latlon_dataset(
+            os.path.join(root_dir, d),
+            latlon_pattern=LATLON_PATTERN,
+            chunks=latlon_chunks,
+            start=ANALYSIS_START,
+            end=ANALYSIS_END,
         )
-    ds = ds.sel(Time=expected_time)
-    ds = xr.merge([ds, cloud_responses], compat="override", join="exact")
+        ds = standardize_latlon_dataset(ds, latlon_vars)
+        expected_time = precip_rate_from_accum(total_precip_accum(ds)).Time
+        cloud_responses = load_wave_cloud_responses(sim_names[i]).sel(
+            Time=expected_time
+        )
+        if not np.array_equal(
+            cloud_responses.Time.values, expected_time.values
+        ):
+            raise RuntimeError(
+                f"{sim_names[i]}: shared high-cloud classification Time "
+                "coordinate does not exactly match the precipitation-rate record"
+            )
+        ds = ds.sel(Time=expected_time)
+        ds = xr.merge([ds, cloud_responses], compat="override", join="exact")
 
-    zds = load_latlon_dataset(
-        os.path.join(root_dir, d),
-        latlon_pattern=ZONAL_MEAN_PATTERN,
-        chunks=zm_chunks,
-        start=ANALYSIS_START,
-        end=ANALYSIS_END,
-    )
-    zds = standardize_latlon_dataset(zds, zonal_mean_vars)
+        zds = load_latlon_dataset(
+            os.path.join(root_dir, d),
+            latlon_pattern=ZONAL_MEAN_PATTERN,
+            chunks=zm_chunks,
+            start=ANALYSIS_START,
+            end=ANALYSIS_END,
+        )
+        zds = standardize_latlon_dataset(zds, zonal_mean_vars)
 
-    progress(
-        f"Loaded {sim_names[i]} test={test_mode}: "
-        f"{ds.sizes['Time']} lat-lon times, "
-        f"{zds.sizes['Time']} zonal-mean times"
-    )
-    dss.append(ds)
-    dss_zm.append(zds)
+        progress(
+            f"Loaded {sim_names[i]} test={test_mode}: "
+            f"{ds.sizes['Time']} lat-lon times, "
+            f"{zds.sizes['Time']} zonal-mean times"
+        )
+        dss.append(ds)
+        dss_zm.append(zds)
 
 
 # -----------------------------------------------------------------------------
@@ -2078,7 +2095,9 @@ def _native_lpo_vertical_fields(ds):
     """Return native-level fields required by filtered LPO composites."""
 
     required = {
-        "theta", "pressure", "rho", "w", "qv", "uReconstructZonal"
+        "theta", "pressure", "rho", "w", "qv", "qc", "qr", "qi",
+        "qs", "qg", "relhum",
+        "uReconstructZonal",
     }
     missing = sorted(required - set(ds.data_vars))
     if missing:
@@ -2106,28 +2125,17 @@ def _native_lpo_vertical_fields(ds):
     specific_humidity = ds.qv.sel(Time=time) / (
         1.0 + ds.qv.sel(Time=time)
     )
-    temperature_c = temperature - 273.15
-    saturation_vapour_pressure = 611.2 * np.exp(
-        17.67 * temperature_c / (temperature_c + 243.5)
-    )
-    saturation_specific_humidity = (
-        0.622 * saturation_vapour_pressure
-        / (pressure_pa - 0.378 * saturation_vapour_pressure)
-    )
-    relative_humidity = (
-        100.0 * specific_humidity / saturation_specific_humidity
-    )
     return {
         "T": temperature,
         "w": (
             9.80665
-            * ds.rho.sel(Time=time)
+            * mpas_moist_air_density(ds).sel(Time=time)
             * align_vertical_velocity_to_reference(
                 ds.w.sel(Time=time), ds.rho.sel(Time=time)
             )
         ),
         "qv": 1000.0 * specific_humidity,
-        "RH": relative_humidity,
+        "RH": ds.relhum.sel(Time=time),
         "u": ds.uReconstructZonal.sel(Time=time),
         "N2": static_stability,
         "pressure_hpa": pressure_pa / 100.0,
@@ -2652,6 +2660,12 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
         ("precipitation_wave_rms", "mm day-1"),
     ):
         dataset[name].attrs["units"] = units
+    dataset.filtered_relative_humidity.attrs[
+        "source_variable"
+    ] = "relhum"
+    dataset.filtered_static_stability.attrs[
+        "input_nonpositive_values"
+    ] = "retained before filtering"
     dataset.filtered_upward_pressure_velocity.attrs[
         "sign_convention"
     ] = "positive values represent ascent (-omega)"
@@ -3420,17 +3434,152 @@ def plot_wave_response_metrics(table, contrasts):
     )
 
 
+def plot_wave_cloud_class_efficiencies(table, contrasts):
+    """Plot each filtered cloud response and its direct contrasts."""
+
+    cloud_responses = tuple(
+        (response_key, response_label)
+        for response_key, response_label, _field_name
+        in WAVE_RESPONSE_CLOUD_FIELDS
+    )
+    fig, axes = plt.subplots(
+        len(WAVE_RESPONSE_FILTERS),
+        len(cloud_responses),
+        figsize=(3.5 * len(cloud_responses), 2.5 * len(WAVE_RESPONSE_FILTERS)),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    for row, wave_name in enumerate(WAVE_RESPONSE_FILTERS):
+        for column, (response_key, response_label) in enumerate(
+            cloud_responses
+        ):
+            axis = axes[row, column]
+            subset = table[
+                (table.wave == wave_name)
+                & (table.sensitivity_subset == "full_record")
+                & (table.response_variable == response_key)
+            ].set_index("simulation").reindex(sim_names)
+            values = subset.regression_slope.to_numpy(dtype=float)
+            axis.bar(
+                np.arange(len(sim_names)),
+                values,
+                color=cols,
+                width=0.72,
+            )
+            _draw_wave_response_errorbars(
+                axis,
+                np.arange(len(sim_names)),
+                values,
+                subset.regression_slope_ci_low.values,
+                subset.regression_slope_ci_high.values,
+            )
+            axis.axhline(0.0, color="0.6", lw=0.7)
+            axis.grid(axis="y", alpha=0.2)
+            if row == 0:
+                axis.set_title(response_label)
+            if column == 0:
+                axis.set_ylabel(wave_label(wave_name))
+            if row == len(WAVE_RESPONSE_FILTERS) - 1:
+                axis.set_xticks(
+                    range(len(sim_names)),
+                    sim_names,
+                    rotation=25,
+                    ha="right",
+                )
+            else:
+                axis.set_xticks([])
+    fig.suptitle(
+        "Wave-filtered cloud-class efficiency "
+        "(fraction per mm day$^{-1}$)\n"
+        "Error bars show 95% block-bootstrap intervals"
+    )
+    save_figure(
+        WAVE_RESPONSE_FIGURE_NUMBER,
+        fig,
+        "wave_precipitation_cloud_class_efficiencies",
+    )
+
+    contrast_keys = ("U_minus_control", "T_minus_control", "U_minus_T")
+    contrast_labels = (
+        r"$u$-nudged − control",
+        r"$T$-nudged − control",
+        r"$u$-nudged − $T$-nudged",
+    )
+    fig, axes = plt.subplots(
+        len(WAVE_RESPONSE_FILTERS),
+        len(cloud_responses),
+        figsize=(3.5 * len(cloud_responses), 2.5 * len(WAVE_RESPONSE_FILTERS)),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    for row, wave_name in enumerate(WAVE_RESPONSE_FILTERS):
+        for column, (response_key, response_label) in enumerate(
+            cloud_responses
+        ):
+            axis = axes[row, column]
+            subset = contrasts[
+                (contrasts.wave == wave_name)
+                & (contrasts.sensitivity_subset == "full_record")
+                & (contrasts.response_variable == response_key)
+                & (contrasts.metric == "regression_slope")
+            ].set_index("contrast_key").reindex(contrast_keys)
+            values = subset.response_change.to_numpy(dtype=float)
+            axis.bar(
+                np.arange(len(contrast_keys)),
+                values,
+                color=(cols[1], cols[2], "0.35"),
+                width=0.72,
+            )
+            _draw_wave_response_errorbars(
+                axis,
+                np.arange(len(contrast_keys)),
+                values,
+                subset.ci_low.values,
+                subset.ci_high.values,
+            )
+            axis.axhline(0.0, color="0.6", lw=0.7)
+            axis.grid(axis="y", alpha=0.2)
+            if row == 0:
+                axis.set_title(response_label)
+            if column == 0:
+                axis.set_ylabel(wave_label(wave_name))
+            if row == len(WAVE_RESPONSE_FILTERS) - 1:
+                axis.set_xticks(
+                    range(len(contrast_keys)),
+                    contrast_labels,
+                    rotation=25,
+                    ha="right",
+                )
+            else:
+                axis.set_xticks([])
+    fig.suptitle(
+        "Direct cloud-class efficiency differences; no thermal scaling\n"
+        "Error bars show paired 95% block-bootstrap intervals"
+    )
+    save_figure(
+        WAVE_RESPONSE_FIGURE_NUMBER,
+        fig,
+        "wave_precipitation_cloud_class_efficiency_differences",
+    )
+
+
 def _plot_wave_response_scatter(
     table,
     response_field,
     response_variable,
     response_kind,
     output_stem,
+    response_label=None,
 ):
     """Plot the filtered values used by each Figure 11 regression."""
 
     is_longwave = response_kind == "toa_longwave"
-    response_symbol = r"$L_f$" if is_longwave else r"$H_f$"
+    is_total_cloud = response_variable == "total_high_cloud"
+    response_symbol = (
+        r"$L_f$"
+        if is_longwave
+        else (r"$H_f$" if is_total_cloud else r"$H_{f,c}$")
+    )
     response_units = r"W m$^{-2}$" if is_longwave else "cloud fraction"
     fig, axes = plt.subplots(
         len(WAVE_RESPONSE_FILTERS),
@@ -3501,7 +3650,11 @@ def _plot_wave_response_scatter(
                 f"[{metric_row.regression_slope_ci_low:.3g}, "
                 f"{metric_row.regression_slope_ci_high:.3g}]"
             )
-            coefficient_label = r"$-\beta_L$" if is_longwave else r"$\beta_H$"
+            coefficient_label = (
+                r"$-\beta_L$"
+                if is_longwave
+                else (r"$\beta_H$" if is_total_cloud else r"$\beta_{H,c}$")
+            )
             axis.text(
                 0.03,
                 0.97,
@@ -3526,11 +3679,15 @@ def _plot_wave_response_scatter(
                 )
             if row_index == len(WAVE_RESPONSE_FILTERS) - 1:
                 axis.set_xlabel(r"$P_f$ (mm day$^{-1}$)")
-    relation = (
-        r"$L_f$ versus $P_f$; Figure 11 reports $-\beta_L$"
-        if is_longwave
-        else r"$H_f$ versus $P_f$; Figure 11 reports $\beta_H$"
-    )
+    if is_longwave:
+        relation = r"$L_f$ versus $P_f$; Figure 11 reports $-\beta_L$"
+    elif is_total_cloud:
+        relation = r"$H_f$ versus $P_f$; Figure 11 reports $\beta_H$"
+    else:
+        relation = (
+            f"{response_label}: "
+            r"$H_{f,c}$ versus $P_f$; Figure 11 reports $\beta_{H,c}$"
+        )
     fig.suptitle(f"Wave-filtered regression values: {relation}")
     save_figure(WAVE_RESPONSE_FIGURE_NUMBER, fig, output_stem)
 
@@ -5815,13 +5972,24 @@ if should_build_figure(10, "wave_phase_speed_power_distributions"):
 # Rainfall amplitude, high-cloud production per unit rainfall, and TOA
 # longwave response per unit rainfall are separate physical quantities. Cloud
 # and OLR responses are filtered in exactly the same band as precipitation.
-# P_f is filtered precipitation. H_f is filtered total-high-cloud occurrence.
+# P_f is filtered precipitation. H_f,c is filtered cloud-class occurrence.
 # L_f is filtered outgoing longwave radiation.
 
+wave_response_cloud_scatter_stems = {
+    response_key: (
+        "wave_precipitation_high_cloud_scatter"
+        if response_key == "total_high_cloud"
+        else f"wave_precipitation_{response_key}_scatter"
+    )
+    for response_key, _response_label, _field_name
+    in WAVE_RESPONSE_CLOUD_FIELDS
+}
 wave_response_figure_stems = [
     "wave_precipitation_cloud_olr_response",
     "wave_precipitation_cloud_olr_response_differences",
-    "wave_precipitation_high_cloud_scatter",
+    "wave_precipitation_cloud_class_efficiencies",
+    "wave_precipitation_cloud_class_efficiency_differences",
+    *wave_response_cloud_scatter_stems.values(),
     "wave_precipitation_olr_scatter",
 ]
 wave_response_signature = cache_signature(
@@ -5915,13 +6083,20 @@ if should_build_versioned_figure(
             index=False,
         )
     plot_wave_response_metrics(wave_response, wave_response_contrasts)
-    _plot_wave_response_scatter(
-        wave_response,
-        "high_cloud",
-        "total_high_cloud",
-        "cloud",
-        "wave_precipitation_high_cloud_scatter",
+    plot_wave_cloud_class_efficiencies(
+        wave_response, wave_response_contrasts
     )
+    for response_key, response_label, field_name in (
+        WAVE_RESPONSE_CLOUD_FIELDS
+    ):
+        _plot_wave_response_scatter(
+            wave_response,
+            field_name,
+            response_key,
+            "cloud",
+            wave_response_cloud_scatter_stems[response_key],
+            response_label=response_label,
+        )
     _plot_wave_response_scatter(
         wave_response,
         "OLR",
@@ -6243,6 +6418,8 @@ if 14 in figures_to_run:
                     reuse = (
                         existing.attrs.get("cache_version")
                         == LPO_WAVE_SECTION_CACHE_VERSION
+                        and existing.attrs.get("tracking_product_version")
+                        == LPO_TRACKING_PRODUCT_VERSION
                         and existing.attrs.get("source_simulation")
                         == simulation
                         and int(existing.attrs.get("test_subset", -1))
