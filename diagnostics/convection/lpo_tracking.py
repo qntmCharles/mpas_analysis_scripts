@@ -134,7 +134,7 @@ UPSTREAM_SOURCE = Path(
 )
 UPSTREAM_CITATION = "Kerns and Chen (2020), doi:10.1029/2019JD032142"
 TRACK_FIGURE_CITATION = "Kerns and Chen (2016), doi:10.1002/2015JD024661, Figure 4"
-PRODUCT_VERSION = "mpas-lpt-precipitation-envelope-v17-tropics-20deg"
+PRODUCT_VERSION = "mpas-lpt-precipitation-envelope-v18-rain-volume-units"
 TRACKING_CACHE_VERSION = "mpas-upstream-lpt-tracking-v3-strict-linking"
 TRACKING_OVERVIEW_LATITUDE_BAND = (
     "20S-20N cosine-latitude weighted mean"
@@ -1827,8 +1827,7 @@ def diagnose_envelope_steps(
                 "area_integrated_precip_km2_mm_day": (
                     precipitation_statistics["area_integral"]
                 ),
-                # Keep the historical column name for cache compatibility.
-                "area_integrated_24h_precip_km2_mm_day": rain_volume_24h,
+                "area_integrated_24h_precip_km2_mm": rain_volume_24h,
                 "mean_precip_mm_day": precipitation_statistics["mean"],
                 "maximum_precip_mm_day": maximum_precipitation,
                 "precip_weighted_centroid_lon": lon,
@@ -2459,7 +2458,7 @@ def postprocess_event_masks(
                 "analysed_record_days": reference_record_days,
                 "tracking_domain_area_km2": domain_area_km2,
                 "maximum_area_integrated_24h_precipitation": float(
-                    event_steps.area_integrated_24h_precip_km2_mm_day.max()
+                    event_steps.area_integrated_24h_precip_km2_mm.max()
                 ),
                 "mean_precip_mm_day": float(event_steps.mean_precip_mm_day.mean()),
                 "maximum_precip_mm_day": float(event_steps.maximum_precip_mm_day.max()),
@@ -2520,14 +2519,14 @@ def assign_lifecycle_reference(
     lag_set = set(configuration.lifecycle_lags_hours)
     for event_id, event in steps.groupby("event_id", sort=False):
         event = event.sort_values("Time").copy()
-        valid = np.isfinite(event.area_integrated_24h_precip_km2_mm_day)
+        valid = np.isfinite(event.area_integrated_24h_precip_km2_mm)
         if not valid.any():
             raise RuntimeError(
                 f"{event_id}: no finite trailing-24-hour integrated rain "
                 "volume is available for the lifecycle reference"
             )
         peak_index = event.loc[
-            valid, "area_integrated_24h_precip_km2_mm_day"
+            valid, "area_integrated_24h_precip_km2_mm"
         ].idxmax()
         reference_time = pd.Timestamp(event.loc[peak_index, "Time"])
         event["lag_hours"] = (
@@ -2896,11 +2895,15 @@ def _load_simulation_dataset(
         "olrtoa",
         "precipw",
         "cldfrac",
+        "qc",
+        "qr",
         "qi",
         "qs",
+        "qg",
         "rho",
         "theta",
         "qv",
+        "relhum",
         "w",
         "pressure",
         "zgrid",
@@ -4996,7 +4999,7 @@ def _plot_tracking_overview(
     )
     fig.suptitle(
         f"{record_label}: {SIMULATION_LABELS[simulation]} "
-        "15°S–15°N filtered rain and LPO tracks"
+        "20°S–20°N filtered rain and LPO tracks"
     )
     return fig
 

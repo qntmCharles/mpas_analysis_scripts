@@ -22,6 +22,7 @@ from diagnostics.convection.lpo_tracking import (
 )
 from diagnostics.diagnostic_helpers import (
     align_vertical_velocity_to_reference,
+    mpas_moist_air_density,
     native_midlevel_height,
     pressure_to_pa,
     vertical_dim,
@@ -34,9 +35,9 @@ from diagnostics.waves.wave_metrics import (
 )
 
 
-SECTION_CACHE_VERSION = "lpo-lifecycle-sections-v8-tropics-20deg"
+SECTION_CACHE_VERSION = "lpo-lifecycle-sections-v10-moist-density"
 COMPOSITE_CACHE_VERSION = (
-    "lpo-lifecycle-2d-composites-v10-tropics-20deg"
+    "lpo-lifecycle-2d-composites-v11-source-rh-unstable-n2-area-weighted"
 )
 
 DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES = 5.0
@@ -161,42 +162,6 @@ def _nearest_indices(source, targets, *, periodic=False):
         distance, indices[..., None], axis=-1
     )[..., 0]
     return indices, mismatch
-
-
-def _saturation_specific_humidity(
-    temperature: xr.DataArray,
-    pressure_pa: xr.DataArray,
-) -> xr.DataArray:
-    """Return phase-aware Murphy--Koop saturation specific humidity."""
-
-    temperature = xr.where(temperature > 120.0, temperature, np.nan)
-    log_temperature = np.log(temperature)
-    log_es_ice = (
-        9.550426
-        - 5723.265 / temperature
-        + 3.53068 * log_temperature
-        - 0.00728332 * temperature
-    )
-    log_es_liquid = (
-        54.842763
-        - 6763.22 / temperature
-        - 4.210 * log_temperature
-        + 0.000367 * temperature
-        + np.tanh(0.0415 * (temperature - 218.8))
-        * (
-            53.878
-            - 1331.22 / temperature
-            - 9.44523 * log_temperature
-            + 0.014025 * temperature
-        )
-    )
-    vapour_pressure = np.exp(
-        xr.where(temperature < 273.15, log_es_ice, log_es_liquid)
-    )
-    epsilon = 0.622
-    return epsilon * vapour_pressure / (
-        pressure_pa - (1.0 - epsilon) * vapour_pressure
-    )
 
 
 def sample_centroid_latitude_native_sections(
@@ -577,7 +542,9 @@ def native_peak_ray_sections(
             theta_profile = source["theta"][finite][order][unique]
             wind_profile = source["wind"][finite][order][unique]
             pressure_profile = source["pressure"][finite][order][unique]
-            n2_profile = buoyancy_frequency_squared(theta_profile, z)
+            n2_profile = buoyancy_frequency_squared(
+                theta_profile, z, mask_nonpositive=False
+            )
             inside = (RAY_HEIGHT_M >= z[0]) & (RAY_HEIGHT_M <= z[-1])
             values["wind"][event_index, inside, longitude_index] = np.interp(
                 RAY_HEIGHT_M[inside], z, wind_profile
@@ -585,8 +552,11 @@ def native_peak_ray_sections(
             values["n2"][event_index, inside, longitude_index] = np.interp(
                 RAY_HEIGHT_M[inside], z, n2_profile
             )
+            interpolated_n2 = values["n2"][
+                event_index, inside, longitude_index
+            ]
             values["n"][event_index, inside, longitude_index] = np.sqrt(
-                values["n2"][event_index, inside, longitude_index]
+                np.where(interpolated_n2 > 0.0, interpolated_n2, np.nan)
             )
             values["pressure"][event_index, inside, longitude_index] = (
                 np.interp(RAY_HEIGHT_M[inside], z, pressure_profile)
@@ -609,6 +579,9 @@ def native_peak_ray_sections(
     output.ray_background_zonal_wind.attrs["units"] = "m s-1"
     output.ray_buoyancy_frequency.attrs["units"] = "s-1"
     output.ray_unfiltered_static_stability.attrs["units"] = "s-2"
+    output.ray_unfiltered_static_stability.attrs[
+        "nonpositive_values"
+    ] = "retained"
     output.ray_pressure_hpa.attrs["units"] = "hPa"
     return output
 
@@ -664,12 +637,20 @@ def cloud_top_height_occurrence(
         )
     height_values = height_scale * np.asarray(height, dtype=float)
     indicator_values = np.asarray(indicator, dtype=float)
+    physical_latitude = (
+        np.asarray(peak_steps.centroid_lat, dtype=float)[:, None]
+        + np.asarray(RAY_RELATIVE_LATITUDE_DEGREES, dtype=float)[None, :]
+    )
+    latitude_weights = np.cos(np.deg2rad(physical_latitude))
     for event_index in range(len(peak_steps)):
         for longitude_index in range(len(RAY_RELATIVE_LONGITUDE_DEGREES)):
             valid = np.isfinite(indicator_values[event_index, :, longitude_index])
             if not valid.any():
                 continue
-            denominator = int(valid.sum())
+            weights = latitude_weights[event_index]
+            denominator = np.sum(weights[valid])
+            if denominator <= 0.0:
+                continue
             cloud_height = height_values[event_index, :, longitude_index]
             cloud = indicator_values[event_index, :, longitude_index] > 0.5
             for height_index in range(len(RAY_HEIGHT_M)):
@@ -680,7 +661,7 @@ def cloud_top_height_occurrence(
                     & (cloud_height < edges[height_index + 1])
                 )
                 output[event_index, height_index, longitude_index] = (
-                    np.count_nonzero(in_bin) / denominator
+                    np.sum(weights[in_bin]) / denominator
                 )
     return xr.DataArray(
         output,
@@ -690,7 +671,10 @@ def cloud_top_height_occurrence(
             "ray_height_m": RAY_HEIGHT_M,
             "ray_relative_longitude": RAY_RELATIVE_LONGITUDE_DEGREES,
         },
-        attrs={"units": "1"},
+        attrs={
+            "units": "1",
+            "latitude_weighting": "cosine of physical latitude",
+        },
     )
 
 
@@ -1041,8 +1025,9 @@ def build_unfiltered_event_sections(
     steps = select_section_steps(steps, test=test)
     required = {
         "precipw", "olrtoa", "theta", "pressure", "rho", "w", "qv",
-        "cldfrac", "uReconstructZonal", "zgrid", "uzonal_isobaric",
-        "umeridional_isobaric",
+        "qc", "qr", "qi", "qs", "qg",
+        "relhum", "cldfrac", "uReconstructZonal", "zgrid",
+        "uzonal_isobaric", "umeridional_isobaric",
     }
     missing = sorted(required - set(dataset.data_vars))
     if missing:
@@ -1062,10 +1047,10 @@ def build_unfiltered_event_sections(
             steps.precip_weighted_centroid_lat.astype(float),
         ),
     }
-    if "area_integrated_24h_precip_km2_mm_day" in steps:
+    if "area_integrated_24h_precip_km2_mm" in steps:
         variables["lpo_envelope_precipitation"] = (
             ("event_step",),
-            steps.area_integrated_24h_precip_km2_mm_day.astype(float),
+            steps.area_integrated_24h_precip_km2_mm.astype(float),
         )
     for flag in (
         "complete_primary_lag_window",
@@ -1090,18 +1075,13 @@ def build_unfiltered_event_sections(
         287.0 / 1004.0
     )
     vapour_specific_humidity = dataset.qv / (1.0 + dataset.qv)
-    saturation_specific_humidity = _saturation_specific_humidity(
-        native_temperature, pressure_pa
-    )
-    native_relative_humidity = (
-        100.0 * vapour_specific_humidity / saturation_specific_humidity
-    )
     height = native_midlevel_height(dataset, theta)
     zdim = vertical_dim(theta)
     native_n2 = xr.apply_ufunc(
         buoyancy_frequency_squared,
         theta,
         height,
+        kwargs={"mask_nonpositive": False},
         input_core_dims=[[zdim], [zdim]],
         output_core_dims=[[zdim]],
         vectorize=True,
@@ -1113,13 +1093,13 @@ def build_unfiltered_event_sections(
         "unfiltered_temperature": native_temperature,
         "unfiltered_upward_pressure_velocity": (
             9.80665
-            * dataset.rho
+            * mpas_moist_air_density(dataset)
             * align_vertical_velocity_to_reference(
                 dataset.w, dataset.rho
             )
         ),
         "unfiltered_specific_humidity": 1000.0 * vapour_specific_humidity,
-        "unfiltered_relative_humidity": native_relative_humidity,
+        "unfiltered_relative_humidity": dataset.relhum,
         "unfiltered_cloud_fraction": dataset.cldfrac,
         "unfiltered_static_stability": native_n2,
     }
@@ -1198,6 +1178,12 @@ def build_unfiltered_event_sections(
     }
     for name, unit in units.items():
         output[name].attrs["units"] = unit
+    output.unfiltered_relative_humidity.attrs[
+        "source_variable"
+    ] = "relhum"
+    output.unfiltered_static_stability.attrs[
+        "nonpositive_values"
+    ] = "retained"
     output.unfiltered_upward_pressure_velocity.attrs[
         "sign_convention"
     ] = "positive values represent ascent (-omega = rho g w)"

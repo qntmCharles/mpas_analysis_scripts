@@ -46,6 +46,7 @@ from diagnostics.diagnostic_helpers import (
     SIMULATION_COLOURS,
 )
 from diagnostics.convection.lpo_tracking import (
+    DEFAULT_ROOT,
     DEFAULT_TEST_DAYS,
     DEFAULT_TEST_MINIMUM_DURATION_DAYS,
     LIFECYCLE_LAGS_HOURS,
@@ -70,6 +71,7 @@ from diagnostics.convection.lpo_tracking import (
 )
 from diagnostics.diagnostic_helpers import (
     FigureSaver,
+    LATLON_PATTERN,
     difference_cmap,
     grid_cell_area_km2,
     native_layer_interfaces,
@@ -79,10 +81,12 @@ from diagnostics.diagnostic_helpers import (
     precipitation_rate_from_dataset,
     pressure_to_pa,
     progress,
+    source_file_signature,
     symmetric_levels,
     vertical_dim,
 )
 from diagnostics.waves.cached_wave_products import (
+    filtered_wave_cache_path,
     load_existing_filtered_wave,
     load_existing_kelvin_dispersion,
     load_existing_lpo_wave_sections,
@@ -132,6 +136,7 @@ LIFECYCLE_CONFIGURATION_FILENAME = "lpo_lifecycle_configuration.json"
 LIFECYCLE_COMPOSITE_FILENAME = "lpo_lifecycle_event_equal_composites.nc"
 LIFECYCLE_SECTION_FILENAME = "lpo_lifecycle_event_sections.nc"
 LIFECYCLE_2D_COMPOSITE_FILENAME = "lpo_lifecycle_2d_composites.nc"
+LIFECYCLE_EVENT_CACHE_DIRECTORY = "lpo_lifecycle_event_cache"
 TEST_EVENTS_PER_SIMULATION = 2
 DEEP_CLOUD_TOP_PERCENTILE = 10
 TIMING_BOOTSTRAP_RESAMPLES = 1000
@@ -178,7 +183,7 @@ WAVE_LIFECYCLE_FIELDS = {
     for cache_field, (suffix, _units) in WAVE_FIELD_DEFINITIONS.items()
 }
 LIFECYCLE_COMPOSITE_VARIABLES = (
-    "area_integrated_24h_precip_km2_mm_day",
+    "area_integrated_24h_precip_km2_mm",
     "envelope_area_km2",
     "total_high_cloud_area_km2",
     "active_deep_convective_area_km2",
@@ -815,7 +820,7 @@ def event_lifecycle_summary(
         "simulation",
         "event_id",
         "lag_hours",
-        "area_integrated_24h_precip_km2_mm_day",
+        "area_integrated_24h_precip_km2_mm",
         "active_deep_convective_area_km2",
         "stratiform_precipitating_high_cloud_area_km2",
         "nonprecipitating_high_cloud_area_km2",
@@ -928,7 +933,7 @@ def event_lifecycle_summary(
                 event.lag_hours.values,
             )
         )
-        peak_rain = np.nanmax(event.area_integrated_24h_precip_km2_mm_day)
+        peak_rain = np.nanmax(event.area_integrated_24h_precip_km2_mm)
         post_total = _finite_mean(
             post_peak.total_high_cloud_area_km2.to_numpy(),
             axis=0,
@@ -1012,7 +1017,7 @@ def normalized_lifetime_composite(
                         values[valid],
                     )
             rain = np.asarray(
-                event.area_integrated_24h_precip_km2_mm_day,
+                event.area_integrated_24h_precip_km2_mm,
                 dtype=float,
             )
             if np.isfinite(rain).any():
@@ -1311,7 +1316,7 @@ def _tracking_timing_columns(table: pd.DataFrame) -> list[str]:
         "Time",
         "envelope_area_km2",
         "area_integrated_precip_km2_mm_day",
-        "area_integrated_24h_precip_km2_mm_day",
+        "area_integrated_24h_precip_km2_mm",
         "mean_precip_mm_day",
         "maximum_precip_mm_day",
         "precip_weighted_centroid_lon",
@@ -1348,7 +1353,7 @@ def _select_test_events(
     ranking = (
         timing[timing.event_id.isin(candidates.event_id)]
         .groupby("event_id")
-        .area_integrated_24h_precip_km2_mm_day.max()
+        .area_integrated_24h_precip_km2_mm.max()
         .sort_values()
     )
     centre = float(ranking.median())
@@ -1555,9 +1560,290 @@ def _wave_event_summary(lifecycle: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _file_sha256(path: Path) -> str:
+    """Return the content hash for one cache product."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
+    """Write a CSV atomically."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    frame.to_csv(temporary, index=False)
+    os.replace(temporary, path)
+
+
+def _metadata_hash_is_valid(metadata: Mapping[str, object]) -> bool:
+    """Validate the embedded hash for one metadata document."""
+
+    expected = metadata.get("configuration_sha256")
+    unhashed = dict(metadata)
+    unhashed.pop("configuration_sha256", None)
+    encoded = json.dumps(
+        unhashed, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return expected == hashlib.sha256(encoded).hexdigest()
+
+
+def _event_timing_sha256(timing: pd.DataFrame) -> str:
+    """Hash every authoritative input column for one event."""
+
+    ordered = timing.copy()
+    for column in ordered.columns:
+        if pd.api.types.is_datetime64_any_dtype(ordered[column]):
+            ordered[column] = ordered[column].dt.strftime(
+                "%Y-%m-%dT%H:%M:%S.%f"
+            )
+    ordered = ordered.reindex(sorted(ordered.columns), axis=1)
+    sort_columns = [
+        column for column in ("event_id", "Time", "lag_hours")
+        if column in ordered
+    ]
+    if sort_columns:
+        ordered = ordered.sort_values(sort_columns, kind="stable")
+    encoded = ordered.to_json(
+        orient="records", date_format="iso", double_precision=15
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _lifecycle_dependency_hashes(
+    standard: Path,
+    simulation: str,
+    event_ids: Sequence[str],
+    *,
+    test: bool,
+) -> dict[str, str]:
+    """Hash calculation and wave-cache source file identities."""
+
+    tracking_paths = [
+        standard / "lpt_event_relative_diagnostics.csv",
+        standard / "lpt_events.csv",
+        standard / "lpt_track_steps.csv",
+        standard / "lpt_event_mask_index.csv",
+    ]
+    mask_index = pd.read_csv(
+        standard / "lpt_event_mask_index.csv", dtype={"event_id": str}
+    ).set_index("event_id")
+    missing_masks = sorted(set(map(str, event_ids)) - set(mask_index.index))
+    if missing_masks:
+        raise RuntimeError(
+            f"{standard}: mask index lacks lifecycle events {missing_masks[:3]}"
+        )
+    mask_paths = [
+        standard / str(mask_index.loc[str(event_id), "mask_file"])
+        for event_id in event_ids
+    ]
+    source_directory = Path(DEFAULT_ROOT) / SIMULATION_DIRS[simulation]
+    model_paths = sorted(source_directory.glob(LATLON_PATTERN))
+    classification_path = (
+        Path(DEFAULT_ROOT)
+        / "classification_cache"
+        / f"{simulation.replace('-', '_')}_classified_high_cloud.nc"
+    )
+    calculation_paths = tracking_paths + mask_paths + model_paths + [
+        classification_path
+    ]
+    calculation_hash = source_file_signature(calculation_paths)["sha256"]
+    wave_paths = [
+        Path(
+            filtered_wave_cache_path(
+                WAVE_SIMULATION_LABELS[simulation],
+                cache_field,
+                wave_name,
+                test=test,
+            )
+        )
+        for wave_name in LPO_LIFECYCLE_FILTERS
+        for cache_field in WAVE_FIELD_DEFINITIONS
+    ]
+    bundle_hash = source_file_signature(
+        calculation_paths + wave_paths
+    )["sha256"]
+    return {"calculation": calculation_hash, "bundle": bundle_hash}
+
+
+def _event_cache_paths(
+    standard: Path, event_id: str
+) -> tuple[Path, Path, Path]:
+    token = hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()[:20]
+    root = standard / LIFECYCLE_EVENT_CACHE_DIRECTORY
+    return (
+        root / f"{token}.steps.csv",
+        root / f"{token}.profiles.csv",
+        root / f"{token}.json",
+    )
+
+
+def _read_event_checkpoint(
+    standard: Path,
+    *,
+    simulation: str,
+    event_id: str,
+    timing_sha256: str,
+    calculation_source_sha256: str,
+    test: bool,
+    force_recompute: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    """Load one complete and current event checkpoint."""
+
+    if force_recompute:
+        return None
+    steps_path, profiles_path, metadata_path = _event_cache_paths(
+        standard, event_id
+    )
+    if not all(path.is_file() for path in (steps_path, profiles_path, metadata_path)):
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        expected = {
+            "lifecycle_analysis_version": LIFECYCLE_ANALYSIS_VERSION,
+            "tracking_product_version": PRODUCT_VERSION,
+            "simulation": simulation,
+            "event_id": str(event_id),
+            "timing_sha256": timing_sha256,
+            "calculation_source_sha256": calculation_source_sha256,
+            "test_product": bool(test),
+        }
+        if not _metadata_hash_is_valid(metadata):
+            return None
+        if any(metadata.get(key) != value for key, value in expected.items()):
+            return None
+        output_hashes = metadata.get("output_sha256", {})
+        if output_hashes != {
+            "steps": _file_sha256(steps_path),
+            "profiles": _file_sha256(profiles_path),
+        }:
+            return None
+        steps = pd.read_csv(steps_path, dtype={"event_id": str})
+        profiles = pd.read_csv(profiles_path, dtype={"event_id": str})
+        steps["Time"] = pd.to_datetime(steps.Time)
+        profiles["Time"] = pd.to_datetime(profiles.Time)
+        if set(steps.event_id) != {str(event_id)}:
+            return None
+        if set(profiles.event_id) != {str(event_id)}:
+            return None
+        return steps, profiles
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_event_checkpoint(
+    standard: Path,
+    *,
+    simulation: str,
+    event_id: str,
+    timing_sha256: str,
+    calculation_source_sha256: str,
+    test: bool,
+    steps: pd.DataFrame,
+    profiles: pd.DataFrame,
+) -> None:
+    """Commit one event checkpoint after both calculations finish."""
+
+    steps_path, profiles_path, metadata_path = _event_cache_paths(
+        standard, event_id
+    )
+    _atomic_write_csv(steps, steps_path)
+    _atomic_write_csv(profiles, profiles_path)
+    _write_lifecycle_metadata_file(
+        metadata_path,
+        {
+            "lifecycle_analysis_version": LIFECYCLE_ANALYSIS_VERSION,
+            "tracking_product_version": PRODUCT_VERSION,
+            "simulation": simulation,
+            "event_id": str(event_id),
+            "timing_sha256": timing_sha256,
+            "calculation_source_sha256": calculation_source_sha256,
+            "test_product": bool(test),
+            "step_columns": list(steps.columns),
+            "profile_columns": list(profiles.columns),
+            "output_sha256": {
+                "steps": _file_sha256(steps_path),
+                "profiles": _file_sha256(profiles_path),
+            },
+        },
+    )
+
+
+def _read_simulation_bundle(
+    standard: Path,
+    *,
+    simulation: str,
+    event_ids: Sequence[str],
+    bundle_source_sha256: str,
+    test: bool,
+    force_recompute: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] | None:
+    """Load a validated lifecycle table bundle."""
+
+    if force_recompute:
+        return None
+    paths = {
+        "steps": standard / LIFECYCLE_STEP_FILENAME,
+        "summary": standard / LIFECYCLE_SUMMARY_FILENAME,
+        "profiles": standard / LIFECYCLE_PROFILE_FILENAME,
+    }
+    metadata_path = standard / LIFECYCLE_CONFIGURATION_FILENAME
+    if not metadata_path.is_file() or any(
+        not path.is_file() for path in paths.values()
+    ):
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not _metadata_hash_is_valid(metadata):
+            return None
+        expected = {
+            "lifecycle_analysis_version": LIFECYCLE_ANALYSIS_VERSION,
+            "tracking_product_version": PRODUCT_VERSION,
+            "wave_config_version": WAVE_CONFIG_VERSION,
+            "source_simulation": simulation,
+            "bundle_source_sha256": bundle_source_sha256,
+            "test_product": bool(test),
+            "selected_event_ids": list(map(str, event_ids)),
+        }
+        if any(metadata.get(key) != value for key, value in expected.items()):
+            return None
+        if metadata.get("output_sha256") != {
+            key: _file_sha256(path) for key, path in paths.items()
+        }:
+            return None
+        lifecycle = pd.read_csv(paths["steps"], dtype={"event_id": str})
+        summary = pd.read_csv(paths["summary"], dtype={"event_id": str})
+        profiles = pd.read_csv(paths["profiles"], dtype={"event_id": str})
+        lifecycle["Time"] = pd.to_datetime(lifecycle.Time)
+        profiles["Time"] = pd.to_datetime(profiles.Time)
+        if list(lifecycle.columns) != metadata.get("lifecycle_step_columns"):
+            return None
+        if list(summary.columns) != metadata.get("lifecycle_summary_columns"):
+            return None
+        if list(profiles.columns) != metadata.get("vertical_profile_columns"):
+            return None
+        expected_ids = set(map(str, event_ids))
+        if set(lifecycle.event_id) != expected_ids:
+            return None
+        if set(summary.event_id) != expected_ids:
+            return None
+        if set(profiles.event_id) != expected_ids:
+            return None
+        return lifecycle, summary, profiles
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _write_lifecycle_metadata(
     standard: Path,
     *,
+    simulation: str,
+    event_ids: Sequence[str],
+    calculation_source_sha256: str,
+    bundle_source_sha256: str,
     lifecycle: pd.DataFrame,
     summary: pd.DataFrame,
     profiles: pd.DataFrame,
@@ -1567,6 +1853,10 @@ def _write_lifecycle_metadata(
     metadata = {
         "lifecycle_analysis_version": LIFECYCLE_ANALYSIS_VERSION,
         "tracking_product_version": PRODUCT_VERSION,
+        "source_simulation": simulation,
+        "selected_event_ids": list(map(str, event_ids)),
+        "calculation_source_sha256": calculation_source_sha256,
+        "bundle_source_sha256": bundle_source_sha256,
         "wave_config_version": WAVE_CONFIG_VERSION,
         "wave_filters": {
             wave: WAVE_BOXES[wave] for wave in LPO_LIFECYCLE_FILTERS
@@ -1612,6 +1902,11 @@ def _write_lifecycle_metadata(
         "vertical_profile_columns": list(profiles.columns),
         "test_event_ids": list(test_event_ids or ()),
         "test_product": test_event_ids is not None,
+        "output_sha256": {
+            "steps": _file_sha256(standard / LIFECYCLE_STEP_FILENAME),
+            "summary": _file_sha256(standard / LIFECYCLE_SUMMARY_FILENAME),
+            "profiles": _file_sha256(standard / LIFECYCLE_PROFILE_FILENAME),
+        },
     }
     path = standard / LIFECYCLE_CONFIGURATION_FILENAME
     _write_lifecycle_metadata_file(path, metadata)
@@ -1717,6 +2012,7 @@ def _event_section_cache_is_current(
     simulation: str,
     test: bool,
     tracking_timing_path: Path,
+    calculation_source_sha256: str | None = None,
     force_recompute: bool = False,
 ) -> bool:
     if force_recompute:
@@ -1727,7 +2023,16 @@ def _event_section_cache_is_current(
         with xr.open_dataset(path) as cached:
             return (
                 cached.attrs.get("cache_version") == SECTION_CACHE_VERSION
+                and cached.attrs.get("lifecycle_analysis_version")
+                == LIFECYCLE_ANALYSIS_VERSION
+                and cached.attrs.get("tracking_product_version")
+                == PRODUCT_VERSION
                 and cached.attrs.get("source_simulation") == simulation
+                and (
+                    calculation_source_sha256 is None
+                    or cached.attrs.get("calculation_source_sha256")
+                    == calculation_source_sha256
+                )
                 and int(cached.attrs.get("test_subset", -1)) == int(test)
                 and "cloud_class_indicator" in cached
                 and "background_zonal_wind" in cached
@@ -1848,9 +2153,9 @@ def analyse_run_lifecycles(
             raise FileNotFoundError(
                 f"Missing stable tracking products below {standard}"
             )
-        tracking_timing = pd.read_csv(timing_path)
+        tracking_timing = pd.read_csv(timing_path, dtype={"event_id": str})
         tracking_timing["Time"] = pd.to_datetime(tracking_timing.Time)
-        events = pd.read_csv(event_path)
+        events = pd.read_csv(event_path, dtype={"event_id": str})
         if test:
             event_ids = _select_test_events(events, tracking_timing)
         else:
@@ -1865,6 +2170,7 @@ def analyse_run_lifecycles(
             )
         geometric = pd.read_csv(
             geometric_path,
+            dtype={"event_id": str},
             usecols=[
                 "event_id", "Time", "centroid_lon", "centroid_lat",
             ],
@@ -1880,111 +2186,232 @@ def analyse_run_lifecycles(
             raise RuntimeError(
                 f"{standard}: lifecycle times lack geometric centroids"
             )
-        masks = _read_standard_masks(standard)
-        progress(
-            f"{run_directory.name}/{simulation}: sampling cloud and "
-            f"environment lifecycles for {len(event_ids)} LPOs"
-        )
-        dataset = _load_simulation_dataset(
-            simulation,
-            include_lifecycle_fields=True,
-        )
-        latitude_slice = _selected_mask_latitude_slice(
-            dataset.latitude,
-            masks,
-            event_ids,
-        )
-        if build_two_dimensional:
-            latitude_slice = _section_latitude_slice(
-                dataset.latitude, latitude_slice
-            )
-        dataset = dataset.isel(latitude=latitude_slice)
-        progress(
-            f"{run_directory.name}/{simulation}: using LPO latitude support "
-            f"{float(dataset.latitude.min()):.2f} to "
-            f"{float(dataset.latitude.max()):.2f} degrees"
-        )
-        full_precipitation = precipitation_rate_from_dataset(dataset)
-        diagnostic_times = pd.DatetimeIndex(
-            selected_timing.Time.drop_duplicates().sort_values()
-        )
-        precipitation = full_precipitation.sel(Time=diagnostic_times.values)
-        classification = _load_classification(
-            simulation,
-            precipitation.Time,
-            REQUIRED_CLASSIFICATION_FIELDS,
-        )
         if test:
-            projection_precipitation = precipitation
             environment_anomaly_baseline = (
                 "selected actual-data LPO diagnostic times; test figure "
                 "smoke-test product only"
             )
         else:
-            projection_precipitation = full_precipitation
             environment_anomaly_baseline = "complete simulation record"
-        progress(
-            f"{run_directory.name}/{simulation}: projecting model fields and "
-            "environment baselines"
+        dependency_hashes = _lifecycle_dependency_hashes(
+            standard, simulation, event_ids, test=test
         )
-        model_fields = project_model_fields(
-            dataset,
-            projection_precipitation,
-        )
-        event_rows: list[pd.DataFrame] = []
-        for event_number, event_id in enumerate(event_ids, start=1):
-            progress(
-                f"{run_directory.name}/{simulation}: lifecycle event "
-                f"{event_number}/{len(event_ids)} {event_id}"
-            )
-            diagnosed = diagnose_event_steps(
-                masks[event_id],
-                precipitation,
-                classification,
-                model_fields,
-                event_id=event_id,
-                simulation=simulation,
-            )
-            event_rows.append(
-                _merge_authoritative_timing(diagnosed, selected_timing)
-            )
-        lifecycle = pd.concat(event_rows, ignore_index=True)
-        lifecycle = _add_wave_lifecycle_fields(lifecycle, test=test)
-        summary = event_lifecycle_summary(lifecycle)
-        summary = summary.merge(
-            _wave_event_summary(lifecycle),
-            on="event_id",
-            how="left",
-            validate="one_to_one",
-        )
-        profiles = _sample_native_cloud_profiles(
-            dataset,
-            masks,
-            selected_timing,
-            event_ids,
-            simulation,
-        )
-        lifecycle.to_csv(standard / LIFECYCLE_STEP_FILENAME, index=False)
-        summary.to_csv(standard / LIFECYCLE_SUMMARY_FILENAME, index=False)
-        profiles.to_csv(standard / LIFECYCLE_PROFILE_FILENAME, index=False)
-        _write_lifecycle_metadata(
+        bundle = _read_simulation_bundle(
             standard,
-            lifecycle=lifecycle,
-            summary=summary,
-            profiles=profiles,
-            test_event_ids=event_ids if test else None,
-            environment_anomaly_baseline=environment_anomaly_baseline,
+            simulation=simulation,
+            event_ids=event_ids,
+            bundle_source_sha256=dependency_hashes["bundle"],
+            test=test,
+            force_recompute=force_recompute_caches,
         )
-        if build_two_dimensional:
-            section_path = standard / LIFECYCLE_SECTION_FILENAME
-            section_paths[simulation] = section_path
-            if _event_section_cache_is_current(
-                section_path,
+        if bundle is not None:
+            lifecycle, summary, profiles = bundle
+            expected_steps = {
+                (str(row.event_id), pd.Timestamp(row.Time))
+                for row in selected_timing.itertuples()
+            }
+            cached_steps = set(
+                zip(
+                    lifecycle.event_id.astype(str),
+                    pd.to_datetime(lifecycle.Time),
+                )
+            )
+            if cached_steps != expected_steps:
+                bundle = None
+        section_path = standard / LIFECYCLE_SECTION_FILENAME
+        section_current = build_two_dimensional and _event_section_cache_is_current(
+            section_path,
+            simulation=simulation,
+            test=test,
+            tracking_timing_path=timing_path,
+            calculation_source_sha256=dependency_hashes["calculation"],
+            force_recompute=force_recompute_caches,
+        )
+        event_checkpoints: dict[
+            str, tuple[pd.DataFrame, pd.DataFrame]
+        ] = {}
+        if bundle is None:
+            for event_id in event_ids:
+                event_timing = selected_timing[
+                    selected_timing.event_id == event_id
+                ]
+                checkpoint = _read_event_checkpoint(
+                    standard,
+                    simulation=simulation,
+                    event_id=event_id,
+                    timing_sha256=_event_timing_sha256(event_timing),
+                    calculation_source_sha256=dependency_hashes[
+                        "calculation"
+                    ],
+                    test=test,
+                    force_recompute=force_recompute_caches,
+                )
+                if checkpoint is not None:
+                    event_checkpoints[event_id] = checkpoint
+        missing_event_ids = [
+            event_id for event_id in event_ids
+            if event_id not in event_checkpoints
+        ] if bundle is None else []
+        needs_source_data = bool(missing_event_ids) or (
+            build_two_dimensional and not section_current
+        )
+        dataset: xr.Dataset | None = None
+        masks: Mapping[str, xr.DataArray] | None = None
+        full_precipitation: xr.DataArray | None = None
+        classification: Mapping[str, xr.DataArray] | None = None
+        if needs_source_data:
+            masks = _read_standard_masks(standard)
+            progress(
+                f"{run_directory.name}/{simulation}: opening lifecycle "
+                "source data"
+            )
+            dataset = _load_simulation_dataset(
+                simulation,
+                include_lifecycle_fields=True,
+            )
+            latitude_slice = _selected_mask_latitude_slice(
+                dataset.latitude,
+                masks,
+                event_ids,
+            )
+            if build_two_dimensional:
+                latitude_slice = _section_latitude_slice(
+                    dataset.latitude, latitude_slice
+                )
+            dataset = dataset.isel(latitude=latitude_slice)
+            progress(
+                f"{run_directory.name}/{simulation}: using LPO latitude "
+                f"support {float(dataset.latitude.min()):.2f} to "
+                f"{float(dataset.latitude.max()):.2f} degrees"
+            )
+            full_precipitation = precipitation_rate_from_dataset(dataset)
+            diagnostic_times = pd.DatetimeIndex(
+                selected_timing.Time.drop_duplicates().sort_values()
+            )
+            classification = _load_classification(
+                simulation,
+                full_precipitation.sel(
+                    Time=diagnostic_times.values
+                ).Time,
+                REQUIRED_CLASSIFICATION_FIELDS,
+            )
+        if bundle is None:
+            if missing_event_ids:
+                assert dataset is not None
+                assert masks is not None
+                assert full_precipitation is not None
+                assert classification is not None
+                diagnostic_times = pd.DatetimeIndex(
+                    selected_timing.Time.drop_duplicates().sort_values()
+                )
+                precipitation = full_precipitation.sel(
+                    Time=diagnostic_times.values
+                )
+                projection_precipitation = (
+                    precipitation if test else full_precipitation
+                )
+                progress(
+                    f"{run_directory.name}/{simulation}: projecting model "
+                    "fields and environment baselines"
+                )
+                model_fields = project_model_fields(
+                    dataset,
+                    projection_precipitation,
+                )
+                for event_number, event_id in enumerate(
+                    event_ids, start=1
+                ):
+                    if event_id in event_checkpoints:
+                        progress(
+                            f"{run_directory.name}/{simulation}: reusing "
+                            f"event {event_number}/{len(event_ids)} {event_id}"
+                        )
+                        continue
+                    progress(
+                        f"{run_directory.name}/{simulation}: lifecycle "
+                        f"event {event_number}/{len(event_ids)} {event_id}"
+                    )
+                    event_timing = selected_timing[
+                        selected_timing.event_id == event_id
+                    ].copy()
+                    diagnosed = diagnose_event_steps(
+                        masks[event_id],
+                        precipitation,
+                        classification,
+                        model_fields,
+                        event_id=event_id,
+                        simulation=simulation,
+                    )
+                    steps = _merge_authoritative_timing(
+                        diagnosed, event_timing
+                    )
+                    event_profiles = _sample_native_cloud_profiles(
+                        dataset,
+                        masks,
+                        event_timing,
+                        [event_id],
+                        simulation,
+                    )
+                    _write_event_checkpoint(
+                        standard,
+                        simulation=simulation,
+                        event_id=event_id,
+                        timing_sha256=_event_timing_sha256(event_timing),
+                        calculation_source_sha256=dependency_hashes[
+                            "calculation"
+                        ],
+                        test=test,
+                        steps=steps,
+                        profiles=event_profiles,
+                    )
+                    event_checkpoints[event_id] = (
+                        steps, event_profiles
+                    )
+            event_rows = [
+                event_checkpoints[event_id][0] for event_id in event_ids
+            ]
+            profile_rows = [
+                event_checkpoints[event_id][1] for event_id in event_ids
+            ]
+            lifecycle = pd.concat(event_rows, ignore_index=True)
+            profiles = pd.concat(profile_rows, ignore_index=True)
+            lifecycle = _add_wave_lifecycle_fields(lifecycle, test=test)
+            summary = event_lifecycle_summary(lifecycle)
+            summary = summary.merge(
+                _wave_event_summary(lifecycle),
+                on="event_id",
+                how="left",
+                validate="one_to_one",
+            )
+            _atomic_write_csv(
+                lifecycle, standard / LIFECYCLE_STEP_FILENAME
+            )
+            _atomic_write_csv(
+                summary, standard / LIFECYCLE_SUMMARY_FILENAME
+            )
+            _atomic_write_csv(
+                profiles, standard / LIFECYCLE_PROFILE_FILENAME
+            )
+            _write_lifecycle_metadata(
+                standard,
                 simulation=simulation,
-                test=test,
-                tracking_timing_path=timing_path,
-                force_recompute=force_recompute_caches,
-            ):
+                event_ids=event_ids,
+                calculation_source_sha256=dependency_hashes["calculation"],
+                bundle_source_sha256=dependency_hashes["bundle"],
+                lifecycle=lifecycle,
+                summary=summary,
+                profiles=profiles,
+                test_event_ids=event_ids if test else None,
+                environment_anomaly_baseline=environment_anomaly_baseline,
+            )
+        else:
+            progress(
+                f"{run_directory.name}/{simulation}: reusing complete "
+                "lifecycle table bundle"
+            )
+        if build_two_dimensional:
+            section_paths[simulation] = section_path
+            if section_current:
                 progress(
                     f"{run_directory.name}/{simulation}: reusing event "
                     "section cache"
@@ -1992,6 +2419,9 @@ def analyse_run_lifecycles(
                 with xr.open_dataset(section_path) as saved_sections:
                     event_sections = saved_sections.load()
             else:
+                assert dataset is not None
+                assert full_precipitation is not None
+                assert classification is not None
                 progress(
                     f"{run_directory.name}/{simulation}: building broad "
                     "event sections and cloud context"
@@ -2008,10 +2438,15 @@ def analyse_run_lifecycles(
                 event_sections.attrs.update(
                     lifecycle_analysis_version=LIFECYCLE_ANALYSIS_VERSION,
                     tracking_product_version=PRODUCT_VERSION,
+                    calculation_source_sha256=dependency_hashes[
+                        "calculation"
+                    ],
                 )
                 _atomic_write_netcdf(event_sections, section_path)
             wave_sections = load_existing_lpo_wave_sections(
-                simulation, test=test
+                simulation,
+                tracking_product_version=PRODUCT_VERSION,
+                test=test,
             )
             wave_sections = _align_wave_sections_to_unfiltered_events(
                 wave_sections, event_sections
@@ -2031,7 +2466,8 @@ def analyse_run_lifecycles(
             )
         combined_lifecycle.append(lifecycle)
         combined_summary.append(summary)
-        dataset.close()
+        if dataset is not None:
+            dataset.close()
 
     lifecycle = pd.concat(combined_lifecycle, ignore_index=True)
     summary = pd.concat(combined_summary, ignore_index=True)
@@ -2080,6 +2516,7 @@ def require_lifecycle_products(run_directory: Path) -> None:
     require_sections = run_directory.name == "primary"
     for simulation in SIMULATION_DIRS:
         standard = run_directory / simulation / "standard"
+        dependency_hashes: dict[str, str] | None = None
         for filename in (
             LIFECYCLE_STEP_FILENAME,
             LIFECYCLE_SUMMARY_FILENAME,
@@ -2093,9 +2530,17 @@ def require_lifecycle_products(run_directory: Path) -> None:
         metadata_path = standard / LIFECYCLE_CONFIGURATION_FILENAME
         if metadata_path.is_file():
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not _metadata_hash_is_valid(metadata):
+                raise RuntimeError(
+                    f"{metadata_path} has invalid configuration metadata"
+                )
             if metadata.get("lifecycle_analysis_version") != LIFECYCLE_ANALYSIS_VERSION:
                 raise RuntimeError(
                     f"{metadata_path} predates {LIFECYCLE_ANALYSIS_VERSION}"
+                )
+            if metadata.get("tracking_product_version") != PRODUCT_VERSION:
+                raise RuntimeError(
+                    f"{metadata_path} does not match {PRODUCT_VERSION}"
                 )
             if set(metadata.get("wave_filters", {})) != set(
                 LPO_LIFECYCLE_FILTERS
@@ -2104,12 +2549,61 @@ def require_lifecycle_products(run_directory: Path) -> None:
                     f"{metadata_path} does not contain the configured "
                     "lifecycle wave filters"
                 )
+            event_ids = metadata.get("selected_event_ids")
+            if not isinstance(event_ids, list) or not event_ids:
+                raise RuntimeError(
+                    f"{metadata_path} lacks its selected event identities"
+                )
+            dependency_hashes = _lifecycle_dependency_hashes(
+                standard,
+                simulation,
+                event_ids,
+                test=bool(metadata.get("test_product", False)),
+            )
+            if (
+                metadata.get("calculation_source_sha256")
+                != dependency_hashes["calculation"]
+                or metadata.get("bundle_source_sha256")
+                != dependency_hashes["bundle"]
+            ):
+                raise RuntimeError(
+                    f"{metadata_path} has stale lifecycle dependencies"
+                )
+            product_paths = {
+                "steps": standard / LIFECYCLE_STEP_FILENAME,
+                "summary": standard / LIFECYCLE_SUMMARY_FILENAME,
+                "profiles": standard / LIFECYCLE_PROFILE_FILENAME,
+            }
+            if all(path.is_file() for path in product_paths.values()):
+                expected_hashes = {
+                    key: _file_sha256(path)
+                    for key, path in product_paths.items()
+                }
+                if metadata.get("output_sha256") != expected_hashes:
+                    raise RuntimeError(
+                        f"{metadata_path} does not match its lifecycle tables"
+                    )
         section_path = standard / LIFECYCLE_SECTION_FILENAME
         if require_sections and section_path.is_file():
             with xr.open_dataset(section_path) as section:
                 if section.attrs.get("cache_version") != SECTION_CACHE_VERSION:
                     raise RuntimeError(
                         f"{section_path} predates {SECTION_CACHE_VERSION}"
+                    )
+                if (
+                    section.attrs.get("tracking_product_version")
+                    != PRODUCT_VERSION
+                ):
+                    raise RuntimeError(
+                        f"{section_path} does not match {PRODUCT_VERSION}"
+                    )
+                if (
+                    dependency_hashes is None
+                    or section.attrs.get("calculation_source_sha256")
+                    != dependency_hashes["calculation"]
+                ):
+                    raise RuntimeError(
+                        f"{section_path} has stale lifecycle dependencies"
                     )
     if require_sections:
         composite_path = run_directory / LIFECYCLE_2D_COMPOSITE_FILENAME
@@ -2120,6 +2614,13 @@ def require_lifecycle_products(run_directory: Path) -> None:
                 if composite.attrs.get("cache_version") != COMPOSITE_CACHE_VERSION:
                     raise RuntimeError(
                         f"{composite_path} predates {COMPOSITE_CACHE_VERSION}"
+                    )
+                if (
+                    composite.attrs.get("tracking_product_version")
+                    != PRODUCT_VERSION
+                ):
+                    raise RuntimeError(
+                        f"{composite_path} does not match {PRODUCT_VERSION}"
                     )
     if missing:
         raise FileNotFoundError(
@@ -2183,8 +2684,28 @@ def _test_event_products_are_current(run_directory: Path) -> bool:
         if (
             metadata.get("lifecycle_analysis_version")
             != LIFECYCLE_ANALYSIS_VERSION
+            or metadata.get("tracking_product_version") != PRODUCT_VERSION
             or not metadata.get("test_product", False)
+            or not _metadata_hash_is_valid(metadata)
         ):
+            return False
+        event_ids = metadata.get("selected_event_ids")
+        if not isinstance(event_ids, list) or not event_ids:
+            return False
+        try:
+            dependency_hashes = _lifecycle_dependency_hashes(
+                standard, simulation, event_ids, test=True
+            )
+        except (OSError, RuntimeError, FileNotFoundError, ValueError):
+            return False
+        if _read_simulation_bundle(
+            standard,
+            simulation=simulation,
+            event_ids=event_ids,
+            bundle_source_sha256=dependency_hashes["bundle"],
+            test=True,
+            force_recompute=False,
+        ) is None:
             return False
         for tracking_filename in (
             "lpt_event_relative_diagnostics.csv",
@@ -2198,10 +2719,18 @@ def _test_event_products_are_current(run_directory: Path) -> bool:
             with xr.open_dataset(
                 standard / LIFECYCLE_SECTION_FILENAME
             ) as section:
-                if section.attrs.get("cache_version") != SECTION_CACHE_VERSION:
+                if (
+                    section.attrs.get("cache_version") != SECTION_CACHE_VERSION
+                    or section.attrs.get("tracking_product_version")
+                    != PRODUCT_VERSION
+                    or section.attrs.get("calculation_source_sha256")
+                    != dependency_hashes["calculation"]
+                ):
                     return False
             load_existing_lpo_wave_sections(
-                simulation, test=True
+                simulation,
+                tracking_product_version=PRODUCT_VERSION,
+                test=True,
             ).close()
         except (OSError, RuntimeError, FileNotFoundError, ValueError):
             return False
@@ -2229,7 +2758,9 @@ def _rebuild_test_2d_composite_from_saved_sections(
         with xr.open_dataset(section_path) as saved_sections:
             event_sections = saved_sections.load()
         wave_sections = load_existing_lpo_wave_sections(
-            simulation, test=True
+            simulation,
+            tracking_product_version=PRODUCT_VERSION,
+            test=True,
         )
         try:
             aligned_wave_sections = _align_wave_sections_to_unfiltered_events(
@@ -2303,6 +2834,8 @@ def reuse_test_lifecycle_products(run_directory: Path) -> bool:
                 rebuild_2d = (
                     composite_2d.attrs.get("cache_version")
                     != COMPOSITE_CACHE_VERSION
+                    or composite_2d.attrs.get("tracking_product_version")
+                    != PRODUCT_VERSION
                 )
     except OSError:
         rebuild_2d = True
@@ -2336,7 +2869,7 @@ def _plot_composite_grid(
     title: str,
 ):
     display_scale = {
-        "area_integrated_24h_precip_km2_mm_day": (
+        "area_integrated_24h_precip_km2_mm": (
             RAIN_VOLUME_DISPLAY_SCALE
         ),
         "envelope_area_km2": 1.0e-6,
@@ -2423,7 +2956,7 @@ def _plot_lifecycle(lifecycle: pd.DataFrame):
         lifecycle,
         (
             (
-                "area_integrated_24h_precip_km2_mm_day",
+                "area_integrated_24h_precip_km2_mm",
                 RAIN_VOLUME_LABEL,
             ),
             (
@@ -2542,7 +3075,7 @@ def _plot_lifecycle_timing(summary: pd.DataFrame):
 def _plot_normalized_lifetime(lifecycle: pd.DataFrame):
     variables = (
         (
-            "area_integrated_24h_precip_km2_mm_day",
+            "area_integrated_24h_precip_km2_mm",
             RAIN_VOLUME_TITLE,
             RAIN_VOLUME_UNITS,
             RAIN_VOLUME_DISPLAY_SCALE,
@@ -5077,6 +5610,13 @@ def build_lifecycle_figures(
                 raise RuntimeError(
                     f"{composite_path} predates {COMPOSITE_CACHE_VERSION}"
                 )
+            if (
+                composite.attrs.get("tracking_product_version")
+                != PRODUCT_VERSION
+            ):
+                raise RuntimeError(
+                    f"{composite_path} does not match {PRODUCT_VERSION}"
+                )
             if 9 in figures:
                 progress("Starting Figure 9: modal high-cloud context")
                 save(
@@ -5359,7 +5899,7 @@ def build_validation_lifecycle_figure(
         (
             "Precipitation-threshold sensitivity",
             ("threshold_9", "threshold_12", "threshold_15"),
-            "area_integrated_24h_precip_km2_mm_day",
+            "area_integrated_24h_precip_km2_mm",
             RAIN_VOLUME_LABEL,
             RAIN_VOLUME_DISPLAY_SCALE,
         ),
@@ -5373,21 +5913,21 @@ def build_validation_lifecycle_figure(
         (
             "Record-subset sensitivity",
             ("threshold_12", "record_first_half", "record_second_half"),
-            "area_integrated_24h_precip_km2_mm_day",
+            "area_integrated_24h_precip_km2_mm",
             RAIN_VOLUME_LABEL,
             RAIN_VOLUME_DISPLAY_SCALE,
         ),
         (
             "Temporal-mean sensitivity",
             ("running_mean_48", "running_mean_60", "threshold_12"),
-            "area_integrated_24h_precip_km2_mm_day",
+            "area_integrated_24h_precip_km2_mm",
             RAIN_VOLUME_LABEL,
             RAIN_VOLUME_DISPLAY_SCALE,
         ),
         (
             "Gaussian-filter sensitivity",
             ("gaussian_sigma_3", "threshold_12", "gaussian_sigma_7"),
-            "area_integrated_24h_precip_km2_mm_day",
+            "area_integrated_24h_precip_km2_mm",
             RAIN_VOLUME_LABEL,
             RAIN_VOLUME_DISPLAY_SCALE,
         ),
@@ -5540,12 +6080,23 @@ def parse_command_line(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=LIFECYCLE_FIGURES,
         default=None,
     )
-    parser.add_argument(
-        "--force-recompute-caches",
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument(
+        "--figures-only",
         action="store_true",
         help=(
-            "Rebuild lifecycle event sections and derived composites from "
-            "the current simulation and prerequisite wave products."
+            "Build figures only from current lifecycle products. Fail when "
+            "a required product is missing or stale."
+        ),
+    )
+    cache_mode.add_argument(
+        "--rebuild-cache",
+        "--force-recompute-caches",
+        dest="rebuild_cache",
+        action="store_true",
+        help=(
+            "Ignore lifecycle table bundles, event checkpoints, event "
+            "sections, and derived composites. Rebuild every product."
         ),
     )
     parser.add_argument(
@@ -5583,14 +6134,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             minimum_duration_days=args.test_min_duration_days,
         )
         primary_directory = mode_directory / "primary"
-        if (
-            args.force_recompute_caches
+        if args.figures_only:
+            require_lifecycle_products(primary_directory)
+        elif (
+            args.rebuild_cache
             or not reuse_test_lifecycle_products(primary_directory)
         ):
             analyse_run_lifecycles(
                 primary_directory,
                 test=True,
-                force_recompute_caches=args.force_recompute_caches,
+                force_recompute_caches=args.rebuild_cache,
             )
         figure_output = actual_test_output_directory(
             lpo_tracking_figure_root(),
@@ -5613,10 +6166,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         mode_directory = require_publication_products(
             allow_stale_product_version=args.allow_stale_lpo_products
         )
-        analyse_run_lifecycles(
-            mode_directory / "primary",
-            force_recompute_caches=args.force_recompute_caches,
-        )
+        primary_directory = mode_directory / "primary"
+        if args.figures_only:
+            require_lifecycle_products(primary_directory)
+        else:
+            analyse_run_lifecycles(
+                primary_directory,
+                force_recompute_caches=args.rebuild_cache,
+            )
         figures = args.figures or list(LIFECYCLE_FIGURES)
         build_lifecycle_figures(
             mode_directory,
@@ -5635,10 +6192,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise FileNotFoundError(
                     f"Missing configured LPO validation run: {run_directory}"
                 )
-            analyse_run_lifecycles(
-                run_directory,
-                force_recompute_caches=args.force_recompute_caches,
-            )
+            if args.figures_only:
+                require_lifecycle_products(run_directory)
+            else:
+                analyse_run_lifecycles(
+                    run_directory,
+                    force_recompute_caches=args.rebuild_cache,
+                )
         build_validation_lifecycle_figure(
             mode_directory,
             figure_output=lpo_tracking_figure_root() / "validation",
