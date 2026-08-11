@@ -611,17 +611,27 @@ for i, ds in enumerate(dss):
     zmid = 0.5 * (z_lower + z_upper)   # (z, latitude, longitude)
 
     # Horizontal diagnostics
+    zmid_field = xr.DataArray(
+        zmid,
+        dims=("z", "latitude", "longitude"),
+        coords={
+            "latitude": ds.latitude,
+            "longitude": ds.longitude,
+        },
+    )
+    latitude_weights = np.cos(
+        np.deg2rad(zmid_field.latitude)
+    ).clip(min=0.0)
+    weighted_horizontal = zmid_field.weighted(latitude_weights)
     z_zonal = np.nanmean(zmid, axis=2)            # (z, latitude)
-    zmean = lat_mean(
-        xr.DataArray(
-            z_zonal,
-            dims=("z", "latitude"),
-            coords={"latitude": ds.latitude},
-        )
+    zmean = weighted_horizontal.mean(
+        ("latitude", "longitude"), skipna=True
     ).values                                      # global mean profile
     zmin = np.nanmin(zmid, axis=(1, 2))           # global min at each level
     zmax = np.nanmax(zmid, axis=(1, 2))           # global max at each level
-    zstd = np.nanstd(zmid, axis=(1, 2))           # global std at each level
+    zstd = weighted_horizontal.std(
+        ("latitude", "longitude"), skipna=True
+    ).values                                      # area-weighted global std
 
     # Zonal mean and anomaly from global mean
     z_anom = z_zonal - zmean[:, None]

@@ -12,8 +12,11 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import shutil
+import socket
 import subprocess
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +29,7 @@ DEFAULT_SIMULATION_ROOT = Path(
 )
 DEFAULT_DIAGNOSTIC_CACHE_ROOT = DEFAULT_SIMULATION_ROOT
 DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
+DIAGNOSTIC_FIGURE_VERSION_ENV = "MPAS_DIAGNOSTIC_FIGURE_VERSION"
 MODULE_SEARCH_DIRS = [
     ANALYSIS_DIR,
     ANALYSIS_DIR.parent,
@@ -36,6 +40,7 @@ DEFAULT_SCRIPT_ORDER = [
     "mean_state/energy_budget.py",
     "mean_state/vapour_transport_budget.py",
     "mean_state/thermal_wind.py",
+    "mean_state/circulation_diagnostics.py",
     "mean_state/jet_variability_diagnostics.py",
     "convection/refined_high_cloud_classification_diagnostics.py",
     "convection/lpo_tracking.py",
@@ -68,19 +73,47 @@ CONVECTION_ARGUMENTS_BY_SCRIPT = {
     ),
 }
 
-# Corrected T-nudge omg_isobaric affects wave filtering, unfiltered lifecycle
-# sections and the vertical-motion bootstrap products.  Classification and
-# tracking do not derive any products from omg_isobaric and need no forced
-# cache rebuild.
+# These scripts own the reusable scientific caches in the convection workflow.
+# Classification and tracking use their own validated product contracts.
 CONVECTION_REBUILD_ARGUMENTS_BY_SCRIPT = {
-    "waves/equatorial_wave_diagnostics.py": ("--force-recompute-caches",),
-    "convection/lpo_lifecycle_analysis.py": ("--force-recompute-caches",),
+    "waves/equatorial_wave_diagnostics.py": ("--rebuild-cache",),
+    "convection/lpo_lifecycle_analysis.py": ("--rebuild-cache",),
+    "significance/significance_bootstrap_diagnostics.py": (
+        "--rebuild-cache",
+    ),
 }
 
-CONVECTION_REBUILD_ENV_BY_SCRIPT = {
-    "significance/significance_bootstrap_diagnostics.py": {
-        "FORCE_RECOMPUTE_BOOTSTRAP_CACHE": "1",
-    },
+CONVECTION_REBUILD_ENV_BY_SCRIPT = {}
+
+FIGURES_ONLY_ARGUMENTS_BY_SCRIPT = {
+    "mean_state/mean_state_diagnostics.py": ("--figures-only",),
+    "mean_state/energy_budget.py": ("--figures-only",),
+    "mean_state/vapour_transport_budget.py": ("--figures-only",),
+    "mean_state/thermal_wind.py": ("--figures-only",),
+    "mean_state/circulation_diagnostics.py": ("--figures-only",),
+    "mean_state/jet_variability_diagnostics.py": ("--figures-only",),
+    "convection/refined_high_cloud_classification_diagnostics.py": (
+        "--figures-only",
+    ),
+    "convection/lpo_tracking.py": ("--stage", "figures"),
+    "waves/equatorial_wave_diagnostics.py": ("--figures-only",),
+    "convection/lpo_lifecycle_analysis.py": ("--figures-only",),
+    "significance/significance_bootstrap_diagnostics.py": ("--figures-only",),
+}
+
+REBUILD_ARGUMENTS_BY_SCRIPT = {
+    "mean_state/mean_state_diagnostics.py": ("--rebuild-cache",),
+    "mean_state/energy_budget.py": ("--rebuild-cache",),
+    "mean_state/vapour_transport_budget.py": ("--rebuild-cache",),
+    "mean_state/thermal_wind.py": ("--rebuild-cache",),
+    "mean_state/circulation_diagnostics.py": ("--rebuild-cache",),
+    "mean_state/jet_variability_diagnostics.py": ("--rebuild-cache",),
+    "convection/refined_high_cloud_classification_diagnostics.py": (
+        "--rebuild-derived-cache",
+    ),
+    "waves/equatorial_wave_diagnostics.py": ("--rebuild-cache",),
+    "convection/lpo_lifecycle_analysis.py": ("--rebuild-cache",),
+    "significance/significance_bootstrap_diagnostics.py": ("--rebuild-cache",),
 }
 
 QC_ARGUMENTS_BY_SCRIPT = {
@@ -124,16 +157,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "With --convection-workflow, force regeneration of wave, lifecycle "
-            "and bootstrap caches affected by corrected T-nudge omg_isobaric."
+            "and bootstrap caches."
         ),
     )
-    parser.add_argument(
-        "--reuse-lpo-tracking",
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument(
+        "--figures-only",
         action="store_true",
         help=(
-            "With --convection-workflow, skip LPO tracking and reuse the "
-            "existing publication tracking products."
+            "Render only from current calculation products. Selected scripts "
+            "without figure-only support cause an error."
         ),
+    )
+    cache_mode.add_argument(
+        "--rebuild-caches",
+        action="store_true",
+        help="Rebuild reusable calculation products before rendering.",
     )
     parser.add_argument(
         "--only",
@@ -193,11 +232,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "keeps its usual relative subdirectory under this root."
         ),
     )
+    parser.add_argument(
+        "--figure-version",
+        metavar="NAME",
+        help=(
+            "Save figures beneath this release directory instead of the "
+            "default v1 directory."
+        ),
+    )
+    parser.add_argument(
+        "--notify-email",
+        metavar="ADDRESS",
+        help="Send a summary through the local mail service after a failure.",
+    )
+    parser.add_argument(
+        "--notify-on",
+        choices=("failure", "always"),
+        default="failure",
+        help="Select whether email reports failures only or every completed run.",
+    )
     args = parser.parse_args(argv)
+    if (
+        args.figure_version
+        and (
+            args.figure_version in {".", ".."}
+            or Path(args.figure_version).name != args.figure_version
+        )
+    ):
+        parser.error("--figure-version must be one directory name")
     if args.rebuild_convection_caches and not args.convection_workflow:
         parser.error("--rebuild-convection-caches requires --convection-workflow")
-    if args.reuse_lpo_tracking and not args.convection_workflow:
-        parser.error("--reuse-lpo-tracking requires --convection-workflow")
+    if args.rebuild_convection_caches and (
+        args.rebuild_caches or args.figures_only
+    ):
+        parser.error("Choose one cache mode")
     if args.convection_workflow and args.only:
         parser.error("--convection-workflow cannot be combined with --only")
     if args.convection_workflow and args.skip:
@@ -250,8 +318,6 @@ def selected_scripts(args: argparse.Namespace) -> list[str]:
     available = set(diagnostic_scripts)
     if args.convection_workflow:
         selected = list(CONVECTION_WORKFLOW_ORDER)
-        if args.reuse_lpo_tracking:
-            selected.remove("convection/lpo_tracking.py")
     elif args.only:
         selected = [
             resolve_script_name(name, diagnostic_scripts) for name in args.only
@@ -273,6 +339,77 @@ def print_script_list(scripts: list[str]) -> None:
         print(f"{index:2d}. {script}")
 
 
+def local_mail_command() -> str | None:
+    """Return an installed command that accepts ``mail -s subject address``."""
+
+    return shutil.which("mail") or shutil.which("mailx")
+
+
+def diagnostic_log_path(script: str, args: argparse.Namespace) -> Path | None:
+    if args.no_log or not args.log_dir:
+        return None
+    log_name = script.removesuffix(".py").replace("/", "__")
+    return args.log_dir / f"{log_name}.log"
+
+
+def send_run_notification(
+    args: argparse.Namespace,
+    scripts: list[str],
+    failures: list[tuple[str, int]],
+    started: datetime,
+) -> bool:
+    """Send one run summary without changing the diagnostic exit status."""
+
+    if not args.notify_email:
+        return True
+    if not failures and args.notify_on != "always":
+        return True
+
+    mail_command = local_mail_command()
+    if mail_command is None:
+        print("Notification failed: neither mail nor mailx is installed.", file=sys.stderr)
+        return False
+
+    ended = datetime.now()
+    status = "FAILED" if failures else "COMPLETED"
+    subject = f"MPAS diagnostics {status} on {socket.gethostname()}"
+    lines = [
+        f"Status: {status}",
+        f"Host: {socket.gethostname()}",
+        f"Started: {started:%Y-%m-%d %H:%M:%S}",
+        f"Ended: {ended:%Y-%m-%d %H:%M:%S}",
+        f"Elapsed: {ended - started}",
+        "",
+        "Selected diagnostics:",
+        *(f"  {script}" for script in scripts),
+    ]
+    if failures:
+        lines.extend(("", "Failures:"))
+        for script, return_code in failures:
+            log_path = diagnostic_log_path(script, args)
+            log_text = str(log_path) if log_path else "logging disabled"
+            lines.append(f"  {script}: exit code {return_code}; log: {log_text}")
+
+    try:
+        result = subprocess.run(
+            [mail_command, "-s", subject, args.notify_email],
+            input="\n".join(lines) + "\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"Notification failed: {exc}", file=sys.stderr)
+        return False
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit code {result.returncode}"
+        print(f"Notification failed: {detail}", file=sys.stderr)
+        return False
+
+    print(f"Notification sent to {args.notify_email}.")
+    return True
+
+
 def child_environment(args: argparse.Namespace) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -282,6 +419,8 @@ def child_environment(args: argparse.Namespace) -> dict[str, str]:
     env.setdefault("XDG_CACHE_HOME", str(DEFAULT_DIAGNOSTIC_CACHE_ROOT / f"xdg-cache-{os.getuid()}"))
     if args.figure_root:
         env[DIAGNOSTIC_OUTPUT_ROOT_ENV] = str(args.figure_root.expanduser().resolve())
+    if args.figure_version:
+        env[DIAGNOSTIC_FIGURE_VERSION_ENV] = args.figure_version
 
     Path(env["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
     Path(env["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
@@ -309,6 +448,10 @@ def script_arguments(script: str, args: argparse.Namespace) -> list[str]:
         script_args.extend(
             CONVECTION_REBUILD_ARGUMENTS_BY_SCRIPT.get(script, ())
         )
+    if args.figures_only:
+        script_args.extend(FIGURES_ONLY_ARGUMENTS_BY_SCRIPT.get(script, ()))
+    if args.rebuild_caches:
+        script_args.extend(REBUILD_ARGUMENTS_BY_SCRIPT.get(script, ()))
     return script_args
 
 
@@ -356,8 +499,8 @@ def run_script(script: str, args: argparse.Namespace) -> int:
     log_file = None
     if args.log_dir and not args.no_log:
         args.log_dir.mkdir(parents=True, exist_ok=True)
-        log_name = script.removesuffix(".py").replace("/", "__")
-        log_path = args.log_dir / f"{log_name}.log"
+        log_path = diagnostic_log_path(script, args)
+        assert log_path is not None
         log_file = log_path.open("w", encoding="utf-8")
         log_file.write(f"[{start:%Y-%m-%d %H:%M:%S}] Starting {script}\n")
         log_file.write(f"Command: {command_text}\n\n")
@@ -400,6 +543,20 @@ def run_script(script: str, args: argparse.Namespace) -> int:
 def main() -> int:
     args = parse_args()
     scripts = selected_scripts(args)
+    run_started = datetime.now()
+
+    if args.figures_only:
+        unsupported = [
+            script for script in scripts
+            if script not in FIGURES_ONLY_ARGUMENTS_BY_SCRIPT
+        ]
+        if unsupported:
+            names = ", ".join(unsupported)
+            print(
+                f"Figure-only mode is unavailable for: {names}",
+                file=sys.stderr,
+            )
+            return 2
 
     if args.list:
         print_script_list(scripts)
@@ -415,15 +572,26 @@ def main() -> int:
         print("Mode: complete dependency-ordered convection workflow.")
     if args.rebuild_convection_caches:
         print(
-            "Cache policy: rebuild corrected-omg wave, lifecycle and "
-            "bootstrap products."
+            "Cache policy: rebuild wave, lifecycle and bootstrap products."
         )
+    if args.figures_only:
+        print("Cache policy: render only from current scientific products.")
+    if args.rebuild_caches:
+        print("Cache policy: rebuild supported reusable scientific products.")
     if args.no_log:
         print("Logging disabled (--no-log).")
     elif args.log_dir:
         print(f"Logs will be written to: {args.log_dir}")
     if args.figure_root:
         print(f"Figures/output will be written under: {args.figure_root.expanduser().resolve()}")
+    if args.notify_email:
+        if local_mail_command() is None:
+            print(
+                "Cannot enable email notifications because mail and mailx are absent.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"Email notifications will be sent to: {args.notify_email}")
 
     if args.dry_run:
         print("\nDry run only; no diagnostics were executed.")
@@ -439,7 +607,11 @@ def main() -> int:
 
     failures: list[tuple[str, int]] = []
     for script in scripts:
-        return_code = run_script(script, args)
+        try:
+            return_code = run_script(script, args)
+        except Exception:
+            traceback.print_exc()
+            return_code = 1
         if return_code != 0:
             failures.append((script, return_code))
             if not args.continue_on_error:
@@ -449,9 +621,11 @@ def main() -> int:
         print("\nDiagnostic failures:")
         for script, return_code in failures:
             print(f"  {script}: exit code {return_code}")
+        send_run_notification(args, scripts, failures, run_started)
         return failures[0][1]
 
     print("\nAll selected diagnostics completed successfully.")
+    send_run_notification(args, scripts, failures, run_started)
     return 0
 
 
