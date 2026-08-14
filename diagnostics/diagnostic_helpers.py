@@ -1,9 +1,7 @@
 import glob
-import hashlib
 import json
 import os
 from datetime import datetime
-from pathlib import Path
 
 import dask
 import dask.array as dsa
@@ -15,20 +13,39 @@ import scipy.interpolate as intp
 import xarray as xr
 
 from diagnostics.ttl import TTL_HEIGHT_BOUNDS_M
+from diagnostics.analysis_config import (
+    ANALYSIS_END,
+    ANALYSIS_START,
+    DEFAULT_FIGURE_ROOT,
+    DEFAULT_FIGURE_VERSION,
+    DIAGNOSTIC_FIGURE_ROOT_ENV,
+    DIAGNOSTIC_FIGURE_VERSION_ENV,
+    DIAGNOSTIC_OUTPUT_ROOT_ENV,
+    LATLON_PATTERN,
+    QUICK_TEST_LAT_BOUNDS,
+    QUICK_TEST_LON_BOUNDS,
+    SIMULATION_COLOURS,
+    SIMULATION_ROOT,
+    ZONAL_MEAN_PATTERN,
+    cache_directory,
+    simulation_colour,
+)
+from diagnostics.cache_support import (
+    cache_manifest,
+    cache_manifest_matches,
+    jsonable_value,
+    metadata_reader,
+    metadata_writer,
+    read_json_file,
+    source_file_signature,
+    write_json_file,
+)
 
 
-DEFAULT_SIMULATION_PARENT_DIR = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on"
-DEFAULT_DIAGNOSTIC_OUTPUT_ROOT = "/home/cwp29/tmp/mpas/crf_on"
-DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
-DIAGNOSTIC_FIGURE_ROOT_ENV = "MPAS_DIAGNOSTIC_FIGURE_ROOT"
-DIAGNOSTIC_FIGURE_VERSION_ENV = "MPAS_DIAGNOSTIC_FIGURE_VERSION"
-DEFAULT_DIAGNOSTIC_FIGURE_VERSION = "v1"
-ANALYSIS_START = "2000-05-05 06:00:00"
-ANALYSIS_END = "2000-11-21 00:00:00"
-LATLON_PATTERN = "latlon.2000-*.nc"
-ZONAL_MEAN_PATTERN = "zm_latlon.2000-*.nc"
-QUICK_TEST_LAT_BOUNDS = (-20.0, 20.0)
-QUICK_TEST_LON_BOUNDS = (60.0, 180.0)
+DEFAULT_SIMULATION_PARENT_DIR = str(SIMULATION_ROOT)
+DEFAULT_DIAGNOSTIC_OUTPUT_ROOT = str(DEFAULT_FIGURE_ROOT)
+DEFAULT_DIAGNOSTIC_FIGURE_VERSION = DEFAULT_FIGURE_VERSION
+SPECIFIC_HUMIDITY_CMAP = "BrBG"
 
 
 def simulation_parent_dir():
@@ -36,10 +53,10 @@ def simulation_parent_dir():
     return os.path.abspath(DEFAULT_SIMULATION_PARENT_DIR)
 
 
-def diagnostic_cache_dir(*parts):
-    """Return a diagnostic cache path beside the source simulations."""
-    base = simulation_parent_dir()
-    return os.path.join(base, *parts)
+def diagnostic_cache_dir(family, *parts):
+    """Return a path from the central diagnostic cache layout."""
+
+    return os.fspath(cache_directory(family, *parts))
 
 
 def diagnostic_output_dir(default_save_loc, root_dir=DEFAULT_DIAGNOSTIC_OUTPUT_ROOT):
@@ -328,17 +345,18 @@ def pressure_to_pa(pressure):
 MPAS_MOISTURE_SCALARS = ("qv", "qc", "qr", "qi", "qs", "qg")
 
 
-def mpas_moist_air_density(dataset):
+def mpas_moist_air_density(dataset, total_moisture=None):
     """Return MPAS moist density from dry density and all moisture scalars."""
 
     required = ("rho", *MPAS_MOISTURE_SCALARS)
     missing = [name for name in required if name not in dataset.data_vars]
     if missing:
         raise ValueError(f"MPAS moist density requires fields {missing}")
-    total_moisture = sum(
-        (finite_or_nan(dataset[name]) for name in MPAS_MOISTURE_SCALARS),
-        start=xr.zeros_like(finite_or_nan(dataset.rho)),
-    )
+    if total_moisture is None:
+        total_moisture = sum(
+            (finite_or_nan(dataset[name]) for name in MPAS_MOISTURE_SCALARS),
+            start=xr.zeros_like(finite_or_nan(dataset.rho)),
+        )
     density = finite_or_nan(dataset.rho) * (1.0 + total_moisture)
     density.name = "moist_air_density"
     density.attrs.update(
@@ -800,33 +818,6 @@ PRECIP_RATE_COLORS = [
 ]
 PRECIP_RATE_LEVELS = np.linspace(0.01, 25.0, len(PRECIP_RATE_COLORS))
 
-SIMULATION_COLOURS = {
-    "control": "#222222",
-    "nudged-u": "#1f77b4",
-    "nudged-T": "#d62728",
-}
-
-_SIMULATION_COLOUR_ALIASES = {
-    "control": "control",
-    "nudged-u": "nudged-u",
-    "u-nudged": "nudged-u",
-    "nudged u": "nudged-u",
-    "nudged-t": "nudged-T",
-    "t-nudged": "nudged-T",
-    "nudged t": "nudged-T",
-}
-
-
-def simulation_colour(simulation):
-    """Return the project-standard colour for a simulation name or label."""
-    key = str(simulation).strip().lower()
-    try:
-        canonical = _SIMULATION_COLOUR_ALIASES[key]
-    except KeyError as exc:
-        raise KeyError(f"Unknown simulation name {simulation!r}") from exc
-    return SIMULATION_COLOURS[canonical]
-
-
 HIGH_CLOUD_CLASS_SPECS = (
     (1, "Deep convection", "tab:red"),
     (2, "Stratiform cloud", "tab:blue"),
@@ -843,6 +834,15 @@ def precip_rate_cmap_norm():
         PRECIP_RATE_LEVELS, ncolors=len(PRECIP_RATE_COLORS) - 1
     )
     return cmap, norm
+
+
+def blue_sky_white_cloud_cmap():
+    """Return the shared sequential palette for cloud fraction or occurrence."""
+
+    return colors.LinearSegmentedColormap.from_list(
+        "blue_sky_white_cloud",
+        ("#154c79", "#5fa8d3", "#d9edf7", "#ffffff"),
+    )
 
 
 def high_cloud_class_cmap_norm(alpha=0.82):
@@ -1090,23 +1090,6 @@ def progress(message):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
 
 
-def jsonable_value(value):
-    """Recursively convert numpy/pandas values into JSON-safe Python values."""
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, (list, tuple, np.ndarray)):
-        return [jsonable_value(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): jsonable_value(item) for key, item in value.items()}
-    if isinstance(value, float) and not np.isfinite(value):
-        return None
-    if isinstance(value, (pd.Timestamp, np.datetime64)):
-        return str(pd.Timestamp(value))
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
 def safe_name(text):
     """Return the filename-safe convention used by diagnostic cache products."""
     return str(text).replace(" ", "_").replace("/", "-").replace(".", "p").replace("-", "m")
@@ -1116,94 +1099,6 @@ def configured_label(mapping, name):
     """Return a configured display label, falling back to the key itself."""
 
     return mapping.get(name, {}).get("label", name)
-
-
-def read_json_file(path):
-    """Read a JSON cache file, returning ``None`` when it does not exist."""
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def write_json_file(path, payload):
-    """Atomically write a JSON cache payload."""
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(jsonable_value(payload), handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.replace(tmp_path, path)
-
-
-def source_file_signature(paths):
-    """Return a stable signature for one source-file collection."""
-
-    records = []
-    for value in sorted({os.path.abspath(os.fspath(path)) for path in paths}):
-        path = Path(value)
-        if not path.is_file():
-            raise FileNotFoundError(f"Missing cache source file: {path}")
-        stat = path.stat()
-        records.append(
-            {
-                "path": value,
-                "size": int(stat.st_size),
-                "mtime_ns": int(stat.st_mtime_ns),
-            }
-        )
-    if not records:
-        raise ValueError("Cache source-file collection is empty")
-    encoded = json.dumps(records, sort_keys=True, separators=(",", ":"))
-    return {
-        "sha256": hashlib.sha256(encoded.encode()).hexdigest(),
-        "files": records,
-    }
-
-
-def cache_manifest(
-    producer,
-    *,
-    schema,
-    configuration=None,
-    dependencies=None,
-    source_paths=None,
-):
-    """Build one shared cache manifest with explicit dependencies."""
-
-    manifest = {
-        "producer": str(producer),
-        "schema": str(schema),
-        "configuration": jsonable_value(configuration or {}),
-        "dependencies": jsonable_value(dependencies or {}),
-    }
-    if source_paths is not None:
-        manifest["sources"] = source_file_signature(source_paths)
-    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
-    manifest["manifest_sha256"] = hashlib.sha256(encoded.encode()).hexdigest()
-    return manifest
-
-
-def cache_manifest_matches(saved, expected):
-    """Return whether two complete cache manifests match exactly."""
-
-    if not isinstance(saved, dict):
-        return False
-    return jsonable_value(saved) == jsonable_value(expected)
-
-
-def metadata_reader(path_resolver):
-    """Bind a cache-name-to-path resolver to the shared JSON reader."""
-    return lambda name: read_json_file(path_resolver(name))
-
-
-def metadata_writer(path_resolver, enabled=True):
-    """Bind a cache-name-to-path resolver to the shared JSON writer."""
-    if not enabled:
-        return lambda name, payload: None
-    return lambda name, payload: write_json_file(path_resolver(name), payload)
 
 
 def netcdf_safe_attribute(value):

@@ -155,7 +155,7 @@ def filtered_wave_phase_diagnostics(
         "phase_angle_degrees": angle,
         "phase_number": phase,
         "normalized_amplitude": amplitude,
-        "strong_amplitude": valid & (amplitude >= 1.0),
+        "strong_amplitude": valid & (amplitude > 1.0),
     }
 
 

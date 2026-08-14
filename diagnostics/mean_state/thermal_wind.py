@@ -52,6 +52,7 @@ from diagnostics.diagnostic_helpers import (
     add_symmetric_colorbar,
     annotate_panel_label,
     cache_manifest,
+    cache_manifest_matches,
     control_diff_label,
     diagnostic_cache_dir,
     diagnostic_output_dir,
@@ -68,24 +69,35 @@ from diagnostics.diagnostic_helpers import (
     subset_between,
     symmetric_levels,
     symmetric_percentile_levels_for_fields,
+    time_block_slices,
     total_precip_accum,
     write_json_file,
 )
 from diagnostics.ttl import TTL_HEIGHT_BOUNDS_M
+from diagnostics.analysis_config import (
+    BLOCK_LENGTH_DAYS,
+    BOOTSTRAP_REPLICATES,
+    BOOTSTRAP_SEED,
+    CONFIDENCE_PERCENTILES,
+    SIMULATION_ARCHIVES,
+    SIMULATION_ROOT,
+)
+from diagnostics.uncertainty import independent_bootstrap_difference
 
 
-ROOT_DIR = Path("/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on")
+ROOT_DIR = SIMULATION_ROOT
 SIMULATIONS = (
-    ("control", "control_new", "k"),
-    (r"$u$-nudged", "u_nudge", "b"),
-    (r"$T$-nudged", "T_nudge", "r"),
+    ("control", SIMULATION_ARCHIVES["control"], "k"),
+    (r"$u$-nudged", SIMULATION_ARCHIVES["nudged-u"], "b"),
+    (r"$T$-nudged", SIMULATION_ARCHIVES["nudged-T"], "r"),
 )
 FIGURES = (1, 2, 13, 14)
 SAVE_LOCATION = diagnostic_output_dir(
     "/home/cwp29/tmp/mpas/crf_on/final/thermal_wind/"
 )
-THERMAL_WIND_CACHE_SCHEMA = "thermal-wind-v1"
-THERMAL_WIND_CACHE_ROOT = diagnostic_cache_dir("thermal_wind_cache")
+THERMAL_WIND_CACHE_SCHEMA = "thermal-wind-v2-block-uncertainty"
+THERMAL_WIND_CACHE_ROOT = diagnostic_cache_dir("thermal_wind")
+TEST_TIME_COUNT: int | None = None
 
 RD = 287.0
 CP = 1004.0
@@ -441,7 +453,9 @@ def thermal_wind_source_paths(directory: str, pattern: str) -> list[str]:
     return sorted(glob.glob(str(ROOT_DIR / directory / pattern)))
 
 
-def thermal_wind_manifest(kind: str, *, directory: str | None = None):
+def thermal_wind_manifest(
+    kind: str, *, directory: str | None = None, include_sources=True
+):
     patterns = (
         (LATLON_PATTERN, ZONAL_MEAN_PATTERN)
         if kind == "realised_state_summary"
@@ -458,32 +472,48 @@ def thermal_wind_manifest(kind: str, *, directory: str | None = None):
         for pattern in patterns
         for path in thermal_wind_source_paths(source_directory, pattern)
     ]
+    configuration = {
+        "kind": kind,
+        "directory": directory,
+        "analysis_start": ANALYSIS_START,
+        "analysis_end": ANALYSIS_END,
+        "simulations": [simulation[:2] for simulation in SIMULATIONS],
+        "test_times": TEST_TIME_COUNT,
+        "ttl_bounds_m": TTL_Z_BOUNDS,
+        "equator_mask_degrees": EQUATOR_MASK_DEGREES,
+    }
+    if kind == "realised_state_summary":
+        configuration.update(
+            block_days=BLOCK_LENGTH_DAYS["thermal_wind"],
+            bootstrap_seed=BOOTSTRAP_SEED,
+            bootstrap_replicates=BOOTSTRAP_REPLICATES,
+            confidence_percentiles=list(CONFIDENCE_PERCENTILES),
+        )
     return cache_manifest(
         "mean_state.thermal_wind",
         schema=THERMAL_WIND_CACHE_SCHEMA,
-        configuration={
-            "kind": kind,
-            "directory": directory,
-            "analysis_start": ANALYSIS_START,
-            "analysis_end": ANALYSIS_END,
-            "simulations": [simulation[:2] for simulation in SIMULATIONS],
-            "ttl_bounds_m": TTL_Z_BOUNDS,
-            "equator_mask_degrees": EQUATOR_MASK_DEGREES,
-        },
-        source_paths=source_paths,
+        configuration=configuration,
+        source_paths=source_paths if include_sources else None,
     )
 
 
-def thermal_wind_cache_is_current(path: Path, manifest: dict) -> bool:
+def thermal_wind_cache_is_current(
+    path: Path, manifest: dict, *, validate_sources=True
+) -> bool:
     if not path.is_file():
         return False
     try:
         with xr.open_dataset(path) as cached:
-            return (
-                cached.attrs.get("cache_schema")
-                == THERMAL_WIND_CACHE_SCHEMA
-                and cached.attrs.get("manifest_sha256")
-                == manifest["manifest_sha256"]
+            if cached.attrs.get("cache_schema") != THERMAL_WIND_CACHE_SCHEMA:
+                return False
+            if validate_sources:
+                return (
+                    cached.attrs.get("manifest_sha256")
+                    == manifest["manifest_sha256"]
+                )
+            saved = json.loads(cached.attrs.get("cache_manifest", "null"))
+            return cache_manifest_matches(
+                saved, manifest, compare_sources=False
             )
     except (OSError, ValueError):
         return False
@@ -511,9 +541,12 @@ def prepare_zonal_mean_caches(
     for label, directory, _colour in SIMULATIONS:
         path = Path(THERMAL_WIND_CACHE_ROOT) / f"{directory}_zonal_mean.nc"
         manifest = thermal_wind_manifest(
-            "zonal_time_mean", directory=directory
+            "zonal_time_mean", directory=directory,
+            include_sources=not figures_only,
         )
-        current = thermal_wind_cache_is_current(path, manifest)
+        current = thermal_wind_cache_is_current(
+            path, manifest, validate_sources=not figures_only
+        )
         if current and not rebuild_cache:
             progress(f"{label}: using thermal-wind cache {path}")
             with xr.open_dataset(path) as cached:
@@ -531,6 +564,8 @@ def prepare_zonal_mean_caches(
         )
         try:
             raw = standardize_latlon_dataset(raw, ZONAL_MEAN_VARIABLES)
+            if TEST_TIME_COUNT is not None:
+                raw = raw.isel(Time=slice(0, TEST_TIME_COUNT))
             temperature_mean = model_level_temperature(raw).mean(
                 "Time", skipna=True
             ).load()
@@ -551,17 +586,35 @@ def realised_summary_cache_paths() -> tuple[Path, Path]:
     )
 
 
+def realised_block_cache_paths() -> tuple[Path, Path]:
+    root = Path(THERMAL_WIND_CACHE_ROOT)
+    return (
+        root / "realised_state_blocks.csv",
+        root / "realised_state_response_uncertainty.csv",
+    )
+
+
 def prepare_realised_state_summary(
     zonal_datasets: Sequence[xr.Dataset],
     *,
     figures_only: bool = False,
     rebuild_cache: bool = False,
+    skip_uncertainty: bool = False,
 ) -> pd.DataFrame:
     table_path, metadata_path = realised_summary_cache_paths()
-    manifest = thermal_wind_manifest("realised_state_summary")
+    blocks_path, uncertainty_path = realised_block_cache_paths()
+    manifest = thermal_wind_manifest(
+        "realised_state_summary", include_sources=not figures_only
+    )
     current = (
         table_path.is_file()
-        and read_json_file(metadata_path) == manifest
+        and blocks_path.is_file()
+        and (skip_uncertainty or uncertainty_path.is_file())
+        and cache_manifest_matches(
+            read_json_file(metadata_path),
+            manifest,
+            compare_sources=not figures_only,
+        )
     )
     if current and not rebuild_cache:
         progress(f"using realised-state cache {table_path}")
@@ -571,26 +624,70 @@ def prepare_realised_state_summary(
             "Figure-only mode requires a current realised-state cache: "
             f"{table_path}"
         )
-    latlon_datasets = []
-    for label, directory, _colour in SIMULATIONS:
+    rows = []
+    block_rows = []
+    block_days = BLOCK_LENGTH_DAYS["thermal_wind"]
+    for index, (label, directory, _colour) in enumerate(SIMULATIONS):
         progress(f"{label}: loading realised-state inputs")
-        raw = load_latlon_dataset(
+        latlon = load_latlon_dataset(
             ROOT_DIR / directory,
             latlon_pattern=LATLON_PATTERN,
             chunks={"Time": -1},
         )
-        latlon_datasets.append(
-            standardize_latlon_dataset(raw, LATLON_VARIABLES)
+        zonal = load_latlon_dataset(
+            ROOT_DIR / directory,
+            latlon_pattern=ZONAL_MEAN_PATTERN,
+            chunks={"Time": -1},
         )
-    try:
-        table = realised_state_summary(latlon_datasets, zonal_datasets)
-    finally:
-        for dataset in latlon_datasets:
-            dataset.close()
+        try:
+            latlon = standardize_latlon_dataset(latlon, LATLON_VARIABLES)
+            zonal = standardize_latlon_dataset(zonal, ZONAL_MEAN_VARIABLES)
+            if TEST_TIME_COUNT is not None:
+                latlon = latlon.isel(Time=slice(0, TEST_TIME_COUNT))
+                zonal = zonal.isel(Time=slice(0, TEST_TIME_COUNT))
+            rows.append(
+                realised_state_row(label, latlon, zonal_datasets[index])
+            )
+            if not skip_uncertainty:
+                latlon_blocks = time_block_slices(
+                    latlon.olrtoa, block_days=block_days, complete=True
+                )
+                zonal_blocks = time_block_slices(
+                    zonal.theta, block_days=block_days, complete=True
+                )
+                for block_index, (latlon_slice, zonal_slice) in enumerate(
+                    zip(latlon_blocks, zonal_blocks, strict=True)
+                ):
+                    row = realised_state_row(
+                        label,
+                        latlon.isel(Time=latlon_slice),
+                        zonal.isel(Time=zonal_slice),
+                    )
+                    row["block"] = block_index
+                    row["block_days"] = block_days
+                    block_rows.append(row)
+        finally:
+            latlon.close()
+            zonal.close()
+    table = add_control_differences(pd.DataFrame(rows))
+    blocks = pd.DataFrame(block_rows)
+    uncertainty = (
+        pd.DataFrame()
+        if skip_uncertainty
+        else realised_state_response_uncertainty(blocks)
+    )
     table_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = table_path.with_suffix(table_path.suffix + ".tmp")
     table.to_csv(temporary, index=False)
     os.replace(temporary, table_path)
+    temporary = blocks_path.with_suffix(blocks_path.suffix + ".tmp")
+    blocks.to_csv(temporary, index=False)
+    os.replace(temporary, blocks_path)
+    temporary = uncertainty_path.with_suffix(
+        uncertainty_path.suffix + ".tmp"
+    )
+    uncertainty.to_csv(temporary, index=False)
+    os.replace(temporary, uncertainty_path)
     write_json_file(metadata_path, manifest)
     return table
 
@@ -739,77 +836,131 @@ def plot_thermal_wind_shear_balance(
     return figure, metrics
 
 
+def realised_state_row(
+    simulation: str,
+    latlon: xr.Dataset,
+    zonal: xr.Dataset,
+) -> dict[str, float | str]:
+    """Return one realised-state summary row."""
+
+    temperature = latheight_time_mean_field(zonal, "temperature")
+    wind = latheight_time_mean_field(zonal, "uReconstructZonal")
+    n2 = N2_latheight(zonal)
+    precipitation = precip_rate_from_accum(total_precip_accum(latlon))
+    return {
+        "simulation": simulation,
+        "T16km_K": float(
+            deep_tropical_mean_latheight(
+                temperature, height=TTL_REFERENCE_HEIGHT_M
+            ).values
+        ),
+        "u16km_ms-1": float(
+            deep_tropical_mean_latheight(
+                wind, height=TTL_REFERENCE_HEIGHT_M
+            ).values
+        ),
+        "T_TTL_K": float(
+            deep_tropical_mean_latheight(
+                temperature, height_bounds=TTL_Z_BOUNDS
+            ).values
+        ),
+        "u_TTL_ms-1": float(
+            deep_tropical_mean_latheight(
+                wind, height_bounds=TTL_Z_BOUNDS
+            ).values
+        ),
+        "N2_TTL_1e-4s-2": float(
+            deep_tropical_mean_latheight(
+                n2 * 1.0e4, height_bounds=TTL_Z_BOUNDS
+            ).values
+        ),
+        "OLR_Wm-2": float(
+            deep_tropical_mean_surface(latlon.olrtoa).mean("Time").values
+        ),
+        "PW_kgm-2": float(
+            deep_tropical_mean_surface(latlon.precipw).mean("Time").values
+        ),
+        "precip_mmday-1": float(
+            deep_tropical_mean_surface(precipitation).mean("Time").values
+        ),
+    }
+
+
+def add_control_differences(table: pd.DataFrame) -> pd.DataFrame:
+    table = table.copy()
+    for column in tuple(table.columns[1:]):
+        table[f"d{column}"] = table[column] - table.loc[0, column]
+    return table
+
+
 def realised_state_summary(
     latlon_datasets: Sequence[xr.Dataset],
     zonal_datasets: Sequence[xr.Dataset],
 ) -> pd.DataFrame:
     """Return absolute realised states and direct differences from control."""
 
-    rows = []
-    for index, (latlon, zonal) in enumerate(
-        zip(latlon_datasets, zonal_datasets, strict=True)
-    ):
-        temperature = latheight_time_mean_field(zonal, "temperature")
-        wind = latheight_time_mean_field(zonal, "uReconstructZonal")
-        n2 = N2_latheight(zonal)
-        precipitation = precip_rate_from_accum(total_precip_accum(latlon))
-        rows.append(
-            {
-                "simulation": SIMULATIONS[index][0],
-                "T16km_K": float(
-                    deep_tropical_mean_latheight(
-                        temperature,
-                        height=TTL_REFERENCE_HEIGHT_M,
-                    ).values
-                ),
-                "u16km_ms-1": float(
-                    deep_tropical_mean_latheight(
-                        wind,
-                        height=TTL_REFERENCE_HEIGHT_M,
-                    ).values
-                ),
-                "T_TTL_K": float(
-                    deep_tropical_mean_latheight(
-                        temperature,
-                        height_bounds=TTL_Z_BOUNDS,
-                    ).values
-                ),
-                "u_TTL_ms-1": float(
-                    deep_tropical_mean_latheight(
-                        wind,
-                        height_bounds=TTL_Z_BOUNDS,
-                    ).values
-                ),
-                "N2_TTL_1e-4s-2": float(
-                    deep_tropical_mean_latheight(
-                        n2 * 1.0e4,
-                        height_bounds=TTL_Z_BOUNDS,
-                    ).values
-                ),
-                "OLR_Wm-2": float(
-                    deep_tropical_mean_surface(latlon.olrtoa)
-                    .mean("Time")
-                    .values
-                ),
-                "PW_kgm-2": float(
-                    deep_tropical_mean_surface(latlon.precipw)
-                    .mean("Time")
-                    .values
-                ),
-                "precip_mmday-1": float(
-                    deep_tropical_mean_surface(precipitation)
-                    .mean("Time")
-                    .values
-                ),
-            }
+    rows = [
+        realised_state_row(SIMULATIONS[index][0], latlon, zonal)
+        for index, (latlon, zonal) in enumerate(
+            zip(latlon_datasets, zonal_datasets, strict=True)
         )
-    table = pd.DataFrame(rows)
-    for column in tuple(table.columns[1:]):
-        table[f"d{column}"] = table[column] - table.loc[0, column]
-    return table
+    ]
+    return add_control_differences(pd.DataFrame(rows))
 
 
-def plot_realised_state_summary(table: pd.DataFrame) -> plt.Figure:
+def realised_state_response_uncertainty(blocks: pd.DataFrame) -> pd.DataFrame:
+    """Return independent-block intervals for selected realised-state metrics."""
+
+    metrics = [
+        column
+        for column in blocks.columns
+        if column not in {"simulation", "block", "block_days"}
+    ]
+    comparisons = (
+        (SIMULATIONS[1][0], SIMULATIONS[0][0]),
+        (SIMULATIONS[2][0], SIMULATIONS[0][0]),
+        (SIMULATIONS[1][0], SIMULATIONS[2][0]),
+    )
+    rows = []
+    for metric_index, metric in enumerate(metrics):
+        for comparison_index, (simulation, reference) in enumerate(comparisons):
+            simulation_values = blocks.loc[
+                blocks.simulation == simulation, metric
+            ].to_numpy(dtype=float)
+            reference_values = blocks.loc[
+                blocks.simulation == reference, metric
+            ].to_numpy(dtype=float)
+            result = independent_bootstrap_difference(
+                simulation_values,
+                reference_values,
+                rng=np.random.default_rng(
+                    BOOTSTRAP_SEED + 6000 + 10 * metric_index
+                    + comparison_index
+                ),
+                n_resamples=BOOTSTRAP_REPLICATES,
+            )
+            rows.append(
+                {
+                    "metric": metric,
+                    "simulation": simulation,
+                    "reference": reference,
+                    "mean_response": result["estimate"],
+                    "ci_low": result["interval_low"],
+                    "ci_high": result["interval_high"],
+                    "sign_probability": result["sign_probability"],
+                    "n_simulation_blocks": result["n_simulation"],
+                    "n_reference_blocks": result["n_control"],
+                    "block_days": BLOCK_LENGTH_DAYS["thermal_wind"],
+                    "resampling": "independent complete time blocks by simulation",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def plot_realised_state_summary(
+    table: pd.DataFrame,
+    uncertainty: pd.DataFrame | None = None,
+) -> plt.Figure:
     """Build Figure 2 from direct experiment-minus-control differences."""
 
     specifications = (
@@ -840,6 +991,22 @@ def plot_realised_state_summary(table: pd.DataFrame) -> plt.Figure:
         strict=True,
     ):
         axis.bar(positions, table[column], color=colours)
+        if uncertainty is not None and not uncertainty.empty:
+            metric = column[1:]
+            selected = uncertainty[
+                (uncertainty.metric == metric)
+                & (uncertainty.reference == SIMULATIONS[0][0])
+            ].set_index("simulation")
+            for position, simulation in enumerate(labels[1:], start=1):
+                if simulation in selected.index:
+                    interval = selected.loc[simulation]
+                    axis.vlines(
+                        position,
+                        interval.ci_low,
+                        interval.ci_high,
+                        color="0.15",
+                        linewidth=1.3,
+                    )
         axis.axhline(0, color="0.5", lw=0.6)
         axis.set_xticks(positions, labels, rotation=30, ha="right")
         axis.set_ylabel(label)
@@ -1011,13 +1178,13 @@ def plot_gradient_shear_differences(
             [control],
             percentile=99.0,
             ndiv=12,
-            fallback=raw_fallback,
+            zero_field_scale=raw_fallback,
         )
         difference_levels = symmetric_percentile_levels_for_fields(
             differences,
             percentile=99.0,
             ndiv=12,
-            fallback=difference_fallback,
+            zero_field_scale=difference_fallback,
         )
         control_image = difference_image = None
         for column in range(len(SIMULATIONS)):
@@ -1094,6 +1261,12 @@ def parse_command_line(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Use bounded actual-data subsets and isolated test products.",
+    )
+    parser.add_argument("--test-times", type=int, default=8)
+    parser.add_argument(
         "--figures",
         nargs="+",
         type=int,
@@ -1115,11 +1288,21 @@ def parse_command_line(
     args = parser.parse_args(argv)
     if args.figures:
         args.figures = list(dict.fromkeys(args.figures))
+    if args.test_times < 3:
+        parser.error("--test-times must be at least 3")
     return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global SAVE_LOCATION, TEST_TIME_COUNT, THERMAL_WIND_CACHE_ROOT
     args = parse_command_line(argv)
+    if args.test:
+        TEST_TIME_COUNT = int(args.test_times)
+        test_label = f"all_{TEST_TIME_COUNT:03d}times"
+        THERMAL_WIND_CACHE_ROOT = diagnostic_cache_dir(
+            "thermal_wind", "testing", test_label
+        )
+        SAVE_LOCATION = os.path.join(SAVE_LOCATION, "testing", test_label)
     figures = set(args.figures or FIGURES)
     progress(
         "Starting thermal-wind diagnostics "
@@ -1161,12 +1344,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 zonal_datasets,
                 figures_only=args.figures_only,
                 rebuild_cache=args.rebuild_cache,
+                skip_uncertainty=args.test,
             )
             summary.to_csv(
                 os.path.join(SAVE_LOCATION, "realised_state_summary.csv"),
                 index=False,
             )
-            figure = plot_realised_state_summary(summary)
+            _blocks_path, uncertainty_path = realised_block_cache_paths()
+            try:
+                uncertainty = pd.read_csv(uncertainty_path)
+            except pd.errors.EmptyDataError:
+                uncertainty = pd.DataFrame()
+            uncertainty.to_csv(
+                os.path.join(
+                    SAVE_LOCATION,
+                    "realised_state_response_uncertainty.csv",
+                ),
+                index=False,
+            )
+            figure = plot_realised_state_summary(summary, uncertainty)
             saver.save(figure, "realised_state_summary_bars", number=2)
             plt.close(figure)
         if 13 in figures:

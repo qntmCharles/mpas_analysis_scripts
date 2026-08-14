@@ -18,7 +18,7 @@ import json
 
 
 LPO_WAVE_SECTION_CACHE_VERSION = (
-    "lpo-wave-sections-v11-moist-density"
+    "lpo-wave-sections-v12-amplitude-gt-one"
 )
 LPO_WAVE_SECTION_FILENAME_TEMPLATE = "lpo_wave_sections_{simulation}.nc"
 KELVIN_DISPERSION_FILENAME = "kelvin_reference_energy_dispersion.nc"
@@ -28,7 +28,7 @@ WAVE_RESPONSE_CONTRASTS_FILENAME = "wave_response_efficiency_contrasts.csv"
 
 def _wave_cache_root(*, test=False):
     return diagnostic_cache_dir(
-        "wave_cache",
+        "waves",
         *(("testing",) if test else ()),
     )
 

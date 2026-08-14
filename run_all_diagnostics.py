@@ -20,16 +20,17 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+from diagnostics.analysis_config import (
+    DIAGNOSTIC_FIGURE_VERSION_ENV,
+    DIAGNOSTIC_OUTPUT_ROOT_ENV,
+    SIMULATION_ROOT,
+)
+
 
 ANALYSIS_DIR = Path(__file__).resolve().parent
 DIAGNOSTICS_DIR = ANALYSIS_DIR / "diagnostics"
 DEFAULT_LOG_DIR = ANALYSIS_DIR / "diagnostic_logs"
-DEFAULT_SIMULATION_ROOT = Path(
-    "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on"
-)
-DEFAULT_DIAGNOSTIC_CACHE_ROOT = DEFAULT_SIMULATION_ROOT
-DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
-DIAGNOSTIC_FIGURE_VERSION_ENV = "MPAS_DIAGNOSTIC_FIGURE_VERSION"
+DEFAULT_SIMULATION_ROOT = SIMULATION_ROOT
 MODULE_SEARCH_DIRS = [
     ANALYSIS_DIR,
     ANALYSIS_DIR.parent,
@@ -46,7 +47,6 @@ DEFAULT_SCRIPT_ORDER = [
     "convection/lpo_tracking.py",
     "waves/equatorial_wave_diagnostics.py",
     "convection/lpo_lifecycle_analysis.py",
-    "significance/significance_bootstrap_diagnostics.py",
 ]
 
 # Complete publication workflow for the convection/LPO analysis.  The ordering
@@ -54,14 +54,12 @@ DEFAULT_SCRIPT_ORDER = [
 #
 # * tracking consumes the shared high-cloud classification;
 # * wave Figure 14 consumes the saved primary LPO tracks;
-# * lifecycle analysis consumes wave Figures 13 and 14 products; and
-# * significance consumes the tracks and the wave Figure 11 response table.
+# * lifecycle consumes wave Figures 13 and 14 products.
 CONVECTION_WORKFLOW_ORDER = [
     "convection/refined_high_cloud_classification_diagnostics.py",
     "convection/lpo_tracking.py",
     "waves/equatorial_wave_diagnostics.py",
     "convection/lpo_lifecycle_analysis.py",
-    "significance/significance_bootstrap_diagnostics.py",
 ]
 
 CONVECTION_ARGUMENTS_BY_SCRIPT = {
@@ -76,11 +74,12 @@ CONVECTION_ARGUMENTS_BY_SCRIPT = {
 # These scripts own the reusable scientific caches in the convection workflow.
 # Classification and tracking use their own validated product contracts.
 CONVECTION_REBUILD_ARGUMENTS_BY_SCRIPT = {
+    "convection/refined_high_cloud_classification_diagnostics.py": (
+        "--rebuild-derived-cache",
+    ),
+    "convection/lpo_tracking.py": ("--rebuild-cache",),
     "waves/equatorial_wave_diagnostics.py": ("--rebuild-cache",),
     "convection/lpo_lifecycle_analysis.py": ("--rebuild-cache",),
-    "significance/significance_bootstrap_diagnostics.py": (
-        "--rebuild-cache",
-    ),
 }
 
 CONVECTION_REBUILD_ENV_BY_SCRIPT = {}
@@ -98,7 +97,6 @@ FIGURES_ONLY_ARGUMENTS_BY_SCRIPT = {
     "convection/lpo_tracking.py": ("--stage", "figures"),
     "waves/equatorial_wave_diagnostics.py": ("--figures-only",),
     "convection/lpo_lifecycle_analysis.py": ("--figures-only",),
-    "significance/significance_bootstrap_diagnostics.py": ("--figures-only",),
 }
 
 REBUILD_ARGUMENTS_BY_SCRIPT = {
@@ -111,9 +109,9 @@ REBUILD_ARGUMENTS_BY_SCRIPT = {
     "convection/refined_high_cloud_classification_diagnostics.py": (
         "--rebuild-derived-cache",
     ),
+    "convection/lpo_tracking.py": ("--rebuild-cache",),
     "waves/equatorial_wave_diagnostics.py": ("--rebuild-cache",),
     "convection/lpo_lifecycle_analysis.py": ("--rebuild-cache",),
-    "significance/significance_bootstrap_diagnostics.py": ("--rebuild-cache",),
 }
 
 QC_ARGUMENTS_BY_SCRIPT = {
@@ -126,6 +124,27 @@ QC_ARGUMENTS_BY_SCRIPT = {
         "--mode",
         "validation",
     ),
+}
+
+# Each owner uses the shortest actual-data subset that still satisfies its
+# calculation geometry.  Mean-state spectra require 96 precipitation samples.
+TEST_ARGUMENTS_BY_SCRIPT = {
+    "mean_state/mean_state_diagnostics.py": ("--test", "--test-times", "100"),
+    "mean_state/energy_budget.py": ("--test", "--test-times", "8"),
+    "mean_state/vapour_transport_budget.py": ("--test", "--test-times", "5"),
+    "mean_state/thermal_wind.py": ("--test", "--test-times", "8"),
+    "mean_state/circulation_diagnostics.py": ("--test", "--test-times", "8"),
+    "mean_state/jet_variability_diagnostics.py": ("--test", "--test-times", "16"),
+    "convection/refined_high_cloud_classification_diagnostics.py": (
+        "--test",
+        "--simulation",
+        "all",
+        "--test-times",
+        "16",
+    ),
+    "convection/lpo_tracking.py": ("--test", "--test-days", "10"),
+    "waves/equatorial_wave_diagnostics.py": ("--test", "--test-days", "21"),
+    "convection/lpo_lifecycle_analysis.py": ("--test", "--test-days", "10"),
 }
 
 
@@ -145,19 +164,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Print the commands without running them.",
     )
     parser.add_argument(
+        "--test",
+        action="store_true",
+        help=(
+            "Build every selected diagnostic from isolated, bounded subsets "
+            "of all three simulations. Formal uncertainty is omitted."
+        ),
+    )
+    parser.add_argument(
         "--convection-workflow",
         action="store_true",
         help=(
             "Run the complete publication convection/LPO workflow in dependency "
-            "order, including the required wave and significance products."
+            "order, including the required wave and lifecycle products."
         ),
     )
     parser.add_argument(
         "--rebuild-convection-caches",
         action="store_true",
         help=(
-            "With --convection-workflow, force regeneration of wave, lifecycle "
-            "and bootstrap caches."
+            "With --convection-workflow, rebuild high-cloud, LPO, wave, and "
+            "lifecycle products."
         ),
     )
     cache_mode = parser.add_mutually_exclusive_group()
@@ -243,13 +270,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--notify-email",
         metavar="ADDRESS",
-        help="Send a summary through the local mail service after a failure.",
+        help="Send progress, failure, and final workflow messages by email.",
     )
     parser.add_argument(
         "--notify-on",
         choices=("failure", "always"),
-        default="failure",
-        help="Select whether email reports failures only or every completed run.",
+        default="always",
+        help="Select failure-only email or progress and final-summary email.",
     )
     args = parser.parse_args(argv)
     if (
@@ -277,6 +304,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--convection-workflow is dependency ordered and cannot continue "
             "after a failed prerequisite"
         )
+    if args.test and (
+        args.convection_workflow
+        or args.rebuild_convection_caches
+        or args.rebuild_caches
+        or args.figures_only
+        or args.qc
+    ):
+        parser.error("--test cannot be combined with workflow or cache modes")
     return args
 
 
@@ -410,13 +445,65 @@ def send_run_notification(
     return True
 
 
+def send_progress_notification(
+    args: argparse.Namespace,
+    scripts: list[str],
+    completed: list[str],
+    script: str,
+    return_code: int,
+    started: datetime,
+) -> bool:
+    """Send immediate progress or failure information for one diagnostic."""
+
+    if not args.notify_email:
+        return True
+    if return_code == 0 and args.notify_on != "always":
+        return True
+    mail_command = local_mail_command()
+    if mail_command is None:
+        print("Notification failed: neither mail nor mailx is installed.", file=sys.stderr)
+        return False
+    status = "COMPLETED" if return_code == 0 else "FAILED"
+    remaining = [item for item in scripts if item not in completed and item != script]
+    log_path = diagnostic_log_path(script, args)
+    lines = [
+        f"Status: {status}",
+        f"Diagnostic: {script}",
+        f"Host: {socket.gethostname()}",
+        f"Workflow elapsed: {datetime.now() - started}",
+        f"Completed diagnostics: {len(completed)} of {len(scripts)}",
+        f"Exit code: {return_code}",
+        f"Log: {log_path if log_path else 'logging disabled'}",
+        "",
+        "Remaining diagnostics:",
+        *(f"  {item}" for item in remaining),
+    ]
+    subject = f"MPAS diagnostic {status}: {Path(script).stem}"
+    result = subprocess.run(
+        [mail_command, "-s", subject, args.notify_email],
+        input="\n".join(lines) + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit code {result.returncode}"
+        print(f"Notification failed: {detail}", file=sys.stderr)
+        return False
+    print(f"Progress notification sent to {args.notify_email}.")
+    return True
+
+
 def child_environment(args: argparse.Namespace) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env.pop("MPAS_SIMULATION_ROOT", None)
     env.pop("MPAS_DIAGNOSTIC_CACHE_ROOT", None)
     env.setdefault("MPLCONFIGDIR", str(Path("/tmp") / f"matplotlib-{os.getuid()}"))
-    env.setdefault("XDG_CACHE_HOME", str(DEFAULT_DIAGNOSTIC_CACHE_ROOT / f"xdg-cache-{os.getuid()}"))
+    env.setdefault("XDG_CACHE_HOME", str(Path("/tmp") / f"mpas-xdg-cache-{os.getuid()}"))
+    # These diagnostics run serially.  MPICH otherwise selects an unavailable
+    # OFI network provider on restricted hosts.
+    env.setdefault("FI_PROVIDER", "shm")
     if args.figure_root:
         env[DIAGNOSTIC_OUTPUT_ROOT_ENV] = str(args.figure_root.expanduser().resolve())
     if args.figure_version:
@@ -440,6 +527,8 @@ def script_arguments(script: str, args: argparse.Namespace) -> list[str]:
     """Return diagnostic-specific arguments for one selected workflow."""
 
     script_args: list[str] = []
+    if args.test:
+        script_args.extend(TEST_ARGUMENTS_BY_SCRIPT[script])
     if args.qc and script in QC_ARGUMENTS_BY_SCRIPT:
         script_args.extend(QC_ARGUMENTS_BY_SCRIPT[script])
     if args.convection_workflow:
@@ -521,9 +610,10 @@ def run_script(script: str, args: argparse.Namespace) -> int:
 
         assert process.stdout is not None
         for line in process.stdout:
-            print(line, end="")
+            print(line, end="", flush=True)
             if log_file:
                 log_file.write(line)
+                log_file.flush()
 
         return_code = process.wait()
     finally:
@@ -572,7 +662,7 @@ def main() -> int:
         print("Mode: complete dependency-ordered convection workflow.")
     if args.rebuild_convection_caches:
         print(
-            "Cache policy: rebuild wave, lifecycle and bootstrap products."
+            "Cache policy: rebuild high-cloud, LPO, wave, and lifecycle products."
         )
     if args.figures_only:
         print("Cache policy: render only from current scientific products.")
@@ -606,6 +696,7 @@ def main() -> int:
         return 0
 
     failures: list[tuple[str, int]] = []
+    completed: list[str] = []
     for script in scripts:
         try:
             return_code = run_script(script, args)
@@ -614,8 +705,16 @@ def main() -> int:
             return_code = 1
         if return_code != 0:
             failures.append((script, return_code))
+            send_progress_notification(
+                args, scripts, completed, script, return_code, run_started
+            )
             if not args.continue_on_error:
                 break
+        else:
+            completed.append(script)
+            send_progress_notification(
+                args, scripts, completed, script, return_code, run_started
+            )
 
     if failures:
         print("\nDiagnostic failures:")

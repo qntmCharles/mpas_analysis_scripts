@@ -14,15 +14,14 @@ depth/OLR responses. Core/cold-shield/warm-shield scene regions and vertical
 slices provide the Figures 4-5 validation view in normal and test runs.
 
 The expensive full-record reductions are versioned independently of the
-rendering code below ``high_cloud_diagnostics_cache`` in the data repository.
-After one cache-building run, ``--figures-only --figures ...`` can regenerate
-Figures 1-3 and 6-8 without opening the simulation fields. Figures 4-5 are an
-instantaneous source-data validation view and therefore still open only the
-selected source slices and classification fields.
+rendering code below the central ``cache/high_cloud`` directory.
+After one cache-building run, ``--figures-only --figures ...`` regenerates all
+figures without opening the simulation fields.
 """
 
 import argparse
 import gc
+import glob
 import json
 import os
 import sys
@@ -46,6 +45,7 @@ from scipy import ndimage
 from diagnostics.diagnostic_helpers import (
     FigureSaver, HIGH_CLOUD_CLASS_SPECS, LATLON_PATTERN,
     QUICK_TEST_LON_BOUNDS,
+    blue_sky_white_cloud_cmap,
     diagnostic_cache_dir, diagnostic_output_dir, difference_cmap,
     figure_should_run, hemispheric_fold,
     high_cloud_class_cmap_norm, high_cloud_class_legend_handles,
@@ -54,7 +54,15 @@ from diagnostics.diagnostic_helpers import (
     precipitation_rate_from_dataset, progress,
     sample_matching_arrays, standardize_latlon_dataset,
     simulation_colour, symmetric_levels,
+    source_file_signature,
     subset_latitude, time_block_slices, weighted_area_time_mean,
+)
+from diagnostics.uncertainty import independent_weighted_ratio_difference
+from diagnostics.analysis_config import (
+    BLOCK_LENGTH_DAYS,
+    SIMULATION_ARCHIVES,
+    SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
+    SIMULATION_ROOT,
 )
 from diagnostics.convection.high_cloud_classification import (
     CLASSIFICATION_CACHE_VERSION,
@@ -97,9 +105,9 @@ default_save_loc = save_loc
 figures_to_run = list(range(1, 9))
 figsave = None
 
-root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
-data_locs = ["control_new", "u_nudge", "T_nudge"]
-sim_names = ["control", "nudged u", "nudged T"]
+root_dir = str(SIMULATION_ROOT)
+data_locs = list(SIMULATION_ARCHIVES.values())
+sim_names = list(PROJECT_SIMULATION_LABELS.values())
 cols = [simulation_colour(name) for name in sim_names]
 
 dt = 6
@@ -123,11 +131,11 @@ CF_THRESH = 0.05
 P_HIGH_HPA = 440.0
 P_PRECIP_MIN = 12.0  # 0.5 mm h-1 PF threshold (Feng et al. 2021)
 WRITE_CLASSIFICATION_PRODUCT = True
-classification_cache_dir = diagnostic_cache_dir("classification_cache")
+classification_cache_dir = diagnostic_cache_dir("classification")
 DERIVED_CACHE_VERSION = (
-    "high-cloud-derived-diagnostics-v5-deep-tropical-distributions"
+    "high-cloud-derived-diagnostics-v7-control-selected-complete-blocks"
 )
-derived_cache_dir = diagnostic_cache_dir("high_cloud_diagnostics_cache")
+derived_cache_dir = diagnostic_cache_dir("high_cloud")
 DERIVED_CACHE_SIGNATURE = None
 REBUILD_DERIVED_CACHE = False
 FIGURES_ONLY = False
@@ -148,7 +156,7 @@ SIMULATION_ARGUMENTS = {
 CLASSIFICATION_WRITE_TIME_BATCH = 8
 CLASSIFICATION_WRITE_WORKERS = 2
 
-BOOTSTRAP_BLOCK_DAYS = 10.0
+BOOTSTRAP_BLOCK_DAYS = BLOCK_LENGTH_DAYS["high_cloud"]
 N_BOOTSTRAP = 600
 BOOTSTRAP_SEED = 20240610
 CI_PERCENTILES = (2.5, 97.5)
@@ -157,7 +165,8 @@ CLOUD_STRUCTURE_TIME_BATCH = 4
 # Match the source Time chunk so each expensive 3-D cloud-fraction chunk is read
 # once while still yielding regular progress updates in a full-period run.
 VERTICAL_PROFILE_TIME_BATCH = 8
-RAIN_CONDITIONED_TIME_BATCH_DAYS = BOOTSTRAP_BLOCK_DAYS
+RAIN_CONDITIONED_BLOCK_DAYS = BOOTSTRAP_BLOCK_DAYS
+RAIN_CONDITIONED_LOAD_CHUNK_DAYS = 5.0
 MIN_RAIN_CONDITIONED_BLOCKS = 4
 RAIN_RATE_BINS_MM_H = np.array(
     [0.0, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.0, 1.5, 2.0,
@@ -408,9 +417,9 @@ def parse_command_line(argv=None):
     )
     parser.add_argument(
         "--simulation",
-        choices=tuple(SIMULATION_ARGUMENTS),
+        choices=(*SIMULATION_ARGUMENTS, "all"),
         default="control",
-        help="Simulation used by --test (default: control).",
+        help="Simulation set used by --test (default: control).",
     )
     parser.add_argument(
         "--test-times",
@@ -498,10 +507,11 @@ def configure_run(args):
     if not TEST_MODE:
         return
 
-    index = SIMULATION_ARGUMENTS[args.simulation]
-    data_locs = [data_locs[index]]
-    sim_names = [sim_names[index]]
-    cols = [cols[index]]
+    if args.simulation != "all":
+        index = SIMULATION_ARGUMENTS[args.simulation]
+        data_locs = [data_locs[index]]
+        sim_names = [sim_names[index]]
+        cols = [cols[index]]
 
     start_label = f"_{TEST_START}" if TEST_START else ""
     test_label = (
@@ -512,10 +522,10 @@ def configure_run(args):
     # Test products are isolated from publication caches but remain in the data
     # repository; only rendered figures belong below ~/tmp.
     classification_cache_dir = diagnostic_cache_dir(
-        "classification_cache", "testing", test_label
+        "classification", "testing", test_label
     )
     derived_cache_dir = diagnostic_cache_dir(
-        "high_cloud_diagnostics_cache", "testing", test_label
+        "high_cloud", "testing", test_label
     )
 
 
@@ -595,11 +605,15 @@ def initialise_derived_cache_signature(dss):
         }
     DERIVED_CACHE_SIGNATURE = derived_cache_configuration()
     DERIVED_CACHE_SIGNATURE["time_axes"] = time_axes
+    DERIVED_CACHE_SIGNATURE["source_archives"] = {
+        sim_name: ds.attrs.get("classification_source_sha256")
+        for sim_name, ds in zip(sim_names, dss)
+    }
     os.makedirs(derived_cache_dir, exist_ok=True)
 
 
 def required_derived_products():
-    """Return the cached products needed by the selected non-snapshot figures."""
+    """Return the cached products needed by the selected figures."""
 
     products = []
     if should_run_figure(1):
@@ -608,6 +622,8 @@ def required_derived_products():
         products.append(("high_cloud_vertical_contribution_profiles", "nc"))
     if should_run_figure(2) or should_run_figure(3):
         products.append(("high_cloud_structure_distributions", "nc"))
+    if should_run_figure(4) or should_run_figure(5):
+        products.append(("high_cloud_validation_snapshots", "nc"))
     if should_run_figure(7):
         products.append(("high_cloud_class_occurrence_maps", "nc"))
     if should_run_figure(8):
@@ -638,10 +654,14 @@ def initialise_derived_cache_signature_from_products(products):
                 f"Stale derived high-cloud cache metadata {metadata_path}; "
                 "configuration differs for " + ", ".join(mismatches)
             )
-        if "time_axes" not in signature:
+        missing_dependencies = [
+            key for key in ("time_axes", "source_archives")
+            if key not in signature
+        ]
+        if missing_dependencies:
             raise RuntimeError(
                 f"Incomplete derived high-cloud cache metadata {metadata_path}: "
-                "time_axes is missing"
+                "missing " + ", ".join(missing_dependencies)
             )
         DERIVED_CACHE_SIGNATURE = signature
         progress(
@@ -746,7 +766,7 @@ def write_classification_method_table():
         dict(component="non-precipitating high cloud", implementation=f"all remaining non-core high cloud with surface rain < {P_PRECIP_MIN / 24.0:g} mm h-1", origin="baseline core/rain decomposition", reference="this analysis", doi="not applicable"),
         dict(component="vertical rain attribution", implementation="none in the baseline; surface rain is associated with the high-cloud column", origin="deliberately deferred sensitivity", reference="not applicable", doi="not applicable"),
         dict(component="spatial class response", implementation="unfiltered time-mean occurrence difference for each high-cloud class; grey contours show the control occurrence", origin="class-aware analogue of published cloud-regime occurrence maps", reference="Jin et al. (2023), Nature Communications", doi="10.1038/s41467-023-39465-7"),
-        dict(component="rain-matched cloud structure", implementation="cloud-top pressure and OLR conditioned on the same surface-rain-rate bins; nudged-minus-control response from 10-day block ratios", origin="combines published cloud-depth/radiative property comparisons with precipitation matching", reference="Jin et al. (2023), Nature Communications; Sakaeda et al. (2020), JGR Atmospheres", doi="10.1038/s41467-023-39465-7; 10.1029/2020JD033196"),
+        dict(component="rain-matched cloud structure", implementation=f"cloud-top pressure and OLR conditioned on the same surface-rain-rate bins; nudged-minus-control response from {BOOTSTRAP_BLOCK_DAYS:g}-day block ratios", origin="combines published cloud-depth/radiative property comparisons with precipitation matching", reference="Jin et al. (2023), Nature Communications; Sakaeda et al. (2020), JGR Atmospheres", doi="10.1038/s41467-023-39465-7; 10.1029/2020JD033196"),
     ]
     save_table(pd.DataFrame(rows), "cloud_classification_method_and_references")
 
@@ -947,10 +967,14 @@ def select_absolute_latitude_band(da, absolute_latitude_bounds):
     return out
 
 
-block_slices = partial(
-    time_block_slices,
-    block_days=BOOTSTRAP_BLOCK_DAYS,
-)
+def block_slices(da, block_days=BOOTSTRAP_BLOCK_DAYS):
+    """Return complete production blocks and bounded test blocks."""
+
+    return time_block_slices(
+        da,
+        block_days=block_days,
+        complete=not TEST_MODE,
+    )
 
 
 def block_area_fraction_values(da, block_days=BOOTSTRAP_BLOCK_DAYS):
@@ -967,6 +991,13 @@ def bootstrap_mean_1d(values, rng, n_boot=N_BOOTSTRAP):
     values = values[np.isfinite(values)]
     if values.size == 0:
         return dict(mean=np.nan, ci_low=np.nan, ci_high=np.nan, n_blocks=0)
+    if TEST_MODE:
+        return dict(
+            mean=float(np.nanmean(values)),
+            ci_low=np.nan,
+            ci_high=np.nan,
+            n_blocks=int(values.size),
+        )
     boot = np.empty(n_boot, dtype=float)
     for i in range(n_boot):
         idx = rng.integers(0, values.size, values.size)
@@ -982,6 +1013,14 @@ def bootstrap_difference_1d(a, b, rng, n_boot=N_BOOTSTRAP):
     b = b[np.isfinite(b)]
     if a.size == 0 or b.size == 0:
         return dict(mean=np.nan, ci_low=np.nan, ci_high=np.nan, n_blocks_a=int(a.size), n_blocks_b=int(b.size))
+    if TEST_MODE:
+        return dict(
+            mean=float(np.nanmean(a) - np.nanmean(b)),
+            ci_low=np.nan,
+            ci_high=np.nan,
+            n_blocks_a=int(a.size),
+            n_blocks_b=int(b.size),
+        )
     boot = np.empty(n_boot, dtype=float)
     for i in range(n_boot):
         ai = rng.integers(0, a.size, a.size)
@@ -1009,6 +1048,13 @@ def bootstrap_ratio_1d(numerator, denominator, rng, n_boot=N_BOOTSTRAP):
     denominator = denominator[finite]
     if numerator.size == 0 or np.nanmean(denominator) <= 0.0:
         return dict(mean=np.nan, ci_low=np.nan, ci_high=np.nan, n_blocks=0)
+    if TEST_MODE:
+        return dict(
+            mean=float(np.nanmean(numerator) / np.nanmean(denominator)),
+            ci_low=np.nan,
+            ci_high=np.nan,
+            n_blocks=int(numerator.size),
+        )
     boot = np.empty(n_boot, dtype=float)
     for i in range(n_boot):
         index = rng.integers(0, numerator.size, numerator.size)
@@ -1257,10 +1303,26 @@ cached_classification_is_current = partial(
 )
 
 
-def open_cached_classification(cache_path, sim_name, expected_time=None):
+def open_cached_classification(
+    cache_path,
+    sim_name,
+    expected_time=None,
+    expected_source_sha256=None,
+):
     cached = xr.open_dataset(cache_path, chunks={})
     if not cached_classification_is_current(cached):
         progress(f"{sim_name}: cached high-cloud classification is stale: {cache_path}")
+        cached.close()
+        return None
+    if (
+        expected_source_sha256 is not None
+        and cached.attrs.get("source_manifest_sha256")
+        != expected_source_sha256
+    ):
+        progress(
+            f"{sim_name}: cached classification has a stale source signature: "
+            f"{cache_path}"
+        )
         cached.close()
         return None
     missing = [name for name in CLASSIFICATION_CACHE_VARS if name not in cached.data_vars]
@@ -1306,12 +1368,16 @@ def classification_product_path(sim_name):
 def get_or_build_classification(ds, fields, sim_name):
     cache_path = classification_product_path(sim_name)
     precip = fields["precip"]
+    source_sha256 = getattr(ds, "attrs", {}).get(
+        "classification_source_sha256"
+    )
 
     if os.path.exists(cache_path):
         cached = open_cached_classification(
             cache_path,
             sim_name,
             expected_time=precip.Time.values,
+            expected_source_sha256=source_sha256,
         )
         if cached is not None:
             return cached
@@ -1346,7 +1412,14 @@ def get_or_build_classification(ds, fields, sim_name):
 
     if WRITE_CLASSIFICATION_PRODUCT:
         cached_classif = {name: classif[name] for name in CLASSIFICATION_CACHE_VARS}
-        fds = classification_dataset(cached_classif)
+        fds = (
+            classification_dataset(
+                cached_classif,
+                extra_attrs={"source_manifest_sha256": source_sha256},
+            )
+            if source_sha256 is not None
+            else classification_dataset(cached_classif)
+        )
         encoding = classification_cache_encoding(fds)
         write_time_batched_dataset(
             fds,
@@ -1358,6 +1431,7 @@ def get_or_build_classification(ds, fields, sim_name):
             cache_path,
             sim_name,
             expected_time=precip.Time.values,
+            expected_source_sha256=source_sha256,
         )
         if cached is not None:
             return cached
@@ -2312,16 +2386,12 @@ def plot_cloud_slice(
         "z", horizontal_dim
     ).values
     x_2d = np.broadcast_to(x[None, :], pressure_values.shape)
-    cloud_cmap = colors.LinearSegmentedColormap.from_list(
-        "blue_sky_white_cloud",
-        ("#154c79", "#5fa8d3", "#d9edf7", "#ffffff"),
-    )
     im = ax.pcolormesh(
         x_2d,
         pressure_values,
         field,
         shading="auto",
-        cmap=cloud_cmap,
+        cmap=blue_sky_white_cloud_cmap(),
         vmin=0.0,
         vmax=1.0,
     )
@@ -2353,11 +2423,102 @@ def snapshot_pressure(ds, cf_snapshot, snap_time):
     return standardize_pressure_hpa(raw, cf_snapshot)
 
 
-def plot_validation_snapshots(dss, fields_by_run, classifications):
+def build_validation_snapshot_product(dss, fields_by_run, classifications):
+    """Store only the selected fields needed to reconstruct Figures 4 and 5."""
+
+    snapshots = []
+    for i, sim_name in enumerate(sim_names):
+        classif = classifications.get(sim_name)
+        if classif is None:
+            continue
+        snap_time = representative_validation_time(classif)
+        if snap_time is None:
+            continue
+        precip = subset_lat(
+            fields_by_run[i]["precip"].sel(Time=snap_time),
+            SNAPSHOT_LAT_BOUNDS,
+        ).load()
+        variables = {
+            "precipitation": precip,
+            "high_cloud_mask": subset_lat(
+                classif["high_cloud_mask"].sel(Time=snap_time),
+                SNAPSHOT_LAT_BOUNDS,
+            ).astype("int8").load(),
+            "pyflextrkr_core_mask": subset_lat(
+                classif["pyflextrkr_core_mask"].sel(Time=snap_time),
+                SNAPSHOT_LAT_BOUNDS,
+            ).astype("int8").load(),
+            "pyflextrkr_core_bearing_cold_shield_mask": subset_lat(
+                classif["pyflextrkr_core_bearing_cold_shield_mask"].sel(
+                    Time=snap_time
+                ),
+                SNAPSHOT_LAT_BOUNDS,
+            ).astype("int8").load(),
+            "pyflextrkr_core_bearing_warm_shield_mask": subset_lat(
+                classif["pyflextrkr_core_bearing_warm_shield_mask"].sel(
+                    Time=snap_time
+                ),
+                SNAPSHOT_LAT_BOUNDS,
+            ).astype("int8").load(),
+            "cloud_top_pressure": subset_lat(
+                classif["cloud_top_pressure"].sel(Time=snap_time),
+                SNAPSHOT_LAT_BOUNDS,
+            ).load(),
+        }
+        class_masks = {}
+        for name in (
+            "convective_precipitating_high_cloud_mask",
+            "stratiform_precipitating_high_cloud_mask",
+            "nonprecipitating_high_cloud_mask",
+            "unclassified_high_cloud_mask",
+        ):
+            class_masks[name] = subset_lat(
+                classif[name].sel(Time=snap_time), SNAPSHOT_LAT_BOUNDS
+            ).astype("int8").load()
+            variables[name] = class_masks[name]
+        variables["class_code"] = class_code_from_masks(
+            variables["high_cloud_mask"].astype(bool),
+            class_masks["convective_precipitating_high_cloud_mask"].astype(bool),
+            class_masks["stratiform_precipitating_high_cloud_mask"].astype(bool),
+            class_masks["nonprecipitating_high_cloud_mask"].astype(bool),
+            class_masks["unclassified_high_cloud_mask"].astype(bool),
+        )
+        focus_lat, focus_lon = focus_point_for_snapshot(
+            precip,
+            variables["high_cloud_mask"],
+            class_masks["convective_precipitating_high_cloud_mask"],
+            class_masks["stratiform_precipitating_high_cloud_mask"],
+            class_masks["nonprecipitating_high_cloud_mask"],
+        )
+        cloud_fraction = get_cloud_fraction(dss[i])
+        if cloud_fraction is not None:
+            cloud_fraction = subset_lat(
+                select_time_value(cloud_fraction, snap_time),
+                SNAPSHOT_LAT_BOUNDS,
+            )
+            variables["cloud_fraction"] = cloud_fraction.load()
+            variables["pressure_hpa"] = subset_lat(
+                snapshot_pressure(dss[i], cloud_fraction, snap_time),
+                SNAPSHOT_LAT_BOUNDS,
+            ).load()
+        snapshot_time = np.asarray(snap_time).reshape(-1)[0]
+        snapshot = xr.Dataset(variables).expand_dims(simulation=[sim_name])
+        snapshot = snapshot.assign_coords(
+            snapshot_time=("simulation", [np.datetime64(snapshot_time)]),
+            focus_latitude=("simulation", [float(focus_lat)]),
+            focus_longitude=("simulation", [float(focus_lon)]),
+        )
+        snapshots.append(snapshot)
+    if not snapshots:
+        raise RuntimeError("No high-cloud validation snapshots were calculated")
+    return xr.concat(snapshots, dim="simulation", join="outer")
+
+
+def plot_validation_snapshots(snapshot_product):
     if not (should_run_figure(4) or should_run_figure(5)):
         return
     progress("Starting Figures 4-5: cloud_classification_validation_snapshots")
-    if not any(classifications.get(sim_name) is not None for sim_name in sim_names):
+    if snapshot_product is None or not snapshot_product.sizes.get("simulation", 0):
         print("Skipping Figures 4-5: high-cloud classification is unavailable.")
         return
 
@@ -2374,40 +2535,33 @@ def plot_validation_snapshots(dss, fields_by_run, classifications):
 
     rows = []
     last_cf_im = None
+    boundary_handles = []
     for i, sim_name in enumerate(sim_names):
         ax_lon, ax_lat = slice_axes[i]
-        classif = classifications.get(sim_name)
-        if classif is None:
+        if sim_name not in snapshot_product.simulation.values:
             for ax in slice_axes[i]:
                 ax.text(0.5, 0.5, "classification unavailable", transform=ax.transAxes, ha="center", va="center")
             continue
-        snap_time = representative_validation_time(classif)
-        if snap_time is None:
-            for ax in slice_axes[i]:
-                ax.text(0.5, 0.5, "no Time dimension", transform=ax.transAxes, ha="center", va="center")
-            continue
-
-        precip = subset_lat(
-            fields_by_run[i]["precip"].sel(Time=snap_time),
-            SNAPSHOT_LAT_BOUNDS,
-        ).load()
-        high = subset_lat(classif["high_cloud_mask"].sel(Time=snap_time).astype(float), SNAPSHOT_LAT_BOUNDS).load()
-        pyflextrkr_core = subset_lat(classif["pyflextrkr_core_mask"].sel(Time=snap_time).astype(bool), SNAPSHOT_LAT_BOUNDS).load()
-        core_bearing_cold_shield = subset_lat(classif["pyflextrkr_core_bearing_cold_shield_mask"].sel(Time=snap_time).astype(bool), SNAPSHOT_LAT_BOUNDS).load()
-        core_bearing_warm_shield = subset_lat(classif["pyflextrkr_core_bearing_warm_shield_mask"].sel(Time=snap_time).astype(bool), SNAPSHOT_LAT_BOUNDS).load()
-        cloud_top_pressure = subset_lat(
-            classif["cloud_top_pressure"].sel(Time=snap_time),
-            SNAPSHOT_LAT_BOUNDS,
-        ).load()
-        convective = subset_lat(classif["convective_precipitating_high_cloud_mask"].sel(Time=snap_time).astype(float), SNAPSHOT_LAT_BOUNDS).load()
-        stratiform = subset_lat(classif["stratiform_precipitating_high_cloud_mask"].sel(Time=snap_time).astype(float), SNAPSHOT_LAT_BOUNDS).load()
-        nonprecipitating = subset_lat(classif["nonprecipitating_high_cloud_mask"].sel(Time=snap_time).astype(float), SNAPSHOT_LAT_BOUNDS).load()
-        unclassified = subset_lat(classif["unclassified_high_cloud_mask"].sel(Time=snap_time).astype(float), SNAPSHOT_LAT_BOUNDS).load()
-        precip_object = (precip >= P_PRECIP_MIN).astype(float)
-        class_code = class_code_from_masks(high, convective, stratiform, nonprecipitating, unclassified)
-        focus_lat, focus_lon = focus_point_for_snapshot(
-            precip, high, convective, stratiform, nonprecipitating
+        snapshot = snapshot_product.sel(simulation=sim_name)
+        snap_time = snapshot.snapshot_time.values
+        precip = snapshot.precipitation
+        high = snapshot.high_cloud_mask.astype(float)
+        pyflextrkr_core = snapshot.pyflextrkr_core_mask.astype(bool)
+        core_bearing_cold_shield = (
+            snapshot.pyflextrkr_core_bearing_cold_shield_mask.astype(bool)
         )
+        core_bearing_warm_shield = (
+            snapshot.pyflextrkr_core_bearing_warm_shield_mask.astype(bool)
+        )
+        cloud_top_pressure = snapshot.cloud_top_pressure
+        convective = snapshot.convective_precipitating_high_cloud_mask.astype(float)
+        stratiform = snapshot.stratiform_precipitating_high_cloud_mask.astype(float)
+        nonprecipitating = snapshot.nonprecipitating_high_cloud_mask.astype(float)
+        unclassified = snapshot.unclassified_high_cloud_mask.astype(float)
+        precip_object = (precip >= P_PRECIP_MIN).astype(float)
+        class_code = snapshot.class_code
+        focus_lat = float(snapshot.focus_latitude)
+        focus_lon = float(snapshot.focus_longitude)
 
         if should_run_figure(4):
             save_validation_map_figure(
@@ -2416,20 +2570,18 @@ def plot_validation_snapshots(dss, fields_by_run, classifications):
                 cloud_top_pressure, class_code, focus_lon, focus_lat,
             )
 
-        cf = get_cloud_fraction(dss[i])
+        cf = snapshot.get("cloud_fraction")
         if cf is None:
             ax_lon.text(0.5, 0.5, "cloud fraction unavailable", transform=ax_lon.transAxes, ha="center", va="center")
             ax_lat.text(0.5, 0.5, "cloud fraction unavailable", transform=ax_lat.transAxes, ha="center", va="center")
         else:
-            cf_snapshot = select_time_value(cf, snap_time)
-            pressure_snapshot = snapshot_pressure(dss[i], cf_snapshot, snap_time)
             last_cf_im, boundary_handles = plot_cloud_slice(
-                ax_lon, cf_snapshot, class_code, precip, focus_lat, focus_lon,
-                "longitude", pressure_snapshot,
+                ax_lon, cf, class_code, precip, focus_lat, focus_lon,
+                "longitude", snapshot.pressure_hpa,
             )
             last_cf_im, boundary_handles = plot_cloud_slice(
-                ax_lat, cf_snapshot, class_code, precip, focus_lat, focus_lon,
-                "latitude", pressure_snapshot,
+                ax_lat, cf, class_code, precip, focus_lat, focus_lon,
+                "latitude", snapshot.pressure_hpa,
             )
             ax_lat.set_ylabel("")
             ax_lat.tick_params(labelleft=False)
@@ -2525,12 +2677,17 @@ def load_datasets():
     progress("Loading lat-lon datasets")
     for i, d in enumerate(data_locs):
         progress(f"{sim_names[i]}: opening lat-lon dataset")
+        source_paths = sorted(
+            glob.glob(os.path.join(root_dir, d, LATLON_PATTERN))
+        )
+        source_sha256 = source_file_signature(source_paths)["sha256"]
         ds = load_latlon_dataset(
             os.path.join(root_dir, d),
             latlon_pattern=LATLON_PATTERN,
             chunks=latlon_chunks,
         )
         ds = standardize_latlon_dataset(ds, latlon_vars)
+        ds.attrs["classification_source_sha256"] = source_sha256
         if TEST_MODE:
             ds, _selected_test_times = test_time_window(ds, sim_names[i])
         progress(f"{sim_names[i]}: lat-lon dataset ready with {len(ds.data_vars)} variables")
@@ -3468,7 +3625,7 @@ def rain_bin_centres():
 
 
 def rain_conditioned_block_sums(classifications, fields_by_run):
-    """Accumulate exact area-weighted sums in 10-day time blocks."""
+    """Accumulate exact area-weighted sums in configured time blocks."""
     rows = []
     fields_by_name = dict(zip(sim_names, fields_by_run))
     class_keys = [key for key, _label, _color in RAIN_CONDITIONED_CLASS_SPECS]
@@ -3499,66 +3656,93 @@ def rain_conditioned_block_sums(classifications, fields_by_run):
         )
         slices = time_block_slices(
             rain_rate,
-            block_days=RAIN_CONDITIONED_TIME_BATCH_DAYS,
+            block_days=RAIN_CONDITIONED_BLOCK_DAYS,
+            complete=not TEST_MODE,
         )
         progress(
             f"{sim_name}: rain-matched high-cloud properties in {len(slices)} "
-            f"blocks of about {RAIN_CONDITIONED_TIME_BATCH_DAYS:g} days"
+            f"blocks of about {RAIN_CONDITIONED_BLOCK_DAYS:g} days"
         )
         latitude_weights = np.cos(
             np.deg2rad(np.asarray(rain_rate.latitude.values, dtype=float))
         )[None, :, None]
         for block_index, time_slice in enumerate(slices):
-            block = data.isel(Time=time_slice).load()
-            rain_values = np.asarray(block["rain_rate"].values, dtype=float)
-            weights = np.broadcast_to(latitude_weights, rain_values.shape)
-            field_values = {
-                "cloud_top_pressure": np.asarray(
-                    block["cloud_top_pressure"].values, dtype=float
-                ),
-                "olr": np.asarray(block["olr"].values, dtype=float),
+            statistical_block = data.isel(Time=time_slice)
+            block_times = statistical_block.Time.values
+            accumulators = {
+                (key, property_key, bin_index): [0.0, 0.0, 0]
+                for key, _label, _color in RAIN_CONDITIONED_CLASS_SPECS
+                for property_key in ("cloud_top_pressure", "olr")
+                for bin_index in range(len(RAIN_RATE_BINS_MM_H) - 1)
             }
-            block_times = block.Time.values
-            for key, label, _color in RAIN_CONDITIONED_CLASS_SPECS:
-                class_mask = np.asarray(block[key].values, dtype=bool)
-                for bin_index, (lower, upper) in enumerate(
-                    zip(RAIN_RATE_BINS_MM_H[:-1], RAIN_RATE_BINS_MM_H[1:])
-                ):
-                    in_bin = (
-                        np.isfinite(rain_values)
-                        & (rain_values >= lower)
-                        & (
-                            (rain_values < upper)
-                            if np.isfinite(upper) else True
-                        )
-                    )
-                    for property_key, values in field_values.items():
-                        valid = class_mask & in_bin & np.isfinite(values)
-                        valid_weights = weights[valid]
-                        rows.append(
-                            dict(
-                                simulation=sim_name,
-                                class_key=key,
-                                cloud_class=label,
-                                property_key=property_key,
-                                block_index=int(block_index),
-                                block_start=format_time_value(block_times[0]),
-                                block_end=format_time_value(block_times[-1]),
-                                rain_bin_index=int(bin_index),
-                                rain_bin_lower_mm_h=float(lower),
-                                rain_bin_upper_mm_h=(
-                                    float(upper) if np.isfinite(upper) else np.inf
-                                ),
-                                rain_bin_centre_mm_h=float(
-                                    rain_bin_centres()[bin_index]
-                                ),
-                                weighted_sum=float(
-                                    np.sum(values[valid] * valid_weights)
-                                ),
-                                area_time_weight=float(np.sum(valid_weights)),
-                                grid_cell_time_count=int(np.count_nonzero(valid)),
+            load_slices = time_block_slices(
+                statistical_block["rain_rate"],
+                block_days=RAIN_CONDITIONED_LOAD_CHUNK_DAYS,
+            )
+            for load_slice in load_slices:
+                chunk = statistical_block.isel(Time=load_slice).load()
+                rain_values = np.asarray(chunk["rain_rate"].values, dtype=float)
+                weights = np.broadcast_to(latitude_weights, rain_values.shape)
+                field_values = {
+                    "cloud_top_pressure": np.asarray(
+                        chunk["cloud_top_pressure"].values, dtype=float
+                    ),
+                    "olr": np.asarray(chunk["olr"].values, dtype=float),
+                }
+                for key, _label, _color in RAIN_CONDITIONED_CLASS_SPECS:
+                    class_mask = np.asarray(chunk[key].values, dtype=bool)
+                    for bin_index, (lower, upper) in enumerate(
+                        zip(RAIN_RATE_BINS_MM_H[:-1], RAIN_RATE_BINS_MM_H[1:])
+                    ):
+                        in_bin = (
+                            np.isfinite(rain_values)
+                            & (rain_values >= lower)
+                            & (
+                                (rain_values < upper)
+                                if np.isfinite(upper) else True
                             )
                         )
+                        for property_key, values in field_values.items():
+                            valid = class_mask & in_bin & np.isfinite(values)
+                            valid_weights = weights[valid]
+                            accumulator = accumulators[
+                                (key, property_key, bin_index)
+                            ]
+                            accumulator[0] += float(
+                                np.sum(values[valid] * valid_weights)
+                            )
+                            accumulator[1] += float(np.sum(valid_weights))
+                            accumulator[2] += int(np.count_nonzero(valid))
+                del chunk, field_values
+            labels = {
+                key: label
+                for key, label, _color in RAIN_CONDITIONED_CLASS_SPECS
+            }
+            for (key, property_key, bin_index), values in accumulators.items():
+                lower = RAIN_RATE_BINS_MM_H[bin_index]
+                upper = RAIN_RATE_BINS_MM_H[bin_index + 1]
+                rows.append(
+                    dict(
+                        simulation=sim_name,
+                        class_key=key,
+                        cloud_class=labels[key],
+                        property_key=property_key,
+                        block_index=int(block_index),
+                        block_start=format_time_value(block_times[0]),
+                        block_end=format_time_value(block_times[-1]),
+                        rain_bin_index=int(bin_index),
+                        rain_bin_lower_mm_h=float(lower),
+                        rain_bin_upper_mm_h=(
+                            float(upper) if np.isfinite(upper) else np.inf
+                        ),
+                        rain_bin_centre_mm_h=float(
+                            rain_bin_centres()[bin_index]
+                        ),
+                        weighted_sum=values[0],
+                        area_time_weight=values[1],
+                        grid_cell_time_count=values[2],
+                    )
+                )
             if (
                 block_index == 0
                 or (block_index + 1) % 5 == 0
@@ -3567,7 +3751,7 @@ def rain_conditioned_block_sums(classifications, fields_by_run):
                 progress(
                     f"{sim_name}: rain-matched block {block_index + 1}/{len(slices)}"
                 )
-            del block, field_values
+            del statistical_block, accumulators
         gc.collect()
     table = pd.DataFrame(rows)
     save_table(table, "rain_matched_high_cloud_block_sums")
@@ -3583,6 +3767,8 @@ def bootstrap_weighted_ratio(block_rows, rng):
     if sums.size == 0:
         return np.nan, np.nan, np.nan, 0
     value = float(np.sum(sums) / np.sum(weights))
+    if TEST_MODE:
+        return value, np.nan, np.nan, int(sums.size)
     boot = np.empty(N_BOOTSTRAP, dtype=float)
     for iboot in range(N_BOOTSTRAP):
         index = rng.integers(0, sums.size, sums.size)
@@ -3591,40 +3777,54 @@ def bootstrap_weighted_ratio(block_rows, rng):
     return value, float(ci_low), float(ci_high), int(sums.size)
 
 
-def bootstrap_paired_weighted_ratio_difference(sim_rows, control_rows, rng):
-    paired = sim_rows.merge(
-        control_rows,
-        on="block_index",
-        suffixes=("_simulation", "_control"),
+def bootstrap_independent_weighted_ratio_difference(sim_rows, control_rows, rng):
+    """Resample the simulation and control climates independently."""
+
+    if len(sim_rows) == 0 or len(control_rows) == 0:
+        return np.nan, np.nan, np.nan, 0, 0
+    sim_valid = (
+        np.isfinite(sim_rows.weighted_sum)
+        & np.isfinite(sim_rows.area_time_weight)
+        & (sim_rows.area_time_weight > 0.0)
     )
-    valid = (
-        np.isfinite(paired.weighted_sum_simulation)
-        & np.isfinite(paired.weighted_sum_control)
-        & np.isfinite(paired.area_time_weight_simulation)
-        & np.isfinite(paired.area_time_weight_control)
-        & (paired.area_time_weight_simulation > 0.0)
-        & (paired.area_time_weight_control > 0.0)
+    control_valid = (
+        np.isfinite(control_rows.weighted_sum)
+        & np.isfinite(control_rows.area_time_weight)
+        & (control_rows.area_time_weight > 0.0)
     )
-    paired = paired.loc[valid]
-    if len(paired) == 0:
-        return np.nan, np.nan, np.nan, 0
-    sim_sum = paired.weighted_sum_simulation.to_numpy(dtype=float)
-    sim_weight = paired.area_time_weight_simulation.to_numpy(dtype=float)
-    control_sum = paired.weighted_sum_control.to_numpy(dtype=float)
-    control_weight = paired.area_time_weight_control.to_numpy(dtype=float)
-    value = float(
-        np.sum(sim_sum) / np.sum(sim_weight)
-        - np.sum(control_sum) / np.sum(control_weight)
-    )
-    boot = np.empty(N_BOOTSTRAP, dtype=float)
-    for iboot in range(N_BOOTSTRAP):
-        index = rng.integers(0, len(paired), len(paired))
-        boot[iboot] = (
-            np.sum(sim_sum[index]) / np.sum(sim_weight[index])
-            - np.sum(control_sum[index]) / np.sum(control_weight[index])
+    simulation_count = int(sim_valid.sum())
+    control_count = int(control_valid.sum())
+    if TEST_MODE:
+        if not simulation_count or not control_count:
+            return np.nan, np.nan, np.nan, simulation_count, control_count
+        simulation_value = float(
+            sim_rows.loc[sim_valid, "weighted_sum"].sum()
+            / sim_rows.loc[sim_valid, "area_time_weight"].sum()
         )
-    ci_low, ci_high = np.nanpercentile(boot, CI_PERCENTILES)
-    return value, float(ci_low), float(ci_high), int(len(paired))
+        control_value = float(
+            control_rows.loc[control_valid, "weighted_sum"].sum()
+            / control_rows.loc[control_valid, "area_time_weight"].sum()
+        )
+        return (
+            simulation_value - control_value,
+            np.nan,
+            np.nan,
+            simulation_count,
+            control_count,
+        )
+    try:
+        value, ci_low, ci_high, _draws = independent_weighted_ratio_difference(
+            sim_rows.weighted_sum.to_numpy(dtype=float),
+            sim_rows.area_time_weight.to_numpy(dtype=float),
+            control_rows.weighted_sum.to_numpy(dtype=float),
+            control_rows.area_time_weight.to_numpy(dtype=float),
+            rng=rng,
+            n_resamples=N_BOOTSTRAP,
+            percentiles=CI_PERCENTILES,
+        )
+    except ValueError:
+        return np.nan, np.nan, np.nan, simulation_count, control_count
+    return value, ci_low, ci_high, simulation_count, control_count
 
 
 def aggregate_rain_conditioned_response(block_table):
@@ -3652,6 +3852,8 @@ def aggregate_rain_conditioned_response(block_table):
                     ci_low=ci_low,
                     ci_high=ci_high,
                     n_blocks=n_blocks,
+                    n_simulation_blocks=n_blocks,
+                    n_control_blocks=np.nan,
                     sample_count=int(group.grid_cell_time_count.sum()),
                     control_sample_count=np.nan,
                 )
@@ -3668,8 +3870,8 @@ def aggregate_rain_conditioned_response(block_table):
                 & (block_table.property_key == key_values[2])
                 & (block_table.rain_bin_index == key_values[3])
             ]
-            value, ci_low, ci_high, n_blocks = (
-                bootstrap_paired_weighted_ratio_difference(
+            value, ci_low, ci_high, simulation_blocks, control_blocks = (
+                bootstrap_independent_weighted_ratio_difference(
                     sim_group, control_group, rng
                 )
             )
@@ -3689,7 +3891,9 @@ def aggregate_rain_conditioned_response(block_table):
                     value=value,
                     ci_low=ci_low,
                     ci_high=ci_high,
-                    n_blocks=n_blocks,
+                    n_blocks=min(simulation_blocks, control_blocks),
+                    n_simulation_blocks=simulation_blocks,
+                    n_control_blocks=control_blocks,
                     sample_count=int(sim_group.grid_cell_time_count.sum()),
                     control_sample_count=int(
                         control_group.grid_cell_time_count.sum()
@@ -3699,11 +3903,13 @@ def aggregate_rain_conditioned_response(block_table):
     out = pd.DataFrame(rows)
     out["temporal_filter"] = "none"
     out["conditioning"] = "surface rain-rate bin"
-    out["interval"] = "95% 10-day block-bootstrap consistency interval"
+    out["interval"] = (
+        f"95% {BOOTSTRAP_BLOCK_DAYS:g}-day block-bootstrap consistency interval"
+    )
     out["block_support"] = np.where(
         out.statistic == "difference_from_control",
-        "paired 10-day blocks containing class samples in both simulations",
-        "10-day blocks containing class samples",
+        f"independent {BOOTSTRAP_BLOCK_DAYS:g}-day blocks sampled within each simulation",
+        f"{BOOTSTRAP_BLOCK_DAYS:g}-day blocks containing class samples",
     )
     save_table(out, "rain_matched_high_cloud_response")
     return out
@@ -4337,9 +4543,7 @@ def main(argv=None):
     write_classification_method_table()
 
     products = required_derived_products()
-    cache_only_render = FIGURES_ONLY and not (
-        should_run_figure(4) or should_run_figure(5)
-    )
+    cache_only_render = FIGURES_ONLY
     if cache_only_render:
         progress(
             "Rendering selected figures directly from derived products; "
@@ -4400,6 +4604,16 @@ def main(argv=None):
                 "rain_matched_high_cloud_response",
                 lambda: aggregate_rain_conditioned_response(rain_blocks),
             )
+    snapshot_product = (
+        load_or_compute_derived_dataset(
+            "high_cloud_validation_snapshots",
+            lambda: build_validation_snapshot_product(
+                dss, fields_by_run, classifications
+            ),
+        )
+        if should_run_figure(4) or should_run_figure(5)
+        else None
+    )
 
     plot_class_budget(classifications, fields_by_run, budget=budget)
     plot_literature_high_cloud_structure(
@@ -4408,7 +4622,7 @@ def main(argv=None):
         vertical_profiles,
         structure=structure,
     )
-    plot_validation_snapshots(dss, fields_by_run, classifications)
+    plot_validation_snapshots(snapshot_product)
     plot_vertical_contribution_profiles(vertical_profiles)
     plot_class_spatial_response(
         classifications,

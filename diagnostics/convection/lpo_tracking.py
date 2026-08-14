@@ -19,8 +19,8 @@ The adapter rejects a different commit or modified tracked source. Original
 upstream object, system, composite-mask, and individual-mask outputs are
 preserved below each run's ``upstream_lpt`` directory.
 
-Large and regenerable products are kept below the fixed ``lpt_cache`` location
-beside the MPAS simulation data. Only rendered figures are written below the
+Large and regenerable products are kept below the central ``cache/lpt`` location.
+Only rendered figures are written below the
 usual ``~/tmp/mpas/crf_on/final/organisation_lpt`` figure tree. The tracking
 script does not expose an alternative data-location option.
 
@@ -56,8 +56,8 @@ validation remain fixed at seven days.
 The publication ``standard`` directories are the downstream interface. They
 contain event and track-step tables, per-event masks, precipitation-relative
 timing, population summaries, and complete configuration metadata.
-``lpo_lifecycle_analysis.py`` and the LPO section of
-``significance_bootstrap_diagnostics.py`` consume this interface.
+``lpo_lifecycle_analysis.py`` consumes this interface. This script also owns
+the LPO population uncertainty summaries.
 
 Method citation: Kerns and Chen (2020), JGR Atmospheres,
 doi:10.1029/2019JD032142; https://github.com/uwincm/lpt-python-public.
@@ -109,6 +109,8 @@ from diagnostics.diagnostic_helpers import (
     FigureSaver,
     SIMULATION_COLOURS,
     LATLON_PATTERN,
+    cache_manifest,
+    cache_manifest_matches,
     diagnostic_output_dir,
     grid_cell_area_km2,
     high_cloud_class_cmap_norm,
@@ -118,8 +120,19 @@ from diagnostics.diagnostic_helpers import (
     precip_rate_cmap_norm,
     precipitation_rate_from_dataset,
     progress,
+    read_json_file,
     standardize_latlon_dataset,
+    write_json_file,
 )
+from diagnostics.analysis_config import (
+    BOOTSTRAP_REPLICATES,
+    BOOTSTRAP_SEED,
+    SIMULATION_ARCHIVES,
+    SIMULATION_PUBLICATION_LABELS,
+    SIMULATION_ROOT,
+    cache_directory,
+)
+from diagnostics.uncertainty import independent_bootstrap_difference
 from diagnostics.waves.wave_metrics import sample_masked_field
 from diagnostics.convection.high_cloud_classification import (
     HighCloudThresholds,
@@ -136,6 +149,7 @@ UPSTREAM_CITATION = "Kerns and Chen (2020), doi:10.1029/2019JD032142"
 TRACK_FIGURE_CITATION = "Kerns and Chen (2016), doi:10.1002/2015JD024661, Figure 4"
 PRODUCT_VERSION = "mpas-lpt-precipitation-envelope-v18-rain-volume-units"
 TRACKING_CACHE_VERSION = "mpas-upstream-lpt-tracking-v3-strict-linking"
+OWNER_CACHE_SCHEMA = "lpo-owner-v1-source-signed-standard-products"
 TRACKING_OVERVIEW_LATITUDE_BAND = (
     "20S-20N cosine-latitude weighted mean"
 )
@@ -156,16 +170,8 @@ MPAS_MINIMUM_OBJECT_GRID_CELLS = int(
     )
 )
 
-SIMULATION_DIRS = {
-    "control": "control_new",
-    "nudged-u": "u_nudge",
-    "nudged-T": "T_nudge",
-}
-SIMULATION_LABELS = {
-    "control": "control",
-    "nudged-u": r"$u$-nudged",
-    "nudged-T": r"$T$-nudged",
-}
+SIMULATION_DIRS = dict(SIMULATION_ARCHIVES)
+SIMULATION_LABELS = dict(SIMULATION_PUBLICATION_LABELS)
 CENTROID_TRACK_COLOUR = "black"
 LPO_ENVELOPE_COLOUR = "purple"
 CENTROID_TRACK_LINEWIDTH = 2.4
@@ -231,8 +237,8 @@ TRACKING_MOVIE_FRAME_STEP_HOURS = 24
 TRACKING_MOVIE_FRAMES_PER_SECOND = 6
 TROPICAL_CENTROID_LIMIT_DEG = 20.0
 TROPICAL_MIN_CONSECUTIVE_HOURS = 24.0
-DEFAULT_ROOT = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on"
-DEFAULT_LPT_CACHE_ROOT = os.path.join(DEFAULT_ROOT, "lpt_cache")
+DEFAULT_ROOT = str(SIMULATION_ROOT)
+DEFAULT_LPT_CACHE_ROOT = os.fspath(cache_directory("lpt"))
 DEFAULT_LPT_FIGURE_ROOT = "/home/cwp29/tmp/mpas/crf_on/final/organisation_lpt"
 DEFAULT_TRACKING_DOMAIN = (-50.0, 50.0)
 
@@ -2839,14 +2845,95 @@ def _simulation_paths(mode_directory: Path, simulation: str) -> dict[str, Path]:
     }
 
 
+def _classification_cache_path(simulation: str) -> Path:
+    return cache_directory(
+        "classification",
+        f"{simulation.replace('-', '_')}_classified_high_cloud.nc",
+    )
+
+
+def lpo_owner_cache_manifest(
+    specification: RunSpecification,
+    simulation: str,
+    *,
+    test_start: str | None,
+    test_days: int | None,
+    tracking_figure_test: bool,
+) -> dict:
+    """Describe inputs that determine one standard LPO product family."""
+
+    source_root = Path(DEFAULT_ROOT) / SIMULATION_DIRS[simulation]
+    source_paths = sorted(source_root.glob(LATLON_PATTERN))
+    source_paths.append(_classification_cache_path(simulation))
+    return cache_manifest(
+        "lpo_tracking.py",
+        schema=OWNER_CACHE_SCHEMA,
+        configuration={
+            "product_version": PRODUCT_VERSION,
+            "tracking_cache_version": TRACKING_CACHE_VERSION,
+            "upstream_commit": UPSTREAM_COMMIT,
+            "run_name": specification.name,
+            "record_subset": specification.record_subset,
+            "configuration": specification.configuration.as_dict(),
+            "test_start": test_start,
+            "test_days": test_days,
+            "tracking_figure_test": bool(tracking_figure_test),
+            "classification_fields": list(
+                TRACKING_FIGURE_CLASSIFICATION_FIELDS
+            ),
+        },
+        source_paths=source_paths,
+    )
+
+
+def standard_lpo_products_are_current(
+    standard: Path,
+    expected_manifest: Mapping,
+) -> bool:
+    """Return whether one complete standard family matches its inputs."""
+
+    required = (
+        "lpt_configuration.json",
+        "lpt_events.csv",
+        "lpt_track_steps.csv",
+        "lpt_event_relative_diagnostics.csv",
+        "lpt_event_lifecycle_summary.csv",
+        "lpt_event_mask_index.csv",
+    )
+    if not all((standard / name).is_file() for name in required):
+        return False
+    if not cache_manifest_matches(
+        read_json_file(standard / "lpt_cache_manifest.json"),
+        expected_manifest,
+    ):
+        return False
+    configuration = read_json_file(standard / "lpt_configuration.json")
+    if not isinstance(configuration, dict):
+        return False
+    if configuration.get("product_version") != PRODUCT_VERSION:
+        return False
+    saved_hash = configuration.get("configuration_sha256")
+    unhashed = dict(configuration)
+    unhashed.pop("configuration_sha256", None)
+    if saved_hash != _sha256_json(unhashed):
+        return False
+    try:
+        mask_index = pd.read_csv(standard / "lpt_event_mask_index.csv")
+    except (OSError, pd.errors.ParserError):
+        return False
+    if "mask_file" not in mask_index:
+        return False
+    return all((standard / value).is_file() for value in mask_index.mask_file)
+
+
 def _load_classification(
     simulation: str,
     expected_time: xr.DataArray,
     required_fields: Sequence[str],
 ) -> dict:
-    cache_dir = Path(DEFAULT_ROOT) / "classification_cache"
-    path = cache_dir / (
-        f"{simulation.replace('-', '_')}_classified_high_cloud.nc"
+    path = cache_directory(
+        "classification",
+        f"{simulation.replace('-', '_')}_classified_high_cloud.nc",
     )
     if not path.exists():
         raise FileNotFoundError(
@@ -3000,6 +3087,7 @@ def run_specification(
     test_start: str | None = None,
     test_days: int | None = None,
     tracking_figure_test: bool = False,
+    rebuild_cache: bool = False,
 ) -> None:
     mode_directory = output / specification.name
     for simulation in simulations:
@@ -3010,6 +3098,25 @@ def run_specification(
         paths = _simulation_paths(mode_directory, simulation)
         for path in paths.values():
             path.mkdir(parents=True, exist_ok=True)
+        expected_manifest = lpo_owner_cache_manifest(
+            specification,
+            simulation,
+            test_start=test_start,
+            test_days=test_days,
+            tracking_figure_test=tracking_figure_test,
+        )
+        if (
+            stage == "all"
+            and not rebuild_cache
+            and standard_lpo_products_are_current(
+                paths["standard"], expected_manifest
+            )
+        ):
+            progress(
+                f"{specification.name}/{simulation}: reusing current "
+                "source-signed standard LPO products"
+            )
+            continue
         dataset = _load_simulation_dataset(
             simulation,
             tracking_figure_test=True,
@@ -3123,6 +3230,10 @@ def run_specification(
                 lifecycle=lifecycle,
                 lifecycle_summary=lifecycle_summary,
             )
+            write_json_file(
+                paths["standard"] / "lpt_cache_manifest.json",
+                expected_manifest,
+            )
             progress(
                 f"{specification.name}/{simulation}: wrote "
                 f"{len(events)} retained tracks and {len(lifecycle)} event steps"
@@ -3153,9 +3264,20 @@ def run_specification(
             mode_directory / "lpo_population_summary.csv",
             index=False,
         )
-        progress(
-            f"{specification.name}: wrote LPO population summary"
-        )
+        if tracking_figure_test:
+            progress(
+                f"{specification.name}: wrote LPO population summary; "
+                "test mode omits event uncertainty"
+            )
+        else:
+            uncertainty = lpo_event_property_uncertainty(combined_events)
+            uncertainty.to_csv(
+                mode_directory / "lpo_event_property_uncertainty.csv",
+                index=False,
+            )
+            progress(
+                f"{specification.name}: wrote LPO population and uncertainty summaries"
+            )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -3216,6 +3338,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="all",
     )
     parser.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Rebuild source-signed LPO products before plotting.",
+    )
+    parser.add_argument(
         "--simulation",
         choices=(*SIMULATION_DIRS, "all"),
         default="all",
@@ -3258,6 +3385,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     if args.figures:
         args.figures = list(dict.fromkeys(args.figures))
+    if args.rebuild_cache and args.stage != "all":
+        parser.error("--rebuild-cache requires --stage all")
     return args
 
 
@@ -3334,6 +3463,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             test_start=args.test_start if args.test else None,
             test_days=args.test_days if args.test else None,
             tracking_figure_test=args.test,
+            rebuild_cache=args.rebuild_cache,
         )
     if args.mode == "validation" and args.stage in {"all", "postprocess"}:
         progress("Matching validation events to the primary threshold run")
@@ -3707,6 +3837,13 @@ def build_tracking_figures_from_saved_outputs(
                 tracking_figure_test=tracking_figure_test,
             ),
         )
+        if not tracking_figure_test:
+            progress("Starting Figure 3c: LPO event-property uncertainty")
+            save(
+                3,
+                "lpo_event_property_uncertainty",
+                _plot_event_property_uncertainty(events),
+            )
 
 
 def _event_product_path(primary: Path, simulation: str, event_id: str) -> Path:
@@ -5237,6 +5374,117 @@ def lpo_population_summary(events: pd.DataFrame) -> pd.DataFrame:
             )
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+LPO_UNCERTAINTY_METRICS = (
+    ("duration_hours", "h"),
+    ("maximum_area_km2", "km2"),
+    ("event_integrated_precipitation", "km2 mm"),
+    ("zonal_speed_m_s", "m s-1"),
+    ("total_zonal_displacement_km", "km"),
+)
+LPO_UNCERTAINTY_COMPARISONS = (
+    ("nudged-u", "control", "nudged u - control"),
+    ("nudged-T", "control", "nudged T - control"),
+    ("nudged-u", "nudged-T", "nudged u - nudged T"),
+)
+
+
+def lpo_event_property_uncertainty(events: pd.DataFrame) -> pd.DataFrame:
+    """Bootstrap complete LPO events independently between simulations."""
+
+    selected = _selected_population_events(events)
+    rows = []
+    for metric_index, (metric, units) in enumerate(LPO_UNCERTAINTY_METRICS):
+        for comparison_index, (simulation, reference, label) in enumerate(
+            LPO_UNCERTAINTY_COMPARISONS
+        ):
+            simulation_values = selected.loc[
+                selected.simulation == simulation, metric
+            ].to_numpy(dtype=float)
+            reference_values = selected.loc[
+                selected.simulation == reference, metric
+            ].to_numpy(dtype=float)
+            finite_simulation = int(np.isfinite(simulation_values).sum())
+            finite_reference = int(np.isfinite(reference_values).sum())
+            if finite_simulation and finite_reference:
+                result = independent_bootstrap_difference(
+                    simulation_values,
+                    reference_values,
+                    rng=np.random.default_rng(
+                        BOOTSTRAP_SEED
+                        + 3000
+                        + 10 * metric_index
+                        + comparison_index
+                    ),
+                    n_resamples=BOOTSTRAP_REPLICATES,
+                )
+                status = "ok"
+            else:
+                result = {
+                    "estimate": np.nan,
+                    "interval_low": np.nan,
+                    "interval_high": np.nan,
+                    "sign_probability": np.nan,
+                    "n_simulation": finite_simulation,
+                    "n_control": finite_reference,
+                }
+                status = "insufficient_events"
+            rows.append(
+                {
+                    "product_version": PRODUCT_VERSION,
+                    "metric": metric,
+                    "units": units,
+                    "simulation": simulation,
+                    "reference": reference,
+                    "comparison_label": label,
+                    "mean_response": result["estimate"],
+                    "ci_low": result["interval_low"],
+                    "ci_high": result["interval_high"],
+                    "sign_probability": result["sign_probability"],
+                    "n_simulation_events": result["n_simulation"],
+                    "n_reference_events": result["n_control"],
+                    "status": status,
+                    "event_weighting": "each retained tropical LPO has equal weight",
+                    "resampling": "complete events sampled independently by simulation",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _plot_event_property_uncertainty(events: pd.DataFrame):
+    """Plot event-property responses and complete-event uncertainty."""
+
+    table = lpo_event_property_uncertainty(events)
+    titles = {
+        "duration_hours": "Duration response (h)",
+        "maximum_area_km2": r"Maximum area response (km$^2$)",
+        "event_integrated_precipitation": r"Integrated rain response (km$^2$ mm)",
+        "zonal_speed_m_s": r"Zonal speed response (m s$^{-1}$)",
+        "total_zonal_displacement_km": "Net zonal displacement response (km)",
+    }
+    colours = {"nudged-u": SIMULATION_COLOURS["nudged-u"], "nudged-T": SIMULATION_COLOURS["nudged-T"]}
+    figure, axes = plt.subplots(5, 1, figsize=(8.5, 9.0), constrained_layout=True)
+    y_positions = np.arange(len(LPO_UNCERTAINTY_COMPARISONS))
+    for axis, (metric, _units) in zip(axes, LPO_UNCERTAINTY_METRICS):
+        subset = table[table.metric == metric]
+        for position, row in enumerate(subset.itertuples(index=False)):
+            colour = colours.get(row.simulation, "0.25")
+            axis.errorbar(
+                row.mean_response,
+                position,
+                xerr=[[row.mean_response - row.ci_low], [row.ci_high - row.mean_response]],
+                marker="o",
+                color=colour,
+                capsize=2,
+            )
+        axis.axvline(0.0, color="0.55", linewidth=0.8)
+        axis.set_yticks(y_positions)
+        axis.set_yticklabels(subset.comparison_label)
+        axis.set_xlabel(titles[metric])
+        axis.grid(axis="x", alpha=0.18)
+    figure.suptitle("Tropical LPO event-property responses with 95% event-bootstrap intervals")
+    return figure
 
 
 def _selected_population_events(events: pd.DataFrame) -> pd.DataFrame:

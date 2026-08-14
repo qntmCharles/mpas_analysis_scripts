@@ -4,9 +4,7 @@
 """
 Equatorial wave diagnostics for QBO-like UTLS nudging experiments.
 
-This script is intended to sit alongside:
-  * mean_state_diagnostics.py
-  * symmetry_convection_diagnostics.py
+This script complements the maintained mean-state and convection diagnostics.
 
 It does not assign a planetary intraseasonal mode to this aquaplanet.
 Instead it asks whether the precipitation/cloud response is associated with
@@ -29,14 +27,14 @@ script's caches in ``lpo_lifecycle_analysis.py``.
 The easterly-wave definition follows Rios-Berrios et al. (2023). It is a
 rectangular TD/easterly-wave band rather than a shallow-water normal mode.
 
-The script caches filtered fields beside the source simulations so that figures
+The script stores filtered fields below the central cache root so that figures
 can be regenerated without re-running the k-f filters. All machine-readable
 CSV and NetCDF products remain in that fixed data-cache tree; only rendered
 figures are written below ``~/tmp``.
 """
 
 import argparse
-import os, sys, numbers, json
+import os, sys, numbers, json, uuid
 from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -56,6 +54,7 @@ from scipy import fft, signal
 
 from diagnostics.diagnostic_helpers import (
     ANALYSIS_END, ANALYSIS_START, FigureSaver, LATLON_PATTERN,
+    MPAS_MOISTURE_SCALARS,
     ZONAL_MEAN_PATTERN, add_period_reference_lines_frequency,
     align_vertical_velocity_to_reference,
     add_symmetric_colorbar,
@@ -70,6 +69,12 @@ from diagnostics.diagnostic_helpers import (
     pressure_to_pa, progress, safe_name, simulation_colour,
     standardize_latlon_dataset, symmetric_levels,
     total_precip_accum, vertical_dim, write_json_file,
+)
+from diagnostics.analysis_config import (
+    SIMULATION_ARCHIVES,
+    SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
+    SIMULATION_ROOT,
+    WAVE_RESPONSE_BLOCK_LENGTH_DAYS,
 )
 from diagnostics.waves.equatorial_wave_config import (
     ALL_CACHED_FILTERS,
@@ -282,15 +287,16 @@ figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 skip_existing_figures = False
 force_recompute_caches = bool(runtime_args.force_recompute_caches)
 _rebuilt_filter_input_paths = set()
+_used_filter_input_paths = set()
 _rebuilt_wave_cache_paths = set()
 
 # Figure 8 is deliberately excluded from the default list because it filters
 # latitude-resolved u and v. Add 8 to figures_to_run after the cheaper figures
 # have run and cached their filtered fields.
 
-root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
-data_locs = ["control_new", "u_nudge", "T_nudge"]
-sim_names = ["control", "nudged u", "nudged T"]
+root_dir = str(SIMULATION_ROOT)
+data_locs = list(SIMULATION_ARCHIVES.values())
+sim_names = list(PROJECT_SIMULATION_LABELS.values())
 cols = [simulation_colour(name) for name in sim_names]
 
 dt = 6
@@ -307,7 +313,7 @@ filter_avg_lat = True
 
 WAVE_RESPONSE_FIGURE_NUMBER = 11
 WAVE_RESPONSE_PRODUCT_VERSION = (
-    "wave-response-efficiency-v3-tropics-20deg"
+    "wave-response-efficiency-v5-control-selected-blocks"
 )
 WAVE_RESPONSE_BOOTSTRAP_RESAMPLES = 2000
 WAVE_RESPONSE_BOOTSTRAP_SEED = 20240602
@@ -339,6 +345,7 @@ WAVE_RESPONSE_CLOUD_FIELDS = (
 
 # Heavier latitude-resolved filtering in figure 8 can use its own wider band.
 eddy_flux_lat_bounds = (-20, 20)
+filter_input_lat_bounds = eddy_flux_lat_bounds
 
 # Analysis collections are defined centrally so slow intraseasonal variability
 # is not forced into short-lag or shallow-water diagnostics.
@@ -370,8 +377,14 @@ lag_target_fields = ["Precip", "OLR", "PW", "cldfrac"]
 conditioned_fields = ["Precip", "OLR", "PW", "cldfrac"]
 vertical_profile_waves = list(VERTICAL_STRUCTURE_FILTERS)
 vertical_profile_fields = ["u", "w", "T", "cldfrac"]
-vertical_profile_levels = [50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 850, 900, 950, 1000]
-cldfrac_profile_heights_km = [2, 5, 8, 11, 14, 17, 20]
+vertical_profile_levels = (
+    [50, 100, 250, 500, 850, 1000]
+    if test_mode
+    else [50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 850, 900, 950, 1000]
+)
+cldfrac_profile_heights_km = (
+    [2, 8, 14, 20] if test_mode else [2, 5, 8, 11, 14, 17, 20]
+)
 top_heaviness_pressure_hpa = np.asarray(
     [100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 850, 900, 950, 1000],
     dtype=float,
@@ -395,6 +408,7 @@ LPO_SECTION_PRESSURE_HPA = np.asarray(
     [50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 850, 900, 950, 1000],
     dtype=float,
 )
+LPO_SECTION_TEST_NATIVE_LEVEL_COUNT = 25
 LPO_SECTION_VERTICAL_FIELDS = ("T", "w", "qv", "RH", "u", "N2")
 LPO_SECTION_SURFACE_FIELDS = ("Precip", "PW", "OLR")
 
@@ -451,7 +465,7 @@ earth_radius_m = 6.371e6
 
 # Input/output cache for k-f filtered fields.
 cache_dir = diagnostic_cache_dir(
-    "wave_cache",
+    "waves",
     *(("testing",) if test_mode else ()),
 )
 input_cache_dir = os.path.join(cache_dir, "filter_inputs")
@@ -719,7 +733,7 @@ def write_cached_dataset(cache_name, ds, signature):
 # -----------------------------------------------------------------------------
 
 classification_cache_dir = diagnostic_cache_dir(
-    "classification_cache"
+    "classification"
 )
 
 
@@ -1024,6 +1038,10 @@ def filter_input_cache_matches(fname, field_name):
                 and cached.attrs.get("source_field") == field_name
                 and cached.attrs.get("analysis_start") == ANALYSIS_START
                 and cached.attrs.get("analysis_end") == ANALYSIS_END
+                and float(cached.attrs.get("latitude_min", np.nan))
+                == filter_input_lat_bounds[0]
+                and float(cached.attrs.get("latitude_max", np.nan))
+                == filter_input_lat_bounds[1]
                 and int(cached.attrs.get("test_subset", -1))
                 == int(test_mode)
                 and (
@@ -1059,19 +1077,22 @@ def filter_input_cache_matches(fname, field_name):
 
 
 def write_filter_input_if_needed(ds, sim_index, field_name):
-    """Cache a standard NetCDF input for kf_filter."""
+    """Create a restartable intermediate NetCDF input for kf_filter."""
     fname = os.path.join(input_cache_dir, f"{safe_name(sim_names[sim_index])}_{safe_name(field_name)}.nc")
     force_this_path = (
         force_recompute_caches
         and fname not in _rebuilt_filter_input_paths
     )
     if not force_this_path and filter_input_cache_matches(fname, field_name):
+        _used_filter_input_paths.add(fname)
         return fname
     if os.path.exists(fname):
         print(f"Regenerating stale filter input: {fname}")
 
     print(f"Writing filter input: {fname}")
-    da = get_filter_field(ds, field_name)
+    da = get_filter_field(ds, field_name).sel(
+        latitude=slice(*filter_input_lat_bounds)
+    )
     fds = to_filter_input_dataset(da, obs_var="x")
     fds.attrs.update(
         source_field=field_name,
@@ -1080,6 +1101,8 @@ def write_filter_input_if_needed(ds, sim_index, field_name):
         wave_config_version=WAVE_CONFIG_VERSION,
         analysis_start=ANALYSIS_START,
         analysis_end=ANALYSIS_END,
+        latitude_min=filter_input_lat_bounds[0],
+        latitude_max=filter_input_lat_bounds[1],
         test_subset=int(test_mode),
     )
     if is_pressure_level_field(field_name):
@@ -1097,11 +1120,35 @@ def write_filter_input_if_needed(ds, sim_index, field_name):
             TTL_BASE_PRESSURE_HPA
         )
     encoding = {"x": {"dtype": "float32"}}
-    tmp_fname = fname + ".tmp"
-    fds.to_netcdf(tmp_fname, encoding=encoding)
-    os.replace(tmp_fname, fname)
+    tmp_fname = f"{fname}.{uuid.uuid4().hex}.tmp"
+    try:
+        fds.to_netcdf(tmp_fname, encoding=encoding)
+        os.replace(tmp_fname, fname)
+    finally:
+        if os.path.exists(tmp_fname):
+            os.remove(tmp_fname)
     _rebuilt_filter_input_paths.add(fname)
+    _used_filter_input_paths.add(fname)
     return fname
+
+
+def cleanup_filter_input_caches(paths):
+    """Remove inputs used by filters that completed during this invocation."""
+
+    failures = []
+    removed = 0
+    for path in sorted(paths):
+        if not os.path.isfile(path):
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+    if removed:
+        progress(f"Removed {removed} completed wave-filter input checkpoints")
+    for failure in failures:
+        progress(f"Could not remove wave-filter input checkpoint {failure}")
 
 
 def normalise_filtered_dims(wave_da):
@@ -2105,14 +2152,25 @@ def _native_lpo_vertical_fields(ds):
             f"Native filtered LPO profiles require fields {missing}"
         )
     time = precip_rate(ds).Time
-    pressure_pa = pressure_to_pa(ds.pressure).sel(Time=time)
-    theta = ds.theta.sel(Time=time)
-    height = native_midlevel_height(ds, theta)
-    native_dimension = vertical_dim(theta)
+    theta_all = ds.theta.sel(Time=time)
+    native_dimension = vertical_dim(theta_all)
+    source_native_level_count = theta_all.sizes[native_dimension]
+    native_level_indices = np.arange(source_native_level_count)
+    if test_mode and source_native_level_count > LPO_SECTION_TEST_NATIVE_LEVEL_COUNT:
+        native_level_indices = np.unique(
+            np.linspace(
+                0,
+                source_native_level_count - 1,
+                LPO_SECTION_TEST_NATIVE_LEVEL_COUNT,
+                dtype=int,
+            )
+        )
+    pressure_pa_all = pressure_to_pa(ds.pressure).sel(Time=time)
+    height_all = native_midlevel_height(ds, theta_all)
     static_stability = xr.apply_ufunc(
         buoyancy_frequency_squared,
-        theta,
-        height,
+        theta_all,
+        height_all,
         kwargs={"mask_nonpositive": False},
         input_core_dims=[[native_dimension], [native_dimension]],
         output_core_dims=[[native_dimension]],
@@ -2120,27 +2178,42 @@ def _native_lpo_vertical_fields(ds):
         dask="parallelized",
         output_dtypes=[float],
         dask_gufunc_kwargs={"allow_rechunk": True},
+    ).isel({native_dimension: native_level_indices})
+    theta = theta_all.isel({native_dimension: native_level_indices})
+    pressure_pa = pressure_pa_all.isel(
+        {native_dimension: native_level_indices}
     )
+    height = height_all.isel({native_dimension: native_level_indices})
+    density_source = ds[["rho", *MPAS_MOISTURE_SCALARS]].sel(
+        Time=time
+    ).isel({native_dimension: native_level_indices})
+    aligned_w = align_vertical_velocity_to_reference(
+        ds.w.sel(Time=time), ds.rho.sel(Time=time)
+    ).isel({native_dimension: native_level_indices})
     temperature = theta * (pressure_pa / 100_000.0) ** (287.0 / 1004.0)
-    specific_humidity = ds.qv.sel(Time=time) / (
-        1.0 + ds.qv.sel(Time=time)
+    mixing_ratio = ds.qv.sel(Time=time).isel(
+        {native_dimension: native_level_indices}
     )
-    return {
+    specific_humidity = mixing_ratio / (1.0 + mixing_ratio)
+    fields = {
         "T": temperature,
         "w": (
             9.80665
-            * mpas_moist_air_density(ds).sel(Time=time)
-            * align_vertical_velocity_to_reference(
-                ds.w.sel(Time=time), ds.rho.sel(Time=time)
-            )
+            * mpas_moist_air_density(density_source)
+            * aligned_w
         ),
         "qv": 1000.0 * specific_humidity,
-        "RH": ds.relhum.sel(Time=time),
-        "u": ds.uReconstructZonal.sel(Time=time),
+        "RH": ds.relhum.sel(Time=time).isel(
+            {native_dimension: native_level_indices}
+        ),
+        "u": ds.uReconstructZonal.sel(Time=time).isel(
+            {native_dimension: native_level_indices}
+        ),
         "N2": static_stability,
         "pressure_hpa": pressure_pa / 100.0,
         "height_m": height,
     }
+    return fields, source_native_level_count
 
 
 def _peak_filtered_temperature_ray_sections(native_fields, steps):
@@ -2399,7 +2472,7 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
         len(LPO_SECTION_RELATIVE_LONGITUDE_DEGREES),
         len(wave_names),
     )
-    native_fields = _native_lpo_vertical_fields(ds)
+    native_fields, source_native_level_count = _native_lpo_vertical_fields(ds)
     native_template = native_fields["T"]
     native_dimension = vertical_dim(native_template)
     native_level_count = native_template.sizes[native_dimension]
@@ -2606,6 +2679,12 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
             "tracking_product_version": LPO_TRACKING_PRODUCT_VERSION,
             "source_simulation": simulation,
             "test_subset": int(test_mode),
+            "source_native_level_count": source_native_level_count,
+            "native_level_sampling": (
+                f"{native_level_count} evenly spaced source levels"
+                if test_mode
+                else "all source levels"
+            ),
             "event_selection": (
                 "saved primary_tropical_sample and reference_in_record_subset; "
                 "every available sample within -72 to +72 hours"
@@ -2860,14 +2939,20 @@ def _wave_response_effective_segment_count(sample_count, interval_hours):
 
 
 def _wave_response_block_days(wave_name):
-    """Use the geometric midpoint of each wave period range."""
+    """Return the control-selected block length for one wave band."""
 
-    period = np.asarray(WAVE_BOXES[wave_name]["period"], dtype=float)
-    return float(np.sqrt(np.prod(period)))
+    try:
+        return float(WAVE_RESPONSE_BLOCK_LENGTH_DAYS[wave_name])
+    except KeyError as error:
+        raise KeyError(
+            f"No wave-response block length is configured for {wave_name!r}"
+        ) from error
 
 
-def _wave_response_bootstrap_indices(wave_name, subset_name, sample_count):
-    """Create reproducible indices shared across simulations and responses."""
+def _wave_response_bootstrap_indices(
+    wave_name, subset_name, sample_count, simulation_index
+):
+    """Create reproducible indices independently for each simulation."""
 
     subset_offset = {
         "full_record": 0,
@@ -2876,7 +2961,10 @@ def _wave_response_bootstrap_indices(wave_name, subset_name, sample_count):
     }[subset_name]
     wave_offset = WAVE_RESPONSE_FILTERS.index(wave_name)
     rng = np.random.default_rng(
-        WAVE_RESPONSE_BOOTSTRAP_SEED + 10 * wave_offset + subset_offset
+        WAVE_RESPONSE_BOOTSTRAP_SEED
+        + 100 * simulation_index
+        + 10 * wave_offset
+        + subset_offset
     )
     requested_days = _wave_response_block_days(wave_name)
     block_length = max(1, int(round(requested_days * obs_per_day)))
@@ -2964,8 +3052,10 @@ def _wave_response_metric_row(
             "covariance": np.nan,
             "regression_slope": np.nan,
         }
-        bootstrap_draws = np.full(
-            WAVE_RESPONSE_BOOTSTRAP_RESAMPLES, np.nan
+        bootstrap_draws = (
+            np.asarray([], dtype=float)
+            if test_mode
+            else np.full(WAVE_RESPONSE_BOOTSTRAP_RESAMPLES, np.nan)
         )
         status = "insufficient_record_for_filter"
     else:
@@ -2974,12 +3064,16 @@ def _wave_response_metric_row(
             y.values,
             response_kind=response_kind,
         )
-        bootstrap_draws = block_bootstrap_filtered_wave_metrics(
-            x.values,
-            y.values,
-            response_kind=response_kind,
-            time_indices=bootstrap_indices,
-        )["regression_slope"]
+        bootstrap_draws = (
+            np.asarray([], dtype=float)
+            if test_mode
+            else block_bootstrap_filtered_wave_metrics(
+                x.values,
+                y.values,
+                response_kind=response_kind,
+                time_indices=bootstrap_indices,
+            )["regression_slope"]
+        )
         status = "ok"
     bootstrap = _wave_response_bootstrap_summary(
         metrics["regression_slope"], bootstrap_draws
@@ -3023,11 +3117,15 @@ def _wave_response_metric_row(
         ],
         "regression_slope_robust": bootstrap["robust"],
         "bootstrap_method": (
-            "circular moving-block bootstrap of complete longitude fields"
+            "omitted in test mode"
+            if test_mode
+            else "circular moving-block bootstrap of complete longitude fields"
         ),
         "bootstrap_reference": WAVE_RESPONSE_BOOTSTRAP_REFERENCE,
         "bootstrap_interval": "central 95% percentile interval",
-        "bootstrap_resamples": WAVE_RESPONSE_BOOTSTRAP_RESAMPLES,
+        "bootstrap_resamples": (
+            0 if test_mode else WAVE_RESPONSE_BOOTSTRAP_RESAMPLES
+        ),
         "bootstrap_block_days": bootstrap_block_days,
         "bootstrap_blocks_per_resample": int(
             np.ceil(
@@ -3052,7 +3150,6 @@ def compute_wave_response_metric_table():
 
     rows = []
     bootstrap_draws = {}
-    reference_times = {}
     for simulation_index, ds in enumerate(dss):
         simulation = sim_names[simulation_index]
         for wave_name in WAVE_RESPONSE_FILTERS:
@@ -3102,22 +3199,18 @@ def compute_wave_response_metric_table():
                     ),
                 )[subset_name]
                 subset_times = predictor.Time.values[subset_mask]
-                time_key = (wave_name, subset_name)
-                if time_key in reference_times:
-                    if not np.array_equal(reference_times[time_key], subset_times):
-                        raise RuntimeError(
-                            f"{wave_label(wave_name)} {subset_name}: simulation "
-                            "times do not support paired block resampling"
-                        )
+                if test_mode:
+                    bootstrap_indices = None
+                    bootstrap_block_days = _wave_response_block_days(wave_name)
                 else:
-                    reference_times[time_key] = subset_times.copy()
-                bootstrap_indices, bootstrap_block_days = (
-                    _wave_response_bootstrap_indices(
-                        wave_name,
-                        subset_name,
-                        subset_times.size,
+                    bootstrap_indices, bootstrap_block_days = (
+                        _wave_response_bootstrap_indices(
+                            wave_name,
+                            subset_name,
+                            subset_times.size,
+                            simulation_index,
+                        )
                     )
-                )
                 for response_key, (
                     response_label,
                     response_kind,
@@ -3227,8 +3320,8 @@ def wave_response_direct_contrasts(table):
                         "units": metadata.loc[index, "units"],
                         **bootstrap,
                         "bootstrap_method": (
-                            "paired circular moving-block bootstrap of "
-                            "complete longitude fields"
+                            "independent circular moving-block bootstrap "
+                            "within each simulation climate"
                             if metric == "regression_slope"
                             else ""
                         ),
@@ -3239,7 +3332,7 @@ def wave_response_direct_contrasts(table):
                         ),
                         "bootstrap_resamples": (
                             WAVE_RESPONSE_BOOTSTRAP_RESAMPLES
-                            if metric == "regression_slope"
+                            if metric == "regression_slope" and not test_mode
                             else 0
                         ),
                     }
@@ -3425,7 +3518,7 @@ def plot_wave_response_metrics(table, contrasts):
                 axis.set_xticks([])
     fig.suptitle(
         "Direct wave-response differences; no thermal scaling\n"
-        "Error bars show paired 95% block-bootstrap intervals"
+        "Error bars show independent 95% block-bootstrap intervals"
     )
     save_figure(
         WAVE_RESPONSE_FIGURE_NUMBER,
@@ -3554,7 +3647,7 @@ def plot_wave_cloud_class_efficiencies(table, contrasts):
                 axis.set_xticks([])
     fig.suptitle(
         "Direct cloud-class efficiency differences; no thermal scaling\n"
-        "Error bars show paired 95% block-bootstrap intervals"
+        "Error bars show independent 95% block-bootstrap intervals"
     )
     save_figure(
         WAVE_RESPONSE_FIGURE_NUMBER,
@@ -6006,14 +6099,15 @@ wave_response_signature = cache_signature(
             "positive slope means OLR reduction per unit precipitation"
         ),
         "bootstrap_method": (
-            "paired circular moving-block bootstrap of complete longitude "
-            "fields"
+            "independent circular moving-block bootstrap within each "
+            "simulation climate"
         ),
         "bootstrap_resamples": WAVE_RESPONSE_BOOTSTRAP_RESAMPLES,
         "bootstrap_seed": WAVE_RESPONSE_BOOTSTRAP_SEED,
         "bootstrap_ci_percentiles": list(WAVE_RESPONSE_CI_PERCENTILES),
-        "bootstrap_block_length": (
-            "geometric midpoint of each wave period range"
+        "bootstrap_block_length_days": WAVE_RESPONSE_BLOCK_LENGTH_DAYS,
+        "bootstrap_block_selection": (
+            "rounded control-only filtered-amplitude autocorrelation review"
         ),
         "bootstrap_reference": WAVE_RESPONSE_BOOTSTRAP_REFERENCE,
         "scatter_sample_count": WAVE_RESPONSE_SCATTER_SAMPLE,
@@ -6424,6 +6518,11 @@ if 14 in figures_to_run:
                         == simulation
                         and int(existing.attrs.get("test_subset", -1))
                         == int(test_mode)
+                        and (
+                            not test_mode
+                            or existing.sizes.get("native_level")
+                            == LPO_SECTION_TEST_NATIVE_LEVEL_COUNT
+                        )
                         and "relative_longitude" in existing.sizes
                         and "wave_phase_number" in existing
                         and "MRG" in set(
@@ -6448,4 +6547,6 @@ if 14 in figures_to_run:
         os.replace(temporary_path, output_path)
         progress(f"Wrote compact LPO wave sections: {output_path}")
 
+if not runtime_args.figures_only:
+    cleanup_filter_input_caches(_used_filter_input_paths)
 print("\nFinished equatorial_wave_diagnostics.py")

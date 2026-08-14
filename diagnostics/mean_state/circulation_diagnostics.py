@@ -52,13 +52,21 @@ from diagnostics.diagnostic_helpers import (
     time_block_slices,
     write_json_file,
 )
+from diagnostics.analysis_config import (
+    BLOCK_LENGTH_DAYS,
+    BOOTSTRAP_REPLICATES,
+    BOOTSTRAP_SEED,
+    CONFIDENCE_PERCENTILES,
+    SIMULATION_ARCHIVES,
+    SIMULATION_ROOT,
+)
 
 
 FIGURES = (1, 2, 3)
 SIMULATIONS = (
-    ("control", "control_new"),
-    ("nudged u", "u_nudge"),
-    ("nudged T", "T_nudge"),
+    ("control", SIMULATION_ARCHIVES["control"]),
+    ("nudged u", SIMULATION_ARCHIVES["nudged-u"]),
+    ("nudged T", SIMULATION_ARCHIVES["nudged-T"]),
 )
 COMPARISONS = (
     ("control", 0, None, "control"),
@@ -67,11 +75,11 @@ COMPARISONS = (
     ("u_minus_t", 1, 2, "U - T"),
 )
 
-ROOT_DIR = Path("/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on")
+ROOT_DIR = SIMULATION_ROOT
 SAVE_LOCATION = diagnostic_output_dir(
     "/home/cwp29/tmp/mpas/crf_on/final/circulation/"
 )
-CACHE_ROOT = Path(diagnostic_cache_dir("circulation_cache"))
+CACHE_ROOT = Path(diagnostic_cache_dir("circulation"))
 CACHE_SCHEMA = {
     "circulation": "circulation-v1",
     "eddy": "circulation-eddy-v1",
@@ -93,11 +101,10 @@ PSI_METHOD = "Psi_300_700"
 STJ_METHOD = "adjusted_peak"
 EDJ_METHOD = "peak"
 TPB_METHOD = "max_gradient"
-BLOCK_DAYS = 10.0
+BLOCK_DAYS = BLOCK_LENGTH_DAYS["circulation"]
 MIN_BLOCKS = 6
-N_BOOTSTRAP = 1000
-BOOTSTRAP_SEED = 20240602
-CI_PERCENTILES = (2.5, 97.5)
+N_BOOTSTRAP = BOOTSTRAP_REPLICATES
+CI_PERCENTILES = CONFIDENCE_PERCENTILES
 ROBUST_SIGN_THRESHOLD = 0.95
 EARTH_RADIUS_M = 6_371_000.0
 DEFAULT_TEST_TIMES = 5
@@ -263,6 +270,7 @@ def family_manifest(
     test: bool = False,
     test_times: int = DEFAULT_TEST_TIMES,
     test_start: str | None = None,
+    include_sources: bool = True,
 ) -> dict:
     configuration = {
         "family": family,
@@ -309,7 +317,7 @@ def family_manifest(
         schema=CACHE_SCHEMA[family],
         configuration=configuration,
         dependencies={"pytropd": pytropd_version()},
-        source_paths=family_source_paths(family),
+        source_paths=family_source_paths(family) if include_sources else None,
     )
 
 
@@ -363,6 +371,7 @@ def family_cache_is_current(
     family: str,
     manifest: dict | None = None,
     cache_root: Path | None = None,
+    validate_sources: bool = True,
 ) -> bool:
     if not all(
         cache_path(name, cache_root).is_file() for name in CACHE_FILES[family]
@@ -373,7 +382,9 @@ def family_cache_is_current(
         saved = read_json_file(str(manifest_path(family, cache_root)))
     except (OSError, ValueError):
         return False
-    return cache_manifest_matches(saved, expected)
+    return cache_manifest_matches(
+        saved, expected, compare_sources=validate_sources
+    )
 
 
 def atomic_write_dataset(dataset: xr.Dataset, path: Path) -> None:
@@ -1170,11 +1181,13 @@ def prepare_family(
         test=test,
         test_times=test_times,
         test_start=test_start,
+        include_sources=not figures_only,
     )
     current = not rebuild_cache and family_cache_is_current(
         family,
         manifest,
         root,
+        validate_sources=not figures_only,
     )
     if current:
         progress(f"using current {family} cache in {root}")
@@ -1286,10 +1299,13 @@ def bootstrap_metric_response(
     sign_robustness = (
         np.nan if sign == 0 else float(np.nanmean(np.sign(boot) == sign))
     )
-    n_pair = min(run_values.size, reference_values.size)
-    paired = run_values[:n_pair] - reference_values[:n_pair]
+    independent_differences = (
+        run_values[:, np.newaxis] - reference_values[np.newaxis, :]
+    )
     block_sign = (
-        np.nan if sign == 0 else float(np.nanmean(np.sign(paired) == sign))
+        np.nan
+        if sign == 0
+        else float(np.nanmean(np.sign(independent_differences) == sign))
     )
     excludes_zero = bool(ci_low > 0.0 or ci_high < 0.0)
     return {
@@ -1302,7 +1318,7 @@ def bootstrap_metric_response(
         "bootstrap_noise": noise,
         "response_to_noise": primary_response / noise if noise > 0 else np.nan,
         "sign_robustness": sign_robustness,
-        "block_sign_robustness": block_sign,
+        "independent_block_sign_probability": block_sign,
         "n_blocks_run": int(run_values.size),
         "n_blocks_reference": int(reference_values.size),
         "ci_excludes_zero": excludes_zero,

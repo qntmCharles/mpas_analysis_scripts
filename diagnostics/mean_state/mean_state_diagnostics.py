@@ -40,16 +40,38 @@ from diagnostics.diagnostic_helpers import (
     tropopause_on_latitudes, tropopause_region_masks,
     vertical_velocity_from_zm,
 )
-from diagnostics.mean_state.mean_state_cache import prepare_products, split_simulations
+from diagnostics.mean_state.mean_state_cache import (
+    configure_test_mode,
+    prepare_products,
+    split_simulations,
+)
+from diagnostics.analysis_config import BOOTSTRAP_SEED, FIELD_BOOTSTRAP_REPLICATES
+from diagnostics.uncertainty import independent_bootstrap_field_difference
+from diagnostics.analysis_config import (
+    SIMULATION_ARCHIVES,
+    SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
+    SIMULATION_ROOT,
+)
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Build mean-state diagnostics.")
     parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Use bounded actual-data subsets and isolated test products.",
+    )
+    parser.add_argument(
+        "--test-times",
+        type=int,
+        default=100,
+        help="Maximum source times used by test mode. The default supports test spectra.",
+    )
+    parser.add_argument(
         "--figures",
         nargs="+",
         type=int,
-        choices=[*range(1, 15), 16, 17, 18],
+        choices=[*range(1, 15), 16, 17, 18, 19],
         default=None,
         help="Build only these numbered figures.",
     )
@@ -64,12 +86,22 @@ def parse_args(argv=None):
         action="store_true",
         help="Rebuild selected compact mean-state caches before plotting.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.test_times < 2:
+        parser.error("--test-times must be at least 2")
+    return args
 
 
 runtime_args = parse_args()
 save = True
 save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/mean_state/')
+if runtime_args.test:
+    configure_test_mode(runtime_args.test_times)
+    save_loc = os.path.join(
+        save_loc,
+        "testing",
+        f"all_{runtime_args.test_times:03d}times",
+    )
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -92,6 +124,7 @@ save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/mean_state/'
 #   16: temperature_wind_latheight, w_rh_latheight, tem_latheight
 #   17: mslp_maps
 #   18: scalar_constituents_latheight
+#   19: precipitable-water and CAPE distribution responses
 #
 # WHAT TO LOOK FOR:
 #   * Use mean-state figures to establish the baseline structural response:
@@ -507,9 +540,9 @@ SCALAR_CONSTITUENT_GROUPS = [
     },
 ]
 
-root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
-data_locs = ['control_new', 'u_nudge', 'T_nudge']
-sim_names = ['control', 'nudged u', 'nudged T']
+root_dir = str(SIMULATION_ROOT)
+data_locs = list(SIMULATION_ARCHIVES.values())
+sim_names = list(PROJECT_SIMULATION_LABELS.values())
 
 cols = [simulation_colour(name) for name in sim_names]
 
@@ -522,7 +555,7 @@ latlon_vars = [
     "uzonal_isobaric", "umeridional_isobaric",
     "rh_isobaric", "t_isobaric", "qv_isobaric", "theta",
     "uReconstructZonal", "uReconstructMeridional",
-    "cldfrac", "olrtoa", "zgrid", "pressure", "vorticity", "ke",
+    "cldfrac", "olrtoa", "zgrid", "pressure", "vorticity", "ke", "cape",
 ]
 zonal_mean_vars = [
     "qv_isobaric", "relhum", "rh_isobaric", "t_isobaric", "theta",
@@ -783,7 +816,7 @@ if should_run_figure(5):
     # Normalised rainfall intensity distribution
     fig, ax = plt.subplots(1, 3, figsize=(8, 3), constrained_layout=True, sharey=True)
 
-    rain_edges = distribution_cache.rain_bin_edges.values
+    rain_edges = distribution_cache.rain_bin_edges.isel(simulation=0).values
     imerg_histograms = distribution_cache.imerg_rain_histogram
     for domain_index, (domain, linestyle) in enumerate(DISTRIBUTION_DOMAIN_STYLES):
         counts = imerg_histograms.isel(domain=domain_index).values
@@ -823,7 +856,7 @@ if should_run_figure(5):
 if should_run_figure(6):
     fig, ax = plt.subplots(1, 3, figsize=(8, 3), constrained_layout=True, sharey=True)
 
-    duration_edges = distribution_cache.duration_bin_edges.values
+    duration_edges = distribution_cache.duration_bin_edges.isel(simulation=0).values
     imerg_histograms = distribution_cache.imerg_duration_histogram
     for domain_index, (domain, linestyle) in enumerate(DISTRIBUTION_DOMAIN_STYLES):
         counts = imerg_histograms.isel(domain=domain_index).values
@@ -857,6 +890,63 @@ if should_run_figure(6):
 
     save_figure(fig, "duration_dist", number=6)
     print("Done with figure: comp_duration_dist")
+
+
+if should_run_figure(19):
+    # These compact block PDFs preserve the retained distribution analysis.
+    # Simulations represent independent
+    # statistical climates, so each bootstrap uses separate block indices.
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.4), constrained_layout=True)
+    comparison_specs = (
+        (1, 0, "nudged u - control", cols[1]),
+        (2, 0, "nudged T - control", cols[2]),
+        (1, 2, "nudged u - nudged T", "0.25"),
+    )
+    field_specs = (
+        ("pw", "Precipitable water", "kg m$^{-2}$", (0.0, 80.0)),
+        ("cape", "CAPE", "J kg$^{-1}$", (0.0, 5000.0)),
+    )
+    for field_index, (name, label, units, x_limits) in enumerate(field_specs):
+        axis = axes[field_index]
+        for comparison_index, (run_index, reference_index, comparison_label, colour) in enumerate(
+            comparison_specs
+        ):
+            simulation = distribution_cache.sel(simulation=sim_names[run_index])[
+                f"{name}_pdf_blocks"
+            ].values
+            control = distribution_cache.sel(simulation=sim_names[reference_index])[
+                f"{name}_pdf_blocks"
+            ].values
+            if runtime_args.test:
+                estimate = np.nanmean(simulation, axis=0) - np.nanmean(
+                    control, axis=0
+                )
+                low = high = np.full_like(estimate, np.nan)
+            else:
+                estimate, low, high = independent_bootstrap_field_difference(
+                    simulation,
+                    control,
+                    rng=np.random.default_rng(
+                        BOOTSTRAP_SEED
+                        + 1900
+                        + 10 * field_index
+                        + comparison_index
+                    ),
+                    n_resamples=FIELD_BOOTSTRAP_REPLICATES,
+                )
+            centres = distribution_cache[f"{name}_bin"].values
+            axis.plot(centres, estimate, color=colour, linewidth=1.2, label=comparison_label)
+            axis.fill_between(centres, low, high, color=colour, alpha=0.12)
+        axis.axhline(0.0, color="0.6", linewidth=0.8)
+        axis.set_yscale("symlog", linthresh=1.0e-4)
+        axis.set_xlim(*x_limits)
+        axis.set_title(label)
+        axis.set_xlabel(f"{label} ({units})")
+        axis.set_ylabel("PDF response")
+        axis.grid(alpha=0.18)
+    axes[0].legend(frameon=False, fontsize=8)
+    save_figure(fig, "pw_cape_distribution_responses", number=19)
+    print("Done with figure: pw_cape_distribution_responses")
 
 
 if should_run_figure(7):

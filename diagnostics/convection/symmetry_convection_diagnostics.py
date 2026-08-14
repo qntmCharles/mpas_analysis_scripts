@@ -87,7 +87,7 @@ sim_names = ['control', 'nudged u', 'nudged T']
 CF_THRESH = 0.05
 P_HIGH_HPA = 440.0
 P_PRECIP_MIN = 12.0  # 0.5 mm h-1 PF threshold (Feng et al. 2021)
-classification_cache_dir = diagnostic_cache_dir("classification_cache")
+classification_cache_dir = diagnostic_cache_dir("classification")
 
 cols = [simulation_colour(name) for name in sim_names]
 

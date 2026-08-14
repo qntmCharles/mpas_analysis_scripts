@@ -37,7 +37,7 @@ from diagnostics.waves.wave_metrics import (
 
 SECTION_CACHE_VERSION = "lpo-lifecycle-sections-v10-moist-density"
 COMPOSITE_CACHE_VERSION = (
-    "lpo-lifecycle-2d-composites-v11-source-rh-unstable-n2-area-weighted"
+    "lpo-lifecycle-2d-composites-v13-background-rays"
 )
 
 DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES = 5.0
@@ -1771,7 +1771,7 @@ def _phase_composites(
                 "the compositing coordinate and unfiltered composites have "
                 "no phase conditioning"
             ),
-            "strong_wave_threshold": "normalized phase-space amplitude >= 1",
+            "strong_wave_threshold": "normalized phase-space amplitude > 1",
             "amplitude_summary": "event median and interquartile range",
             "phase_bootstrap": (
                 f"{BOOTSTRAP_RESAMPLES} independent-event resamples"
@@ -1854,7 +1854,10 @@ def _phase_pressure_event_cube(
             for phase_index, phase_number in enumerate(phase_numbers):
                 positions = event_positions[
                     strong[event_positions, wave_index]
-                    & (phase[event_positions, wave_index] == phase_number)
+                    & (
+                        phase[event_positions, wave_index]
+                        == phase_number
+                    )
                 ]
                 if positions.size:
                     output[event_index, wave_index, phase_index] = (
@@ -1874,7 +1877,9 @@ def _phase_pressure_event_cube(
 
 def _phase_pressure_composites(wave_sections: xr.Dataset) -> xr.Dataset:
     output = xr.Dataset()
-    for variable_index, variable in enumerate(FILTERED_VERTICAL_VARIABLES):
+    for variable_index, variable in enumerate(
+        FILTERED_VERTICAL_VARIABLES
+    ):
         cube = _phase_pressure_event_cube(wave_sections, variable)
         statistics = event_equal_statistics(
             cube, seed=BOOTSTRAP_SEED + 300 + variable_index
@@ -1890,6 +1895,13 @@ def _phase_pressure_composites(wave_sections: xr.Dataset) -> xr.Dataset:
     output["phase_pressure_filtered_native_pressure_hpa"] = (
         pressure_cube.mean("event", skipna=True)
     )
+    output.attrs.update(
+        {
+            "phase_pressure_selection": (
+                "normalized filtered-precipitation amplitude greater than one"
+            ),
+        }
+    )
     return output
 
 
@@ -1899,26 +1911,77 @@ def theoretical_ray_event_paths(
     *,
     kelvin_k_m1: float = 1.57e-7,
     vertical_wavenumber_m1: float = -2.0 * np.pi / 10_000.0,
+    background_profile: xr.Dataset | None = None,
 ) -> xr.DataArray:
     """Trace event rays from 200 hPa in the moving LPO reference frame."""
 
     if wave_name not in {"Kelvin", "MRG"}:
         raise ValueError(f"No theoretical LPO ray for {wave_name}")
-    central = event_sections.sel(
-        ray_relative_longitude=slice(-5.0, 5.0)
-    )
-
-
-    wind = central.ray_background_zonal_wind.mean(
-        "ray_relative_longitude", skipna=True
-    )
-    buoyancy_frequency = central.ray_buoyancy_frequency.mean(
-        "ray_relative_longitude", skipna=True
-    )
-    pressure = central.ray_pressure_hpa.mean(
-        "ray_relative_longitude", skipna=True
-    )
     height = np.asarray(event_sections.ray_height_m, dtype=float)
+    if background_profile is None:
+        central = event_sections.sel(
+            ray_relative_longitude=slice(-5.0, 5.0)
+        )
+        wind = np.asarray(
+            central.ray_background_zonal_wind.mean(
+                "ray_relative_longitude", skipna=True
+            ),
+            dtype=float,
+        )
+        buoyancy_frequency = np.asarray(
+            central.ray_buoyancy_frequency.mean(
+                "ray_relative_longitude", skipna=True
+            ),
+            dtype=float,
+        )
+        pressure = np.asarray(
+            central.ray_pressure_hpa.mean(
+                "ray_relative_longitude", skipna=True
+            ),
+            dtype=float,
+        )
+        profile_source = "event-local U and N within 5 degrees of centroid"
+    else:
+        required = {
+            "background_zonal_wind",
+            "buoyancy_frequency",
+            "background_pressure_hpa",
+        }
+        missing = sorted(required - set(background_profile.data_vars))
+        if missing or "height_m" not in background_profile.coords:
+            raise ValueError(
+                "Unconditional ray background lacks "
+                f"{missing or ['height_m coordinate']}"
+            )
+        source_height = np.asarray(
+            background_profile.height_m, dtype=float
+        )
+
+        def interpolate(variable: str) -> np.ndarray:
+            values = np.asarray(background_profile[variable], dtype=float)
+            valid = np.isfinite(source_height) & np.isfinite(values)
+            if valid.sum() < 2:
+                return np.full(height.shape, np.nan)
+            return np.interp(
+                height,
+                source_height[valid],
+                values[valid],
+                left=np.nan,
+                right=np.nan,
+            )
+
+        background_wind = interpolate("background_zonal_wind")
+        background_n = interpolate("buoyancy_frequency")
+        background_pressure = interpolate("background_pressure_hpa")
+        event_count = event_sections.sizes["peak_event"]
+        wind = np.broadcast_to(background_wind, (event_count, len(height)))
+        buoyancy_frequency = np.broadcast_to(
+            background_n, (event_count, len(height))
+        )
+        pressure = np.broadcast_to(
+            background_pressure, (event_count, len(height))
+        )
+        profile_source = "unconditional deep-tropical U and N from wave Figure 13"
     result = np.full(
         (
             event_sections.sizes["peak_event"],
@@ -1929,9 +1992,9 @@ def theoretical_ray_event_paths(
         dtype=np.float32,
     )
     for event_index in range(event_sections.sizes["peak_event"]):
-        u = np.asarray(wind[event_index], dtype=float)
-        n = np.asarray(buoyancy_frequency[event_index], dtype=float)
-        p = np.asarray(pressure[event_index], dtype=float)
+        u = wind[event_index]
+        n = buoyancy_frequency[event_index]
+        p = pressure[event_index]
         speed = float(event_sections.lpo_zonal_speed_48h_m_s[event_index])
         latitude = float(event_sections.geometric_centroid_lat[event_index])
         valid = (
@@ -2006,6 +2069,7 @@ def theoretical_ray_event_paths(
             "launch_pressure_hpa": 200.0,
             "horizontal_reference_frame": "Cgx minus geometric LPO speed",
             "lpo_speed_window_hours": "-48 to 0",
+            "background_profile": profile_source,
         },
     )
 
@@ -2017,6 +2081,7 @@ def _add_peak_simulation_composites(
     *,
     primary_k_m1: float,
     primary_m_m1: float,
+    background_profile: xr.Dataset | None = None,
 ) -> None:
     """Add geometric peak composites when the current caches provide them."""
 
@@ -2114,6 +2179,20 @@ def _add_peak_simulation_composites(
         output[f"{key}_ray_finite_event_count"] = rays.notnull().sum(
             "peak_event"
         )
+        if background_profile is not None:
+            background_rays = theoretical_ray_event_paths(
+                event_sections,
+                wave_name,
+                kelvin_k_m1=primary_k_m1,
+                vertical_wavenumber_m1=primary_m_m1,
+                background_profile=background_profile,
+            )
+            output[f"{key}_background_ray_relative_longitude"] = (
+                background_rays.mean("peak_event", skipna=True)
+            )
+            output[f"{key}_background_ray_finite_event_count"] = (
+                background_rays.notnull().sum("peak_event")
+            )
     for variable in (
         "matsuno_zonal_wind_anomaly",
         "matsuno_meridional_wind_anomaly",
@@ -2137,6 +2216,7 @@ def build_simulation_composites(
     primary_k_m1: float,
     primary_m_m1: float,
     test: bool,
+    background_profile: xr.Dataset | None = None,
 ) -> xr.Dataset:
     """Reduce one simulation's raw event caches into fast plot products."""
 
@@ -2225,6 +2305,7 @@ def build_simulation_composites(
         wave_sections,
         primary_k_m1=primary_k_m1,
         primary_m_m1=primary_m_m1,
+        background_profile=background_profile,
     )
 
     filtered_pressure_mean, filtered_pressure_statistics = _mean_for_windows(
@@ -2383,12 +2464,19 @@ def build_simulation_composites(
                 f"{BOOTSTRAP_RESAMPLES} independent-event resamples; "
                 "intervals stored for the default 5-degree longitude window"
             ),
+            "phase_pressure_selection": (
+                "normalized filtered-precipitation amplitude greater than one"
+            ),
             "default_longitude_half_width_degrees": (
                 DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES
             ),
             "kelvin_reference_method": (
                 "Lim-and-Son dry Kelvin reference using event-local U and N; "
                 "not a generic moist-mode group velocity"
+            ),
+            "ray_profile_comparison": (
+                "event-local U and N compared with unconditional deep-tropical "
+                "U and N; both retain each event's propagation speed and latitude"
             ),
             "primary_k_m-1": float(primary_k_m1),
             "primary_m_m-1": float(primary_m_m1),
@@ -2686,14 +2774,17 @@ def build_review_response_composites(
                 f"response_kelvin_sensitivity_{variable}",
                 results,
             )
-        for variable_index, variable in enumerate(FILTERED_VERTICAL_VARIABLES):
+        for variable_index, variable in enumerate(
+            FILTERED_VERTICAL_VARIABLES
+        ):
             phase_cubes = {
                 simulation: _phase_pressure_event_cube(dataset, variable)
                 for simulation, dataset in wave_sections.items()
             }
             results = {
                 simulation: independent_event_contrast(
-                    phase_cubes[simulation], phase_cubes["control"],
+                    phase_cubes[simulation],
+                    phase_cubes["control"],
                     seed=BOOTSTRAP_SEED + 400 + variable_index,
                 )
                 for simulation in contrasts

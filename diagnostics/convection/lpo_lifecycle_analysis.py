@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -72,6 +73,8 @@ from diagnostics.convection.lpo_tracking import (
 from diagnostics.diagnostic_helpers import (
     FigureSaver,
     LATLON_PATTERN,
+    SPECIFIC_HUMIDITY_CMAP,
+    blue_sky_white_cloud_cmap,
     difference_cmap,
     grid_cell_area_km2,
     native_layer_interfaces,
@@ -85,6 +88,7 @@ from diagnostics.diagnostic_helpers import (
     symmetric_levels,
     vertical_dim,
 )
+from diagnostics.analysis_config import cache_directory
 from diagnostics.waves.cached_wave_products import (
     filtered_wave_cache_path,
     load_existing_filtered_wave,
@@ -138,6 +142,7 @@ LIFECYCLE_SECTION_FILENAME = "lpo_lifecycle_event_sections.nc"
 LIFECYCLE_2D_COMPOSITE_FILENAME = "lpo_lifecycle_2d_composites.nc"
 LIFECYCLE_EVENT_CACHE_DIRECTORY = "lpo_lifecycle_event_cache"
 TEST_EVENTS_PER_SIMULATION = 2
+TEST_MODE = False
 DEEP_CLOUD_TOP_PERCENTILE = 10
 TIMING_BOOTSTRAP_RESAMPLES = 1000
 TIMING_BOOTSTRAP_SEED = 20260804
@@ -714,6 +719,7 @@ def project_model_fields(dataset: xr.Dataset, precipitation: xr.DataArray) -> di
         buoyancy_frequency_squared,
         theta,
         height,
+        kwargs={"mask_nonpositive": False},
         input_core_dims=[[zdim], [zdim]],
         output_core_dims=[[zdim]],
         vectorize=True,
@@ -1098,6 +1104,9 @@ def bootstrap_event_composite(
 ) -> xr.Dataset:
     """Build composites by resampling independent LPO event identities."""
 
+    if TEST_MODE:
+        n_bootstrap = 0
+
     selected = lifecycle[
         lifecycle.in_primary_lifecycle_window.astype(bool)
     ].copy()
@@ -1176,9 +1185,10 @@ def bootstrap_event_composite(
             draw = rng.integers(0, len(event_ids), len(event_ids))
             boot[index] = _finite_mean(cube[draw], axis=0)
         bootstrap_by_simulation[simulation] = boot
-        low[isim], high[isim] = _finite_percentiles(
-            boot, [2.5, 97.5]
-        )
+        if n_bootstrap:
+            low[isim], high[isim] = _finite_percentiles(
+                boot, [2.5, 97.5]
+            )
     data_vars = {
         "event_equal_mean": (
             ("simulation", "lag_hours", "variable"),
@@ -1220,13 +1230,14 @@ def bootstrap_event_composite(
                 bootstrap_by_simulation[simulation]
                 - bootstrap_by_simulation["control"]
             )
-            (
-                difference_low[icontrast],
-                difference_high[icontrast],
-            ) = _finite_percentiles(
-                bootstrap_difference,
-                [2.5, 97.5],
-            )
+            if n_bootstrap:
+                (
+                    difference_low[icontrast],
+                    difference_high[icontrast],
+                ) = _finite_percentiles(
+                    bootstrap_difference,
+                    [2.5, 97.5],
+                )
             contrast_event_count[icontrast] = (
                 count[simulation_index[simulation]],
                 count[simulation_index["control"]],
@@ -1642,10 +1653,9 @@ def _lifecycle_dependency_hashes(
     ]
     source_directory = Path(DEFAULT_ROOT) / SIMULATION_DIRS[simulation]
     model_paths = sorted(source_directory.glob(LATLON_PATTERN))
-    classification_path = (
-        Path(DEFAULT_ROOT)
-        / "classification_cache"
-        / f"{simulation.replace('-', '_')}_classified_high_cloud.nc"
+    classification_path = cache_directory(
+        "classification",
+        f"{simulation.replace('-', '_')}_classified_high_cloud.nc",
     )
     calculation_paths = tracking_paths + mask_paths + model_paths + [
         classification_path
@@ -1679,6 +1689,15 @@ def _event_cache_paths(
         root / f"{token}.profiles.csv",
         root / f"{token}.json",
     )
+
+
+def _cleanup_event_checkpoints(standard: Path) -> None:
+    """Remove intermediate checkpoints after final-bundle validation."""
+
+    root = standard / LIFECYCLE_EVENT_CACHE_DIRECTORY
+    if root.is_dir():
+        shutil.rmtree(root)
+        progress(f"Removed completed lifecycle checkpoints: {root}")
 
 
 def _read_event_checkpoint(
@@ -2095,29 +2114,61 @@ def _add_conditioned_static_stability(
     primary = kelvin_reference.sel(
         zonal_wavenumber=1, vertical_wavelength_km=10.0
     )
-    backgrounds = []
+    backgrounds = {
+        "ray_unconditional_background_zonal_wind": [],
+        "ray_unconditional_buoyancy_frequency": [],
+        "ray_unconditional_static_stability": [],
+        "ray_unconditional_pressure_hpa": [],
+    }
+    source_names = {
+        "ray_unconditional_background_zonal_wind": "background_zonal_wind",
+        "ray_unconditional_buoyancy_frequency": "buoyancy_frequency",
+        "ray_unconditional_static_stability": "static_stability",
+        "ray_unconditional_pressure_hpa": "background_pressure_hpa",
+    }
     for simulation in SIMULATION_DIRS:
-        source = primary.static_stability.sel(
+        selected = primary.sel(
             simulation=WAVE_SIMULATION_LABELS[simulation]
-        ).interp(height_m=np.asarray(composite.ray_height_m, dtype=float))
-        backgrounds.append(
-            source.rename({"height_m": "ray_height_m"}).reset_coords(
-                drop=True
-            )
         )
-    background = xr.concat(
-        backgrounds,
-        dim=xr.IndexVariable("simulation", SIMULATION_DIRS),
-    )
-    composite["ray_unconditional_static_stability"] = background
+        for output_name, source_name in source_names.items():
+            source = selected[source_name].interp(
+                height_m=np.asarray(composite.ray_height_m, dtype=float)
+            )
+            backgrounds[output_name].append(
+                source.rename({"height_m": "ray_height_m"}).reset_coords(
+                    drop=True
+                )
+            )
+    for output_name, profiles in backgrounds.items():
+        composite[output_name] = xr.concat(
+            profiles,
+            dim=xr.IndexVariable(
+                "simulation", np.asarray(list(SIMULATION_DIRS), dtype=str)
+            ),
+        )
     composite["ray_lpo_conditioned_static_stability_anomaly"] = (
-        composite.ray_unfiltered_static_stability - background
+        composite.ray_unfiltered_static_stability
+        - composite.ray_unconditional_static_stability
+    )
+    composite.ray_unconditional_background_zonal_wind.attrs.update(
+        units="m s-1",
+        definition="unconditional tropical-mean U from equatorial wave Figure 13",
+    )
+    composite.ray_unconditional_buoyancy_frequency.attrs.update(
+        units="s-1",
+        definition="unconditional tropical-mean N from equatorial wave Figure 13",
     )
     composite.ray_unconditional_static_stability.attrs.update(
         units="s-2",
         definition=(
             "unconditional tropical-mean static stability from equatorial "
             "wave Figure 13"
+        ),
+    )
+    composite.ray_unconditional_pressure_hpa.attrs.update(
+        units="hPa",
+        definition=(
+            "unconditional tropical-mean pressure from equatorial wave Figure 13"
         ),
     )
     composite.ray_lpo_conditioned_static_stability_anomaly.attrs.update(
@@ -2218,6 +2269,8 @@ def analyse_run_lifecycles(
             )
             if cached_steps != expected_steps:
                 bundle = None
+            else:
+                _cleanup_event_checkpoints(standard)
         section_path = standard / LIFECYCLE_SECTION_FILENAME
         section_current = build_two_dimensional and _event_section_cache_is_current(
             section_path,
@@ -2404,6 +2457,20 @@ def analyse_run_lifecycles(
                 test_event_ids=event_ids if test else None,
                 environment_anomaly_baseline=environment_anomaly_baseline,
             )
+            validated_bundle = _read_simulation_bundle(
+                standard,
+                simulation=simulation,
+                event_ids=event_ids,
+                bundle_source_sha256=dependency_hashes["bundle"],
+                test=test,
+                force_recompute=False,
+            )
+            if validated_bundle is None:
+                raise RuntimeError(
+                    f"{run_directory.name}/{simulation}: final lifecycle "
+                    "bundle failed validation; checkpoints remain for restart"
+                )
+            _cleanup_event_checkpoints(standard)
         else:
             progress(
                 f"{run_directory.name}/{simulation}: reusing complete "
@@ -2462,6 +2529,11 @@ def analyse_run_lifecycles(
                         kelvin_reference.attrs["primary_m_m-1"]
                     ),
                     test=test,
+                    background_profile=kelvin_reference.sel(
+                        simulation=WAVE_SIMULATION_LABELS[simulation],
+                        zonal_wavenumber=1,
+                        vertical_wavelength_km=10.0,
+                    ),
                 )
             )
         combined_lifecycle.append(lifecycle)
@@ -2772,11 +2844,19 @@ def _rebuild_test_2d_composite_from_saved_sections(
                 primary_k_m1=primary_k_m1,
                 primary_m_m1=primary_m_m1,
                 test=True,
+                background_profile=kelvin_reference.sel(
+                    simulation=WAVE_SIMULATION_LABELS[simulation],
+                    zonal_wavenumber=1,
+                    vertical_wavelength_km=10.0,
+                ),
             )
         finally:
             wave_sections.close()
             event_sections.close()
     composite_2d = combine_simulation_composites(simulation_composites)
+    composite_2d = _add_conditioned_static_stability(
+        composite_2d, kelvin_reference
+    )
     response_composites = build_review_response_composites(
         section_paths,
         wave_section_paths={
@@ -2836,6 +2916,8 @@ def reuse_test_lifecycle_products(run_directory: Path) -> bool:
                     != COMPOSITE_CACHE_VERSION
                     or composite_2d.attrs.get("tracking_product_version")
                     != PRODUCT_VERSION
+                    or "ray_lpo_conditioned_static_stability_anomaly"
+                    not in composite_2d
                 )
     except OSError:
         rebuild_2d = True
@@ -3025,27 +3107,43 @@ def _plot_lifecycle_timing(summary: pd.DataFrame):
                     body.set_alpha(0.28)
             if len(values):
                 q25, median, q75 = np.percentile(values, [25, 50, 75])
-                bootstrap_median = np.asarray(
-                    [
-                        np.median(
-                            rng.choice(values, size=len(values), replace=True)
-                        )
-                        for _ in range(TIMING_BOOTSTRAP_RESAMPLES)
-                    ]
-                )
-                ci_low, ci_high = np.percentile(
-                    bootstrap_median, [2.5, 97.5]
-                )
                 axis.plot(
                     [q25, q75], [index, index], color="black", lw=3.0,
                     solid_capstyle="butt",
                 )
-                axis.errorbar(
-                    median, index, xerr=[[median - ci_low], [ci_high - median]],
-                    fmt="o", color=SIMULATION_COLOURS[simulation],
-                    markeredgecolor="black", markeredgewidth=0.5,
-                    capsize=2.0, zorder=4,
-                )
+                if TEST_MODE:
+                    axis.plot(
+                        median,
+                        index,
+                        "o",
+                        color=SIMULATION_COLOURS[simulation],
+                        markeredgecolor="black",
+                        markeredgewidth=0.5,
+                        zorder=4,
+                    )
+                else:
+                    bootstrap_median = np.asarray(
+                        [
+                            np.median(
+                                rng.choice(values, size=len(values), replace=True)
+                            )
+                            for _ in range(TIMING_BOOTSTRAP_RESAMPLES)
+                        ]
+                    )
+                    ci_low, ci_high = np.percentile(
+                        bootstrap_median, [2.5, 97.5]
+                    )
+                    axis.errorbar(
+                        median,
+                        index,
+                        xerr=[[median - ci_low], [ci_high - median]],
+                        fmt="o",
+                        color=SIMULATION_COLOURS[simulation],
+                        markeredgecolor="black",
+                        markeredgewidth=0.5,
+                        capsize=2.0,
+                        zorder=4,
+                    )
             censored_column = f"{column}_censored"
             rejected = (
                 int(subset[censored_column].fillna(False).astype(bool).sum())
@@ -4158,7 +4256,13 @@ def _plot_vertical_sections(
     shade_styles = {}
     for key in ("temperature", "specific_humidity", "static_stability"):
         if symmetric:
-            shade_styles[key] = _symmetric_cmap_norm(selections[key])
+            cmap, norm = _symmetric_cmap_norm(selections[key])
+            shade_styles[key] = (
+                SPECIFIC_HUMIDITY_CMAP
+                if key == "specific_humidity"
+                else cmap,
+                norm,
+            )
         elif key == "temperature":
             shade_styles[key] = (
                 "coolwarm",
@@ -4166,7 +4270,7 @@ def _plot_vertical_sections(
             )
         elif key == "specific_humidity":
             shade_styles[key] = (
-                "YlGnBu",
+                SPECIFIC_HUMIDITY_CMAP,
                 mpl_colors.LogNorm(vmin=0.001, vmax=20.0),
             )
         else:
@@ -4214,6 +4318,7 @@ def _plot_vertical_sections(
             "Static stability", r"$N^2$ (s$^{-2}$)",
         ),
     )
+    has_envelope_precipitation = "lpo_envelope_precipitation" in composite
     fig = plt.figure(
         figsize=(15, 8.0 if response else 10.0),
         constrained_layout=True,
@@ -4229,7 +4334,16 @@ def _plot_vertical_sections(
             for row in range(len(rows))
         ]
     )
-    precipitation_axis = fig.add_subplot(grid[-1, :])
+    precipitation_axes = []
+    for column in range(len(definitions)):
+        precipitation_axes.append(
+            fig.add_subplot(
+                grid[-1, column],
+                sharex=axes[-1, column],
+                sharey=(None if column == 0 else precipitation_axes[0]),
+            )
+        )
+    precipitation_axes = np.asarray(precipitation_axes)
     column_mappables = [None] * len(definitions)
     for row, simulation in enumerate(rows):
         for column, (shade_key, contour_key, title, unit) in enumerate(
@@ -4276,18 +4390,34 @@ def _plot_vertical_sections(
                     ).transpose("native_level", "lag_hours"),
                     dtype=float,
                 )
+            shade = shade_source.transpose(vertical_dimension, "lag_hours")
+            contour = (
+                contour_source.transpose(vertical_dimension, "lag_hours")
+                if contour_source is not None
+                else None
+            )
+            available_levels = np.any(
+                np.isfinite(pressure) & (pressure > 0.0), axis=1
+            )
+            if np.count_nonzero(available_levels) < 2:
+                raise RuntimeError(
+                    f"{simulation} {wave_name or 'unfiltered'} "
+                    "lag-pressure plot has fewer than two pressure levels"
+                )
+            if not np.all(available_levels):
+                level_indices = np.flatnonzero(available_levels)
+                pressure = pressure[available_levels]
+                shade = shade.isel({vertical_dimension: level_indices})
+                if contour is not None:
+                    contour = contour.isel(
+                        {vertical_dimension: level_indices}
+                    )
             pressure = _fill_native_pressure_coordinates(
                 pressure,
                 context=(
                     f"{simulation} {wave_name or 'unfiltered'} "
                     "lag-pressure plot"
                 ),
-            )
-            shade = shade_source.transpose(vertical_dimension, "lag_hours")
-            contour = (
-                contour_source.transpose(vertical_dimension, "lag_hours")
-                if contour_source is not None
-                else None
             )
             lag_grid = np.broadcast_to(
                 np.asarray(shade.lag_hours)[None, :], shade.shape
@@ -4347,14 +4477,14 @@ def _plot_vertical_sections(
                 axis.set_ylabel(
                     f"{row_label}\nPressure (hPa)"
                 )
-            if row == len(rows) - 1:
+            if row == len(rows) - 1 and not has_envelope_precipitation:
                 axis.set_xlabel("Lag (h)")
     for column, (_shade_key, _contour_key, _title, unit) in enumerate(
         definitions
     ):
         fig.colorbar(
             column_mappables[column],
-            ax=axes[:, column],
+            ax=[*axes[:, column], precipitation_axes[column]],
             label=unit,
             pad=0.01,
             extend="both",
@@ -4363,49 +4493,55 @@ def _plot_vertical_sections(
         WAVE_BOXES[wave_name].get("label", wave_name)
         if wave_name else "Unfiltered"
     )
-    has_envelope_precipitation = "lpo_envelope_precipitation" in composite
     if has_envelope_precipitation:
         precipitation = composite.lpo_envelope_precipitation
-        if response:
-            control = precipitation.sel(simulation="control")
-            for simulation in rows:
-                curve = precipitation.sel(simulation=simulation) - control
-                precipitation_axis.plot(
-                    curve.lag_hours,
-                    RAIN_VOLUME_DISPLAY_SCALE * curve,
-                    color=SIMULATION_COLOURS[simulation],
-                    label=f"{SIMULATION_LABELS[simulation]} − control",
-                )
-            precipitation_axis.axhline(0.0, color="0.4", lw=0.7)
-        else:
-            for simulation in SIMULATION_DIRS:
-                curve = precipitation.sel(simulation=simulation)
-                precipitation_axis.plot(
-                    curve.lag_hours,
-                    RAIN_VOLUME_DISPLAY_SCALE * curve,
-                    color=SIMULATION_COLOURS[simulation],
-                    label=SIMULATION_LABELS[simulation],
-                )
-                if "lpo_envelope_precipitation_ci_low" in composite:
-                    low = composite.lpo_envelope_precipitation_ci_low.sel(
-                        simulation=simulation
-                    )
-                    high = composite.lpo_envelope_precipitation_ci_high.sel(
-                        simulation=simulation
-                    )
-                    precipitation_axis.fill_between(
+        control = precipitation.sel(simulation="control")
+        for column, precipitation_axis in enumerate(precipitation_axes):
+            if response:
+                for simulation in rows:
+                    curve = precipitation.sel(simulation=simulation) - control
+                    precipitation_axis.plot(
                         curve.lag_hours,
-                        RAIN_VOLUME_DISPLAY_SCALE * low,
-                        RAIN_VOLUME_DISPLAY_SCALE * high,
+                        RAIN_VOLUME_DISPLAY_SCALE * curve,
                         color=SIMULATION_COLOURS[simulation],
-                        alpha=0.15,
+                        label=f"{SIMULATION_LABELS[simulation]} − control",
                     )
-        precipitation_axis.axvline(0.0, color="0.35", lw=0.7)
-        precipitation_axis.set_ylabel(RAIN_VOLUME_LABEL)
-        precipitation_axis.set_xlabel(LIFECYCLE_LAG_LABEL)
-        precipitation_axis.legend(frameon=False, ncol=3, fontsize=8)
+                precipitation_axis.axhline(0.0, color="0.4", lw=0.7)
+            else:
+                for simulation in SIMULATION_DIRS:
+                    curve = precipitation.sel(simulation=simulation)
+                    precipitation_axis.plot(
+                        curve.lag_hours,
+                        RAIN_VOLUME_DISPLAY_SCALE * curve,
+                        color=SIMULATION_COLOURS[simulation],
+                        label=SIMULATION_LABELS[simulation],
+                    )
+                    if "lpo_envelope_precipitation_ci_low" in composite:
+                        low = composite.lpo_envelope_precipitation_ci_low.sel(
+                            simulation=simulation
+                        )
+                        high = composite.lpo_envelope_precipitation_ci_high.sel(
+                            simulation=simulation
+                        )
+                        precipitation_axis.fill_between(
+                            curve.lag_hours,
+                            RAIN_VOLUME_DISPLAY_SCALE * low,
+                            RAIN_VOLUME_DISPLAY_SCALE * high,
+                            color=SIMULATION_COLOURS[simulation],
+                            alpha=0.15,
+                        )
+            precipitation_axis.axvline(0.0, color="0.35", lw=0.7)
+            precipitation_axis.set_xlabel(LIFECYCLE_LAG_LABEL)
+            if column == 0:
+                precipitation_axis.set_ylabel(RAIN_VOLUME_LABEL)
+                precipitation_axis.legend(
+                    frameon=False, ncol=1, fontsize=7
+                )
+            else:
+                precipitation_axis.tick_params(labelleft=False)
     else:
-        precipitation_axis.set_axis_off()
+        for precipitation_axis in precipitation_axes:
+            precipitation_axis.set_axis_off()
     ascent_text = ", ".join(
         f"{value:.2g}"
         for value in contour_levels["upward_pressure_velocity"]
@@ -4472,6 +4608,8 @@ def _plot_unfiltered_vertical_response(
         shade_cmap, shade_norm = _symmetric_cmap_norm(
             composite[f"{shade_stem}_mean"]
         )
+        if shade_name == "unfiltered_specific_humidity":
+            shade_cmap = SPECIFIC_HUMIDITY_CMAP
         contour_limit = _symmetric_limit(
             composite[f"{contour_stem}_mean"], percentile=90.0
         )
@@ -4869,7 +5007,7 @@ def _plot_phase_pressure_structure(
     composite: xr.Dataset,
     wave_name: str,
 ):
-    """Plot strong-wave phase-pressure structure and experiment responses."""
+    """Plot phase-pressure structure and experiment responses."""
 
     columns = (
         (
@@ -4918,7 +5056,9 @@ def _plot_phase_pressure_structure(
             composite[f"{response_stem}_mean"].sel(wave_band=wave_name)
         )
         if contour_name is not None:
-            absolute_contour_stem = f"phase_pressure_{contour_name}"
+            absolute_contour_stem = (
+                f"phase_pressure_{contour_name}"
+            )
             response_contour_stem = (
                 f"response_phase_pressure_{contour_name}"
             )
@@ -4937,7 +5077,9 @@ def _plot_phase_pressure_structure(
         absolute_mappable = None
         response_mappable = None
         pressure_grid = np.asarray(
-            composite.phase_pressure_filtered_native_pressure_hpa.sel(
+            composite[
+                "phase_pressure_filtered_native_pressure_hpa"
+            ].sel(
                 simulation="control", wave_band=wave_name
             ).transpose("native_level", "wave_phase"),
             dtype=float,
@@ -5008,7 +5150,11 @@ def _plot_phase_pressure_structure(
                 phase_grid,
                 pressure_grid,
                 shade,
-                cmap="RdBu_r",
+                cmap=(
+                    SPECIFIC_HUMIDITY_CMAP
+                    if shade_name == "filtered_specific_humidity"
+                    else "RdBu_r"
+                ),
                 vmin=-shade_limit,
                 vmax=shade_limit,
                 shading="auto",
@@ -5072,9 +5218,7 @@ def _plot_phase_pressure_structure(
                 va="bottom",
             )
     label = WAVE_BOXES[wave_name].get("label", wave_name)
-    fig.suptitle(
-        f"{label} strong-wave phase composites"
-    )
+    fig.suptitle(f"{label} strong-wave phase composites")
     return fig
 
 
@@ -5265,6 +5409,16 @@ def _plot_matsuno_gill_response(composite: xr.Dataset):
     )
     mappable = None
     for row, simulation in enumerate(rows):
+        included = int(
+            composite.matsuno_eastward_event_count.sel(
+                simulation=simulation
+            )
+        )
+        total = int(
+            composite.matsuno_total_event_count.sel(
+                simulation=simulation
+            )
+        )
         for column, pressure in enumerate(pressures):
             axis = axes[row, column]
             fields = {}
@@ -5302,30 +5456,37 @@ def _plot_matsuno_gill_response(composite: xr.Dataset):
                 "matsuno_relative_latitude",
                 "matsuno_relative_longitude",
             )
-            axis.quiver(
-                u.matsuno_relative_longitude[::stride],
-                u.matsuno_relative_latitude[::stride],
-                u.values[::stride, ::stride],
-                v.values[::stride, ::stride],
-                color="black",
-                scale=None,
-                width=0.0022,
-            )
+            finite_vectors = np.isfinite(u.values) & np.isfinite(v.values)
+            if included > 0 and finite_vectors.any():
+                axis.quiver(
+                    u.matsuno_relative_longitude[::stride],
+                    u.matsuno_relative_latitude[::stride],
+                    u.values[::stride, ::stride],
+                    v.values[::stride, ::stride],
+                    color="black",
+                    scale=None,
+                    width=0.0022,
+                )
+            else:
+                short_sample = bool(
+                    composite.attrs.get("test_subset", False)
+                )
+                message = "No eastward events"
+                if short_sample:
+                    message += "\nin short test sample"
+                axis.text(
+                    0.5,
+                    0.5,
+                    message,
+                    ha="center",
+                    va="center",
+                    transform=axis.transAxes,
+                )
             axis.axhline(0.0, color="0.4", lw=0.6)
             axis.axvline(0.0, color="0.4", lw=0.6)
             if row == 0:
                 axis.set_title(f"{pressure:g} hPa")
             if column == 0:
-                included = int(
-                    composite.matsuno_eastward_event_count.sel(
-                        simulation=simulation
-                    )
-                )
-                total = int(
-                    composite.matsuno_total_event_count.sel(
-                        simulation=simulation
-                    )
-                )
                 label = SIMULATION_LABELS[simulation]
                 axis.set_ylabel(
                     f"{label}\nLatitude from centroid (°)\n"
@@ -5341,8 +5502,8 @@ def _plot_matsuno_gill_response(composite: xr.Dataset):
         pad=0.01,
     )
     fig.suptitle(
-        "Matsuno-Gill response at geometric LPO centroids; own-simulation "
-        "climatologies; eastward geometric propagation only"
+        "Matsuno-Gill response at geometric LPO centroids\n"
+        "Own-simulation climatologies; eastward geometric propagation only"
     )
     return fig
 
@@ -5355,13 +5516,27 @@ def _draw_peak_rays(
     *,
     include_control: bool,
 ) -> None:
-    key = f"{wave_name.lower()}_ray_relative_longitude"
+    event_key = f"{wave_name.lower()}_ray_relative_longitude"
+    background_key = (
+        f"{wave_name.lower()}_background_ray_relative_longitude"
+    )
 
-    def draw(source_simulation: str, *, color: str, linestyle: str) -> None:
+    def draw(
+        source_simulation: str,
+        *,
+        key: str,
+        pressure_name: str,
+        color: str,
+        linestyle: str,
+    ) -> None:
         longitude = composite[key].sel(simulation=source_simulation)
-        pressure = composite.ray_pressure_hpa.sel(
+        pressure = composite[pressure_name].sel(
             simulation=source_simulation
-        ).mean("ray_relative_longitude", skipna=True)
+        )
+        if "ray_relative_longitude" in pressure.dims:
+            pressure = pressure.mean(
+                "ray_relative_longitude", skipna=True
+            )
         for launch in longitude.ray_launch_longitude:
             axis.plot(
                 longitude.sel(ray_launch_longitude=launch),
@@ -5372,9 +5547,25 @@ def _draw_peak_rays(
                 alpha=0.85,
             )
 
+    def draw_pair(source_simulation: str, linestyle: str) -> None:
+        draw(
+            source_simulation,
+            key=event_key,
+            pressure_name="ray_pressure_hpa",
+            color="tab:purple",
+            linestyle=linestyle,
+        )
+        draw(
+            source_simulation,
+            key=background_key,
+            pressure_name="ray_unconditional_pressure_hpa",
+            color="tab:green",
+            linestyle=linestyle,
+        )
+
     if include_control:
-        draw("control", color="0.45", linestyle="--")
-    draw(simulation, color="black", linestyle="-")
+        draw_pair("control", "--")
+    draw_pair(simulation, "-")
 
 
 def _plot_peak_longitude_height(
@@ -5384,6 +5575,8 @@ def _plot_peak_longitude_height(
     title: str,
     units: str,
     wave_name: str = "Kelvin",
+    control_cmap=None,
+    control_limits: tuple[float, float] | None = None,
 ):
     """Plot control and independent peak-response longitude-height sections."""
 
@@ -5405,11 +5598,24 @@ def _plot_peak_longitude_height(
     positive_control = bool(
         control_finite.size and np.nanmin(control_finite) >= 0.0
     )
-    if positive_control:
-        upper = float(np.percentile(control_finite, 98.0))
+    if positive_control or control_cmap is not None:
+        if control_limits is None:
+            lower = (
+                min(0.0, float(np.percentile(control_finite, 2.0)))
+                if control_finite.size
+                else 0.0
+            )
+            upper = (
+                float(np.percentile(control_finite, 98.0))
+                if control_finite.size
+                else 1.0
+            )
+        else:
+            lower, upper = control_limits
         control_style = {
-            "cmap": "viridis", "vmin": 0.0,
-            "vmax": upper if upper > 0.0 else 1.0,
+            "cmap": control_cmap or "viridis",
+            "vmin": lower,
+            "vmax": upper if upper > lower else lower + 1.0,
         }
     else:
         limit = _symmetric_limit(displayed["control"])
@@ -5428,29 +5634,48 @@ def _plot_peak_longitude_height(
         "vmax": response_limit,
     }
     fig = plt.figure(figsize=(11, 12), constrained_layout=True)
-    outer = fig.add_gridspec(3, 1)
-    section_axes = []
-    precipitation_axes = []
+    grid = fig.add_gridspec(
+        7,
+        2,
+        height_ratios=(0.13, 1.0, 0.24, 1.0, 0.24, 1.0, 0.24),
+        width_ratios=(1.0, 0.035),
+    )
+    title_axis = fig.add_subplot(grid[0, :])
+    title_axis.set_axis_off()
     mappables = []
     for row, simulation in enumerate(rows):
-        inner = outer[row].subgridspec(2, 1, height_ratios=(1.0, 0.24))
-        axis = fig.add_subplot(inner[0, 0])
-        precipitation_axis = fig.add_subplot(inner[1, 0], sharex=axis)
-        section_axes.append(axis)
-        precipitation_axes.append(precipitation_axis)
+        axis = fig.add_subplot(grid[2 * row + 1, 0])
+        precipitation_axis = fig.add_subplot(
+            grid[2 * row + 2, 0], sharex=axis
+        )
         field = displayed[simulation].transpose(
             "ray_height_m", "ray_relative_longitude"
         )
         pressure = composite.ray_pressure_hpa.sel(
             simulation=simulation
         ).transpose("ray_height_m", "ray_relative_longitude")
+        pressure_values = np.asarray(pressure, dtype=float)
+        available_heights = np.any(
+            np.isfinite(pressure_values) & (pressure_values > 0.0), axis=1
+        )
+        if np.count_nonzero(available_heights) < 2:
+            raise RuntimeError(
+                f"{simulation} {wave_name} ray plot has fewer than two "
+                "pressure levels"
+            )
+        height_indices = np.flatnonzero(available_heights)
+        field = field.isel(ray_height_m=height_indices)
+        pressure_values = _fill_native_pressure_coordinates(
+            pressure_values[available_heights],
+            context=f"{simulation} {wave_name} ray plot",
+        )
         longitude_grid = np.broadcast_to(
             np.asarray(field.ray_relative_longitude)[None, :], field.shape
         )
         style = control_style if simulation == "control" else response_style
         mappable = axis.pcolormesh(
             longitude_grid,
-            pressure,
+            pressure_values,
             field,
             shading="auto",
             **style,
@@ -5464,6 +5689,7 @@ def _plot_peak_longitude_height(
                 simulation="control"
             )
         cloud = cloud.transpose("ray_height_m", "ray_relative_longitude")
+        cloud = cloud.isel(ray_height_m=height_indices)
         cloud_limit = _symmetric_limit(cloud, percentile=90.0)
         if simulation == "control":
             cloud_values = np.asarray(cloud, dtype=float)
@@ -5485,13 +5711,13 @@ def _plot_peak_longitude_height(
             positive = levels[levels > 0.0]
             if negative.size:
                 axis.contour(
-                    longitude_grid, pressure, cloud,
+                    longitude_grid, pressure_values, cloud,
                     levels=negative, colors="0.25",
                     linestyles="dashed", linewidths=0.7,
                 )
             if positive.size:
                 axis.contour(
-                    longitude_grid, pressure, cloud,
+                    longitude_grid, pressure_values, cloud,
                     levels=positive, colors="black",
                     linestyles="solid", linewidths=0.7,
                 )
@@ -5533,17 +5759,27 @@ def _plot_peak_longitude_height(
         precipitation_axis.set_ylabel("Rain\n(mm day⁻¹)")
         if row == len(rows) - 1:
             precipitation_axis.set_xlabel("Longitude from centroid (°)")
+    control_colorbar_axis = fig.add_subplot(grid[1, 1])
+    response_colorbar_axis = fig.add_subplot(grid[3:6, 1])
     fig.colorbar(
-        mappables[0], ax=section_axes[0],
-        label=f"Control {units}", pad=0.01,
+        mappables[0], cax=control_colorbar_axis,
+        label=f"Control {units}",
     )
     fig.colorbar(
-        mappables[-1], ax=section_axes[1:],
-        label=f"Difference {units}", pad=0.01, extend="both",
+        mappables[-1], cax=response_colorbar_axis,
+        label=f"Difference {units}", extend="both",
     )
-    fig.suptitle(
-        f"{title} at precipitation peak; geometric LPO centroids; "
-        "non-precipitating high cloud contoured; rays launch at 200 hPa"
+    title_axis.text(
+        0.5,
+        0.5,
+        f"{title} at geometric-centroid precipitation peak\n"
+        "Non-precipitating high-cloud contours; rays launch at 200 hPa; "
+        "purple: event-local U,N; green: unconditional U,N",
+        ha="center",
+        va="center",
+        fontsize=plt.rcParams["figure.titlesize"],
+        fontweight=plt.rcParams["figure.titleweight"],
+        transform=title_axis.transAxes,
     )
     return fig
 
@@ -5844,6 +6080,7 @@ def build_lifecycle_figures(
                         "ray_unfiltered_static_stability",
                         title="Unfiltered static stability",
                         units=r"$N^2$ (s$^{-2}$)",
+                        control_cmap="YlGnBu",
                     ),
                 )
             if 44 in figures:
@@ -5856,6 +6093,7 @@ def build_lifecycle_figures(
                         "ray_high_cloud_occurrence",
                         title="Unfiltered high-cloud occurrence",
                         units="occurrence",
+                        control_cmap=blue_sky_white_cloud_cmap(),
                     ),
                 )
             if 45 in figures:
@@ -6122,7 +6360,9 @@ def parse_command_line(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global TEST_MODE
     args = parse_command_line(argv)
+    TEST_MODE = bool(args.test)
     progress(
         "Starting LPO lifecycle analysis "
         f"({'actual-data test' if args.test else args.mode} mode)"

@@ -35,11 +35,21 @@ import xarray as xr
 
 from diagnostics.diagnostic_helpers import (
     ANALYSIS_END, ANALYSIS_START, FigureSaver, LATLON_PATTERN,
-    annotate_panel_label, cache_manifest, diagnostic_cache_dir,
+    annotate_panel_label, cache_manifest, cache_manifest_matches,
+    diagnostic_cache_dir,
     diagnostic_output_dir, figure_should_run, load_latlon_dataset,
-    netcdf_safe_dataset, precip_rate_from_accum,
-    standardize_latlon_dataset, total_precip_accum, vertical_dim,
+    mpas_moist_air_density, netcdf_safe_dataset, precip_rate_from_accum,
+    standardize_latlon_dataset, time_block_slices, total_precip_accum, vertical_dim,
 )
+from diagnostics.analysis_config import (
+    BLOCK_LENGTH_DAYS,
+    BOOTSTRAP_REPLICATES,
+    BOOTSTRAP_SEED,
+    SIMULATION_ARCHIVES,
+    SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
+    SIMULATION_ROOT,
+)
+from diagnostics.uncertainty import independent_bootstrap_difference
 
 
 
@@ -73,12 +83,12 @@ G = 9.80665
 LV = 2.5e6
 DT_HOURS = 6
 ENERGY_CACHE_SCHEMA = "energy-budget-v2-mpas-moist-density"
-ENERGY_CACHE_ROOT = diagnostic_cache_dir("global_atmospheric_energy_budget")
+ENERGY_CACHE_ROOT = diagnostic_cache_dir("energy_budget")
 
 
-root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
-data_locs = ["control_new", "u_nudge", "T_nudge"]
-sim_names = ["control", "nudged u", "nudged T"]
+root_dir = str(SIMULATION_ROOT)
+data_locs = list(SIMULATION_ARCHIVES.values())
+sim_names = list(PROJECT_SIMULATION_LABELS.values())
 
 latlon_chunks = {
     "Time": 8,
@@ -213,18 +223,9 @@ def total_moisture_mixing_ratio(ds):
 
 
 def moist_air_density(ds, total_moisture=None):
-    """Apply the MPAS-A relation rho_m = rho_d * (1 + sum(q_m))."""
+    """Apply the shared MPAS-A moist-density definition."""
 
-    if total_moisture is None:
-        total_moisture = total_moisture_mixing_ratio(ds)
-    density = ds.rho * (1.0 + total_moisture)
-    density.name = "moist_air_density"
-    density.attrs.update(
-        units="kg m-3",
-        dry_density_source="rho",
-        formulation="rho_m = rho_d * (1 + qv + qc + qr + qi + qs + qg)",
-    )
-    return density
+    return mpas_moist_air_density(ds, total_moisture=total_moisture)
 
 
 def water_vapour_mass_fraction(ds, total_moisture=None):
@@ -416,6 +417,67 @@ def timeseries_rows(sim_name, term, ts, origin):
             "flux_w_m2": float(flux),
             "cumulative_mj_m2": float(cumulative_energy),
         }
+
+
+def energy_budget_uncertainty(entries):
+    """Return independent-climate intervals from cached energy time series."""
+
+    entry_by_name = {entry["simulation"]: entry for entry in entries}
+    comparisons = (
+        (sim_names[1], sim_names[0]),
+        (sim_names[2], sim_names[0]),
+        (sim_names[1], sim_names[2]),
+    )
+    rows = []
+    block_days = BLOCK_LENGTH_DAYS["energy_budget"]
+    for term_index, term in enumerate(SERIES_NAMES):
+        blocks = {}
+        for simulation, entry in entry_by_name.items():
+            if term not in entry["series"]:
+                continue
+            series = entry["series"][term]
+            blocks[simulation] = np.asarray(
+                [
+                    float(
+                        series.isel(Time=time_slice)
+                        .mean("Time", skipna=True)
+                        .compute()
+                        .values
+                    )
+                    for time_slice in time_block_slices(
+                        series, block_days=block_days, complete=True
+                    )
+                ],
+                dtype=float,
+            )
+        for comparison_index, (simulation, reference) in enumerate(comparisons):
+            if simulation not in blocks or reference not in blocks:
+                continue
+            result = independent_bootstrap_difference(
+                blocks[simulation],
+                blocks[reference],
+                rng=np.random.default_rng(
+                    BOOTSTRAP_SEED + 4000 + 10 * term_index + comparison_index
+                ),
+                n_resamples=BOOTSTRAP_REPLICATES,
+            )
+            rows.append(
+                {
+                    "term": term,
+                    "label": TERM_LABELS.get(term, term),
+                    "simulation": simulation,
+                    "reference": reference,
+                    "mean_response_w_m2": result["estimate"],
+                    "ci_low_w_m2": result["interval_low"],
+                    "ci_high_w_m2": result["interval_high"],
+                    "sign_probability": result["sign_probability"],
+                    "n_simulation_blocks": result["n_simulation"],
+                    "n_reference_blocks": result["n_control"],
+                    "block_days": block_days,
+                    "resampling": "independent complete time blocks by simulation",
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def print_budget_summary(summary_df):
@@ -661,8 +723,13 @@ def energy_cache_path(simulation):
     return os.path.join(ENERGY_CACHE_ROOT, f"{safe}_energy_budget.nc")
 
 
-def energy_cache_manifest(data_loc, simulation):
-    source_paths = glob.glob(os.path.join(root_dir, data_loc, LATLON_PATTERN))
+def energy_cache_manifest(
+    data_loc, simulation, *, include_sources=True, test_times=None
+):
+    source_paths = (
+        glob.glob(os.path.join(root_dir, data_loc, LATLON_PATTERN))
+        if include_sources else None
+    )
     return cache_manifest(
         "mean_state.energy_budget",
         schema=ENERGY_CACHE_SCHEMA,
@@ -670,6 +737,7 @@ def energy_cache_manifest(data_loc, simulation):
             "simulation": simulation,
             "analysis_start": ANALYSIS_START,
             "analysis_end": ANALYSIS_END,
+            "test_times": test_times,
             "variables": needed_vars,
             "constants": {
                 "rd": RD,
@@ -686,15 +754,21 @@ def energy_cache_manifest(data_loc, simulation):
     )
 
 
-def energy_cache_is_current(path, expected_manifest):
+def energy_cache_is_current(path, expected_manifest, *, validate_sources=True):
     if not os.path.isfile(path):
         return False
     try:
         with xr.open_dataset(path) as cached:
-            return (
-                cached.attrs.get("cache_schema") == ENERGY_CACHE_SCHEMA
-                and cached.attrs.get("manifest_sha256")
-                == expected_manifest["manifest_sha256"]
+            if cached.attrs.get("cache_schema") != ENERGY_CACHE_SCHEMA:
+                return False
+            if validate_sources:
+                return (
+                    cached.attrs.get("manifest_sha256")
+                    == expected_manifest["manifest_sha256"]
+                )
+            saved = json.loads(cached.attrs.get("cache_manifest", "null"))
+            return cache_manifest_matches(
+                saved, expected_manifest, compare_sources=False
             )
     except (OSError, ValueError):
         return False
@@ -722,11 +796,23 @@ def read_energy_cache(path):
 
 
 def prepare_energy_entry(
-    data_loc, simulation, *, figures_only=False, rebuild_cache=False
+    data_loc,
+    simulation,
+    *,
+    figures_only=False,
+    rebuild_cache=False,
+    test_times=None,
 ):
     path = energy_cache_path(simulation)
-    manifest = energy_cache_manifest(data_loc, simulation)
-    current = energy_cache_is_current(path, manifest)
+    manifest = energy_cache_manifest(
+        data_loc,
+        simulation,
+        include_sources=not figures_only,
+        test_times=test_times,
+    )
+    current = energy_cache_is_current(
+        path, manifest, validate_sources=not figures_only
+    )
     if current and not rebuild_cache:
         print(f"{simulation}: using energy-budget cache {path}")
         series, storage_energy = read_energy_cache(path)
@@ -743,8 +829,11 @@ def prepare_energy_entry(
         )
         try:
             ds = standardize_latlon_dataset(ds, needed_vars)
+            if test_times is not None:
+                ds = ds.isel(Time=slice(0, int(test_times)))
             series, storage_energy = derive_budget_series(ds)
             write_energy_cache(path, series, storage_energy, manifest)
+            series, storage_energy = read_energy_cache(path)
         finally:
             ds.close()
     origin = storage_energy.Time.values[0]
@@ -758,6 +847,12 @@ def prepare_energy_entry(
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Use bounded actual-data subsets and isolated test products.",
+    )
+    parser.add_argument("--test-times", type=int, default=8)
     parser.add_argument(
         "--figures",
         nargs="+",
@@ -776,12 +871,21 @@ def parse_args(argv=None):
         action="store_true",
         help="Rebuild all energy-budget caches before plotting.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.test_times < 3:
+        parser.error("--test-times must be at least 3")
+    return args
 
 
 def main(argv=None):
-    global figures_to_run, should_run_figure
+    global ENERGY_CACHE_ROOT, figures_to_run, save_loc, should_run_figure
     args = parse_args(argv)
+    if args.test:
+        test_label = f"all_{args.test_times:03d}times"
+        ENERGY_CACHE_ROOT = diagnostic_cache_dir(
+            "energy_budget", "testing", test_label
+        )
+        save_loc = os.path.join(save_loc, "testing", test_label)
     figures_to_run = args.figures or []
     should_run_figure = partial(figure_should_run, figures_to_run)
     figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
@@ -791,6 +895,7 @@ def main(argv=None):
             simulation,
             figures_only=args.figures_only,
             rebuild_cache=args.rebuild_cache,
+            test_times=args.test_times if args.test else None,
         )
         for data_loc, simulation in zip(data_locs, sim_names)
     ]
@@ -811,6 +916,13 @@ def main(argv=None):
 
     summary_df = pd.DataFrame(summary_rows)
     timeseries_df = pd.DataFrame(ts_rows)
+    uncertainty_df = (
+        pd.DataFrame()
+        if args.test
+        else energy_budget_uncertainty(entries)
+    )
+    if args.test:
+        print("Test mode omits formal energy-budget uncertainty intervals")
     if save:
         summary_df.to_csv(
             os.path.join(save_loc, "global_atmospheric_energy_budget_summary.csv"),
@@ -818,6 +930,13 @@ def main(argv=None):
         )
         timeseries_df.to_csv(
             os.path.join(save_loc, "global_atmospheric_energy_budget_timeseries.csv"),
+            index=False,
+        )
+        uncertainty_df.to_csv(
+            os.path.join(
+                save_loc,
+                "global_atmospheric_energy_budget_uncertainty.csv",
+            ),
             index=False,
         )
 

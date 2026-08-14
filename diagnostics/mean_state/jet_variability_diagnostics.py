@@ -45,9 +45,19 @@ from diagnostics.diagnostic_helpers import (
     latitude_weights, load_latlon_dataset,
     pressure_layer_weights, safe_name, set_latpres_axis,
     simulation_colour, standardize_latlon_dataset, subset_between, symmetric_levels,
-    time_step_days, read_json_file,
+    time_block_slices, time_step_days, read_json_file,
     write_json_file,
 )
+from diagnostics.analysis_config import (
+    BLOCK_LENGTH_DAYS,
+    BOOTSTRAP_REPLICATES,
+    BOOTSTRAP_SEED,
+    CONFIDENCE_PERCENTILES,
+    SIMULATION_ARCHIVES,
+    SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
+    SIMULATION_ROOT,
+)
+from diagnostics.uncertainty import independent_bootstrap_difference
 
 
 # -----------------------------------------------------------------------------
@@ -56,6 +66,12 @@ from diagnostics.diagnostic_helpers import (
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Use bounded actual-data subsets and isolated test products.",
+    )
+    parser.add_argument("--test-times", type=int, default=16)
     parser.add_argument(
         "--figures",
         nargs="+",
@@ -75,12 +91,18 @@ def parse_args(argv=None):
         action="store_true",
         help="Rebuild selected compact jet caches before plotting.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.test_times < 8:
+        parser.error("--test-times must be at least 8")
+    return args
 
 
 runtime_args = parse_args()
 save = True
 save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/jet_variability/")
+if runtime_args.test:
+    test_label = f"all_{runtime_args.test_times:03d}times"
+    save_loc = os.path.join(save_loc, "testing", test_label)
 
 # Set to [] or None to run all figures. Otherwise list numbered figures.
 #
@@ -106,9 +128,9 @@ should_run_figure = partial(figure_should_run, figures_to_run)
 should_run_any = partial(figure_should_run_any, figures_to_run)
 
 
-root_dir = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/"
-data_locs = ["control_new", "u_nudge", "T_nudge"]
-sim_names = ["control", "nudged u", "nudged T"]
+root_dir = str(SIMULATION_ROOT)
+data_locs = list(SIMULATION_ARCHIVES.values())
+sim_names = list(PROJECT_SIMULATION_LABELS.values())
 cols = [simulation_colour(name) for name in sim_names]
 
 
@@ -129,13 +151,22 @@ hemisphere_jet_bounds = {
 }
 eof_pressure_bounds = (1000.0, 100.0)
 eof_min_valid_fraction = 0.95
+TEST_LATITUDE_STRIDE = 4
+TEST_LONGITUDE_BOUNDS = (60.0, 180.0)
 
 latlon_chunks = {"Time": -1, "latitude": 60, "longitude": 120}
 needed_vars = ["uzonal_isobaric"]
 
 dask.config.set({"array.slicing.split_large_chunks": True})
 
-JET_CACHE_ROOT = diagnostic_cache_dir("jet_variability_cache")
+JET_CACHE_ROOT = diagnostic_cache_dir(
+    "jet_variability",
+    *(
+        ("testing", f"all_{runtime_args.test_times:03d}times")
+        if runtime_args.test
+        else ()
+    ),
+)
 JET_CACHE_SCHEMA = "jet-variability-v1"
 if not runtime_args.figures_only:
     os.makedirs(JET_CACHE_ROOT, exist_ok=True)
@@ -146,6 +177,7 @@ JET_CACHE_FILES = {
         f"u{safe_name(f'{fixed_pressure_level:g}')}_zonal_mean_autocorrelation.nc",
         f"u{safe_name(f'{fixed_pressure_level:g}')}_persistence_summary.csv",
         f"u{safe_name(f'{fixed_pressure_level:g}')}_jet_latitude_summary.csv",
+        "jet_latitude_response_uncertainty.csv",
     ),
     "annular": (
         "annular_mode_eof_patterns.nc",
@@ -174,7 +206,7 @@ def jet_source_paths(family):
     ]
 
 
-def jet_cache_manifest(family):
+def jet_cache_manifest(family, *, include_sources=True):
     configuration = {
         "family": family,
         "simulations": list(sim_names),
@@ -185,12 +217,22 @@ def jet_cache_manifest(family):
         "hemisphere_jet_bounds": hemisphere_jet_bounds,
         "eof_pressure_bounds_hpa": eof_pressure_bounds,
         "eof_min_valid_fraction": eof_min_valid_fraction,
+        "test_times": runtime_args.test_times if runtime_args.test else None,
+        "test_latitude_stride": TEST_LATITUDE_STRIDE if runtime_args.test else None,
+        "test_longitude_bounds": TEST_LONGITUDE_BOUNDS if runtime_args.test else None,
     }
+    if family == "fixed":
+        configuration.update(
+            block_days=BLOCK_LENGTH_DAYS["jet_variability"],
+            bootstrap_seed=BOOTSTRAP_SEED,
+            bootstrap_replicates=BOOTSTRAP_REPLICATES,
+            confidence_percentiles=list(CONFIDENCE_PERCENTILES),
+        )
     return cache_manifest(
         "jet_variability_diagnostics.py",
         schema=JET_CACHE_SCHEMA,
         configuration=configuration,
-        source_paths=jet_source_paths(family),
+        source_paths=jet_source_paths(family) if include_sources else None,
     )
 
 
@@ -208,11 +250,17 @@ def jet_cache_is_current(family):
     if not all(os.path.isfile(jet_cache_path(name)) for name in JET_CACHE_FILES[family]):
         return False
     try:
-        expected = jet_cache_manifest(family)
+        expected = jet_cache_manifest(
+            family, include_sources=not runtime_args.figures_only
+        )
         saved = read_json_file(jet_manifest_path(family))
     except (OSError, ValueError):
         return False
-    return cache_manifest_matches(saved, expected)
+    return cache_manifest_matches(
+        saved,
+        expected,
+        compare_sources=not runtime_args.figures_only,
+    )
 
 
 requested_families = requested_cache_families()
@@ -424,7 +472,17 @@ if stale_cache_families & {"fixed", "annular"}:
             chunks=latlon_chunks,
         )
         ds = standardize_latlon_dataset(ds, needed_vars)
-        print(ds)
+        if runtime_args.test:
+            ds = ds.sel(
+                longitude=slice(*TEST_LONGITUDE_BOUNDS),
+            ).isel(
+                Time=slice(0, runtime_args.test_times),
+                latitude=slice(None, None, TEST_LATITUDE_STRIDE),
+            )
+            print(
+                f"{sim_names[i]} test subset: {ds.sizes['Time']} times, "
+                f"{ds.sizes['latitude']} latitudes, {ds.sizes['longitude']} longitudes"
+            )
         dss[i] = ds
 
 def zonal_mean_u_at_level(ds, plev=fixed_pressure_level):
@@ -500,6 +558,88 @@ def jet_latitude_summary(simulation, hemisphere, jet_lat, step_days):
         "modal_bin_fraction": float(hist[modal_idx] / vals.size),
         "longest_modal_residence_days": float(longest_boolean_run(in_modal) * step_days),
     }
+
+
+def jet_latitude_uncertainty(tracks_by_simulation):
+    """Estimate jet-latitude responses from complete independent time blocks."""
+
+    block_days = BLOCK_LENGTH_DAYS["jet_variability"]
+    block_means = {}
+    for simulation, tracks in tracks_by_simulation.items():
+        for hemisphere, track in tracks.items():
+            block_means[(simulation, hemisphere)] = np.asarray(
+                [
+                    float(track.isel(Time=section).mean("Time", skipna=True))
+                    for section in time_block_slices(
+                        track, block_days=block_days, complete=True
+                    )
+                ],
+                dtype=float,
+            )
+
+    comparisons = (
+        (sim_names[1], sim_names[0]),
+        (sim_names[2], sim_names[0]),
+        (sim_names[1], sim_names[2]),
+    )
+    rows = []
+    for hemisphere_index, hemisphere in enumerate(hemisphere_jet_bounds):
+        for comparison_index, (simulation, reference) in enumerate(comparisons):
+            simulation_key = (simulation, hemisphere)
+            reference_key = (reference, hemisphere)
+            if simulation_key not in block_means or reference_key not in block_means:
+                continue
+            if runtime_args.test:
+                simulation_track = np.asarray(
+                    tracks_by_simulation[simulation][hemisphere], dtype=float
+                )
+                reference_track = np.asarray(
+                    tracks_by_simulation[reference][hemisphere], dtype=float
+                )
+                rows.append(
+                    {
+                        "hemisphere": hemisphere,
+                        "simulation": simulation,
+                        "reference": reference,
+                        "mean_latitude_response_degrees": float(
+                            np.nanmean(simulation_track)
+                            - np.nanmean(reference_track)
+                        ),
+                        "ci_low_degrees": np.nan,
+                        "ci_high_degrees": np.nan,
+                        "sign_probability": np.nan,
+                        "n_simulation_blocks": 0,
+                        "n_reference_blocks": 0,
+                        "block_days": np.nan,
+                        "resampling": "omitted in test mode",
+                    }
+                )
+                continue
+            result = independent_bootstrap_difference(
+                block_means[simulation_key],
+                block_means[reference_key],
+                rng=np.random.default_rng(
+                    BOOTSTRAP_SEED + 5000 + 10 * hemisphere_index
+                    + comparison_index
+                ),
+                n_resamples=BOOTSTRAP_REPLICATES,
+            )
+            rows.append(
+                {
+                    "hemisphere": hemisphere,
+                    "simulation": simulation,
+                    "reference": reference,
+                    "mean_latitude_response_degrees": result["estimate"],
+                    "ci_low_degrees": result["interval_low"],
+                    "ci_high_degrees": result["interval_high"],
+                    "sign_probability": result["sign_probability"],
+                    "n_simulation_blocks": result["n_simulation"],
+                    "n_reference_blocks": result["n_control"],
+                    "block_days": block_days,
+                    "resampling": "independent complete time blocks by simulation",
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 fixed_level = {}
@@ -621,7 +761,19 @@ if should_run_any([1, 2]) and "fixed" in stale_cache_families:
             pd.DataFrame(jet_summary_rows),
             f"u{pressure_name(fixed_pressure_level)}_jet_latitude_summary.csv",
         )
-        write_json_file(jet_manifest_path("fixed"), jet_cache_manifest("fixed"))
+if "fixed" in stale_cache_families and fixed_level:
+    uncertainty_tracks = {
+        sim_names[index]: tracks for index, tracks in jet_latitudes.items()
+    }
+    jet_uncertainty = jet_latitude_uncertainty(uncertainty_tracks)
+    if jet_uncertainty.empty:
+        raise RuntimeError("Jet-latitude uncertainty produced no results")
+    save_table(jet_uncertainty, "jet_latitude_response_uncertainty.csv")
+    write_json_file(jet_manifest_path("fixed"), jet_cache_manifest("fixed"))
+elif "fixed" in current_cache_families:
+    jet_uncertainty = pd.read_csv(
+        jet_cache_path("jet_latitude_response_uncertainty.csv")
+    )
 
 
 # -----------------------------------------------------------------------------

@@ -45,6 +45,7 @@ from diagnostics.diagnostic_helpers import (
     ANALYSIS_START,
     FigureSaver,
     LATLON_PATTERN,
+    SPECIFIC_HUMIDITY_CMAP,
     cache_manifest,
     diagnostic_cache_dir,
     diagnostic_output_dir,
@@ -61,6 +62,11 @@ from diagnostics.diagnostic_helpers import (
     simulation_colour,
     standardize_latlon_dataset,
     total_precip_accum,
+)
+from diagnostics.analysis_config import (
+    SIMULATION_ARCHIVES,
+    SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
+    SIMULATION_ROOT,
 )
 
 
@@ -90,16 +96,16 @@ COMPONENT_NAMES = (
     "total",
 )
 
-ROOT_DIR = "/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on"
-DATA_LOCS = ("control_new", "u_nudge", "T_nudge")
-SIM_NAMES = ("control", "nudged u", "nudged T")
+ROOT_DIR = str(SIMULATION_ROOT)
+DATA_LOCS = tuple(SIMULATION_ARCHIVES.values())
+SIM_NAMES = tuple(PROJECT_SIMULATION_LABELS.values())
 SIM_COLORS = tuple(simulation_colour(name) for name in SIM_NAMES)
 COMPARISON_COLORS = SIM_COLORS[1:]
 SAVE_LOC = diagnostic_output_dir(
     "/home/cwp29/tmp/mpas/crf_on/final/vapour_transport_budget/"
 )
-CACHE_ROOT = diagnostic_cache_dir("vapour_transport_budget_cache")
-DATA_LOC = diagnostic_cache_dir("vapour_transport_budget_data")
+CACHE_ROOT = diagnostic_cache_dir("vapour_transport")
+DATA_LOC = diagnostic_cache_dir("vapour_transport_data")
 
 NEEDED_VARS = (
     "theta", "pressure", "zgrid", "rho", "qv", "relhum", "w",
@@ -1160,7 +1166,7 @@ def write_dataset_cache(dataset, path, description):
 def write_final_data_products(
     attribution, products, data_loc=DATA_LOC, test=False
 ):
-    """Write retained data products beside the simulations, not the figures."""
+    """Write retained data products below the central cache root."""
     os.makedirs(data_loc, exist_ok=True)
     suffix = "_test" if test else ""
     attribution_path = os.path.join(
@@ -2078,13 +2084,19 @@ def prepare_simulation(
     """Build one simulation's compact caches, then release its raw history."""
     product_path = cache_path(simulation, test=test)
     state_path = state_cache_path(simulation, test=test)
-    manifest = simulation_cache_manifest(
-        data_loc,
-        simulation,
-        test=test,
-        test_times=test_times,
+    manifest = (
+        None
+        if require_current
+        else simulation_cache_manifest(
+            data_loc,
+            simulation,
+            test=test,
+            test_times=test_times,
+        )
     )
-    manifest_sha256 = manifest["manifest_sha256"]
+    manifest_sha256 = (
+        None if manifest is None else manifest["manifest_sha256"]
+    )
     product_current = (
         not force
         and cache_is_current(
@@ -2694,7 +2706,7 @@ def plot_tropopause_overview(products, figsave):
                 (1.0, 2.0, 5.0, 10.0, 20.0, 50.0,
                  100.0, 200.0, 500.0, 1_000.0)
             ),
-            "cmap": "YlGnBu",
+            "cmap": SPECIFIC_HUMIDITY_CMAP,
             "extend": "both",
             "norm": mpl_colors.LogNorm(vmin=1.0, vmax=1_000.0),
         },
@@ -3432,7 +3444,14 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
+    global SAVE_LOC
     args = parse_args(argv)
+    if args.test_times < 2:
+        raise ValueError("--test-times must be at least 2")
+    if args.test:
+        SAVE_LOC = os.path.join(
+            SAVE_LOC, "testing", f"all_{args.test_times:03d}times"
+        )
     products = [
         prepare_simulation(
             data_loc, simulation, force=args.rebuild_cache,
