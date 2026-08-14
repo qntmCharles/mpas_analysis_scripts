@@ -1,0 +1,121 @@
+"""Shared cache manifests, validation, and atomic metadata writes."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+def jsonable_value(value):
+    """Convert numpy and pandas values into stable JSON values."""
+
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [jsonable_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): jsonable_value(item) for key, item in value.items()}
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return str(pd.Timestamp(value))
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def read_json_file(path):
+    """Read JSON metadata and return ``None`` for a missing file."""
+
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json_file(path, payload):
+    """Write JSON metadata through an atomic same-directory replacement."""
+
+    path = os.fspath(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(jsonable_value(payload), handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, path)
+
+
+def source_file_signature(paths):
+    """Return a stable size and modification-time source signature."""
+
+    records = []
+    for value in sorted({os.path.abspath(os.fspath(path)) for path in paths}):
+        path = Path(value)
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing cache source file: {path}")
+        stat = path.stat()
+        records.append(
+            {"path": value, "size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+        )
+    if not records:
+        raise ValueError("Cache source-file collection is empty")
+    encoded = json.dumps(records, sort_keys=True, separators=(",", ":"))
+    return {"sha256": hashlib.sha256(encoded.encode()).hexdigest(), "files": records}
+
+
+def cache_manifest(
+    producer,
+    *,
+    schema,
+    configuration=None,
+    dependencies=None,
+    source_paths=None,
+):
+    """Build one manifest from scientific settings and dependencies."""
+
+    manifest = {
+        "producer": str(producer),
+        "schema": str(schema),
+        "configuration": jsonable_value(configuration or {}),
+        "dependencies": jsonable_value(dependencies or {}),
+    }
+    if source_paths is not None:
+        manifest["sources"] = source_file_signature(source_paths)
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    manifest["manifest_sha256"] = hashlib.sha256(encoded.encode()).hexdigest()
+    return manifest
+
+
+def cache_manifest_matches(saved, expected, *, compare_sources=True):
+    """Return whether cache identities match at the requested validation level."""
+
+    if not isinstance(saved, dict) or not isinstance(expected, dict):
+        return False
+    if compare_sources:
+        return jsonable_value(saved) == jsonable_value(expected)
+    identity_keys = ("producer", "schema", "configuration", "dependencies")
+    return all(
+        jsonable_value(saved.get(key)) == jsonable_value(expected.get(key))
+        for key in identity_keys
+    ) and isinstance(saved.get("manifest_sha256"), str)
+
+
+def metadata_reader(path_resolver):
+    """Bind a cache-name path resolver to the shared JSON reader."""
+
+    return lambda name: read_json_file(path_resolver(name))
+
+
+def metadata_writer(path_resolver, enabled=True):
+    """Bind a cache-name path resolver to the shared JSON writer."""
+
+    if not enabled:
+        return lambda name, payload: None
+    return lambda name, payload: write_json_file(path_resolver(name), payload)
