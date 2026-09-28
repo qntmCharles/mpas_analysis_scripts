@@ -28,17 +28,25 @@ from diagnostics.analysis_config import (
     SIMULATION_ROOT,
     ZONAL_MEAN_PATTERN,
     cache_directory,
+    profile_cache_directory,
     simulation_colour,
 )
 from diagnostics.cache_support import (
     cache_manifest,
     cache_manifest_matches,
     jsonable_value,
+    load_netcdf,
+    materialize,
     metadata_reader,
     metadata_writer,
+    netcdf_safe_attribute,
+    netcdf_safe_attrs,
+    netcdf_safe_dataset,
     read_json_file,
     source_file_signature,
+    write_csv_atomic,
     write_json_file,
+    write_netcdf_atomic,
 )
 
 
@@ -57,6 +65,12 @@ def diagnostic_cache_dir(family, *parts):
     """Return a path from the central diagnostic cache layout."""
 
     return os.fspath(cache_directory(family, *parts))
+
+
+def diagnostic_profile_cache_dir(family, *parts):
+    """Return a cache path for products that combine simulations."""
+
+    return os.fspath(profile_cache_directory(family, *parts))
 
 
 def diagnostic_output_dir(default_save_loc, root_dir=DEFAULT_DIAGNOSTIC_OUTPUT_ROOT):
@@ -82,6 +96,31 @@ def diagnostic_output_dir(default_save_loc, root_dir=DEFAULT_DIAGNOSTIC_OUTPUT_R
     return os.path.join(override_root, rel_path) + os.sep
 
 
+def figure_release_directory(target_dir, version):
+    """Place one runner release above its diagnostic output directories."""
+
+    configured_root = (
+        os.environ.get(DIAGNOSTIC_OUTPUT_ROOT_ENV)
+        or os.environ.get(DIAGNOSTIC_FIGURE_ROOT_ENV)
+        or DEFAULT_DIAGNOSTIC_OUTPUT_ROOT
+    )
+    configured_root = os.path.abspath(os.path.expanduser(configured_root))
+    target_dir = os.path.abspath(os.path.expanduser(str(target_dir)))
+    relative = os.path.relpath(target_dir, configured_root)
+    parts = relative.split(os.sep)
+    if parts[0] == "final" and os.pardir not in parts:
+        diagnostic_parts = parts[1:]
+        if diagnostic_parts[:2] == ["organisation_lpt", "publication"]:
+            diagnostic_parts = [
+                "organisation_lpt",
+                *diagnostic_parts[2:],
+            ]
+        return os.path.join(
+            configured_root, "final", version, *diagnostic_parts
+        )
+    return os.path.join(target_dir, version)
+
+
 ISOBARIC_DIM_LEVEL_VAR = {
     "nIsoLevelsT": "t_iso_levels",
     "nIsoLevelsU": "u_iso_levels",
@@ -90,7 +129,7 @@ ISOBARIC_DIM_LEVEL_VAR = {
 
 
 def standardize_cldfrac_vertical_coordinate(ds):
-    """Give cldfrac a geometric-height z coordinate regardless of its source."""
+    """Give cldfrac a representative geometric-height ``z`` coordinate."""
     if "cldfrac" not in ds.data_vars:
         return ds
 
@@ -102,17 +141,26 @@ def standardize_cldfrac_vertical_coordinate(ds):
     elif "z" not in cldfrac.dims:
         raise ValueError(f"Could not find vertical dimension in cldfrac dims {cldfrac.dims}")
 
-    if "z" in cldfrac.coords:
-        zvals = np.asarray(cldfrac["z"].values)
-        if zvals.size == cldfrac.sizes["z"] and np.nanmax(zvals) > 100.0:
-            return ds.assign(cldfrac=cldfrac)
-
     if "zgrid" not in ds.data_vars:
-        raise ValueError("Cannot assign geometric z coordinate to cldfrac: zgrid is missing")
+        if "z" in cldfrac.coords:
+            return ds.assign(cldfrac=cldfrac)
+        raise ValueError(
+            "Cannot assign geometric z coordinate to cldfrac: zgrid is missing"
+        )
 
-    zgrid_mean = lat_mean(
-        ds.zgrid.mean(dim="longitude", skipna=True)
-    )
+    zgrid_mean = ds.zgrid
+    for dimension in ("Time", "longitude"):
+        if dimension in zgrid_mean.dims:
+            zgrid_mean = zgrid_mean.mean(dimension, skipna=True)
+    if "latitude" in zgrid_mean.dims:
+        zgrid_mean = lat_mean(zgrid_mean)
+    remaining = [
+        dimension
+        for dimension in zgrid_mean.dims
+        if dimension != "nVertLevelsP1"
+    ]
+    if remaining:
+        zgrid_mean = zgrid_mean.mean(remaining, skipna=True)
     zmid = 0.5 * (
         zgrid_mean.isel(nVertLevelsP1=slice(0, -1)).values
         + zgrid_mean.isel(nVertLevelsP1=slice(1, None)).values
@@ -124,7 +172,9 @@ def standardize_cldfrac_vertical_coordinate(ds):
         )
     cldfrac = cldfrac.assign_coords(z=("z", zmid))
     cldfrac["z"].attrs["units"] = "m"
-    cldfrac["z"].attrs["long_name"] = "geometric height of layer midpoints"
+    cldfrac["z"].attrs["long_name"] = (
+        "time-horizontal-mean geometric height of layer midpoints"
+    )
     return ds.assign(cldfrac=cldfrac)
 
 
@@ -1033,10 +1083,11 @@ class FigureSaver:
         date_stamp=None,
     ):
         self.target_dir = diagnostic_output_dir(save_loc)
+        environment_version = os.environ.get(DIAGNOSTIC_FIGURE_VERSION_ENV)
         selected_version = str(
             version
             or date_stamp
-            or os.environ.get(DIAGNOSTIC_FIGURE_VERSION_ENV)
+            or environment_version
             or DEFAULT_DIAGNOSTIC_FIGURE_VERSION
         )
         if (
@@ -1047,7 +1098,12 @@ class FigureSaver:
         self.version = selected_version
         # Retain the historical attribute for callers that inspect it.
         self.date_stamp = selected_version
-        self.save_loc = os.path.join(self.target_dir, selected_version)
+        if environment_version and version is None and date_stamp is None:
+            self.save_loc = figure_release_directory(
+                self.target_dir, selected_version
+            )
+        else:
+            self.save_loc = os.path.join(self.target_dir, selected_version)
         self.enabled = enabled
         self.index = start
         self.dpi = dpi
@@ -1099,42 +1155,6 @@ def configured_label(mapping, name):
     """Return a configured display label, falling back to the key itself."""
 
     return mapping.get(name, {}).get("label", name)
-
-
-def netcdf_safe_attribute(value):
-    """Convert metadata to scalar/array types accepted by NetCDF backends."""
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, bool):
-        return np.int8(value)
-    if value is None:
-        return ""
-    if isinstance(value, dict):
-        return json.dumps(jsonable_value(value), sort_keys=True)
-    if isinstance(value, (list, tuple, np.ndarray)):
-        array = np.asarray(value)
-        if array.dtype.kind == "b":
-            return array.astype(np.int8)
-        if array.dtype.kind in "SUif":
-            return array
-        return json.dumps(jsonable_value(value), sort_keys=True)
-    if isinstance(value, (str, int, float)):
-        return value
-    return str(value)
-
-
-def netcdf_safe_attrs(attrs):
-    """Return a mapping containing only NetCDF-serializable attribute values."""
-    return {key: netcdf_safe_attribute(value) for key, value in attrs.items()}
-
-
-def netcdf_safe_dataset(ds):
-    """Return a shallow dataset copy with NetCDF-serializable attributes."""
-    out = ds.copy(deep=False)
-    out.attrs = netcdf_safe_attrs(ds.attrs)
-    for name in out.variables:
-        out[name].attrs = netcdf_safe_attrs(ds[name].attrs)
-    return out
 
 
 def subset_between(da, dim, bounds):

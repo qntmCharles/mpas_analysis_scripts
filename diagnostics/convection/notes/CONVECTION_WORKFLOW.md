@@ -12,9 +12,7 @@ The runner enforces this dependency order:
 2. `lpo_tracking.py`
 3. `equatorial_wave_diagnostics.py --figures 11 13 14`
 4. `lpo_lifecycle_analysis.py`
-5. `significance_bootstrap_diagnostics.py`
 
-Wave Figure 11 supplies the response table consumed by the bootstrap analysis.
 Figure 13 supplies the Kelvin reference-dispersion product and action 14 writes
 the compact filtered event sections consumed by the lifecycle analysis.
 
@@ -28,11 +26,8 @@ python run_all_diagnostics.py \
   --rebuild-convection-caches
 ```
 
-This forces wave, lifecycle-section, and bootstrap regeneration. High-cloud
-classification and LPO tracking are still run in the required order, but their
-caches are not forcibly invalidated because they do not derive products from
-`omg_isobaric`. Cache versions also encode the corrected T-nudge omega revision,
-so stale pre-correction products are rejected by ordinary subsequent runs.
+This rebuilds high-cloud, LPO, wave, and lifecycle products. Use this mode only
+after a relevant scientific calculation changes.
 
 Use `--dry-run` to inspect the exact commands and `--list` to inspect the order.
 Normal workflow runs reuse current caches, which is the intended mode for rapid

@@ -10,7 +10,7 @@ that stable interface and owns every downstream lifecycle calculation:
 * native-level vertical cloud-fraction profiles;
 * Kelvin, mixed Rossby-gravity, equatorial-Rossby, TD-type and
   eastward-intraseasonal fields sampled along the saved LPO path;
-* event summaries, independent-event composites and lifecycle Figures 4--50.
+* event summaries, independent-event composites and lifecycle figure selectors.
 
 No tracking is performed here and no upstream-LPT internal file is read.
 Lifecycle tables, profiles and composite datasets are written beside the
@@ -87,8 +87,15 @@ from diagnostics.diagnostic_helpers import (
     source_file_signature,
     symmetric_levels,
     vertical_dim,
+    write_csv_atomic,
+    write_netcdf_atomic,
 )
-from diagnostics.analysis_config import cache_directory
+from diagnostics.analysis_config import (
+    ACTIVE_SIMULATION_PROFILE,
+    DEFAULT_SIMULATION_PROFILE,
+    SIMULATION_LABELS as CONFIGURED_SIMULATION_LABELS,
+    cache_directory,
+)
 from diagnostics.waves.cached_wave_products import (
     filtered_wave_cache_path,
     load_existing_filtered_wave,
@@ -102,6 +109,7 @@ from diagnostics.waves.equatorial_wave_config import (
     WAVE_CONFIG_VERSION,
 )
 from diagnostics.waves.wave_metrics import (
+    blockwise_buoyancy_frequency_squared,
     buoyancy_frequency_squared,
     sample_masked_field,
 )
@@ -118,29 +126,47 @@ from diagnostics.convection.lpo_lifecycle_sections import (
     COMPOSITE_CACHE_VERSION,
     DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES,
     LONGITUDE_HALF_WIDTH_SENSITIVITY_DEGREES,
+    PHASE_ALIGNMENT_WINDOWS_HOURS,
     SECTION_CACHE_VERSION,
     SURFACE_VARIABLES,
     VERTICAL_VARIABLES,
+    _event_cube,
     build_review_response_composites,
     build_simulation_composites,
     build_unfiltered_event_sections,
     combine_simulation_composites,
+    event_equal_statistics,
+    independent_event_contrast,
+    longitude_window_mean,
 )
 
 
 LIFECYCLE_ANALYSIS_VERSION = (
-    "lpo-lifecycle-analysis-v10-tropics-20deg"
+    "lpo-lifecycle-analysis-v11-native-z-profiles"
 )
-LIFECYCLE_FIGURES = tuple(range(4, 51))
-VALIDATION_LIFECYCLE_FIGURE = 108
+LIFECYCLE_FIGURES = (*range(4, 46), "45a", *range(46, 54))
+WAVE_PHASE_PROFILE_FIGURE = 51
+WAVE_COUPLING_LIFECYCLE_FIGURE = 52
+WAVE_COUPLING_RESPONSE_FIGURE = 53
 LIFECYCLE_STEP_FILENAME = "lpo_lifecycle_steps.csv"
 LIFECYCLE_SUMMARY_FILENAME = "lpo_lifecycle_event_summary.csv"
 LIFECYCLE_PROFILE_FILENAME = "lpo_lifecycle_vertical_profiles.csv"
 LIFECYCLE_CONFIGURATION_FILENAME = "lpo_lifecycle_configuration.json"
-LIFECYCLE_COMPOSITE_FILENAME = "lpo_lifecycle_event_equal_composites.nc"
+LIFECYCLE_PROFILE_SUFFIX = (
+    ""
+    if ACTIVE_SIMULATION_PROFILE == DEFAULT_SIMULATION_PROFILE
+    else f".{ACTIVE_SIMULATION_PROFILE}"
+)
+LIFECYCLE_COMPOSITE_FILENAME = (
+    f"lpo_lifecycle_event_equal_composites{LIFECYCLE_PROFILE_SUFFIX}.nc"
+)
 LIFECYCLE_SECTION_FILENAME = "lpo_lifecycle_event_sections.nc"
-LIFECYCLE_2D_COMPOSITE_FILENAME = "lpo_lifecycle_2d_composites.nc"
+LIFECYCLE_2D_COMPOSITE_FILENAME = (
+    f"lpo_lifecycle_2d_composites{LIFECYCLE_PROFILE_SUFFIX}.nc"
+)
 LIFECYCLE_EVENT_CACHE_DIRECTORY = "lpo_lifecycle_event_cache"
+LIFECYCLE_BASELINE_TIME_BATCH_SIZE = 32
+LIFECYCLE_VERTICAL_BASELINE_TIME_BATCH_SIZE = 8
 TEST_EVENTS_PER_SIMULATION = 2
 TEST_MODE = False
 DEEP_CLOUD_TOP_PERCENTILE = 10
@@ -152,11 +178,20 @@ RAIN_VOLUME_LABEL = r"Integrated rain volume (km$^3$)"
 RAIN_VOLUME_TITLE = "Integrated rain volume"
 RAIN_VOLUME_UNITS = r"km$^3$"
 LIFECYCLE_LAG_LABEL = "Lag from precipitation peak (h)"
+NEAR_PEAK_LAGS_HOURS = (-12, -6, 0, 6, 12)
+SPATIAL_STAGE_WINDOWS = (
+    ("Pre-peak", (-42, -36, -30, -24, -18)),
+    ("Near-peak", NEAR_PEAK_LAGS_HOURS),
+    ("Post-peak", (18, 24, 30, 36, 42)),
+)
 
+SIMULATION_ROWS = tuple(SIMULATION_DIRS)
+RESPONSE_ROWS = tuple(
+    simulation for simulation in SIMULATION_ROWS if simulation != "control"
+)
 WAVE_SIMULATION_LABELS = {
-    "control": "control",
-    "nudged-u": "nudged u",
-    "nudged-T": "nudged T",
+    simulation: CONFIGURED_SIMULATION_LABELS[simulation]
+    for simulation in SIMULATION_ROWS
 }
 WAVE_FIELD_DEFINITIONS = {
     "Precip": ("precip_mm_day", "mm day-1"),
@@ -383,6 +418,8 @@ def diagnose_event_steps(
 
     def load_event_horizontal_fields(
         source: Mapping[str, xr.DataArray],
+        *,
+        source_label: str,
     ) -> dict[str, xr.DataArray]:
         """Load each reusable event slice once instead of once per track step."""
 
@@ -405,7 +442,16 @@ def diagnose_event_steps(
             loaded[name] = field.sel(indexers).reset_coords(drop=True)
         if not loaded:
             return loaded
+        progress(
+            f"{simulation}/{event_id}: loading {len(loaded)} "
+            f"{source_label} fields for {precipitation.sizes['Time']} times, "
+            f"{precipitation.sizes['latitude']} latitudes, and "
+            f"{precipitation.sizes['longitude']} longitudes"
+        )
         loaded_dataset = xr.Dataset(loaded).load()
+        progress(
+            f"{simulation}/{event_id}: loaded {source_label} event fields"
+        )
         return {
             name: loaded_dataset[name]
             for name in loaded
@@ -415,8 +461,14 @@ def diagnose_event_steps(
     # this event-level materialisation those means are recomputed separately
     # for every six-hour track step, making even a short smoke test needlessly
     # expensive.
-    classification = load_event_horizontal_fields(classification)
-    model_fields = load_event_horizontal_fields(model_fields)
+    classification = load_event_horizontal_fields(
+        classification,
+        source_label="classification",
+    )
+    model_fields = load_event_horizontal_fields(
+        model_fields,
+        source_label="model",
+    )
     area = grid_cell_area_km2(
         precipitation.latitude.values, precipitation.longitude.values
     )
@@ -581,7 +633,142 @@ def _profile_value_at_index(profile: np.ndarray, index: float) -> float:
     return float(values[integer_index])
 
 
-def project_model_fields(dataset: xr.Dataset, precipitation: xr.DataArray) -> dict:
+def _bounded_time_longitude_means(
+    fields: Mapping[str, xr.DataArray],
+    *,
+    batch_size: int,
+    progress_label: str,
+) -> dict[str, xr.DataArray]:
+    """Calculate full-record zonal-time means in explicit memory bounds."""
+
+    if not fields:
+        return {}
+    if batch_size < 1:
+        raise ValueError("Lifecycle baseline batch size must be positive")
+    first = next(iter(fields.values()))
+    if not {"Time", "longitude"}.issubset(first.dims):
+        raise ValueError("Lifecycle baseline fields require Time and longitude")
+    time_count = first.sizes["Time"]
+    for name, field in fields.items():
+        if not {"Time", "longitude"}.issubset(field.dims):
+            raise ValueError(
+                f"Lifecycle baseline field {name!r} requires Time and longitude"
+            )
+        if not field.indexes["Time"].equals(first.indexes["Time"]):
+            raise ValueError(
+                f"Lifecycle baseline field {name!r} has different times"
+            )
+
+    total_sums: dict[str, xr.DataArray] = {}
+    total_counts: dict[str, xr.DataArray] = {}
+    batch_count = (time_count + batch_size - 1) // batch_size
+    for batch_number, start in enumerate(
+        range(0, time_count, batch_size), start=1
+    ):
+        stop = min(start + batch_size, time_count)
+        progress(
+            f"{progress_label}: baseline time batch {batch_number}/"
+            f"{batch_count} ({start + 1}-{stop}/{time_count})"
+        )
+        partial_variables: dict[str, xr.DataArray] = {}
+        for name, field in fields.items():
+            block = field.isel(Time=slice(start, stop)).reset_coords(drop=True)
+            dimensions = ("Time", "longitude")
+            partial_variables[f"{name}__sum"] = block.sum(
+                dimensions, skipna=True
+            )
+            partial_variables[f"{name}__count"] = block.notnull().sum(
+                dimensions
+            )
+        partial = xr.Dataset(partial_variables).load()
+        for name in fields:
+            block_sum = partial[f"{name}__sum"]
+            block_count = partial[f"{name}__count"]
+            if name not in total_sums:
+                total_sums[name] = block_sum.copy(deep=True)
+                total_counts[name] = block_count.copy(deep=True)
+            else:
+                total_sums[name] += block_sum
+                total_counts[name] += block_count
+
+    baselines: dict[str, xr.DataArray] = {}
+    for name in fields:
+        baseline = total_sums[name] / total_counts[name].where(
+            total_counts[name] > 0
+        )
+        baseline.name = f"{name}_time_zonal_mean"
+        baselines[name] = baseline
+    return baselines
+
+
+def _ttl_layer_mean_n2(
+    theta: xr.DataArray,
+    height: xr.DataArray,
+    layer_thickness: xr.DataArray,
+    vertical_dimension: str,
+    *,
+    progress_label: str,
+) -> xr.DataArray:
+    """Calculate TTL N² from only relevant levels and exact gradient halos."""
+
+    lower_m = 1000.0 * TTL_HEIGHT_BOUNDS_KM[0]
+    upper_m = 1000.0 * TTL_HEIGHT_BOUNDS_KM[1]
+    in_layer = (height >= lower_m) & (height <= upper_m)
+    reduction_dimensions = [
+        dimension
+        for dimension in in_layer.dims
+        if dimension != vertical_dimension
+    ]
+    level_support = (
+        in_layer.any(reduction_dimensions).load()
+        if reduction_dimensions
+        else in_layer.load()
+    )
+    selected_levels = np.flatnonzero(
+        np.asarray(level_support.values, dtype=bool)
+    )
+    if not selected_levels.size:
+        raise RuntimeError(
+            "No MPAS native levels intersect the configured TTL height layer"
+        )
+    support_start = max(0, int(selected_levels[0]) - 1)
+    support_stop = min(
+        theta.sizes[vertical_dimension],
+        int(selected_levels[-1]) + 2,
+    )
+    progress(
+        f"{progress_label}: TTL N2 uses native levels "
+        f"{support_start + 1}-{support_stop}/"
+        f"{theta.sizes[vertical_dimension]}"
+    )
+    selector = {vertical_dimension: slice(support_start, support_stop)}
+    theta_support = theta.isel(selector)
+    height_support = height.isel(selector)
+    thickness_support = layer_thickness.isel(selector)
+    in_layer_support = in_layer.isel(selector)
+    n2 = blockwise_buoyancy_frequency_squared(
+        theta_support,
+        height_support,
+        vertical_dimension,
+        mask_nonpositive=False,
+    )
+    valid_layer = in_layer_support & np.isfinite(n2)
+    return (
+        (n2 * thickness_support)
+        .where(valid_layer)
+        .sum(vertical_dimension, skipna=True)
+        / thickness_support.where(valid_layer).sum(
+            vertical_dimension, skipna=True
+        )
+    )
+
+
+def project_model_fields(
+    dataset: xr.Dataset,
+    precipitation: xr.DataArray,
+    *,
+    progress_label: str = "lifecycle",
+) -> dict:
     """Project the fixed MPAS input contract onto stable lifecycle names."""
 
     required = (
@@ -645,9 +832,6 @@ def project_model_fields(dataset: xr.Dataset, precipitation: xr.DataArray) -> di
         (temperature.pres >= 100.0) & (temperature.pres <= 200.0),
         drop=True,
     ).mean("pres", skipna=True)
-    fields["utls_temperature_anomaly"] = (
-        utls - utls.mean(("Time", "longitude"), skipna=True)
-    )
     t100 = temperature.sel(pres=100.0, method="nearest")
     t200 = temperature.sel(pres=200.0, method="nearest")
     theta100 = t100 * (1000.0 / float(t100.pres)) ** 0.286
@@ -715,26 +899,12 @@ def project_model_fields(dataset: xr.Dataset, precipitation: xr.DataArray) -> di
     theta, height, layer_thickness = xr.align(
         theta, height, layer_thickness, join="exact"
     )
-    n2 = xr.apply_ufunc(
-        buoyancy_frequency_squared,
+    layer_n2 = _ttl_layer_mean_n2(
         theta,
         height,
-        kwargs={"mask_nonpositive": False},
-        input_core_dims=[[zdim], [zdim]],
-        output_core_dims=[[zdim]],
-        vectorize=True,
-        dask="parallelized",
-        output_dtypes=[float],
-        dask_gufunc_kwargs={"allow_rechunk": True},
-    )
-    in_layer = (
-        (height >= 1000.0 * TTL_HEIGHT_BOUNDS_KM[0])
-        & (height <= 1000.0 * TTL_HEIGHT_BOUNDS_KM[1])
-    )
-    valid_layer = in_layer & np.isfinite(n2)
-    layer_n2 = (
-        (n2 * layer_thickness).where(valid_layer).sum(zdim, skipna=True)
-        / layer_thickness.where(valid_layer).sum(zdim, skipna=True)
+        layer_thickness,
+        zdim,
+        progress_label=progress_label,
     )
     layer_n2.attrs.update(
         units="s-2",
@@ -788,27 +958,75 @@ def project_model_fields(dataset: xr.Dataset, precipitation: xr.DataArray) -> di
             * dz
         ).where(high).sum(zdim, skipna=True)
 
-    # Event anomalies retain each experiment's altered mean state by removing
-    # only that simulation's own time-mean zonal mean at the same latitude.
-    # Materialise these compact latitude-only baselines once per simulation;
-    # otherwise their full reductions are rebuilt independently for every LPO.
-    for name in environmental_names:
-        field = fields[name]
-        dimensions = [dim for dim in ("Time", "longitude") if dim in field.dims]
-        if not dimensions:
-            raise RuntimeError(
-                f"Cannot form event anomaly for {name!r}: expected Time "
-                "and/or longitude dimension"
+    # Event anomalies retain each experiment's altered mean state. Calculate
+    # the full-record baselines in explicit batches to prevent Dask from
+    # materialising several complete native-level columns concurrently.
+    expensive_names = {
+        "layer_mean_n2_ttl",
+        "cold_point_tropopause_height_m",
+    }
+    baseline_groups = (
+        ("surface environment", ("olr", "precipitable_water_kg_m2")),
+        (
+            "temperature environment",
+            (
+                "temperature_100hpa",
+                "temperature_100_200hpa",
+                "tropopause_static_stability",
+                "cold_point_tropopause_pressure_hpa",
+            ),
+        ),
+        (
+            "wind environment",
+            (
+                "zonal_wind_100hpa",
+                "zonal_wind_250hpa",
+                "upper_tropospheric_zonal_wind",
+                "utls_shear_u100_minus_u250",
+                "deep_layer_shear_u200_minus_u850",
+            ),
+        ),
+    )
+    grouped_names = {
+        name for _label, names in baseline_groups for name in names
+    }
+    expected_standard_names = set(environmental_names) - expensive_names
+    if grouped_names != expected_standard_names:
+        raise RuntimeError(
+            "Lifecycle baseline groups do not match environmental fields: "
+            f"missing={sorted(expected_standard_names - grouped_names)}, "
+            f"extra={sorted(grouped_names - expected_standard_names)}"
+        )
+    baselines: dict[str, xr.DataArray] = {}
+    for group_label, names in baseline_groups:
+        baselines.update(
+            _bounded_time_longitude_means(
+                {name: fields[name] for name in names},
+                batch_size=LIFECYCLE_BASELINE_TIME_BATCH_SIZE,
+                progress_label=f"{progress_label}: {group_label}",
             )
+        )
+    for name in (
+        "layer_mean_n2_ttl",
+        "cold_point_tropopause_height_m",
+    ):
+        baselines.update(
+            _bounded_time_longitude_means(
+                {name: fields[name]},
+                batch_size=LIFECYCLE_VERTICAL_BASELINE_TIME_BATCH_SIZE,
+                progress_label=f"{progress_label}: {name}",
+            )
+        )
+    fields["utls_temperature_anomaly"] = (
+        utls - baselines["temperature_100_200hpa"]
+    )
+    for name in environmental_names:
         anomaly_name = (
             "olr_event_anomaly"
             if name == "olr"
             else f"{name}_event_anomaly"
         )
-        baseline = field.mean(
-            dimensions, skipna=True
-        ).reset_coords(drop=True).load()
-        fields[anomaly_name] = field - baseline
+        fields[anomaly_name] = fields[name] - baselines[name]
     _require_mapping_fields(
         fields,
         (*REQUIRED_EVENT_MODEL_FIELDS, "cloud_fraction_profile"),
@@ -1208,7 +1426,7 @@ def bootstrap_event_composite(
     }
     contrasts = [
         simulation
-        for simulation in ("nudged-u", "nudged-T")
+        for simulation in RESPONSE_ROWS
         if simulation in bootstrap_by_simulation
         and "control" in bootstrap_by_simulation
     ]
@@ -1450,6 +1668,28 @@ def _sample_native_cloud_profiles(
 ) -> pd.DataFrame:
     """Area-average native cloud, height and pressure profiles in each LPO."""
 
+    def align_midlevel_field(
+        field: xr.DataArray,
+        reference: xr.DataArray,
+        *,
+        name: str,
+    ) -> xr.DataArray:
+        """Align one native midpoint field to the reference ``z`` axis."""
+
+        source_dimension = vertical_dim(field)
+        if source_dimension == "nVertLevelsP1":
+            raise ValueError(f"{name} uses interface levels, not midpoints")
+        source_levels = field.sizes[source_dimension]
+        target_levels = reference.sizes["z"]
+        if source_levels != target_levels:
+            raise ValueError(
+                f"{name} has {source_levels} native levels, but cldfrac has "
+                f"{target_levels}"
+            )
+        if source_dimension != "z":
+            field = field.rename({source_dimension: "z"})
+        return field.assign_coords(z=reference.z)
+
     def select_event_grid(
         field: xr.DataArray, mask: xr.DataArray
     ) -> xr.DataArray:
@@ -1464,9 +1704,20 @@ def _sample_native_cloud_profiles(
 
     rows: list[pd.DataFrame] = []
     cloud = dataset.cldfrac
+    cloud_dimension = vertical_dim(cloud)
+    if cloud_dimension == "nVertLevelsP1":
+        raise ValueError("cldfrac uses interface levels, not midpoints")
+    if cloud_dimension != "z":
+        cloud = cloud.rename({cloud_dimension: "z"})
+    if "z" not in cloud.coords:
+        cloud = cloud.assign_coords(z=np.arange(cloud.sizes["z"]))
     height = native_midlevel_height(dataset, cloud)
-    pressure_hpa = pressure_to_pa(dataset.pressure) / 100.0
-    level_dimension = vertical_dim(cloud)
+    height = align_midlevel_field(height, cloud, name="native height")
+    pressure_hpa = align_midlevel_field(
+        pressure_to_pa(dataset.pressure) / 100.0,
+        cloud,
+        name="pressure",
+    )
     for event_id in event_ids:
         event_timing = timing[timing.event_id == event_id].copy()
         event_timing["Time"] = pd.to_datetime(event_timing.Time)
@@ -1488,33 +1739,45 @@ def _sample_native_cloud_profiles(
         weights = area.where(mask)
         denominator = weights.sum(("latitude", "longitude"), skipna=True)
         safe_denominator = denominator.where(denominator > 0)
+        profile_fields = xr.align(
+            (
+                (event_cloud * weights).sum(
+                    ("latitude", "longitude"), skipna=True
+                )
+                / safe_denominator
+            ),
+            (
+                (event_height * weights).sum(
+                    ("latitude", "longitude"), skipna=True
+                )
+                / safe_denominator
+            ),
+            (
+                (event_pressure * weights).sum(
+                    ("latitude", "longitude"), skipna=True
+                )
+                / safe_denominator
+            ),
+            join="exact",
+        )
         profiles = xr.Dataset(
-            {
-                "cloud_fraction": (
-                    (event_cloud * weights).sum(
-                        ("latitude", "longitude"), skipna=True
-                    )
-                    / safe_denominator
-                ),
-                "height_m": (
-                    (event_height * weights).sum(
-                        ("latitude", "longitude"), skipna=True
-                    )
-                    / safe_denominator
-                ),
-                "pressure_hpa": (
-                    (event_pressure * weights).sum(
-                        ("latitude", "longitude"), skipna=True
-                    )
-                    / safe_denominator
-                ),
-            }
+            dict(
+                zip(
+                    ("cloud_fraction", "height_m", "pressure_hpa"),
+                    profile_fields,
+                    strict=True,
+                )
+            )
+        ).assign_coords(
+            vertical_level_index=(
+                "z",
+                np.arange(cloud.sizes["z"], dtype=int),
+            )
         ).load()
         frame = profiles.to_dataframe().reset_index()
         frame["simulation"] = simulation
         frame["event_id"] = event_id
-        frame["vertical_level_index"] = frame[level_dimension].astype(int)
-        frame = frame.drop(columns=[level_dimension])
+        frame = frame.drop(columns=["z"])
         frame = frame.merge(
             event_timing[["Time", "lag_hours"]],
             on="Time",
@@ -1584,10 +1847,7 @@ def _file_sha256(path: Path) -> str:
 def _atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
     """Write a CSV atomically."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    frame.to_csv(temporary, index=False)
-    os.replace(temporary, path)
+    write_csv_atomic(frame, path, index=False)
 
 
 def _metadata_hash_is_valid(metadata: Mapping[str, object]) -> bool:
@@ -1691,6 +1951,67 @@ def _event_cache_paths(
     )
 
 
+def _require_valid_native_profiles(
+    profiles: pd.DataFrame,
+    steps: pd.DataFrame,
+) -> None:
+    """Require one native-level profile row for each step and level."""
+
+    key_columns = ["event_id", "Time"]
+    profile_key_columns = key_columns + ["vertical_level_index"]
+    missing_steps = set(key_columns) - set(steps.columns)
+    missing_profiles = set(profile_key_columns) - set(profiles.columns)
+    if missing_steps or missing_profiles:
+        raise ValueError(
+            "Lifecycle profile tables lack required keys: "
+            f"steps={sorted(missing_steps)}, "
+            f"profiles={sorted(missing_profiles)}"
+        )
+    if steps.empty or profiles.empty:
+        raise ValueError("Lifecycle steps and native profiles must be non-empty")
+
+    step_keys = steps[key_columns].copy()
+    profile_keys = profiles[profile_key_columns].copy()
+    step_keys["event_id"] = step_keys.event_id.astype(str)
+    profile_keys["event_id"] = profile_keys.event_id.astype(str)
+    step_keys["Time"] = pd.to_datetime(step_keys.Time)
+    profile_keys["Time"] = pd.to_datetime(profile_keys.Time)
+    if step_keys.duplicated().any():
+        raise ValueError("Lifecycle steps contain duplicate event-time keys")
+
+    numeric_levels = pd.to_numeric(
+        profile_keys.vertical_level_index,
+        errors="raise",
+    ).to_numpy(dtype=float)
+    if not np.all(np.isfinite(numeric_levels)):
+        raise ValueError("Native vertical level indices must be finite")
+    integer_levels = numeric_levels.astype(np.int64)
+    if np.any(numeric_levels != integer_levels) or np.any(integer_levels < 0):
+        raise ValueError("Native vertical level indices must be non-negative integers")
+    profile_keys["vertical_level_index"] = integer_levels
+    if profile_keys.duplicated().any():
+        raise ValueError(
+            "Native profiles contain duplicate event-time-level keys"
+        )
+
+    expected_step_keys = set(map(tuple, step_keys.to_numpy()))
+    actual_step_keys = set(
+        map(tuple, profile_keys[key_columns].drop_duplicates().to_numpy())
+    )
+    if actual_step_keys != expected_step_keys:
+        raise ValueError("Native profile event-time keys differ from lifecycle steps")
+
+    levels = np.unique(integer_levels)
+    expected_levels = np.arange(levels.size, dtype=np.int64)
+    if not np.array_equal(levels, expected_levels):
+        raise ValueError("Native vertical level indices must form a zero-based axis")
+    group_sizes = profile_keys.groupby(key_columns, sort=False).size()
+    if not np.all(group_sizes.to_numpy() == levels.size):
+        raise ValueError(
+            "Each lifecycle step must contain every native vertical level"
+        )
+
+
 def _cleanup_event_checkpoints(standard: Path) -> None:
     """Remove intermediate checkpoints after final-bundle validation."""
 
@@ -1748,6 +2069,7 @@ def _read_event_checkpoint(
             return None
         if set(profiles.event_id) != {str(event_id)}:
             return None
+        _require_valid_native_profiles(profiles, steps)
         return steps, profiles
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -1766,6 +2088,7 @@ def _write_event_checkpoint(
 ) -> None:
     """Commit one event checkpoint after both calculations finish."""
 
+    _require_valid_native_profiles(profiles, steps)
     steps_path, profiles_path, metadata_path = _event_cache_paths(
         standard, event_id
     )
@@ -1851,6 +2174,7 @@ def _read_simulation_bundle(
             return None
         if set(profiles.event_id) != expected_ids:
             return None
+        _require_valid_native_profiles(profiles, lifecycle)
         return lifecycle, summary, profiles
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -1988,12 +2312,9 @@ def _write_run_composite(
         }
     )
     composite_path = run_directory / LIFECYCLE_COMPOSITE_FILENAME
-    composite_tmp = composite_path.with_suffix(
-        composite_path.suffix + ".tmp"
-    )
-    netcdf_safe_dataset(composite).to_netcdf(composite_tmp)
-    os.replace(composite_tmp, composite_path)
-    summary.to_csv(
+    write_netcdf_atomic(composite, composite_path)
+    write_csv_atomic(
+        summary,
         run_directory / LIFECYCLE_SUMMARY_FILENAME,
         index=False,
     )
@@ -2019,10 +2340,7 @@ def _section_latitude_slice(
 
 
 def _atomic_write_netcdf(dataset: xr.Dataset, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    netcdf_safe_dataset(dataset).to_netcdf(temporary)
-    os.replace(temporary, path)
+    write_netcdf_atomic(dataset, path)
 
 
 def _event_section_cache_is_current(
@@ -2183,9 +2501,19 @@ def analyse_run_lifecycles(
     *,
     test: bool = False,
     force_recompute_caches: bool = False,
+    simulations: Sequence[str] | None = None,
+    finalize: bool = True,
 ) -> None:
     """Build lifecycle-owned products from one tracking run directory."""
 
+    selected_simulations = tuple(simulations or SIMULATION_DIRS)
+    unknown_simulations = sorted(
+        set(selected_simulations) - set(SIMULATION_DIRS)
+    )
+    if unknown_simulations:
+        raise ValueError(f"Unknown lifecycle simulations: {unknown_simulations}")
+    if finalize and set(selected_simulations) != set(SIMULATION_DIRS):
+        raise ValueError("Lifecycle finalization requires every simulation")
     combined_lifecycle: list[pd.DataFrame] = []
     combined_summary: list[pd.DataFrame] = []
     build_two_dimensional = run_directory.name == "primary"
@@ -2193,10 +2521,10 @@ def analyse_run_lifecycles(
     section_paths: dict[str, Path] = {}
     kelvin_reference = (
         load_existing_kelvin_dispersion(test=test)
-        if build_two_dimensional
+        if build_two_dimensional and finalize
         else None
     )
-    for simulation in SIMULATION_DIRS:
+    for simulation in selected_simulations:
         standard = run_directory / simulation / "standard"
         timing_path = standard / "lpt_event_relative_diagnostics.csv"
         event_path = standard / "lpt_events.csv"
@@ -2370,6 +2698,11 @@ def analyse_run_lifecycles(
                 model_fields = project_model_fields(
                     dataset,
                     projection_precipitation,
+                    progress_label=f"{run_directory.name}/{simulation}",
+                )
+                progress(
+                    f"{run_directory.name}/{simulation}: environment "
+                    "baselines complete"
                 )
                 for event_number, event_id in enumerate(
                     event_ids, start=1
@@ -2395,6 +2728,11 @@ def analyse_run_lifecycles(
                         event_id=event_id,
                         simulation=simulation,
                     )
+                    progress(
+                        f"{run_directory.name}/{simulation}: event "
+                        f"{event_number}/{len(event_ids)} horizontal "
+                        "diagnostics complete"
+                    )
                     steps = _merge_authoritative_timing(
                         diagnosed, event_timing
                     )
@@ -2404,6 +2742,11 @@ def analyse_run_lifecycles(
                         event_timing,
                         [event_id],
                         simulation,
+                    )
+                    progress(
+                        f"{run_directory.name}/{simulation}: event "
+                        f"{event_number}/{len(event_ids)} native profiles "
+                        "complete"
                     )
                     _write_event_checkpoint(
                         standard,
@@ -2419,6 +2762,10 @@ def analyse_run_lifecycles(
                     )
                     event_checkpoints[event_id] = (
                         steps, event_profiles
+                    )
+                    progress(
+                        f"{run_directory.name}/{simulation}: event "
+                        f"{event_number}/{len(event_ids)} checkpoint saved"
                     )
             event_rows = [
                 event_checkpoints[event_id][0] for event_id in event_ids
@@ -2436,6 +2783,7 @@ def analyse_run_lifecycles(
                 how="left",
                 validate="one_to_one",
             )
+            _require_valid_native_profiles(profiles, lifecycle)
             _atomic_write_csv(
                 lifecycle, standard / LIFECYCLE_STEP_FILENAME
             )
@@ -2510,51 +2858,79 @@ def analyse_run_lifecycles(
                     ],
                 )
                 _atomic_write_netcdf(event_sections, section_path)
-            wave_sections = load_existing_lpo_wave_sections(
-                simulation,
-                tracking_product_version=PRODUCT_VERSION,
-                test=test,
-            )
-            wave_sections = _align_wave_sections_to_unfiltered_events(
-                wave_sections, event_sections
-            )
-            simulation_composites[simulation] = (
-                build_simulation_composites(
-                    event_sections,
-                    wave_sections,
-                    primary_k_m1=float(
-                        kelvin_reference.attrs["primary_k_m-1"]
-                    ),
-                    primary_m_m1=float(
-                        kelvin_reference.attrs["primary_m_m-1"]
-                    ),
-                    test=test,
-                    background_profile=kelvin_reference.sel(
-                        simulation=WAVE_SIMULATION_LABELS[simulation],
-                        zonal_wavenumber=1,
-                        vertical_wavelength_km=10.0,
-                    ),
+                progress(
+                    f"{run_directory.name}/{simulation}: wrote event "
+                    f"section cache {section_path}"
                 )
-            )
+            if finalize:
+                assert kelvin_reference is not None
+                progress(
+                    f"{run_directory.name}/{simulation}: building "
+                    "simulation event composites"
+                )
+                wave_sections = load_existing_lpo_wave_sections(
+                    simulation,
+                    tracking_product_version=PRODUCT_VERSION,
+                    test=test,
+                )
+                wave_sections = _align_wave_sections_to_unfiltered_events(
+                    wave_sections, event_sections
+                )
+                simulation_composites[simulation] = (
+                    build_simulation_composites(
+                        event_sections,
+                        wave_sections,
+                        primary_k_m1=float(
+                            kelvin_reference.attrs["primary_k_m-1"]
+                        ),
+                        primary_m_m1=float(
+                            kelvin_reference.attrs["primary_m_m-1"]
+                        ),
+                        test=test,
+                        background_profile=kelvin_reference.sel(
+                            simulation=WAVE_SIMULATION_LABELS[simulation],
+                            zonal_wavenumber=1,
+                            vertical_wavelength_km=10.0,
+                        ),
+                    )
+                )
+                progress(
+                    f"{run_directory.name}/{simulation}: simulation event "
+                    "composites complete"
+                )
         combined_lifecycle.append(lifecycle)
         combined_summary.append(summary)
         if dataset is not None:
             dataset.close()
 
+    if not finalize:
+        progress(
+            f"{run_directory.name}: selected simulation calculation "
+            "complete; shared composites remain for the final run"
+        )
+        return
     lifecycle = pd.concat(combined_lifecycle, ignore_index=True)
     summary = pd.concat(combined_summary, ignore_index=True)
+    progress(f"{run_directory.name}: building event-equal lifecycle composite")
     _write_run_composite(
         run_directory,
         lifecycle,
         summary,
         test=test,
     )
+    progress(f"{run_directory.name}: event-equal lifecycle composite complete")
     if build_two_dimensional:
+        assert kelvin_reference is not None
+        progress(f"{run_directory.name}: combining two-dimensional composites")
         composite_2d = combine_simulation_composites(
             simulation_composites
         )
         composite_2d = _add_conditioned_static_stability(
             composite_2d, kelvin_reference
+        )
+        progress(
+            f"{run_directory.name}: calculating two-dimensional response "
+            "uncertainty"
         )
         response_composites = build_review_response_composites(
             section_paths,
@@ -2580,6 +2956,10 @@ def analyse_run_lifecycles(
         _atomic_write_netcdf(
             composite_2d,
             run_directory / LIFECYCLE_2D_COMPOSITE_FILENAME,
+        )
+        progress(
+            f"{run_directory.name}: wrote combined two-dimensional "
+            "lifecycle composite"
         )
 
 
@@ -3068,6 +3448,8 @@ def _plot_lifecycle(lifecycle: pd.DataFrame):
 
 
 def _plot_lifecycle_timing(summary: pd.DataFrame):
+    """Show the four main lifecycle milestones as a compact forest plot."""
+
     metrics = (
         ("active_peak_lag_hours", "Active-core peak"),
         ("stratiform_peak_lag_hours", "Stratiform peak"),
@@ -3075,75 +3457,50 @@ def _plot_lifecycle_timing(summary: pd.DataFrame):
             "nonprecip_high_cloud_peak_lag_hours",
             "Non-precipitating high-cloud peak",
         ),
-        ("total_high_cloud_peak_lag_hours", "Total high-cloud peak"),
-        (
-            "deepest_cloud_top_pressure_lag_hours",
-            f"Deepest P{DEEP_CLOUD_TOP_PERCENTILE} cloud top",
-        ),
         (
             "ttl_reaching_fraction_peak_lag_hours",
             "TTL-reaching fraction peak",
         ),
-        ("olr_minimum_lag_hours", "OLR minimum"),
-        ("anvil_delay_hours", "Anvil-proxy delay"),
     )
-    fig, axes = plt.subplots(
-        2, 4, figsize=(15, 7.5), constrained_layout=True
-    )
+    fig, axis = plt.subplots(figsize=(9.2, 4.8), constrained_layout=True)
     rng = np.random.default_rng(TIMING_BOOTSTRAP_SEED)
-    for axis, (column, title) in zip(axes.flat, metrics):
-        for index, simulation in enumerate(reversed(SIMULATION_DIRS)):
+    offsets = np.linspace(-0.22, 0.22, len(SIMULATION_DIRS))
+    positions = np.arange(len(metrics), dtype=float)[::-1]
+    for metric_index, ((column, _title), position) in enumerate(
+        zip(metrics, positions, strict=True)
+    ):
+        for simulation_index, simulation in enumerate(SIMULATION_DIRS):
             subset = summary.loc[summary.simulation == simulation]
-            values = summary.loc[
-                summary.simulation == simulation, column
-            ].dropna()
-            if len(values) >= 2:
-                parts = axis.violinplot(
-                    [values], positions=[index], vert=False,
-                    widths=0.72, showextrema=False,
-                )
-                for body in parts["bodies"]:
-                    body.set_facecolor(SIMULATION_COLOURS[simulation])
-                    body.set_alpha(0.28)
+            values = np.asarray(subset[column].dropna(), dtype=float)
+            y = position + offsets[simulation_index]
             if len(values):
-                q25, median, q75 = np.percentile(values, [25, 50, 75])
-                axis.plot(
-                    [q25, q75], [index, index], color="black", lw=3.0,
-                    solid_capstyle="butt",
+                median = float(np.median(values))
+                bootstrap_median = np.asarray(
+                    [
+                        np.median(
+                            rng.choice(values, size=len(values), replace=True)
+                        )
+                        for _ in range(TIMING_BOOTSTRAP_RESAMPLES)
+                    ]
                 )
-                if TEST_MODE:
-                    axis.plot(
-                        median,
-                        index,
-                        "o",
-                        color=SIMULATION_COLOURS[simulation],
-                        markeredgecolor="black",
-                        markeredgewidth=0.5,
-                        zorder=4,
-                    )
-                else:
-                    bootstrap_median = np.asarray(
-                        [
-                            np.median(
-                                rng.choice(values, size=len(values), replace=True)
-                            )
-                            for _ in range(TIMING_BOOTSTRAP_RESAMPLES)
-                        ]
-                    )
-                    ci_low, ci_high = np.percentile(
-                        bootstrap_median, [2.5, 97.5]
-                    )
-                    axis.errorbar(
-                        median,
-                        index,
-                        xerr=[[median - ci_low], [ci_high - median]],
-                        fmt="o",
-                        color=SIMULATION_COLOURS[simulation],
-                        markeredgecolor="black",
-                        markeredgewidth=0.5,
-                        capsize=2.0,
-                        zorder=4,
-                    )
+                ci_low, ci_high = np.percentile(
+                    bootstrap_median, [2.5, 97.5]
+                )
+                axis.errorbar(
+                    median,
+                    y,
+                    xerr=[[median - ci_low], [ci_high - median]],
+                    fmt="o",
+                    color=SIMULATION_COLOURS[simulation],
+                    markeredgecolor="black",
+                    markeredgewidth=0.5,
+                    capsize=2.0,
+                    label=(
+                        SIMULATION_LABELS[simulation]
+                        if metric_index == 0 else None
+                    ),
+                    zorder=4,
+                )
             censored_column = f"{column}_censored"
             rejected = (
                 int(subset[censored_column].fillna(False).astype(bool).sum())
@@ -3151,22 +3508,34 @@ def _plot_lifecycle_timing(summary: pd.DataFrame):
                 else int(len(subset) - len(values))
             )
             axis.text(
-                0.99, index, f"n={len(values)}, rejected={rejected}",
-                transform=axis.get_yaxis_transform(), ha="right", va="bottom",
-                fontsize=6.5,
+                0.995,
+                y,
+                f"n={len(values)}, r={rejected}",
+                transform=axis.get_yaxis_transform(),
+                ha="right",
+                va="center",
+                fontsize=6.2,
+                color=SIMULATION_COLOURS[simulation],
             )
-        axis.set(
-            yticks=range(3),
-            yticklabels=[
-                SIMULATION_LABELS[name] for name in reversed(SIMULATION_DIRS)
-            ],
-            xlim=(-72, 72),
-            title=title,
-            xlabel=LIFECYCLE_LAG_LABEL,
-        )
-        axis.axvline(0, color="0.5", lw=0.7)
-        axis.grid(axis="x", alpha=0.2)
-    fig.suptitle("Lifecycle timing")
+    axis.set(
+        yticks=positions,
+        yticklabels=[label for _column, label in metrics],
+        xlim=(-78, 78),
+        xlabel=LIFECYCLE_LAG_LABEL,
+    )
+    axis.axvline(0, color="0.5", lw=0.7)
+    axis.grid(axis="x", alpha=0.2)
+    axis.legend(frameon=False, loc="lower left")
+    axis.text(
+        0.995,
+        1.01,
+        "n: retained; r: edge-rejected",
+        transform=axis.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=7,
+    )
+    fig.suptitle("LPO lifecycle milestones")
     return fig
 
 
@@ -3335,7 +3704,6 @@ def _plot_event_centred_evolution(
     primary: Path,
     lifecycle: pd.DataFrame,
 ):
-    stages = (-48, 0, 48)
     fig, axes = plt.subplots(
         3,
         3,
@@ -3352,34 +3720,58 @@ def _plot_event_centred_evolution(
             & lifecycle.primary_tropical_sample.astype(bool)
             & lifecycle.reference_in_record_subset.astype(bool)
         ]
-        for column, lag in enumerate(stages):
-            precipitation_collect: list[xr.DataArray] = []
-            regimes_collect = {1: [], 2: [], 3: []}
-            for event_id in sim.event_id.unique():
-                event = sim[sim.event_id == event_id]
-                sample = event[event.lag_hours == lag]
-                if sample.empty:
+        stage_precipitation = {
+            label: [] for label, _lags in SPATIAL_STAGE_WINDOWS
+        }
+        stage_regimes = {
+            label: {1: [], 2: [], 3: []}
+            for label, _lags in SPATIAL_STAGE_WINDOWS
+        }
+        for event_id in sim.event_id.unique():
+            event = sim[sim.event_id == event_id].set_index("lag_hours")
+            path = _event_product_path(primary, simulation, event_id)
+            with xr.open_dataset(path) as product:
+                if "cloud_regime_context" not in product:
                     continue
-                path = _event_product_path(primary, simulation, event_id)
-                with xr.open_dataset(path) as product:
-                    if "cloud_regime_context" not in product:
+                for label, stage_lags in SPATIAL_STAGE_WINDOWS:
+                    if not set(stage_lags).issubset(event.index):
                         continue
-                    time_value = pd.Timestamp(sample.Time.iloc[0])
-                    precip = product.raw_precipitation_mm_day.sel(Time=time_value)
-                    regime = product.cloud_regime_context.sel(Time=time_value)
-                    lon = float(sample.precip_weighted_centroid_lon.iloc[0])
-                    lat = float(sample.precip_weighted_centroid_lat.iloc[0])
-                    precipitation_collect.append(
-                        _centred_event_field(precip, lon, lat)
-                    )
-                    for code in regimes_collect:
-                        regimes_collect[code].append(
-                            _centred_event_field(
-                                (regime == code).astype(float),
-                                lon,
-                                lat,
-                            )
+                    event_precipitation: list[xr.DataArray] = []
+                    event_regimes = {1: [], 2: [], 3: []}
+                    for lag in stage_lags:
+                        sample = event.loc[lag]
+                        if isinstance(sample, pd.DataFrame):
+                            sample = sample.iloc[-1]
+                        time_value = pd.Timestamp(sample.Time)
+                        precip = product.raw_precipitation_mm_day.sel(
+                            Time=time_value
                         )
+                        regime = product.cloud_regime_context.sel(
+                            Time=time_value
+                        )
+                        lon = float(sample.precip_weighted_centroid_lon)
+                        lat = float(sample.precip_weighted_centroid_lat)
+                        event_precipitation.append(
+                            _centred_event_field(precip, lon, lat)
+                        )
+                        for code in event_regimes:
+                            event_regimes[code].append(
+                                _centred_event_field(
+                                    (regime == code).astype(float),
+                                    lon,
+                                    lat,
+                                )
+                            )
+                    stage_precipitation[label].append(
+                        _event_equal_centred_mean(event_precipitation)
+                    )
+                    for code in event_regimes:
+                        stage_regimes[label][code].append(
+                            _event_equal_centred_mean(event_regimes[code])
+                        )
+        for column, (label, stage_lags) in enumerate(SPATIAL_STAGE_WINDOWS):
+            precipitation_collect = stage_precipitation[label]
+            regimes_collect = stage_regimes[label]
             axis = axes[row, column]
             if precipitation_collect:
                 mean_precip = _event_equal_centred_mean(
@@ -3416,7 +3808,10 @@ def _plot_event_centred_evolution(
             axis.set_xlim(-30.0, 30.0)
             axis.set_ylim(-20.0, 20.0)
             if row == 0:
-                axis.set_title(f"{lag:+d} h")
+                axis.set_title(
+                    f"{label}\n{min(stage_lags):+d} to "
+                    f"{max(stage_lags):+d} h"
+                )
             if column == 0:
                 axis.set_ylabel(
                     f"{SIMULATION_LABELS[simulation]}\nrelative latitude (°)"
@@ -3456,7 +3851,10 @@ def _plot_event_centred_evolution(
         frameon=True,
         title="10% occurrence contours",
     )
-    fig.suptitle("LPO-centred precipitation and cloud regimes")
+    fig.suptitle(
+        "LPO-centred precipitation and cloud regimes\n"
+        "Event-first six-hourly window means"
+    )
     return fig
 
 
@@ -3641,6 +4039,168 @@ def _stipple_significance(
     )
 
 
+NEAR_PEAK_VERTICAL_VARIABLES = (
+    ("unfiltered_cloud_fraction", "Cloud fraction", ""),
+    ("unfiltered_temperature", "Temperature", "K"),
+    ("unfiltered_static_stability", "Static stability", r"s$^{-2}$"),
+    (
+        "unfiltered_upward_pressure_velocity",
+        "Ascent",
+        r"Pa s$^{-1}$",
+    ),
+)
+
+
+def _near_peak_event_profiles(sections: xr.Dataset) -> xr.Dataset:
+    """Average five near-peak samples within each complete LPO event."""
+
+    variables = (
+        "native_pressure_hpa",
+        *(name for name, _title, _unit in NEAR_PEAK_VERTICAL_VARIABLES),
+    )
+    cubes = {}
+    for variable in variables:
+        windowed = longitude_window_mean(
+            sections[variable], DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES
+        )
+        temporary = xr.Dataset(
+            {
+                variable: windowed,
+                "event_id": sections.event_id,
+                "lag_hours": sections.lag_hours,
+            }
+        )
+        cubes[variable] = _event_cube(
+            temporary, variable, lags=NEAR_PEAK_LAGS_HOURS
+        )
+    pressure = cubes["native_pressure_hpa"]
+    complete = pressure.notnull().any("native_level").all("lag_hours")
+    if not bool(complete.any()):
+        raise RuntimeError(
+            "No LPO event contains every near-peak vertical sample"
+        )
+    profiles = {
+        variable: cube.where(complete, drop=True).mean(
+            "lag_hours", skipna=False
+        )
+        for variable, cube in cubes.items()
+    }
+    output = xr.Dataset(profiles)
+    output.attrs.update(
+        event_count=int(complete.sum()),
+        event_weighting="one equal weight per complete LPO event",
+        lag_hours=json.dumps(NEAR_PEAK_LAGS_HOURS),
+        longitude_half_width_degrees=(
+            DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES
+        ),
+    )
+    return output
+
+
+def _plot_near_peak_vertical_profiles(primary: Path):
+    """Plot absolute and attributable profiles near precipitation peak."""
+
+    profiles = {}
+    for simulation in SIMULATION_DIRS:
+        path = (
+            primary
+            / simulation
+            / "standard"
+            / LIFECYCLE_SECTION_FILENAME
+        )
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Missing cached lifecycle event sections {path}"
+            )
+        with xr.open_dataset(path) as sections:
+            profiles[simulation] = _near_peak_event_profiles(
+                sections
+            ).load()
+
+    fig, axes = plt.subplots(
+        2,
+        len(NEAR_PEAK_VERTICAL_VARIABLES),
+        figsize=(13.5, 7.2),
+        constrained_layout=True,
+        sharey=True,
+    )
+    control_pressure = profiles["control"].native_pressure_hpa.mean("event")
+    for column, (variable, title, unit) in enumerate(
+        NEAR_PEAK_VERTICAL_VARIABLES
+    ):
+        absolute_axis = axes[0, column]
+        response_axis = axes[1, column]
+        for simulation_index, simulation in enumerate(SIMULATION_DIRS):
+            source = profiles[simulation]
+            statistics = event_equal_statistics(
+                source[variable],
+                seed=TIMING_BOOTSTRAP_SEED + simulation_index,
+            )
+            pressure = source.native_pressure_hpa.mean("event")
+            colour = SIMULATION_COLOURS[simulation]
+            absolute_axis.plot(
+                statistics["mean"],
+                pressure,
+                color=colour,
+                label=(
+                    f"{SIMULATION_LABELS[simulation]} "
+                    f"(n={source.sizes['event']})"
+                ),
+            )
+            absolute_axis.fill_betweenx(
+                pressure,
+                statistics.ci_low,
+                statistics.ci_high,
+                color=colour,
+                alpha=0.14,
+            )
+            if simulation == "control":
+                continue
+            contrast = independent_event_contrast(
+                source[variable],
+                profiles["control"][variable],
+                seed=TIMING_BOOTSTRAP_SEED + simulation_index,
+            )
+            response_axis.plot(
+                contrast["mean"],
+                control_pressure,
+                color=colour,
+                label=f"{SIMULATION_LABELS[simulation]} − control",
+            )
+            response_axis.fill_betweenx(
+                control_pressure,
+                contrast.ci_low,
+                contrast.ci_high,
+                color=colour,
+                alpha=0.14,
+            )
+        for axis in (absolute_axis, response_axis):
+            _shade_ttl_pressure(axis)
+            axis.set_yscale("log")
+            axis.set_ylim(400.0, 50.0)
+            axis.grid(alpha=0.18)
+        response_axis.axvline(0.0, color="0.45", lw=0.7)
+        if variable == "unfiltered_upward_pressure_velocity":
+            absolute_axis.axvline(0.0, color="0.45", lw=0.7)
+        absolute_axis.set_title(title)
+        response_axis.set_xlabel(
+            "Difference" if not unit else f"Difference ({unit})"
+        )
+        absolute_axis.set_xlabel(
+            "Absolute" if not unit else f"Absolute ({unit})"
+        )
+    axes[0, 0].set_ylabel("Absolute\nPressure (hPa)")
+    axes[1, 0].set_ylabel("Response\nPressure (hPa)")
+    axes[0, 0].legend(frameon=False, fontsize=7)
+    axes[1, 0].legend(frameon=False, fontsize=7)
+    fig.suptitle(
+        "Near-peak LPO vertical profiles\n"
+        "Event-first mean at −12, −6, 0, +6, and +12 h; "
+        "±5° longitude"
+    )
+    return fig
+
+
 def _plot_lag_pressure_mechanism(
     composite: xr.Dataset,
     lifecycle: pd.DataFrame,
@@ -3667,13 +4227,14 @@ def _plot_lag_pressure_mechanism(
             r"s$^{-2}$",
         ),
     )
-    rows = ("control", "nudged-u", "nudged-T")
+    rows = SIMULATION_ROWS
     cloud_top = bootstrap_event_composite(
         lifecycle,
         ["median_cloud_top_pressure_hpa", "p10_cloud_top_pressure_hpa"],
     )
     fig, axes = plt.subplots(
-        3, 3, figsize=(13, 9.0), constrained_layout=True,
+        len(rows), 3,
+        figsize=(13, 3.0 * len(rows)), constrained_layout=True,
         sharex=True, sharey=True,
     )
     response_mappables = [None, None, None]
@@ -3762,7 +4323,7 @@ def _plot_lag_pressure_mechanism(
                     else f"{SIMULATION_LABELS[simulation]} − control"
                 )
                 axis.set_ylabel(f"{row_label}\nPressure (hPa)")
-            if row == 2:
+            if row == len(rows) - 1:
                 axis.set_xlabel(LIFECYCLE_LAG_LABEL)
     axes[0, 0].legend(frameon=False, fontsize=7)
     for column, (_absolute, _response, _title, unit) in enumerate(columns):
@@ -4051,7 +4612,7 @@ def _plot_cloud_occurrence_response(
         cloud_relative_latitude=slice(-20.0, 20.0),
     )
     stages = _cloud_stage_lags(source)
-    contrasts = ("nudged-u", "nudged-T")
+    contrasts = RESPONSE_ROWS
     fig, axes = plt.subplots(
         len(stages) * len(contrasts), len(classes),
         figsize=(13, 14), constrained_layout=True,
@@ -4123,7 +4684,7 @@ def _plot_surface_sections(
     )
     prefix = "filtered" if wave_name else "unfiltered"
     variables = [f"{prefix}_{name}" for name, _title, _unit in definitions]
-    rows = ("nudged-u", "nudged-T") if response else SIMULATION_DIRS
+    rows = RESPONSE_ROWS if response else SIMULATION_ROWS
     fig, axes = plt.subplots(
         len(rows), len(variables),
         figsize=(12, 6.2 if response else 8.2), constrained_layout=True,
@@ -4303,7 +4864,7 @@ def _plot_vertical_sections(
             contour_levels[key] = np.unique(
                 np.percentile(finite, [25.0, 50.0, 75.0])
             )
-    rows = ("nudged-u", "nudged-T") if response else SIMULATION_DIRS
+    rows = RESPONSE_ROWS if response else SIMULATION_ROWS
     definitions = (
         (
             "temperature", "upward_pressure_velocity",
@@ -4595,10 +5156,11 @@ def _plot_unfiltered_vertical_response(
             r"g kg$^{-1}$",
         ),
     )
-    contrasts = ("nudged-u", "nudged-T")
+    contrasts = RESPONSE_ROWS
     x, pressure = _native_plot_coordinates(composite, "control")
     fig, axes = plt.subplots(
-        2, 2, figsize=(12, 7.2), constrained_layout=True,
+        len(contrasts), 2,
+        figsize=(12, 3.6 * len(contrasts)), constrained_layout=True,
         sharex=True, sharey=True,
     )
     mappables = [None, None]
@@ -4659,7 +5221,7 @@ def _plot_unfiltered_vertical_response(
                 axis.set_ylabel(
                     f"{SIMULATION_LABELS[contrast]} − control\nPressure (hPa)"
                 )
-            if row == 1:
+            if row == len(contrasts) - 1:
                 axis.set_xlabel(LIFECYCLE_LAG_LABEL)
         fig.colorbar(
             mappables[column],
@@ -4737,9 +5299,10 @@ def _plot_kelvin_reference_lifecycle(composite: xr.Dataset):
             r"$C_{gz}/C_{gx}$",
         ),
     )
-    rows = ("control", "nudged-u", "nudged-T")
+    rows = SIMULATION_ROWS
     fig, axes = plt.subplots(
-        3, 3, figsize=(12.5, 8.5), constrained_layout=True,
+        len(rows), 3,
+        figsize=(12.5, 2.85 * len(rows)), constrained_layout=True,
         sharex=True, sharey=True,
     )
     for column, (absolute, response, label) in enumerate(variables):
@@ -4811,7 +5374,7 @@ def _plot_kelvin_reference_lifecycle(composite: xr.Dataset):
                     else f"{SIMULATION_LABELS[simulation]} − control"
                 )
                 axis.set_ylabel(f"{row_label}\nHeight (km)")
-            if row == 2:
+            if row == len(rows) - 1:
                 axis.set_xlabel(LIFECYCLE_LAG_LABEL)
         fig.colorbar(
             absolute_mappable,
@@ -4852,10 +5415,11 @@ def _plot_group_velocity_sensitivity(composite: xr.Dataset):
             r"$C_{gz}/C_{gx}$",
         ),
     )
+    rows = SIMULATION_ROWS
     fig, axes = plt.subplots(
-        3, 3, figsize=(11, 9.5), constrained_layout=True
+        len(rows), 3,
+        figsize=(11, 3.15 * len(rows)), constrained_layout=True,
     )
-    rows = ("control", "nudged-u", "nudged-T")
     for column, (variable, response, label) in enumerate(variables):
         control = composite[variable].sel(
             simulation="control",
@@ -4905,7 +5469,7 @@ def _plot_group_velocity_sensitivity(composite: xr.Dataset):
                     f"{row_label}\n"
                     "Vertical wavelength (km)"
                 )
-            if row == 2:
+            if row == len(rows) - 1:
                 axes[row, column].set_xlabel("Zonal wavenumber")
             fig.colorbar(image, ax=axes[row, column], pad=0.01)
     fig.suptitle("Kelvin-reference sensitivity (14–20 km; ±24 h mean)")
@@ -5032,10 +5596,11 @@ def _plot_phase_pressure_structure(
             None,
         ),
     )
-    rows = ("control", "nudged-u", "nudged-T")
+    rows = SIMULATION_ROWS
     phase = np.asarray(composite.wave_phase, dtype=float)
     fig, axes = plt.subplots(
-        3, 3, figsize=(13, 9.0), constrained_layout=True,
+        len(rows), 3,
+        figsize=(13, 3.0 * len(rows)), constrained_layout=True,
         sharex=True, sharey=True,
     )
     for column, (
@@ -5194,7 +5759,7 @@ def _plot_phase_pressure_structure(
                     else f"{SIMULATION_LABELS[simulation]} − control"
                 )
                 axis.set_ylabel(f"{row_label}\nPressure (hPa)")
-            if row == 2:
+            if row == len(rows) - 1:
                 axis.set_xlabel("Filtered precipitation phase")
         fig.colorbar(
             absolute_mappable,
@@ -5303,6 +5868,456 @@ def _plot_wave_phase_alignment(composite: xr.Dataset, wave_name: str):
     return fig
 
 
+def _phase_alignment_window_label(wave_name: str) -> str:
+    """Return the compact lag-window label for one wave band."""
+
+    window = PHASE_ALIGNMENT_WINDOWS_HOURS[wave_name]
+    if len(window) == 1:
+        return "lag 0 h"
+    return f"±{max(window)} h mean"
+
+
+def _plot_cross_wave_phase_alignment(composite: xr.Dataset):
+    """Compare near-peak phase profiles and complementary coupling metrics."""
+
+    coupling_stem = "phase_window_alignment_strength"
+    locking_stem = "phase_window_phase_locking_strength"
+    required = {
+        "phase_window_excess_over_random",
+        "phase_window_excess_over_random_ci_low",
+        "phase_window_excess_over_random_ci_high",
+        coupling_stem,
+        f"{coupling_stem}_ci_low",
+        f"{coupling_stem}_ci_high",
+        locking_stem,
+        f"{locking_stem}_ci_low",
+        f"{locking_stem}_ci_high",
+        "strong_wave_event_count",
+    }
+    missing = sorted(required - set(composite.data_vars))
+    if missing:
+        raise RuntimeError(
+            f"Cross-wave phase comparison lacks variables {missing}"
+        )
+    wave_colours = {
+        wave_name: plt.get_cmap("tab10")(index)
+        for index, wave_name in enumerate(LPO_LIFECYCLE_FILTERS)
+    }
+    interval_names = (
+        "phase_window_excess_over_random_ci_low",
+        "phase_window_excess_over_random_ci_high",
+    )
+    intervals = [
+        np.asarray(composite[name], dtype=float)
+        for name in interval_names
+    ]
+    finite = np.concatenate(
+        [values[np.isfinite(values)] for values in intervals]
+    )
+    probability_limit = (
+        max(0.05, float(np.nanmax(np.abs(finite))))
+        if finite.size else 0.05
+    )
+    coupling_intervals = [
+        np.asarray(composite[f"{coupling_stem}_{bound}"], dtype=float)
+        for bound in ("ci_low", "ci_high")
+    ]
+    finite_coupling = np.concatenate(
+        [values[np.isfinite(values)] for values in coupling_intervals]
+    )
+    coupling_limit = (
+        max(0.05, float(np.nanmax(np.abs(finite_coupling))))
+        if finite_coupling.size else 0.05
+    )
+    locking_intervals = [
+        np.asarray(composite[f"{locking_stem}_{bound}"], dtype=float)
+        for bound in ("ci_low", "ci_high")
+    ]
+    finite_locking = np.concatenate(
+        [values[np.isfinite(values)] for values in locking_intervals]
+    )
+    locking_limit = (
+        max(0.05, float(np.nanmax(np.abs(finite_locking))))
+        if finite_locking.size else 0.05
+    )
+    fig, axes = plt.subplots(
+        len(SIMULATION_DIRS),
+        3,
+        figsize=(16.2, 2.8 * len(SIMULATION_DIRS)),
+        constrained_layout=True,
+        sharex="col",
+    )
+    phase = np.asarray(composite.wave_phase, dtype=float)
+    closed_phase = np.r_[phase, phase[0] + 8.0]
+    wave_positions = np.arange(len(LPO_LIFECYCLE_FILTERS))[::-1]
+    for row, simulation in enumerate(SIMULATION_DIRS):
+        phase_axis, coupling_axis, locking_axis = axes[row]
+        counts = []
+        for wave_position, wave_name in zip(
+            wave_positions, LPO_LIFECYCLE_FILTERS, strict=True
+        ):
+            source = composite.sel(
+                simulation=simulation,
+                wave_band=wave_name,
+            )
+            mean = np.asarray(
+                source.phase_window_excess_over_random, dtype=float
+            )
+            low = np.asarray(
+                source.phase_window_excess_over_random_ci_low, dtype=float
+            )
+            high = np.asarray(
+                source.phase_window_excess_over_random_ci_high, dtype=float
+            )
+            colour = wave_colours[wave_name]
+            label = WAVE_BOXES[wave_name].get("label", wave_name)
+            phase_axis.plot(
+                closed_phase,
+                np.r_[mean, mean[0]],
+                color=colour,
+                label=label,
+            )
+            phase_axis.fill_between(
+                closed_phase,
+                np.r_[low, low[0]],
+                np.r_[high, high[0]],
+                color=colour,
+                alpha=0.12,
+            )
+            coupling = float(source[coupling_stem])
+            coupling_low = float(source[f"{coupling_stem}_ci_low"])
+            coupling_high = float(source[f"{coupling_stem}_ci_high"])
+            coupling_axis.errorbar(
+                coupling,
+                wave_position,
+                xerr=np.asarray(
+                    [
+                        [max(0.0, coupling - coupling_low)],
+                        [max(0.0, coupling_high - coupling)],
+                    ]
+                ),
+                fmt="o",
+                color=colour,
+                markeredgecolor="black",
+                markeredgewidth=0.4,
+                capsize=2.0,
+            )
+            locking = float(source[locking_stem])
+            locking_low = float(source[f"{locking_stem}_ci_low"])
+            locking_high = float(source[f"{locking_stem}_ci_high"])
+            locking_axis.errorbar(
+                locking,
+                wave_position,
+                xerr=np.asarray(
+                    [
+                        [max(0.0, locking - locking_low)],
+                        [max(0.0, locking_high - locking)],
+                    ]
+                ),
+                fmt="o",
+                color=colour,
+                markeredgecolor="black",
+                markeredgewidth=0.4,
+                capsize=2.0,
+            )
+            window = PHASE_ALIGNMENT_WINDOWS_HOURS[wave_name]
+            count_values = np.asarray(
+                source.strong_wave_event_count.sel(
+                    lag_hours=list(window)
+                ),
+                dtype=float,
+            )
+            available = count_values[
+                np.isfinite(count_values) & (count_values > 0.0)
+            ]
+            counts.append(
+                int(np.median(available)) if available.size else 0
+            )
+        coupling_axis.set_yticks(
+            wave_positions,
+            [
+                f"{WAVE_BOXES[wave_name].get('label', wave_name)} "
+                f"({_phase_alignment_window_label(wave_name)}; "
+                f"median n={count})"
+                for wave_name, count in zip(
+                    LPO_LIFECYCLE_FILTERS, counts, strict=True
+                )
+            ],
+        )
+        locking_axis.set_yticks(wave_positions, [""] * len(wave_positions))
+        phase_axis.axhline(0.0, color="0.45", lw=0.7)
+        phase_axis.set_ylim(
+            -1.05 * probability_limit, 1.05 * probability_limit
+        )
+        phase_axis.set_ylabel(
+            f"{SIMULATION_LABELS[simulation]}\nExcess probability"
+        )
+        coupling_axis.axvline(0.0, color="0.45", lw=0.7)
+        coupling_axis.text(
+            0.02,
+            0.95,
+            "Total shifted phase probability",
+            transform=coupling_axis.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+        )
+        locking_axis.axvline(0.0, color="0.45", lw=0.7)
+        locking_axis.text(
+            0.02,
+            0.95,
+            "LPO concentration − matched random",
+            transform=locking_axis.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+        )
+        for axis in (phase_axis, coupling_axis, locking_axis):
+            axis.grid(alpha=0.2)
+    for coupling_axis in axes[:, 1]:
+        coupling_axis.set_xlim(0.0, min(1.0, 1.05 * coupling_limit))
+    for locking_axis in axes[:, 2]:
+        locking_axis.set_xlim(
+            -min(1.0, 1.05 * locking_limit),
+            min(1.0, 1.05 * locking_limit),
+        )
+    axes[0, 0].set_title("Temporally averaged excess phase probability")
+    axes[0, 1].set_title("Near-peak distribution separation")
+    axes[0, 2].set_title("Near-peak phase-locking strength")
+    axes[-1, 0].set_xlabel("Filtered precipitation phase")
+    axes[-1, 1].set_xlabel("Probability shifted from matched random")
+    axes[-1, 2].set_xlabel("Circular concentration above matched random")
+    axes[-1, 0].set_xticks(np.arange(1, 10))
+    axes[-1, 0].set_xticklabels([*map(str, range(1, 9)), "1"])
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="outside lower center",
+        ncol=len(LPO_LIFECYCLE_FILTERS),
+        frameon=False,
+    )
+    fig.suptitle(
+        "Wave–convection phase alignment near the LPO precipitation peak"
+    )
+    return fig
+
+
+def _plot_wave_coupling_lifecycle(composite: xr.Dataset):
+    """Plot phase-distribution separation through the LPO lifecycle."""
+
+    stem = "wave_phase_alignment_strength"
+    required = {stem, f"{stem}_ci_low", f"{stem}_ci_high"}
+    missing = sorted(required - set(composite.data_vars))
+    if missing:
+        raise RuntimeError(
+            f"Wave-coupling lifecycle lacks variables {missing}"
+        )
+    interval_values = np.concatenate(
+        [
+            np.asarray(composite[f"{stem}_{bound}"], dtype=float).ravel()
+            for bound in ("ci_low", "ci_high")
+        ]
+    )
+    finite = interval_values[np.isfinite(interval_values)]
+    probability_limit = (
+        min(1.0, max(0.05, float(np.nanmax(finite))))
+        if finite.size else 0.05
+    )
+    fig, axes = plt.subplots(
+        3,
+        2,
+        figsize=(11.5, 9.0),
+        constrained_layout=True,
+        sharex=True,
+        sharey=True,
+    )
+    axes_flat = axes.ravel()
+    for axis, wave_name in zip(
+        axes_flat, LPO_LIFECYCLE_FILTERS, strict=False
+    ):
+        window = PHASE_ALIGNMENT_WINDOWS_HOURS[wave_name]
+        if len(window) > 1:
+            axis.axvspan(
+                min(window), max(window), color="0.9", alpha=0.45
+            )
+        for simulation in SIMULATION_DIRS:
+            source = composite.sel(
+                simulation=simulation,
+                wave_band=wave_name,
+            )
+            colour = SIMULATION_COLOURS[simulation]
+            axis.plot(
+                source.lag_hours,
+                source[stem],
+                color=colour,
+                label=SIMULATION_LABELS[simulation],
+            )
+            axis.fill_between(
+                source.lag_hours,
+                source[f"{stem}_ci_low"],
+                source[f"{stem}_ci_high"],
+                color=colour,
+                alpha=0.12,
+            )
+        axis.axhline(0.0, color="0.45", lw=0.7)
+        axis.axvline(0.0, color="0.45", lw=0.7)
+        axis.set_ylim(
+            0.0, min(1.0, 1.05 * probability_limit)
+        )
+        label = WAVE_BOXES[wave_name].get("label", wave_name)
+        axis.set_title(
+            f"{label} ({_phase_alignment_window_label(wave_name)})"
+        )
+        axis.grid(alpha=0.2)
+    for axis in axes_flat[len(LPO_LIFECYCLE_FILTERS):]:
+        axis.set_axis_off()
+    fig.supxlabel(LIFECYCLE_LAG_LABEL)
+    fig.supylabel(
+        "Phase-alignment strength: probability shifted from matched random"
+    )
+    handles, labels = axes_flat[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="outside lower center",
+        ncol=len(SIMULATION_DIRS),
+        frameon=False,
+    )
+    fig.suptitle("Wave phase alignment through the LPO lifecycle")
+    return fig
+
+
+def _plot_wave_coupling_response(composite: xr.Dataset):
+    """Plot direct simulation changes in near-peak wave coupling."""
+
+    metrics = (
+        (
+            "phase_window_alignment_strength",
+            "Distribution separation",
+        ),
+        (
+            "phase_window_phase_locking_strength",
+            "Phase-locking strength",
+        ),
+    )
+    required = {
+        f"response_{stem}_{statistic}"
+        for stem, _title in metrics
+        for statistic in (
+            "mean", "ci_low", "ci_high", "pointwise_significant"
+        )
+    }
+    missing = sorted(required - set(composite.data_vars))
+    if missing:
+        raise RuntimeError(
+            f"Wave-coupling response comparison lacks variables {missing}"
+        )
+    contrasts = [
+        simulation
+        for simulation in RESPONSE_ROWS
+        if simulation in composite.contrast.values
+    ]
+    if not contrasts:
+        raise RuntimeError("Wave-coupling response has no simulations")
+    fig, axes = plt.subplots(
+        1,
+        len(metrics),
+        figsize=(11.5, 4.8),
+        constrained_layout=True,
+        sharey=True,
+    )
+    wave_positions = np.arange(len(LPO_LIFECYCLE_FILTERS))[::-1]
+    offsets = np.linspace(0.12, -0.12, len(contrasts))
+    for axis, (stem, title) in zip(axes, metrics, strict=True):
+        response_stem = f"response_{stem}"
+        interval_values = np.concatenate(
+            [
+                np.asarray(
+                    composite[f"{response_stem}_{bound}"], dtype=float
+                ).ravel()
+                for bound in ("ci_low", "ci_high")
+            ]
+        )
+        finite = interval_values[np.isfinite(interval_values)]
+        limit = (
+            max(0.1, 1.05 * float(np.nanmax(np.abs(finite))))
+            if finite.size else 0.1
+        )
+        for offset, simulation in zip(offsets, contrasts, strict=True):
+            source = composite.sel(contrast=simulation)
+            colour = SIMULATION_COLOURS[simulation]
+            for wave_position, wave_name in zip(
+                wave_positions, LPO_LIFECYCLE_FILTERS, strict=True
+            ):
+                point = float(
+                    source[f"{response_stem}_mean"].sel(
+                        wave_band=wave_name
+                    )
+                )
+                low = float(
+                    source[f"{response_stem}_ci_low"].sel(
+                        wave_band=wave_name
+                    )
+                )
+                high = float(
+                    source[f"{response_stem}_ci_high"].sel(
+                        wave_band=wave_name
+                    )
+                )
+                significant = bool(
+                    source[f"{response_stem}_pointwise_significant"].sel(
+                        wave_band=wave_name
+                    )
+                )
+                axis.errorbar(
+                    point,
+                    wave_position + offset,
+                    xerr=np.asarray(
+                        [
+                            [max(0.0, point - low)],
+                            [max(0.0, high - point)],
+                        ]
+                    ),
+                    fmt="o",
+                    color=colour,
+                    markerfacecolor=colour if significant else "white",
+                    markeredgecolor=colour,
+                    capsize=2.0,
+                    label=(
+                        SIMULATION_LABELS[simulation]
+                        if wave_position == wave_positions[0]
+                        else None
+                    ),
+                )
+        axis.axvline(0.0, color="0.35", lw=0.8)
+        axis.set_xlim(-limit, limit)
+        axis.set_title(title)
+        axis.set_xlabel("Change from control")
+        axis.grid(alpha=0.2)
+    axes[0].set_yticks(
+        wave_positions,
+        [
+            f"{WAVE_BOXES[wave_name].get('label', wave_name)} "
+            f"({_phase_alignment_window_label(wave_name)})"
+            for wave_name in LPO_LIFECYCLE_FILTERS
+        ],
+    )
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="outside lower center",
+        ncol=len(contrasts),
+        frameon=False,
+    )
+    fig.suptitle(
+        "Changes in near-peak LPO–wave coupling\n"
+        "Filled markers: 95% bootstrap interval excludes zero"
+    )
+    return fig
+
+
 def _plot_wave_phase_validation(composite: xr.Dataset):
     """Collect supporting phase-coherence, sample, and amplitude measures."""
 
@@ -5394,7 +6409,7 @@ def _plot_matsuno_gill_response(composite: xr.Dataset):
     """Plot eastward-LPO wind and vorticity anomaly composites."""
 
     pressures = (850.0, 200.0)
-    rows = ("control", "nudged-u", "nudged-T")
+    rows = SIMULATION_ROWS
     display_vorticity = [
         composite.matsuno_relative_vorticity_anomaly.sel(
             simulation=simulation
@@ -5577,10 +6592,11 @@ def _plot_peak_longitude_height(
     wave_name: str = "Kelvin",
     control_cmap=None,
     control_limits: tuple[float, float] | None = None,
+    differences_to_control: bool = True,
 ):
-    """Plot control and independent peak-response longitude-height sections."""
+    """Plot peak longitude-height sections for each simulation."""
 
-    rows = ("control", "nudged-u", "nudged-T")
+    rows = SIMULATION_ROWS
     source = composite[variable]
     if "ray_wave_band" in source.dims:
         source = source.sel(ray_wave_band=wave_name)
@@ -5588,7 +6604,7 @@ def _plot_peak_longitude_height(
     displayed = {
         simulation: (
             source.sel(simulation=simulation)
-            if simulation == "control"
+            if simulation == "control" or not differences_to_control
             else source.sel(simulation=simulation) - control
         )
         for simulation in rows
@@ -5624,7 +6640,7 @@ def _plot_peak_longitude_height(
         }
     response_limit = _symmetric_limit(
         xr.concat(
-            [displayed["nudged-u"], displayed["nudged-T"]],
+            [displayed[simulation] for simulation in RESPONSE_ROWS],
             dim="contrast",
         )
     )
@@ -5633,11 +6649,14 @@ def _plot_peak_longitude_height(
         "vmin": -response_limit,
         "vmax": response_limit,
     }
-    fig = plt.figure(figsize=(11, 12), constrained_layout=True)
+    fig = plt.figure(
+        figsize=(11, 4.0 * len(rows)), constrained_layout=True
+    )
+    grid_rows = 1 + 2 * len(rows)
     grid = fig.add_gridspec(
-        7,
+        grid_rows,
         2,
-        height_ratios=(0.13, 1.0, 0.24, 1.0, 0.24, 1.0, 0.24),
+        height_ratios=(0.13, *((1.0, 0.24) * len(rows))),
         width_ratios=(1.0, 0.035),
     )
     title_axis = fig.add_subplot(grid[0, :])
@@ -5684,14 +6703,14 @@ def _plot_peak_longitude_height(
         cloud = composite.ray_nonprecipitating_cloud_occurrence.sel(
             simulation=simulation
         )
-        if simulation != "control":
+        if simulation != "control" and differences_to_control:
             cloud = cloud - composite.ray_nonprecipitating_cloud_occurrence.sel(
                 simulation="control"
             )
         cloud = cloud.transpose("ray_height_m", "ray_relative_longitude")
         cloud = cloud.isel(ray_height_m=height_indices)
         cloud_limit = _symmetric_limit(cloud, percentile=90.0)
-        if simulation == "control":
+        if simulation == "control" or not differences_to_control:
             cloud_values = np.asarray(cloud, dtype=float)
             cloud_values = cloud_values[
                 np.isfinite(cloud_values) & (cloud_values > 0.0)
@@ -5737,7 +6756,11 @@ def _plot_peak_longitude_height(
         label = (
             "Control"
             if simulation == "control"
-            else f"{SIMULATION_LABELS[simulation]} − control"
+            else (
+                f"{SIMULATION_LABELS[simulation]} − control"
+                if differences_to_control
+                else SIMULATION_LABELS[simulation]
+            )
         )
         axis.set_ylabel(f"{label}\nPressure (hPa)")
         axis.tick_params(labelbottom=False)
@@ -5745,7 +6768,7 @@ def _plot_peak_longitude_height(
         precipitation = composite.ray_lpo_precipitation.sel(
             simulation=simulation
         )
-        if simulation != "control":
+        if simulation != "control" and differences_to_control:
             precipitation = precipitation - composite.ray_lpo_precipitation.sel(
                 simulation="control"
             )
@@ -5760,14 +6783,19 @@ def _plot_peak_longitude_height(
         if row == len(rows) - 1:
             precipitation_axis.set_xlabel("Longitude from centroid (°)")
     control_colorbar_axis = fig.add_subplot(grid[1, 1])
-    response_colorbar_axis = fig.add_subplot(grid[3:6, 1])
+    response_colorbar_axis = fig.add_subplot(grid[3:, 1])
     fig.colorbar(
         mappables[0], cax=control_colorbar_axis,
         label=f"Control {units}",
     )
     fig.colorbar(
         mappables[-1], cax=response_colorbar_axis,
-        label=f"Difference {units}", extend="both",
+        label=(
+            f"Difference {units}"
+            if differences_to_control
+            else f"Simulation {units}"
+        ),
+        extend="both",
     )
     title_axis.text(
         0.5,
@@ -5787,55 +6815,65 @@ def _plot_peak_longitude_height(
 def build_lifecycle_figures(
     mode_directory: Path,
     *,
-    figures: Sequence[int],
+    figures: Sequence[int | str],
     figure_output: Path,
     test: bool = False,
 ) -> None:
     primary = mode_directory / "primary"
     lifecycle, summary = read_lifecycle_products(primary)
-    saver = FigureSaver(
-        str(figure_output),
-        enabled=True,
-        figures_to_run=set(figures),
-    )
+    savers: dict[str, FigureSaver] = {}
 
-    def save(number: int, stem: str, figure) -> None:
-        saver.save(figure, stem, number=number)
+    def save(folder: str, number: int, stem: str, figure) -> None:
+        if folder not in savers:
+            savers[folder] = FigureSaver(
+                str(Path(figure_output) / folder), enabled=True
+            )
+        savers[folder].save(figure, stem, number=number)
         plt.close(figure)
 
     if 4 in figures:
-        progress("Starting Figure 4: LPO cloud-population lifecycle")
-        save(4, "lpo_cloud_population_lifecycle", _plot_lifecycle(lifecycle))
-    if 5 in figures:
-        progress("Starting Figure 5: rejected-edge LPO lifecycle timing")
-        save(5, "lpo_lifecycle_timing", _plot_lifecycle_timing(summary))
-    if 6 in figures:
-        progress("Starting Figure 6: LPO-centred spatial evolution")
+        progress("Starting lpo_lifecycle Figure 1: cloud populations")
         save(
-            6,
-            "lpo_centred_spatial_evolution",
+            "lpo_lifecycle", 1, "cloud_population_lifecycle",
+            _plot_lifecycle(lifecycle),
+        )
+    if 5 in figures:
+        progress("Starting lpo_lifecycle Figure 2: lifecycle timing")
+        save(
+            "lpo_lifecycle", 2, "lifecycle_timing",
+            _plot_lifecycle_timing(summary),
+        )
+    if 6 in figures:
+        progress("Starting lpo_lifecycle Figure 3: spatial evolution")
+        save(
+            "lpo_lifecycle", 3, "centred_spatial_evolution",
             _plot_event_centred_evolution(primary, lifecycle),
         )
     if 7 in figures:
-        progress("Starting Figure 7a: LPO UTLS environment")
-        save(7, "a_lpo_utls_environment", _plot_environment(lifecycle))
+        progress("Starting lpo_environment Figure 1: UTLS environment")
+        save(
+            "lpo_environment", 1, "utls_environment",
+            _plot_environment(lifecycle),
+        )
         for subfigure, wave_name in zip(
-            "bcdef", LPO_LIFECYCLE_FILTERS, strict=True
+            "abcde", LPO_LIFECYCLE_FILTERS, strict=True
         ):
-            progress(f"Starting Figure 7{subfigure}: {wave_name} lifecycle")
+            progress(
+                "Starting lpo_wave_alignment Figure 1"
+                f"{subfigure}: {wave_name} lifecycle"
+            )
             save(
-                7,
+                "lpo_wave_alignment", 1,
                 f"{subfigure}_lpo_{_wave_key(wave_name)}_lifecycle",
                 _plot_wave_lifecycle(lifecycle, wave_name),
             )
     if 8 in figures:
-        progress("Starting Figure 8: normalized whole-track lifecycle")
+        progress("Starting lpo_lifecycle Figure 4: normalized track")
         save(
-            8,
-            "lpo_normalized_whole_track_lifecycle",
+            "lpo_lifecycle", 4, "normalized_whole_track_lifecycle",
             _plot_normalized_lifetime(lifecycle),
         )
-    if any(number >= 9 for number in figures):
+    if any(number == "45a" or number >= 9 for number in figures):
         composite_path = primary / LIFECYCLE_2D_COMPOSITE_FILENAME
         if not composite_path.is_file():
             raise FileNotFoundError(
@@ -5854,22 +6892,21 @@ def build_lifecycle_figures(
                     f"{composite_path} does not match {PRODUCT_VERSION}"
                 )
             if 9 in figures:
-                progress("Starting Figure 9: modal high-cloud context")
+                progress("Starting lpo_lifecycle Figure 5: modal cloud class")
                 save(
-                    9,
-                    "lpo_modal_high_cloud_context",
+                    "lpo_lifecycle", 5, "modal_high_cloud_context",
                     _plot_cloud_modal_class(composite),
                 )
             if 10 in figures:
                 for subfigure, simulation in zip(
-                    "abc", SIMULATION_DIRS, strict=True
+                    "abcdefghijklmnopqrstuvwxyz", SIMULATION_ROWS
                 ):
                     progress(
-                        f"Starting Figure 10{subfigure}: {simulation} "
-                        "cloud occurrence"
+                        "Starting lpo_lifecycle Figure 6"
+                        f"{subfigure}: {simulation} cloud occurrence"
                     )
                     save(
-                        10,
+                        "lpo_lifecycle", 6,
                         (
                             f"{subfigure}_lpo_{simulation}_"
                             "cloud_class_occurrence"
@@ -5877,45 +6914,46 @@ def build_lifecycle_figures(
                         _plot_cloud_occurrences(composite, simulation),
                     )
             if 11 in figures:
-                progress("Starting Figure 11: unfiltered absolute lag-latitude")
+                progress("Starting lpo_environment Figure 2: surface absolute")
                 save(
-                    11,
-                    "lpo_unfiltered_surface_absolute",
+                    "lpo_environment", 2, "unfiltered_surface_absolute",
                     _plot_surface_sections(composite),
                 )
             if 12 in figures:
-                progress("Starting Figure 12: surface experiment responses")
+                progress("Starting lpo_environment Figure 3: surface responses")
                 save(
-                    12,
-                    "lpo_unfiltered_surface_responses",
+                    "lpo_environment", 3, "unfiltered_surface_responses",
                     _plot_surface_sections(composite, response=True),
                 )
             if 13 in figures:
-                progress("Starting Figure 13: unfiltered absolute lag-pressure")
+                progress("Starting lpo_environment Figure 4: vertical absolute")
                 save(
-                    13,
-                    "lpo_unfiltered_vertical_absolute",
+                    "lpo_environment", 4, "unfiltered_vertical_absolute",
                     _plot_vertical_sections(composite),
                 )
             if 14 in figures:
-                progress("Starting Figure 14: vertical experiment responses")
+                progress("Starting lpo_environment Figure 5: vertical responses")
                 save(
-                    14,
-                    "lpo_unfiltered_vertical_responses",
+                    "lpo_environment", 5, "unfiltered_vertical_responses",
                     _plot_vertical_sections(composite, response=True),
                 )
             if 15 in figures:
-                progress("Starting Figure 15: Kelvin reference group velocities")
+                progress(
+                    "Starting lpo_wave_propagation Figure 1: "
+                    "Kelvin group velocities"
+                )
                 save(
-                    15,
-                    "lpo_kelvin_reference_group_velocity",
+                    "lpo_wave_propagation", 1,
+                    "kelvin_reference_group_velocity",
                     _plot_kelvin_reference_lifecycle(composite),
                 )
             if 16 in figures:
-                progress("Starting Figure 16: averaging-region sensitivity")
+                progress(
+                    "Starting lpo_sensitivity Figure 1: averaging region"
+                )
                 save(
-                    16,
-                    "lpo_longitude_averaging_sensitivity",
+                    "lpo_sensitivity", 1,
+                    "longitude_averaging_sensitivity",
                     _plot_averaging_sensitivity(composite),
                 )
             legacy_wave_names = tuple(
@@ -5928,47 +6966,51 @@ def build_lifecycle_figures(
                 phase_number = 25 + offset
                 phase_pressure_number = 36 + offset
                 key = _wave_key(wave_name)
+                subfigure = "abcde"[
+                    LPO_LIFECYCLE_FILTERS.index(wave_name)
+                ]
                 if surface_number in figures:
                     progress(
-                        f"Starting Figure {surface_number}: {wave_name} "
-                        "lag-latitude"
+                        "Starting lpo_wave_alignment Figure 2"
+                        f"{subfigure}: {wave_name} lag-latitude"
                     )
                     save(
-                        surface_number,
-                        f"lpo_{key}_filtered_surface",
+                        "lpo_wave_alignment", 2,
+                        f"{subfigure}_lpo_{key}_filtered_surface",
                         _plot_surface_sections(
                             composite, wave_name=wave_name
                         ),
                     )
                 if vertical_number in figures:
                     progress(
-                        f"Starting Figure {vertical_number}: {wave_name} "
-                        "lag-pressure"
+                        "Starting lpo_wave_alignment Figure 3"
+                        f"{subfigure}: {wave_name} lag-pressure"
                     )
                     save(
-                        vertical_number,
-                        f"lpo_{key}_filtered_vertical",
+                        "lpo_wave_alignment", 3,
+                        f"{subfigure}_lpo_{key}_filtered_vertical",
                         _plot_vertical_sections(
                             composite, wave_name=wave_name
                         ),
                     )
                 if phase_number in figures:
                     progress(
-                        f"Starting Figure {phase_number}: {wave_name} phase"
+                        "Starting lpo_wave_alignment Figure 4"
+                        f"{subfigure}: {wave_name} phase"
                     )
                     save(
-                        phase_number,
-                        f"lpo_{key}_phase_alignment",
+                        "lpo_wave_alignment", 4,
+                        f"{subfigure}_lpo_{key}_phase_alignment",
                         _plot_wave_phase_alignment(composite, wave_name),
                     )
                 if phase_pressure_number in figures:
                     progress(
-                        f"Starting Figure {phase_pressure_number}: "
-                        f"{wave_name} phase-pressure structure"
+                        "Starting lpo_wave_alignment Figure 5"
+                        f"{subfigure}: {wave_name} phase-pressure"
                     )
                     save(
-                        phase_pressure_number,
-                        f"lpo_{key}_phase_pressure_structure",
+                        "lpo_wave_alignment", 5,
+                        f"{subfigure}_lpo_{key}_phase_pressure_structure",
                         _plot_phase_pressure_structure(
                             composite, wave_name
                         ),
@@ -5982,86 +7024,117 @@ def build_lifecycle_figures(
             for number, (kind, plotter) in mrg_figure_map.items():
                 if number not in figures:
                     continue
-                progress(f"Starting Figure {number}: MRG {kind}")
+                subfigure = "abcde"[
+                    LPO_LIFECYCLE_FILTERS.index("MRG")
+                ]
+                local_number = {
+                    "surface": 2,
+                    "vertical": 3,
+                    "phase": 4,
+                    "phase_pressure": 5,
+                }[kind]
+                progress(
+                    "Starting lpo_wave_alignment Figure "
+                    f"{local_number}{subfigure}: MRG {kind}"
+                )
                 if kind in {"surface", "vertical"}:
                     figure = plotter(composite, wave_name="MRG")
                 else:
                     figure = plotter(composite, "MRG")
-                save(number, f"lpo_mrg_{kind}", figure)
-            if 40 in figures:
-                progress("Starting Figure 40: wave-phase validation metrics")
                 save(
-                    40,
-                    "lpo_wave_phase_validation_metrics",
+                    "lpo_wave_alignment", local_number,
+                    f"{subfigure}_lpo_mrg_{kind}", figure,
+                )
+            if 40 in figures:
+                progress(
+                    "Starting lpo_sensitivity Figure 3: wave-phase validation"
+                )
+                save(
+                    "lpo_sensitivity", 3,
+                    "wave_phase_validation_metrics",
                     _plot_wave_phase_validation(composite),
                 )
             if 29 in figures:
-                progress("Starting Figure 29: cloud-depth lifecycle")
+                progress("Starting lpo_lifecycle Figure 7: cloud depth")
                 save(
-                    29,
-                    "lpo_cloud_depth_lifecycle",
+                    "lpo_lifecycle", 7, "cloud_depth_lifecycle",
                     _plot_cloud_depth_lifecycle(lifecycle),
                 )
             if 30 in figures:
-                progress("Starting Figure 30: lag-pressure mechanism")
+                progress(
+                    "Starting lpo_environment Figure 6: near-peak profiles"
+                )
                 save(
-                    30,
-                    "lpo_lag_pressure_mechanism",
-                    _plot_lag_pressure_mechanism(composite, lifecycle),
+                    "lpo_environment", 6, "near_peak_vertical_profiles",
+                    _plot_near_peak_vertical_profiles(primary),
                 )
             if 31 in figures:
-                progress("Starting Figure 31: cloud occurrence responses")
+                progress(
+                    "Starting lpo_environment Figure 7: cloud responses"
+                )
                 save(
-                    31,
-                    "lpo_cloud_occurrence_responses_pointwise",
+                    "lpo_environment", 7,
+                    "cloud_occurrence_responses_pointwise",
                     _plot_cloud_occurrence_response(composite),
                 )
             if 32 in figures:
-                progress("Starting Figure 32: FDR cloud responses")
+                progress(
+                    "Starting lpo_environment Figure 8: FDR cloud responses"
+                )
                 save(
-                    32,
-                    "lpo_cloud_occurrence_responses_fdr",
+                    "lpo_environment", 8,
+                    "cloud_occurrence_responses_fdr",
                     _plot_cloud_occurrence_response(
                         composite,
                         significance_variable="fdr_significant",
                     ),
                 )
             if 33 in figures:
-                progress("Starting Figure 33: FDR vertical responses")
+                progress(
+                    "Starting lpo_environment Figure 9: FDR vertical responses"
+                )
                 save(
-                    33,
-                    "lpo_unfiltered_vertical_responses_fdr",
+                    "lpo_environment", 9,
+                    "unfiltered_vertical_responses_fdr",
                     _plot_unfiltered_vertical_response(
                         composite,
                         significance_variable="fdr_significant",
                     ),
                 )
             if 34 in figures:
-                progress("Starting Figure 34: absolute group velocities")
+                progress(
+                    "Starting lpo_wave_propagation Figure 2: "
+                    "absolute group velocities"
+                )
                 save(
-                    34,
-                    "lpo_kelvin_reference_group_velocity_absolute",
+                    "lpo_wave_propagation", 2,
+                    "kelvin_reference_group_velocity_absolute",
                     _plot_kelvin_reference_absolute(composite),
                 )
             if 35 in figures:
-                progress("Starting Figure 35: group-velocity sensitivity")
+                progress(
+                    "Starting lpo_sensitivity Figure 2: group velocities"
+                )
                 save(
-                    35,
-                    "lpo_kelvin_reference_group_velocity_sensitivity",
+                    "lpo_sensitivity", 2,
+                    "kelvin_reference_group_velocity_sensitivity",
                     _plot_group_velocity_sensitivity(composite),
                 )
             if 41 in figures:
-                progress("Starting Figure 41: Matsuno-Gill response")
+                progress(
+                    "Starting lpo_wave_propagation Figure 3: Matsuno-Gill"
+                )
                 save(
-                    41,
-                    "lpo_matsuno_gill_response",
+                    "lpo_wave_propagation", 3, "matsuno_gill_response",
                     _plot_matsuno_gill_response(composite),
                 )
             if 42 in figures:
-                progress("Starting Figure 42: Kelvin peak temperature rays")
+                progress(
+                    "Starting lpo_wave_propagation Figure 4a: Kelvin rays"
+                )
                 save(
-                    42,
-                    "lpo_kelvin_peak_temperature_rays",
+                    "lpo_wave_propagation", 4,
+                    "a_kelvin_peak_temperature_rays",
                     _plot_peak_longitude_height(
                         composite,
                         "ray_filtered_temperature",
@@ -6071,10 +7144,12 @@ def build_lifecycle_figures(
                     ),
                 )
             if 43 in figures:
-                progress("Starting Figure 43: peak static-stability rays")
+                progress(
+                    "Starting lpo_wave_propagation Figure 4b: stability rays"
+                )
                 save(
-                    43,
-                    "lpo_peak_static_stability_rays",
+                    "lpo_wave_propagation", 4,
+                    "b_peak_static_stability_rays",
                     _plot_peak_longitude_height(
                         composite,
                         "ray_unfiltered_static_stability",
@@ -6084,10 +7159,12 @@ def build_lifecycle_figures(
                     ),
                 )
             if 44 in figures:
-                progress("Starting Figure 44: peak high-cloud rays")
+                progress(
+                    "Starting lpo_wave_propagation Figure 4c: cloud rays"
+                )
                 save(
-                    44,
-                    "lpo_peak_high_cloud_occurrence_rays",
+                    "lpo_wave_propagation", 4,
+                    "c_peak_high_cloud_occurrence_rays",
                     _plot_peak_longitude_height(
                         composite,
                         "ray_high_cloud_occurrence",
@@ -6097,10 +7174,12 @@ def build_lifecycle_figures(
                     ),
                 )
             if 45 in figures:
-                progress("Starting Figure 45: LPO-conditioned N2 anomaly")
+                progress(
+                    "Starting lpo_wave_propagation Figure 4d: N2 responses"
+                )
                 save(
-                    45,
-                    "lpo_conditioned_static_stability_anomaly",
+                    "lpo_wave_propagation", 4,
+                    "d_conditioned_static_stability_anomaly",
                     _plot_peak_longitude_height(
                         composite,
                         "ray_lpo_conditioned_static_stability_anomaly",
@@ -6111,11 +7190,31 @@ def build_lifecycle_figures(
                         units=r"$N^2$ anomaly (s$^{-2}$)",
                     ),
                 )
-            if 46 in figures:
-                progress("Starting Figure 46: MRG peak temperature rays")
+            if "45a" in figures:
+                progress(
+                    "Starting lpo_wave_propagation Figure 4e: absolute N2"
+                )
                 save(
-                    46,
-                    "lpo_mrg_peak_temperature_rays",
+                    "lpo_wave_propagation", 4,
+                    "e_conditioned_static_stability_anomaly_absolute",
+                    _plot_peak_longitude_height(
+                        composite,
+                        "ray_lpo_conditioned_static_stability_anomaly",
+                        title=(
+                            "LPO-conditioned static stability minus "
+                            "unconditional tropical background"
+                        ),
+                        units=r"$N^2$ anomaly (s$^{-2}$)",
+                        differences_to_control=False,
+                    ),
+                )
+            if 46 in figures:
+                progress(
+                    "Starting lpo_wave_propagation Figure 4f: MRG rays"
+                )
+                save(
+                    "lpo_wave_propagation", 4,
+                    "f_mrg_peak_temperature_rays",
                     _plot_peak_longitude_height(
                         composite,
                         "ray_filtered_temperature",
@@ -6123,6 +7222,33 @@ def build_lifecycle_figures(
                         units="temperature (K)",
                         wave_name="MRG",
                     ),
+                )
+            if WAVE_PHASE_PROFILE_FIGURE in figures:
+                progress(
+                    "Starting lpo_wave_alignment Figure 6: cross-wave phase"
+                )
+                save(
+                    "lpo_wave_alignment", 6,
+                    "cross_wave_phase_alignment",
+                    _plot_cross_wave_phase_alignment(composite),
+                )
+            if WAVE_COUPLING_LIFECYCLE_FIGURE in figures:
+                progress(
+                    "Starting lpo_wave_alignment Figure 7: coupling lifecycle"
+                )
+                save(
+                    "lpo_wave_alignment", 7,
+                    "wave_coupling_lifecycle",
+                    _plot_wave_coupling_lifecycle(composite),
+                )
+            if WAVE_COUPLING_RESPONSE_FIGURE in figures:
+                progress(
+                    "Starting lpo_wave_alignment Figure 8: coupling responses"
+                )
+                save(
+                    "lpo_wave_alignment", 8,
+                    "wave_coupling_responses",
+                    _plot_wave_coupling_response(composite),
                 )
 
 
@@ -6262,19 +7388,31 @@ def build_validation_lifecycle_figure(
             "LPO lifecycle sensitivity"
         )
         saver = FigureSaver(
-            str(figure_output),
+            str(Path(figure_output) / "lpo_tracking"),
             enabled=True,
-            figures_to_run={VALIDATION_LIFECYCLE_FIGURE},
         )
         saver.save(
             fig,
             "lpo_lifecycle_validation_sensitivity",
-            number=VALIDATION_LIFECYCLE_FIGURE,
+            number=6,
         )
         plt.close(fig)
     finally:
         for dataset in datasets.values():
             dataset.close()
+
+
+def _parse_lifecycle_figure(value: str) -> int | str:
+    """Parse one numeric figure or the Figure 45a identifier."""
+
+    if value.lower() == "45a":
+        return "45a"
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid lifecycle figure: {value!r}"
+        ) from exc
 
 
 def parse_command_line(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -6314,9 +7452,13 @@ def parse_command_line(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--figures",
         nargs="+",
-        type=int,
+        type=_parse_lifecycle_figure,
         choices=LIFECYCLE_FIGURES,
         default=None,
+        help=(
+            "Select legacy lifecycle figure identifiers. Output files use "
+            "folder-local figure numbers."
+        ),
     )
     cache_mode = parser.add_mutually_exclusive_group()
     cache_mode.add_argument(
@@ -6345,6 +7487,16 @@ def parse_command_line(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "version."
         ),
     )
+    parser.add_argument(
+        "--simulation",
+        choices=tuple(SIMULATION_DIRS),
+        default=None,
+        help=(
+            "Calculate one publication simulation and stop before shared "
+            "composites and figures. Run separate simulations concurrently, "
+            "then run this script normally to finalize."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.test and args.mode != "publication":
         parser.error("--test uses isolated publication-shaped products")
@@ -6354,6 +7506,12 @@ def parse_command_line(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.test or args.mode != "publication"
     ):
         parser.error("--allow-stale-lpo-products supports publication mode only")
+    if args.simulation and (args.test or args.mode != "publication"):
+        parser.error("--simulation supports publication mode only")
+    if args.simulation and args.figures_only:
+        parser.error("--simulation cannot be combined with --figures-only")
+    if args.simulation and args.figures:
+        parser.error("--simulation does not render figures")
     if args.figures:
         args.figures = list(dict.fromkeys(args.figures))
     return args
@@ -6409,6 +7567,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         primary_directory = mode_directory / "primary"
         if args.figures_only:
             require_lifecycle_products(primary_directory)
+        elif args.simulation:
+            analyse_run_lifecycles(
+                primary_directory,
+                force_recompute_caches=args.rebuild_cache,
+                simulations=(args.simulation,),
+                finalize=False,
+            )
+            progress(
+                f"Lifecycle products complete for {args.simulation}. "
+                "Run without --simulation after every simulation completes."
+            )
+            return 0
         else:
             analyse_run_lifecycles(
                 primary_directory,
@@ -6418,7 +7588,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         build_lifecycle_figures(
             mode_directory,
             figures=figures,
-            figure_output=lpo_tracking_figure_root() / "publication",
+            figure_output=lpo_tracking_figure_root(),
         )
     else:
         mode_directory = lpo_tracking_output_root() / "validation"
@@ -6441,7 +7611,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
         build_validation_lifecycle_figure(
             mode_directory,
-            figure_output=lpo_tracking_figure_root() / "validation",
+            figure_output=lpo_tracking_figure_root(),
         )
     progress("LPO lifecycle analysis complete")
     return 0

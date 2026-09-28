@@ -46,16 +46,18 @@ from diagnostics.diagnostic_helpers import (
     FigureSaver, HIGH_CLOUD_CLASS_SPECS, LATLON_PATTERN,
     QUICK_TEST_LON_BOUNDS,
     blue_sky_white_cloud_cmap,
-    diagnostic_cache_dir, diagnostic_output_dir, difference_cmap,
+    diagnostic_cache_dir, diagnostic_output_dir, diagnostic_profile_cache_dir,
+    difference_cmap,
     figure_should_run, hemispheric_fold,
     high_cloud_class_cmap_norm, high_cloud_class_legend_handles,
     latitude_is_hemispherically_symmetric,
-    load_latlon_dataset, precip_rate_cmap_norm,
+    load_latlon_dataset, load_netcdf, precip_rate_cmap_norm,
     precipitation_rate_from_dataset, progress,
     sample_matching_arrays, standardize_latlon_dataset,
     simulation_colour, symmetric_levels,
     source_file_signature,
     subset_latitude, time_block_slices, weighted_area_time_mean,
+    write_csv_atomic, write_netcdf_atomic,
 )
 from diagnostics.uncertainty import independent_weighted_ratio_difference
 from diagnostics.analysis_config import (
@@ -135,7 +137,7 @@ classification_cache_dir = diagnostic_cache_dir("classification")
 DERIVED_CACHE_VERSION = (
     "high-cloud-derived-diagnostics-v7-control-selected-complete-blocks"
 )
-derived_cache_dir = diagnostic_cache_dir("high_cloud")
+derived_cache_dir = diagnostic_profile_cache_dir("high_cloud")
 DERIVED_CACHE_SIGNATURE = None
 REBUILD_DERIVED_CACHE = False
 FIGURES_ONLY = False
@@ -145,16 +147,13 @@ TEST_TIME_STEPS = 16
 TEST_START = None
 TEST_DEFAULT_FIGURES = list(range(1, 9))
 SIMULATION_ARGUMENTS = {
-    "control": 0,
-    "nudged-u": 1,
-    "nudged-T": 2,
+    name: index for index, name in enumerate(SIMULATION_ARCHIVES)
 }
 
 # The shared classification product is computed in bounded blocks. Eight times
-# matches the source chunking; limiting the worker pool prevents several large
-# 3-D cloud/pressure intermediates from accumulating ahead of the NetCDF writer.
+# matches the source chunking. Use the synchronous scheduler because concurrent
+# NetCDF/HDF5 reads can deadlock inside the process-wide library locks.
 CLASSIFICATION_WRITE_TIME_BATCH = 8
-CLASSIFICATION_WRITE_WORKERS = 2
 
 BOOTSTRAP_BLOCK_DAYS = BLOCK_LENGTH_DAYS["high_cloud"]
 N_BOOTSTRAP = 600
@@ -524,7 +523,7 @@ def configure_run(args):
     classification_cache_dir = diagnostic_cache_dir(
         "classification", "testing", test_label
     )
-    derived_cache_dir = diagnostic_cache_dir(
+    derived_cache_dir = diagnostic_profile_cache_dir(
         "high_cloud", "testing", test_label
     )
 
@@ -537,7 +536,9 @@ def save_figure(number, fig, stem):
 
 def save_table(df, stem):
     if save and df is not None and len(df) > 0:
-        path = os.path.join(save_loc, f"{stem}.csv")
+        output_directory = figsave.save_loc if figsave is not None else save_loc
+        os.makedirs(output_directory, exist_ok=True)
+        path = os.path.join(output_directory, f"{stem}.csv")
         df.to_csv(path, index=False)
         progress(f"Wrote {path}")
 
@@ -716,9 +717,7 @@ def load_or_compute_derived_table(stem, compute):
     table = compute()
     if table is None or not isinstance(table, pd.DataFrame):
         raise TypeError(f"{stem}: derived table builder did not return a DataFrame")
-    tmp_path = path + ".tmp"
-    table.to_csv(tmp_path, index=False)
-    os.replace(tmp_path, path)
+    write_csv_atomic(table, path, index=False)
     _write_json_atomic(metadata_path, DERIVED_CACHE_SIGNATURE)
     progress(f"Wrote derived high-cloud table {path}")
     return table
@@ -730,8 +729,7 @@ def load_or_compute_derived_dataset(stem, compute):
     path, metadata_path = _derived_product_paths(stem, "nc")
     if os.path.isfile(path) and _read_current_derived_metadata(metadata_path):
         progress(f"Using cached high-cloud dataset {path}")
-        with xr.open_dataset(path) as cached:
-            return cached.load()
+        return load_netcdf(path)
     if FIGURES_ONLY:
         raise RuntimeError(
             f"Missing or stale derived high-cloud dataset {path}; run without "
@@ -748,9 +746,7 @@ def load_or_compute_derived_dataset(stem, compute):
             DERIVED_CACHE_SIGNATURE, sort_keys=True
         ),
     )
-    tmp_path = path + ".tmp"
-    dataset.to_netcdf(tmp_path)
-    os.replace(tmp_path, path)
+    dataset = write_netcdf_atomic(dataset, path)
     _write_json_atomic(metadata_path, DERIVED_CACHE_SIGNATURE)
     progress(f"Wrote derived high-cloud dataset {path}")
     return dataset
@@ -808,7 +804,6 @@ def write_time_batched_dataset(
     label,
     encoding=None,
     time_batch=CLASSIFICATION_WRITE_TIME_BATCH,
-    num_workers=CLASSIFICATION_WRITE_WORKERS,
 ):
     """Write an atomic NetCDF product without evaluating one monolithic graph.
 
@@ -822,8 +817,8 @@ def write_time_batched_dataset(
     ntime = int(ds.sizes["Time"])
     if ntime == 0:
         raise ValueError(f"{label}: refusing to write a product with no times")
-    if time_batch < 1 or num_workers < 1:
-        raise ValueError("time_batch and num_workers must both be positive")
+    if time_batch < 1:
+        raise ValueError("time_batch must be positive")
 
     from netCDF4 import Dataset
 
@@ -834,7 +829,7 @@ def write_time_batched_dataset(
 
     progress(
         f"{label}: initialising {path} for {ntime} times "
-        f"(batch={time_batch}, workers={num_workers})"
+        f"(batch={time_batch}, scheduler=synchronous)"
     )
     template = ds.isel(Time=slice(0, 0))
     writer_encoding = dict(encoding or {})
@@ -874,10 +869,7 @@ def write_time_batched_dataset(
             f"{label}: computing block {block_number}/{nblocks} "
             f"(times {start + 1}-{stop})"
         )
-        block = ds.isel(Time=slice(start, stop)).load(
-            scheduler="threads",
-            num_workers=num_workers,
-        )
+        block = ds.isel(Time=slice(start, stop)).load(scheduler="synchronous")
         computed = time.monotonic()
 
         with Dataset(tmp_path, mode="a") as target:
@@ -4635,7 +4627,5 @@ def main(argv=None):
     )
 
     progress("Refined high-cloud classification diagnostics complete")
-
-
 if __name__ == "__main__":
     main()

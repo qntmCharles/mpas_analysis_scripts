@@ -31,6 +31,7 @@ P0_PA = 100000.0
 REFERENCE_SCRIPT = "/data/phh1-hosted/cwp29/mpas-a/analysis/TEM/compute_tem_new.py"
 TEM_VARIABLES = (
     "t",
+    "rho_zm",
     "upvp",
     "upwp",
     "vptp",
@@ -326,6 +327,7 @@ def compute_tem_dataset(
     out = xr.Dataset(
         {
             "t": t_zm,
+            "rho_zm": rho_zm,
             "upvp": upvp,
             "upwp": upwp,
             "vptp": vptp,
@@ -344,6 +346,10 @@ def compute_tem_dataset(
         out[name] = out[name].transpose(target_time_dim, "z", "latitude")
 
     out["t"].attrs.update(long_name="Zonal mean temperature", units="K")
+    out["rho_zm"].attrs.update(
+        long_name="Zonal mean dry-air density",
+        units="kg m-3",
+    )
     out["upvp"].attrs.update(long_name="Meridional momentum flux", units="m2 s-2")
     out["upwp"].attrs.update(long_name="Vertical momentum flux", units="m2 s-2")
     out["vptp"].attrs.update(long_name="Meridional temperature flux", units="K m s-1")

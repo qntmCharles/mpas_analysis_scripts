@@ -22,7 +22,7 @@ from wavenumber_frequency_functions import (
     genDispersionCurves,
 )
 from diagnostics.diagnostic_helpers import (
-    FigureSaver, add_period_reference_lines_frequency,
+    FigureSaver, N2_latheight, add_period_reference_lines_frequency,
     add_split_difference_colorbars, add_symmetric_colorbar,
     annotate_panel_label, contourf_split_difference,
     control_diff_label, diagnostic_output_dir, difference_cmap,
@@ -33,7 +33,7 @@ from diagnostics.diagnostic_helpers import (
     make_spectrum_cmap, midlevel_height_from_latlon,
     model_lat_field, nice_levels, plot_Tu_latpres, plot_rhw_latpres,
     positive_levels, region_symmetric_levels,
-    relative_frequency_from_histogram, safe_nanpercentile,
+    progress, relative_frequency_from_histogram, safe_nanpercentile,
     set_latheight_labels, set_latpres_axis,
     simulation_colour, split_scales_warranted,
     symmetric_levels,
@@ -71,7 +71,7 @@ def parse_args(argv=None):
         "--figures",
         nargs="+",
         type=int,
-        choices=[*range(1, 15), 16, 17, 18, 19],
+        choices=[*range(1, 15), 16, 17, 18, 19, 20, 21],
         default=None,
         help="Build only these numbered figures.",
     )
@@ -93,6 +93,7 @@ def parse_args(argv=None):
 
 
 runtime_args = parse_args()
+progress("Starting mean-state diagnostics")
 save = True
 save_loc = diagnostic_output_dir('/home/cwp29/tmp/mpas/crf_on/final/mean_state/')
 if runtime_args.test:
@@ -124,7 +125,9 @@ if runtime_args.test:
 #   16: temperature_wind_latheight, w_rh_latheight, tem_latheight
 #   17: mslp_maps
 #   18: scalar_constituents_latheight
-#   19: precipitable-water and CAPE distribution responses
+#   19: precipitable-water and CAPE distributions and responses
+#   20: static-stability latitude-height fields and responses
+#   21: cold-point tropopause height and pressure profiles
 #
 # WHAT TO LOOK FOR:
 #   * Use mean-state figures to establish the baseline structural response:
@@ -570,6 +573,7 @@ zonal_mean_vars = [
 latlon_chunks = {"Time": 4, "latitude": 180, "longitude": 360}
 zm_chunks = {"Time": -1}
 
+progress("Preparing compact mean-state calculation products")
 cached_products = prepare_products(
     root_dir,
     data_locs,
@@ -582,6 +586,7 @@ cached_products = prepare_products(
     figures_only=runtime_args.figures_only,
     rebuild=runtime_args.rebuild_cache,
 )
+progress("Mean-state calculation products are ready")
 
 if "means" in cached_products:
     means_latlon, means_zonal = cached_products["means"]
@@ -653,9 +658,7 @@ if should_run_figure(2):
         dtheta_dz = np.gradient(theta.values, z)
         N2 = g / theta.values * dtheta_dz
 
-        print(z, pressure.values)
         ttp, ptp, ztp, _ = tropopause_profile_single(T.values, pressure.values, z)
-        print(ttp, ptp, ztp)
 
         for a in ax:
             a.axhline(ztp/1000., color=cols[i], ls=':')
@@ -682,7 +685,7 @@ if should_run_figure(2):
 # pre-compute CPTs for plotting
 
 CPTs = None
-if should_run_any([3, 10, 11, 13, 14, 16, 18]):
+if should_run_any([3, 10, 11, 13, 14, 16, 18, 20, 21]):
     CPTs = []
 
     for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
@@ -700,9 +703,12 @@ if should_run_any([3, 10, 11, 13, 14, 16, 18]):
             ttp, ptp, ztp, _ = tropopause_profile(T.values[:, j], pressure.values[:, j], z)
             ztps.append(ztp)
             ptps.append(ptp)
-            print(ztp)
 
         CPTs.append([ztps, ptps])
+        progress(
+            f"Calculated cold-point tropopause profiles for {sim_names[i]} "
+            f"at {len(ztps)} latitudes"
+        )
 
     CPTs = np.array(CPTs)
 
@@ -893,21 +899,52 @@ if should_run_figure(6):
 
 
 if should_run_figure(19):
-    # These compact block PDFs preserve the retained distribution analysis.
-    # Simulations represent independent
-    # statistical climates, so each bootstrap uses separate block indices.
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.4), constrained_layout=True)
-    comparison_specs = (
-        (1, 0, "nudged u - control", cols[1]),
-        (2, 0, "nudged T - control", cols[2]),
-        (1, 2, "nudged u - nudged T", "0.25"),
+    # Plot the absolute distributions as well as their experiment responses.
+    # Simulations represent independent statistical climates, so each
+    # response bootstrap uses separate block indices.
+    fig, axes = plt.subplots(
+        2, 2,
+        figsize=(9, 6.2),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    comparison_specs = [
+        (
+            index,
+            0,
+            f"{sim_names[index]} - {sim_names[0]}",
+            cols[index],
+        )
+        for index in range(1, len(sim_names))
+    ]
+    comparison_specs.extend(
+        (
+            1,
+            index,
+            f"{sim_names[1]} - {sim_names[index]}",
+            "0.25",
+        )
+        for index in range(2, len(sim_names))
     )
     field_specs = (
         ("pw", "Precipitable water", "kg m$^{-2}$", (0.0, 80.0)),
         ("cape", "CAPE", "J kg$^{-1}$", (0.0, 5000.0)),
     )
     for field_index, (name, label, units, x_limits) in enumerate(field_specs):
-        axis = axes[field_index]
+        absolute_axis = axes[0, field_index]
+        response_axis = axes[1, field_index]
+        centres = distribution_cache[f"{name}_bin"].values
+        for simulation_index, simulation_name in enumerate(sim_names):
+            block_pdfs = distribution_cache.sel(simulation=simulation_name)[
+                f"{name}_pdf_blocks"
+            ].values
+            absolute_axis.plot(
+                centres,
+                np.nanmean(block_pdfs, axis=0),
+                color=cols[simulation_index],
+                linewidth=1.2,
+                label=simulation_name,
+            )
         for comparison_index, (run_index, reference_index, comparison_label, colour) in enumerate(
             comparison_specs
         ):
@@ -934,19 +971,174 @@ if should_run_figure(19):
                     ),
                     n_resamples=FIELD_BOOTSTRAP_REPLICATES,
                 )
-            centres = distribution_cache[f"{name}_bin"].values
-            axis.plot(centres, estimate, color=colour, linewidth=1.2, label=comparison_label)
-            axis.fill_between(centres, low, high, color=colour, alpha=0.12)
-        axis.axhline(0.0, color="0.6", linewidth=0.8)
-        axis.set_yscale("symlog", linthresh=1.0e-4)
-        axis.set_xlim(*x_limits)
-        axis.set_title(label)
-        axis.set_xlabel(f"{label} ({units})")
-        axis.set_ylabel("PDF response")
-        axis.grid(alpha=0.18)
-    axes[0].legend(frameon=False, fontsize=8)
-    save_figure(fig, "pw_cape_distribution_responses", number=19)
-    print("Done with figure: pw_cape_distribution_responses")
+            response_axis.plot(
+                centres,
+                estimate,
+                color=colour,
+                linewidth=1.2,
+                label=comparison_label,
+            )
+            response_axis.fill_between(
+                centres, low, high, color=colour, alpha=0.12
+            )
+        absolute_axis.set_xlim(*x_limits)
+        absolute_axis.set_title(label)
+        absolute_axis.set_ylabel("Probability density")
+        absolute_axis.grid(alpha=0.18)
+        response_axis.axhline(0.0, color="0.6", linewidth=0.8)
+        response_axis.set_yscale("symlog", linthresh=1.0e-4)
+        response_axis.set_xlim(*x_limits)
+        response_axis.set_xlabel(f"{label} ({units})")
+        response_axis.set_ylabel("PDF response")
+        response_axis.grid(alpha=0.18)
+    axes[0, 0].legend(frameon=False, fontsize=8)
+    axes[1, 0].legend(frameon=False, fontsize=8)
+    save_figure(fig, "pw_cape_distributions_and_responses", number=19)
+    print("Done with figure: pw_cape_distributions_and_responses")
+
+
+if should_run_figure(20):
+    n2_fields = [N2_latheight(zds) * 1.0e4 for zds in dss_zm]
+    raw_levels = np.linspace(0.0, 8.0, 25)
+    response_levels = symmetric_levels(1.0, ndiv=12)
+    fig, raw_axes = plt.subplots(
+        1,
+        len(dss_zm),
+        figsize=(3.7 * len(dss_zm), 3.6),
+        constrained_layout=True,
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    fig2, response_axes = plt.subplots(
+        1,
+        len(dss_zm),
+        figsize=(3.7 * len(dss_zm), 3.6),
+        constrained_layout=True,
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    raw_axes = raw_axes[0]
+    response_axes = response_axes[0]
+    raw_image = control_image = response_image = None
+    control_n2 = n2_fields[0]
+    for index, (zds, n2) in enumerate(zip(dss_zm, n2_fields)):
+        field, latitude, height = lat_height_mesh(
+            n2, zds.z, zds.latitude.values
+        )
+        raw_image = raw_axes[index].contourf(
+            latitude,
+            height / 1000.0,
+            field.values,
+            levels=raw_levels,
+            cmap="YlGnBu",
+            extend="max",
+        )
+        if index == 0:
+            control_image = response_axes[index].contourf(
+                latitude,
+                height / 1000.0,
+                field.values,
+                levels=raw_levels,
+                cmap="YlGnBu",
+                extend="max",
+            )
+        else:
+            aligned, reference = xr.align(n2, control_n2, join="exact")
+            response = aligned - reference
+            response_image = response_axes[index].contourf(
+                latitude,
+                height / 1000.0,
+                response.values,
+                levels=response_levels,
+                cmap=difference_cmap(response_levels),
+                extend="both",
+            )
+        for axis in (raw_axes[index], response_axes[index]):
+            axis.plot(
+                zds.latitude.values,
+                CPTs[index][0] / 1000.0,
+                color="k",
+                linewidth=1.0,
+                linestyle=":",
+            )
+            set_latheight_labels(axis, ylabel=index == 0)
+        annotate_panel_label(raw_axes[index], sim_names[index])
+        annotate_panel_label(
+            response_axes[index], control_diff_label(sim_names, index)
+        )
+    fig.colorbar(
+        raw_image,
+        ax=raw_axes,
+        location="right",
+        label=r"$N^2$ ($10^{-4}$ s$^{-2}$)",
+    )
+    fig2.colorbar(
+        control_image,
+        ax=response_axes[0],
+        location="right",
+        label=r"$N^2$ ($10^{-4}$ s$^{-2}$)",
+    )
+    if response_image is not None:
+        add_symmetric_colorbar(
+            fig2,
+            response_image,
+            response_axes[1:],
+            response_levels,
+            label=r"$\Delta N^2$ ($10^{-4}$ s$^{-2}$)",
+        )
+    save_figure(fig, "N2_latheight", number=20)
+    save_figure(fig2, "N2_latheight_diff", number=20)
+    print("Done with figure: N2_latheight")
+
+
+if should_run_figure(21):
+    fig, axes = plt.subplots(
+        2,
+        2,
+        figsize=(9, 6),
+        constrained_layout=True,
+        sharex=True,
+    )
+    control_height = CPTs[0][0] / 1000.0
+    control_pressure = CPTs[0][1] / 100.0
+    for index, zds in enumerate(dss_zm):
+        latitude = zds.latitude.values
+        height = CPTs[index][0] / 1000.0
+        pressure = CPTs[index][1] / 100.0
+        axes[0, 0].plot(
+            latitude, height, color=cols[index], label=sim_names[index]
+        )
+        axes[0, 1].plot(latitude, pressure, color=cols[index])
+        if index > 0:
+            axes[1, 0].plot(
+                latitude,
+                height - control_height,
+                color=cols[index],
+                label=f"{sim_names[index]} - {sim_names[0]}",
+            )
+            axes[1, 1].plot(
+                latitude,
+                pressure - control_pressure,
+                color=cols[index],
+            )
+    axes[0, 0].set_ylabel("Cold-point height (km)")
+    axes[0, 1].set_ylabel("Cold-point pressure (hPa)")
+    axes[1, 0].set_ylabel(r"$\Delta$ height (km)")
+    axes[1, 1].set_ylabel(r"$\Delta$ pressure (hPa)")
+    for axis in axes.ravel():
+        axis.set_xlim(-90.0, 90.0)
+        axis.axvline(0.0, color="0.7", linewidth=0.5)
+    axes[1, 0].axhline(0.0, color="0.7", linewidth=0.5)
+    axes[1, 1].axhline(0.0, color="0.7", linewidth=0.5)
+    axes[1, 0].set_xlabel("Latitude (degrees)")
+    axes[1, 1].set_xlabel("Latitude (degrees)")
+    axes[0, 0].legend(frameon=False)
+    axes[1, 0].legend(frameon=False)
+    axes[0, 1].invert_yaxis()
+    save_figure(fig, "cold_point_tropopause_profiles", number=21)
+    print("Done with figure: cold_point_tropopause_profiles")
 
 
 if should_run_figure(7):
@@ -1080,24 +1272,91 @@ precip_norm = colors.BoundaryNorm(boundaries=levels, ncolors=len(precip_cols)-1)
 
 
 if should_run_figure(8):
-    # Hovmoller diagrams of daily precipitation rate
+    # Deep-tropical Hovmoller diagrams.  PW and OLR show zonally asymmetric
+    # anomalies after removing each longitude's time mean and each time's
+    # zonal mean.
+    fig, ax = plt.subplots(
+        3,
+        len(dss),
+        figsize=(3.4 * len(dss), 7.5),
+        constrained_layout=True,
+        sharex=True,
+        sharey="row",
+        squeeze=False,
+    )
 
-    fig, ax = plt.subplots(1, len(dss), figsize=(8, 3), constrained_layout=True)
-
-    for d, simulation in enumerate(sim_names):
+    precip_image = None
+    for column, simulation in enumerate(sim_names):
         pr = rain_cache.precip_rate_hovmoller.sel(simulation=simulation)
-        hovmoller_im = ax[d].contourf(pr.longitude, pr.Time, pr.values, levels=levels, norm=precip_norm, cmap=precip_cmap, extend='max')
+        precip_image = ax[0, column].contourf(
+            pr.longitude,
+            pr.Time,
+            pr.values,
+            levels=levels,
+            norm=precip_norm,
+            cmap=precip_cmap,
+            extend="max",
+        )
+        annotate_panel_label(ax[0, column], sim_names[column])
 
-        annotate_panel_label(ax[d], sim_names[d])
-        if d > 0:
-            ax[d].tick_params(labelleft=False)
+    anomaly_specs = (
+        (
+            "precip_water_hovmoller",
+            "Precipitable-water anomaly",
+            r"kg m$^{-2}$",
+        ),
+        ("olr_hovmoller", "OLR anomaly", r"W m$^{-2}$"),
+    )
+    anomaly_images = []
+    for row, (variable, label, units) in enumerate(anomaly_specs, start=1):
+        anomalies = []
+        for simulation in sim_names:
+            field = rain_cache[variable].sel(simulation=simulation)
+            anomaly = field - field.mean("Time", skipna=True)
+            anomaly = anomaly - anomaly.mean("longitude", skipna=True)
+            anomalies.append(anomaly)
+        limit = max(
+            safe_nanpercentile(
+                np.abs(anomaly.values), 98.0, zero_value=1.0
+            )
+            for anomaly in anomalies
+        )
+        anomaly_levels = symmetric_levels(limit, ndiv=19)
+        image = None
+        for column, anomaly in enumerate(anomalies):
+            image = ax[row, column].contourf(
+                anomaly.longitude,
+                anomaly.Time,
+                anomaly.values,
+                levels=anomaly_levels,
+                cmap=difference_cmap(anomaly_levels),
+                extend="both",
+            )
+        anomaly_images.append((image, anomaly_levels, label, units, row))
 
-    ax[0].set_ylabel("time (days)")
+    ax[0, 0].set_ylabel("Precipitation\ntime")
+    ax[1, 0].set_ylabel("PW anomaly\ntime")
+    ax[2, 0].set_ylabel("OLR anomaly\ntime")
+    for row in range(3):
+        for column in range(1, len(dss)):
+            ax[row, column].tick_params(labelleft=False)
+    for axis in ax[-1, :]:
+        axis.set_xlabel("Longitude")
 
-    fig.colorbar(hovmoller_im, ax=ax[-1], location='right', label="Precipitation rate (mm/day)")
-
-    for a in ax:
-        a.set_xlabel("Longitude")
+    fig.colorbar(
+        precip_image,
+        ax=ax[0, :],
+        location="right",
+        label=r"Precipitation rate (mm day$^{-1}$)",
+    )
+    for image, anomaly_levels, label, units, row in anomaly_images:
+        add_symmetric_colorbar(
+            fig,
+            image,
+            ax[row, :],
+            anomaly_levels,
+            label=f"{label} ({units})",
+        )
 
     save_figure(fig, "hovmoller", number=8)
     print("Done with figure: comp_hovmoller")
@@ -1824,7 +2083,9 @@ if should_run_figure(18):
         try:
             zmid_cache[i] = ds.zmid_latitude
         except Exception as e:
-            print(f"Skipping scalar constituent height cache for {sim_names[i]}: {e}")
+            raise RuntimeError(
+                f"Scalar constituent heights failed for {sim_names[i]}"
+            ) from e
 
     for group in SCALAR_CONSTITUENT_GROUPS:
         scalar_entries = []
@@ -2198,3 +2459,5 @@ if should_run_figure(14):
         print("Done with figure: comp_eke_latpres")
     else:
         print("Skipping EKE latitude-pressure plot: no simulations had the required winds")
+
+progress("Completed mean-state diagnostics")

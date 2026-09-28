@@ -5,7 +5,14 @@ import os
 import numpy as np
 import xarray as xr
 
-from diagnostics.diagnostic_helpers import diagnostic_cache_dir
+from diagnostics.analysis_config import (
+    canonical_simulation_name,
+    simulation_cache_name,
+)
+from diagnostics.diagnostic_helpers import (
+    diagnostic_cache_dir,
+    diagnostic_profile_cache_dir,
+)
 from diagnostics.waves.equatorial_wave_config import (
     FILTERED_WAVE_PRODUCT_VERSION,
     WAVE_BOXES,
@@ -34,7 +41,16 @@ def _wave_cache_root(*, test=False):
 
 
 def wave_product_directory(*, test=False):
-    """Return the fixed machine-readable wave-product directory."""
+    """Return the profile-specific aggregate wave-product directory."""
+
+    root = diagnostic_profile_cache_dir(
+        "waves", *(("testing",) if test else ())
+    )
+    return os.path.join(root, "products")
+
+
+def simulation_wave_product_directory(*, test=False):
+    """Return the shared directory for one-simulation wave products."""
 
     return os.path.join(_wave_cache_root(test=test), "products")
 
@@ -65,7 +81,7 @@ def filtered_wave_cache_path(
     test=False,
 ):
     projection = WAVE_LATITUDE_PROJECTION[wave_name]
-    safe_simulation = simulation.replace(" ", "_")
+    safe_simulation = simulation_cache_name(simulation)
     cache_dir = _wave_cache_root(test=test)
     return os.path.join(
         cache_dir,
@@ -131,9 +147,9 @@ def load_existing_filtered_wave(
 def lpo_wave_section_cache_path(simulation, *, test=False):
     """Return the compact LPO-following wave-section cache path."""
 
-    safe_simulation = simulation.replace(" ", "_")
+    safe_simulation = canonical_simulation_name(simulation)
     return os.path.join(
-        wave_product_directory(test=test),
+        simulation_wave_product_directory(test=test),
         LPO_WAVE_SECTION_FILENAME_TEMPLATE.format(
             simulation=safe_simulation
         ),
@@ -148,7 +164,8 @@ def load_existing_lpo_wave_sections(
 ):
     """Load validated, prefiltered LPO-section values without filtering."""
 
-    path = lpo_wave_section_cache_path(simulation, test=test)
+    canonical_simulation = canonical_simulation_name(simulation)
+    path = lpo_wave_section_cache_path(canonical_simulation, test=test)
     if not os.path.exists(path):
         command = (
             "equatorial_wave_diagnostics.py --test --figures 14"
@@ -164,7 +181,7 @@ def load_existing_lpo_wave_sections(
             "cache_version": LPO_WAVE_SECTION_CACHE_VERSION,
             "wave_config_version": WAVE_CONFIG_VERSION,
             "tracking_product_version": tracking_product_version,
-            "source_simulation": simulation,
+            "source_simulation": canonical_simulation,
             "test_subset": int(test),
         }
         changed = [

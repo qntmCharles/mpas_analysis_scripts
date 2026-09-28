@@ -7,8 +7,7 @@ This script retains the physically direct parts of the former
 * Figure 1: observed and thermal-wind-implied vertical shear;
 * Figure 2: direct realised-state differences from control;
 * Figure 13: observed and shear-implied meridional temperature gradients;
-* Figure 14: control gradient/shear fields and direct nudged-minus-control
-  differences.
+* Figure 14: absolute gradient/shear fields and direct experiment responses.
 
 The residuals in Figures 1 and 13 are local thermal-wind balance residuals
 (observed minus balance-implied fields within one simulation). They are not a
@@ -55,41 +54,53 @@ from diagnostics.diagnostic_helpers import (
     cache_manifest_matches,
     control_diff_label,
     diagnostic_cache_dir,
+    diagnostic_profile_cache_dir,
     diagnostic_output_dir,
     difference_cmap,
     hemispheric_fold,
     load_latlon_dataset,
+    load_netcdf,
     model_lat_field,
-    netcdf_safe_dataset,
     precip_rate_from_accum,
     progress,
     read_json_file,
     set_latheight_labels,
+    simulation_colour,
     standardize_latlon_dataset,
     subset_between,
     symmetric_levels,
     symmetric_percentile_levels_for_fields,
     time_block_slices,
     total_precip_accum,
+    write_csv_atomic,
     write_json_file,
+    write_netcdf_atomic,
 )
 from diagnostics.ttl import TTL_HEIGHT_BOUNDS_M
 from diagnostics.analysis_config import (
+    ALL_SIMULATION_ARCHIVES,
+    ALL_SIMULATION_PUBLICATION_LABELS,
     BLOCK_LENGTH_DAYS,
     BOOTSTRAP_REPLICATES,
     BOOTSTRAP_SEED,
     CONFIDENCE_PERCENTILES,
     SIMULATION_ARCHIVES,
+    SIMULATION_PROFILES,
+    SIMULATION_PUBLICATION_LABELS,
     SIMULATION_ROOT,
+    profile_cache_directory,
 )
 from diagnostics.uncertainty import independent_bootstrap_difference
 
 
 ROOT_DIR = SIMULATION_ROOT
-SIMULATIONS = (
-    ("control", SIMULATION_ARCHIVES["control"], "k"),
-    (r"$u$-nudged", SIMULATION_ARCHIVES["nudged-u"], "b"),
-    (r"$T$-nudged", SIMULATION_ARCHIVES["nudged-T"], "r"),
+SIMULATIONS = tuple(
+    (
+        SIMULATION_PUBLICATION_LABELS[name],
+        directory,
+        simulation_colour(name),
+    )
+    for name, directory in SIMULATION_ARCHIVES.items()
 )
 FIGURES = (1, 2, 13, 14)
 SAVE_LOCATION = diagnostic_output_dir(
@@ -97,7 +108,9 @@ SAVE_LOCATION = diagnostic_output_dir(
 )
 THERMAL_WIND_CACHE_SCHEMA = "thermal-wind-v2-block-uncertainty"
 THERMAL_WIND_CACHE_ROOT = diagnostic_cache_dir("thermal_wind")
+THERMAL_WIND_PROFILE_CACHE_ROOT = diagnostic_profile_cache_dir("thermal_wind")
 TEST_TIME_COUNT: int | None = None
+THERMAL_TIME_CHUNKS = {"Time": 40}
 
 RD = 287.0
 CP = 1004.0
@@ -433,7 +446,7 @@ def load_inputs(
             dataset = load_latlon_dataset(
                 ROOT_DIR / directory,
                 latlon_pattern=LATLON_PATTERN,
-                chunks={"Time": -1},
+                chunks=THERMAL_TIME_CHUNKS,
             )
             latlon_datasets.append(
                 standardize_latlon_dataset(dataset, LATLON_VARIABLES)
@@ -441,7 +454,7 @@ def load_inputs(
         zonal = load_latlon_dataset(
             ROOT_DIR / directory,
             latlon_pattern=ZONAL_MEAN_PATTERN,
-            chunks={"Time": -1},
+            chunks=THERMAL_TIME_CHUNKS,
         )
         zonal_datasets.append(
             standardize_latlon_dataset(zonal, ZONAL_MEAN_VARIABLES)
@@ -454,7 +467,11 @@ def thermal_wind_source_paths(directory: str, pattern: str) -> list[str]:
 
 
 def thermal_wind_manifest(
-    kind: str, *, directory: str | None = None, include_sources=True
+    kind: str,
+    *,
+    directory: str | None = None,
+    include_sources=True,
+    simulations: Sequence[tuple[str, str, str]] = SIMULATIONS,
 ):
     patterns = (
         (LATLON_PATTERN, ZONAL_MEAN_PATTERN)
@@ -464,7 +481,7 @@ def thermal_wind_manifest(
     directories = (
         [directory]
         if directory is not None
-        else [simulation[1] for simulation in SIMULATIONS]
+        else [simulation[1] for simulation in simulations]
     )
     source_paths = [
         path
@@ -477,7 +494,11 @@ def thermal_wind_manifest(
         "directory": directory,
         "analysis_start": ANALYSIS_START,
         "analysis_end": ANALYSIS_END,
-        "simulations": [simulation[:2] for simulation in SIMULATIONS],
+        "simulations": [
+            simulation[:2]
+            for simulation in simulations
+            if directory is None or simulation[1] == directory
+        ],
         "test_times": TEST_TIME_COUNT,
         "ttl_bounds_m": TTL_Z_BOUNDS,
         "equator_mask_degrees": EQUATOR_MASK_DEGREES,
@@ -506,14 +527,19 @@ def thermal_wind_cache_is_current(
         with xr.open_dataset(path) as cached:
             if cached.attrs.get("cache_schema") != THERMAL_WIND_CACHE_SCHEMA:
                 return False
-            if validate_sources:
-                return (
-                    cached.attrs.get("manifest_sha256")
-                    == manifest["manifest_sha256"]
-                )
             saved = json.loads(cached.attrs.get("cache_manifest", "null"))
+            expected_configuration = manifest.get("configuration", {})
+            if expected_configuration.get("directory") is not None:
+                saved = dict(saved)
+                saved["configuration"] = dict(
+                    saved.get("configuration", {})
+                )
+                saved["configuration"]["simulations"] = (
+                    expected_configuration["simulations"]
+                )
+                saved["manifest_sha256"] = manifest["manifest_sha256"]
             return cache_manifest_matches(
-                saved, manifest, compare_sources=False
+                saved, manifest, compare_sources=validate_sources
             )
     except (OSError, ValueError):
         return False
@@ -529,9 +555,7 @@ def write_thermal_wind_cache(
         manifest_sha256=manifest["manifest_sha256"],
         cache_manifest=json.dumps(manifest, sort_keys=True),
     )
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    netcdf_safe_dataset(dataset).to_netcdf(temporary)
-    os.replace(temporary, path)
+    write_netcdf_atomic(dataset, path)
 
 
 def prepare_zonal_mean_caches(
@@ -549,8 +573,7 @@ def prepare_zonal_mean_caches(
         )
         if current and not rebuild_cache:
             progress(f"{label}: using thermal-wind cache {path}")
-            with xr.open_dataset(path) as cached:
-                datasets.append(cached.load())
+            datasets.append(load_netcdf(path))
             continue
         if figures_only:
             raise FileNotFoundError(
@@ -560,7 +583,7 @@ def prepare_zonal_mean_caches(
         raw = load_latlon_dataset(
             ROOT_DIR / directory,
             latlon_pattern=ZONAL_MEAN_PATTERN,
-            chunks={"Time": -1},
+            chunks=THERMAL_TIME_CHUNKS,
         )
         try:
             raw = standardize_latlon_dataset(raw, ZONAL_MEAN_VARIABLES)
@@ -579,7 +602,7 @@ def prepare_zonal_mean_caches(
 
 
 def realised_summary_cache_paths() -> tuple[Path, Path]:
-    root = Path(THERMAL_WIND_CACHE_ROOT)
+    root = Path(THERMAL_WIND_PROFILE_CACHE_ROOT)
     return (
         root / "realised_state_summary.csv",
         root / "realised_state_summary.metadata.json",
@@ -587,11 +610,113 @@ def realised_summary_cache_paths() -> tuple[Path, Path]:
 
 
 def realised_block_cache_paths() -> tuple[Path, Path]:
-    root = Path(THERMAL_WIND_CACHE_ROOT)
+    root = Path(THERMAL_WIND_PROFILE_CACHE_ROOT)
     return (
         root / "realised_state_blocks.csv",
         root / "realised_state_response_uncertainty.csv",
     )
+
+
+def realised_simulation_cache_paths(directory: str) -> tuple[Path, Path, Path]:
+    root = Path(THERMAL_WIND_CACHE_ROOT)
+    return (
+        root / f"{directory}_realised_state_summary.csv",
+        root / f"{directory}_realised_state_blocks.csv",
+        root / f"{directory}_realised_state.metadata.json",
+    )
+
+
+def thermal_profile_simulations(
+    profile: str,
+) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        (
+            ALL_SIMULATION_PUBLICATION_LABELS[name],
+            ALL_SIMULATION_ARCHIVES[name],
+            simulation_colour(name),
+        )
+        for name in SIMULATION_PROFILES[profile]
+    )
+
+
+def thermal_profile_cache_root(profile: str) -> Path:
+    parts = (
+        ("testing", f"all_{TEST_TIME_COUNT:03d}times")
+        if TEST_TIME_COUNT is not None
+        else ()
+    )
+    return profile_cache_directory("thermal_wind", *parts, profile=profile)
+
+
+def _atomic_csv(table: pd.DataFrame, path: Path) -> None:
+    write_csv_atomic(table, path, index=False)
+
+
+def migrate_realised_simulation_cache(
+    simulation: tuple[str, str, str],
+    *,
+    validate_sources: bool,
+    skip_uncertainty: bool,
+) -> bool:
+    """Seed one realised-state cache from a current profile aggregate."""
+
+    label, directory, _colour = simulation
+    canonical = next(
+        name
+        for name, archive in ALL_SIMULATION_ARCHIVES.items()
+        if archive == directory
+    )
+    for profile, names in SIMULATION_PROFILES.items():
+        if canonical not in names:
+            continue
+        donor_simulations = thermal_profile_simulations(profile)
+        root = thermal_profile_cache_root(profile)
+        table_path = root / "realised_state_summary.csv"
+        blocks_path = root / "realised_state_blocks.csv"
+        metadata_path = root / "realised_state_summary.metadata.json"
+        if not table_path.is_file() or not metadata_path.is_file():
+            continue
+        if not skip_uncertainty and not blocks_path.is_file():
+            continue
+        expected = thermal_wind_manifest(
+            "realised_state_summary",
+            include_sources=validate_sources,
+            simulations=donor_simulations,
+        )
+        if not cache_manifest_matches(
+            read_json_file(metadata_path),
+            expected,
+            compare_sources=validate_sources,
+        ):
+            continue
+        table = pd.read_csv(table_path)
+        table = table[table.simulation == label].copy()
+        if table.empty:
+            continue
+        blocks = (
+            pd.DataFrame()
+            if skip_uncertainty
+            else pd.read_csv(blocks_path)
+        )
+        if not blocks.empty:
+            blocks = blocks[blocks.simulation == label].copy()
+        target_table, target_blocks, target_metadata = (
+            realised_simulation_cache_paths(directory)
+        )
+        _atomic_csv(table, target_table)
+        if not skip_uncertainty:
+            _atomic_csv(blocks, target_blocks)
+        manifest = thermal_wind_manifest(
+            "realised_state_summary",
+            directory=directory,
+            simulations=(simulation,),
+        )
+        write_json_file(target_metadata, manifest)
+        progress(
+            f"{label}: migrated realised-state products from {profile}"
+        )
+        return True
+    return False
 
 
 def prepare_realised_state_summary(
@@ -603,41 +728,57 @@ def prepare_realised_state_summary(
 ) -> pd.DataFrame:
     table_path, metadata_path = realised_summary_cache_paths()
     blocks_path, uncertainty_path = realised_block_cache_paths()
-    manifest = thermal_wind_manifest(
-        "realised_state_summary", include_sources=not figures_only
-    )
-    current = (
-        table_path.is_file()
-        and blocks_path.is_file()
-        and (skip_uncertainty or uncertainty_path.is_file())
-        and cache_manifest_matches(
-            read_json_file(metadata_path),
-            manifest,
-            compare_sources=not figures_only,
-        )
-    )
-    if current and not rebuild_cache:
-        progress(f"using realised-state cache {table_path}")
-        return pd.read_csv(table_path)
-    if figures_only:
-        raise FileNotFoundError(
-            "Figure-only mode requires a current realised-state cache: "
-            f"{table_path}"
-        )
-    rows = []
-    block_rows = []
+    simulation_tables = []
+    simulation_blocks = []
     block_days = BLOCK_LENGTH_DAYS["thermal_wind"]
     for index, (label, directory, _colour) in enumerate(SIMULATIONS):
+        simulation = SIMULATIONS[index]
+        sim_table_path, sim_blocks_path, sim_metadata_path = (
+            realised_simulation_cache_paths(directory)
+        )
+        sim_manifest = thermal_wind_manifest(
+            "realised_state_summary",
+            directory=directory,
+            include_sources=not figures_only,
+            simulations=(simulation,),
+        )
+        current = (
+            not rebuild_cache
+            and sim_table_path.is_file()
+            and (skip_uncertainty or sim_blocks_path.is_file())
+            and cache_manifest_matches(
+                read_json_file(sim_metadata_path),
+                sim_manifest,
+                compare_sources=not figures_only,
+            )
+        )
+        if not current and not rebuild_cache:
+            current = migrate_realised_simulation_cache(
+                simulation,
+                validate_sources=not figures_only,
+                skip_uncertainty=skip_uncertainty,
+            )
+        if current:
+            progress(f"{label}: using realised-state simulation cache")
+            simulation_tables.append(pd.read_csv(sim_table_path))
+            if not skip_uncertainty:
+                simulation_blocks.append(pd.read_csv(sim_blocks_path))
+            continue
+        if figures_only:
+            raise FileNotFoundError(
+                "Figure-only mode requires a current realised-state cache: "
+                f"{sim_table_path}"
+            )
         progress(f"{label}: loading realised-state inputs")
         latlon = load_latlon_dataset(
             ROOT_DIR / directory,
             latlon_pattern=LATLON_PATTERN,
-            chunks={"Time": -1},
+            chunks=THERMAL_TIME_CHUNKS,
         )
         zonal = load_latlon_dataset(
             ROOT_DIR / directory,
             latlon_pattern=ZONAL_MEAN_PATTERN,
-            chunks={"Time": -1},
+            chunks=THERMAL_TIME_CHUNKS,
         )
         try:
             latlon = standardize_latlon_dataset(latlon, LATLON_VARIABLES)
@@ -645,9 +786,10 @@ def prepare_realised_state_summary(
             if TEST_TIME_COUNT is not None:
                 latlon = latlon.isel(Time=slice(0, TEST_TIME_COUNT))
                 zonal = zonal.isel(Time=slice(0, TEST_TIME_COUNT))
-            rows.append(
+            sim_rows = [
                 realised_state_row(label, latlon, zonal_datasets[index])
-            )
+            ]
+            sim_block_rows = []
             if not skip_uncertainty:
                 latlon_blocks = time_block_slices(
                     latlon.olrtoa, block_days=block_days, complete=True
@@ -665,30 +807,48 @@ def prepare_realised_state_summary(
                     )
                     row["block"] = block_index
                     row["block_days"] = block_days
-                    block_rows.append(row)
+                    sim_block_rows.append(row)
         finally:
             latlon.close()
             zonal.close()
-    table = add_control_differences(pd.DataFrame(rows))
-    blocks = pd.DataFrame(block_rows)
+        sim_table = pd.DataFrame(sim_rows)
+        sim_blocks = pd.DataFrame(sim_block_rows)
+        _atomic_csv(sim_table, sim_table_path)
+        if not skip_uncertainty:
+            _atomic_csv(sim_blocks, sim_blocks_path)
+        write_json_file(
+            sim_metadata_path,
+            thermal_wind_manifest(
+                "realised_state_summary",
+                directory=directory,
+                simulations=(simulation,),
+            ),
+        )
+        simulation_tables.append(sim_table)
+        if not skip_uncertainty:
+            simulation_blocks.append(sim_blocks)
+
+    table = add_control_differences(
+        pd.concat(simulation_tables, ignore_index=True)
+    )
+    blocks = (
+        pd.DataFrame()
+        if skip_uncertainty
+        else pd.concat(simulation_blocks, ignore_index=True)
+    )
     uncertainty = (
         pd.DataFrame()
         if skip_uncertainty
         else realised_state_response_uncertainty(blocks)
     )
-    table_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = table_path.with_suffix(table_path.suffix + ".tmp")
-    table.to_csv(temporary, index=False)
-    os.replace(temporary, table_path)
-    temporary = blocks_path.with_suffix(blocks_path.suffix + ".tmp")
-    blocks.to_csv(temporary, index=False)
-    os.replace(temporary, blocks_path)
-    temporary = uncertainty_path.with_suffix(
-        uncertainty_path.suffix + ".tmp"
-    )
-    uncertainty.to_csv(temporary, index=False)
-    os.replace(temporary, uncertainty_path)
-    write_json_file(metadata_path, manifest)
+    if not figures_only:
+        _atomic_csv(table, table_path)
+        _atomic_csv(blocks, blocks_path)
+        _atomic_csv(uncertainty, uncertainty_path)
+        write_json_file(
+            metadata_path,
+            thermal_wind_manifest("realised_state_summary"),
+        )
     return table
 
 
@@ -916,11 +1076,16 @@ def realised_state_response_uncertainty(blocks: pd.DataFrame) -> pd.DataFrame:
         for column in blocks.columns
         if column not in {"simulation", "block", "block_days"}
     ]
-    comparisons = (
-        (SIMULATIONS[1][0], SIMULATIONS[0][0]),
-        (SIMULATIONS[2][0], SIMULATIONS[0][0]),
-        (SIMULATIONS[1][0], SIMULATIONS[2][0]),
-    )
+    control = SIMULATIONS[0][0]
+    perturbations = [simulation[0] for simulation in SIMULATIONS[1:]]
+    comparisons = [
+        (simulation, control) for simulation in perturbations
+    ]
+    if perturbations:
+        comparisons.extend(
+            (perturbations[0], simulation)
+            for simulation in perturbations[1:]
+        )
     rows = []
     for metric_index, metric in enumerate(metrics):
         for comparison_index, (simulation, reference) in enumerate(comparisons):
@@ -1126,35 +1291,110 @@ def gradient_shear_fields(dataset: xr.Dataset) -> dict[str, xr.DataArray]:
     }
 
 
+GRADIENT_SHEAR_SPECIFICATIONS = (
+    (
+        "dT_dy",
+        r"$\partial T/\partial y$",
+        r"K $(10^3$ km)$^{-1}$",
+        "coolwarm",
+        8.0,
+        2.0,
+    ),
+    (
+        "du_dz",
+        r"$\partial u/\partial z$",
+        r"m s$^{-1}$ km$^{-1}$",
+        "bwr",
+        8.0,
+        2.0,
+    ),
+)
+
+
+def plot_gradient_shear_total_fields(
+    zonal_datasets: Sequence[xr.Dataset],
+    cold_points: Sequence[np.ndarray],
+    fields: Sequence[dict[str, xr.DataArray]] | None = None,
+) -> plt.Figure:
+    """Build the absolute gradient and shear companion to Figure 14."""
+
+    if fields is None:
+        fields = [gradient_shear_fields(dataset) for dataset in zonal_datasets]
+    figure, axes = plt.subplots(
+        len(GRADIENT_SHEAR_SPECIFICATIONS),
+        len(SIMULATIONS),
+        figsize=(3.8 * len(SIMULATIONS), 2.9 * len(GRADIENT_SHEAR_SPECIFICATIONS)),
+        constrained_layout=True,
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+    )
+    for row, (
+        key,
+        label,
+        units,
+        colourmap,
+        raw_fallback,
+        _difference_fallback,
+    ) in enumerate(GRADIENT_SHEAR_SPECIFICATIONS):
+        raw_levels = symmetric_percentile_levels_for_fields(
+            [simulation_fields[key] for simulation_fields in fields],
+            percentile=99.0,
+            ndiv=12,
+            zero_field_scale=raw_fallback,
+        )
+        image = None
+        for column, simulation_fields in enumerate(fields):
+            plotted = simulation_fields[key]
+            image = axes[row, column].contourf(
+                plotted.latitude,
+                plotted.z / 1000.0,
+                plotted,
+                levels=raw_levels,
+                cmap=colourmap,
+                extend="both",
+            )
+            axes[row, column].plot(
+                zonal_datasets[column].latitude,
+                cold_points[column] / 1000.0,
+                color="k",
+                linewidth=1.0,
+                linestyle=":",
+            )
+            add_equator_guides(axes[row, column])
+            annotate_panel_label(axes[row, column], SIMULATIONS[column][0])
+            set_latheight_labels(
+                axes[row, column],
+                xlabel=row == len(GRADIENT_SHEAR_SPECIFICATIONS) - 1,
+                ylabel=column == 0,
+            )
+            axes[row, column].set_xlim(-60.0, 60.0)
+            axes[row, column].set_ylim(0.0, 25.0)
+            if column == 0:
+                axes[row, column].set_ylabel(f"{label}\nHeight (km)")
+        figure.colorbar(
+            image,
+            ax=axes[row, :],
+            location="right",
+            label=f"{label} ({units})",
+        )
+    figure.suptitle("Observed thermal gradient and vertical shear")
+    return figure
+
+
 def plot_gradient_shear_differences(
     zonal_datasets: Sequence[xr.Dataset],
     cold_points: Sequence[np.ndarray],
+    fields: Sequence[dict[str, xr.DataArray]] | None = None,
 ) -> plt.Figure:
     """Build Figure 14 using direct nudged-minus-control differences."""
 
-    fields = [gradient_shear_fields(dataset) for dataset in zonal_datasets]
-    specifications = (
-        (
-            "dT_dy",
-            r"$\partial T/\partial y$",
-            r"K $(10^3$ km)$^{-1}$",
-            "coolwarm",
-            8.0,
-            2.0,
-        ),
-        (
-            "du_dz",
-            r"$\partial u/\partial z$",
-            r"m s$^{-1}$ km$^{-1}$",
-            "bwr",
-            8.0,
-            2.0,
-        ),
-    )
+    if fields is None:
+        fields = [gradient_shear_fields(dataset) for dataset in zonal_datasets]
     figure, axes = plt.subplots(
-        len(specifications),
+        len(GRADIENT_SHEAR_SPECIFICATIONS),
         len(SIMULATIONS),
-        figsize=(3.8 * len(SIMULATIONS), 2.9 * len(specifications)),
+        figsize=(3.8 * len(SIMULATIONS), 2.9 * len(GRADIENT_SHEAR_SPECIFICATIONS)),
         constrained_layout=True,
         squeeze=False,
         sharex=True,
@@ -1167,7 +1407,7 @@ def plot_gradient_shear_differences(
         colourmap,
         raw_fallback,
         difference_fallback,
-    ) in enumerate(specifications):
+    ) in enumerate(GRADIENT_SHEAR_SPECIFICATIONS):
         control = fields[0][key]
         differences = [
             xr.align(fields[index][key], control, join="exact")[0]
@@ -1226,7 +1466,7 @@ def plot_gradient_shear_differences(
             )
             set_latheight_labels(
                 axis,
-                xlabel=row == len(specifications) - 1,
+                xlabel=row == len(GRADIENT_SHEAR_SPECIFICATIONS) - 1,
                 ylabel=column == 0,
             )
             axis.set_xlim(-60, 60)
@@ -1295,11 +1535,15 @@ def parse_command_line(
 
 def main(argv: Sequence[str] | None = None) -> int:
     global SAVE_LOCATION, TEST_TIME_COUNT, THERMAL_WIND_CACHE_ROOT
+    global THERMAL_WIND_PROFILE_CACHE_ROOT
     args = parse_command_line(argv)
     if args.test:
         TEST_TIME_COUNT = int(args.test_times)
         test_label = f"all_{TEST_TIME_COUNT:03d}times"
         THERMAL_WIND_CACHE_ROOT = diagnostic_cache_dir(
+            "thermal_wind", "testing", test_label
+        )
+        THERMAL_WIND_PROFILE_CACHE_ROOT = diagnostic_profile_cache_dir(
             "thermal_wind", "testing", test_label
         )
         SAVE_LOCATION = os.path.join(SAVE_LOCATION, "testing", test_label)
@@ -1333,7 +1577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             plt.close(figure)
             metrics.to_csv(
                 os.path.join(
-                    SAVE_LOCATION,
+                    saver.save_loc,
                     "thermal_wind_total_metrics.csv",
                 ),
                 index=False,
@@ -1347,7 +1591,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 skip_uncertainty=args.test,
             )
             summary.to_csv(
-                os.path.join(SAVE_LOCATION, "realised_state_summary.csv"),
+                os.path.join(saver.save_loc, "realised_state_summary.csv"),
                 index=False,
             )
             _blocks_path, uncertainty_path = realised_block_cache_paths()
@@ -1357,7 +1601,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 uncertainty = pd.DataFrame()
             uncertainty.to_csv(
                 os.path.join(
-                    SAVE_LOCATION,
+                    saver.save_loc,
                     "realised_state_response_uncertainty.csv",
                 ),
                 index=False,
@@ -1381,18 +1625,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             plt.close(figure)
             metrics.to_csv(
                 os.path.join(
-                    SAVE_LOCATION,
+                    saver.save_loc,
                     "thermal_wind_temperature_gradient_total_metrics.csv",
                 ),
                 index=False,
             )
         if 14 in figures:
             progress(
-                "Starting Figure 14: thermal-gradient and shear differences"
+                "Starting Figure 14: absolute and response gradient/shear fields"
             )
+            gradient_shear = [
+                gradient_shear_fields(dataset) for dataset in zonal_datasets
+            ]
+            figure = plot_gradient_shear_total_fields(
+                zonal_datasets,
+                cold_points,
+                fields=gradient_shear,
+            )
+            saver.save(
+                figure,
+                "thermal_wind_gradient_shear_latheight",
+                number=14,
+            )
+            plt.close(figure)
             figure = plot_gradient_shear_differences(
                 zonal_datasets,
                 cold_points,
+                fields=gradient_shear,
             )
             saver.save(
                 figure,

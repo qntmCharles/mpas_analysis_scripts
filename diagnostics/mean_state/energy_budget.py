@@ -32,14 +32,16 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 import xarray as xr
+import dask
 
 from diagnostics.diagnostic_helpers import (
     ANALYSIS_END, ANALYSIS_START, FigureSaver, LATLON_PATTERN,
     annotate_panel_label, cache_manifest, cache_manifest_matches,
     diagnostic_cache_dir,
     diagnostic_output_dir, figure_should_run, load_latlon_dataset,
-    mpas_moist_air_density, netcdf_safe_dataset, precip_rate_from_accum,
-    standardize_latlon_dataset, time_block_slices, total_precip_accum, vertical_dim,
+    load_netcdf, mpas_moist_air_density, precip_rate_from_accum,
+    progress, standardize_latlon_dataset, time_block_slices,
+    total_precip_accum, vertical_dim, write_netcdf_atomic,
 )
 from diagnostics.analysis_config import (
     BLOCK_LENGTH_DAYS,
@@ -84,6 +86,9 @@ LV = 2.5e6
 DT_HOURS = 6
 ENERGY_CACHE_SCHEMA = "energy-budget-v2-mpas-moist-density"
 ENERGY_CACHE_ROOT = diagnostic_cache_dir("energy_budget")
+ENERGY_TIME_BATCH_SIZE = 8
+ENERGY_DASK_WORKERS = 2
+ENERGY_PROGRESS_BATCH_INTERVAL = 5
 
 
 root_dir = str(SIMULATION_ROOT)
@@ -94,8 +99,8 @@ latlon_chunks = {
     "Time": 8,
     "nVertLevels": 25,
     "nVertLevelsP1": 26,
-    "latitude": 60,
-    "longitude": 120,
+    "latitude": 120,
+    "longitude": 240,
 }
 
 MOISTURE_MIXING_RATIO_VARIABLES = ("qv", "qc", "qr", "qi", "qs", "qg")
@@ -296,7 +301,7 @@ def atmospheric_column_storage(ds):
     return global_area_mean(storage_ds).load()
 
 
-def global_energy_budget_fields(ds):
+def instantaneous_energy_budget_fields(ds):
     """
     Return 2-D flux terms in W m-2.
 
@@ -328,9 +333,6 @@ def global_energy_budget_fields(ds):
         "atmospheric_forcing": atmospheric_radiation + surface_turbulent,
     }
 
-    precip = precip_rate_from_accum(total_precip_accum(ds))
-    fields["precip_latent_release"] = precip * LV / 86400.0
-
     for name, field in fields.items():
         field.name = name
         field.attrs["units"] = "W m-2"
@@ -338,14 +340,109 @@ def global_energy_budget_fields(ds):
     return fields
 
 
-def derive_budget_series(ds):
-    flux_fields = global_energy_budget_fields(ds)
-    flux_series = {
-        name: global_area_mean(field).load()
-        for name, field in flux_fields.items()
-    }
+def precipitation_latent_release(ds):
+    """Return latent heat release from accumulated precipitation."""
 
-    storage_energy = atmospheric_column_storage(ds)
+    precip = precip_rate_from_accum(total_precip_accum(ds))
+    release = precip * LV / 86400.0
+    release.name = "precip_latent_release"
+    release.attrs["units"] = "W m-2"
+    return release
+
+
+def global_energy_budget_fields(ds):
+    """Return all instantaneous and interval energy-budget flux fields."""
+
+    fields = instantaneous_energy_budget_fields(ds)
+    fields["precip_latent_release"] = precipitation_latent_release(ds)
+    return fields
+
+
+def _energy_time_slices(time_count, batch_size):
+    if batch_size < 1:
+        raise ValueError("Energy time-batch size must be positive")
+    return [
+        slice(start, min(start + batch_size, time_count))
+        for start in range(0, time_count, batch_size)
+    ]
+
+
+def _log_energy_batch(label, index, count, time_slice):
+    should_log = (
+        index == 0
+        or index + 1 == count
+        or index % ENERGY_PROGRESS_BATCH_INTERVAL == 0
+    )
+    if should_log:
+        progress(
+            f"{label}: energy batch {index + 1}/{count}, "
+            f"time indices {time_slice.start}:{time_slice.stop}"
+        )
+
+
+def derive_budget_series(
+    ds,
+    *,
+    batch_size=ENERGY_TIME_BATCH_SIZE,
+    progress_label="energy budget",
+    log_progress=True,
+):
+    """Reduce the energy budget in bounded time batches.
+
+    Temporal batching changes only the execution layout. It does not change
+    any spatial reduction or scientific definition.
+    """
+
+    slices = _energy_time_slices(ds.sizes["Time"], batch_size)
+    instantaneous_names = tuple(
+        instantaneous_energy_budget_fields(ds.isel(Time=slice(0, 1)))
+    )
+    flux_parts = {name: [] for name in instantaneous_names}
+    precip_parts = []
+    storage_parts = []
+
+    if log_progress:
+        progress(
+            f"{progress_label}: reducing {ds.sizes['Time']} times in "
+            f"{len(slices)} bounded batches"
+        )
+
+    for index, time_slice in enumerate(slices):
+        if log_progress:
+            _log_energy_batch(progress_label, index, len(slices), time_slice)
+
+        batch = ds.isel(Time=time_slice)
+        instantaneous = instantaneous_energy_budget_fields(batch)
+        reduced_flux = xr.Dataset(
+            {
+                name: global_area_mean(field)
+                for name, field in instantaneous.items()
+            }
+        ).load()
+        for name in instantaneous_names:
+            flux_parts[name].append(reduced_flux[name])
+
+        storage_parts.append(atmospheric_column_storage(batch))
+
+        overlap_start = max(0, time_slice.start - 1)
+        precip_input = ds.isel(Time=slice(overlap_start, time_slice.stop))
+        if precip_input.sizes["Time"] >= 2:
+            precip = global_area_mean(
+                precipitation_latent_release(precip_input)
+            ).load()
+            keep = np.isin(precip.Time.values, batch.Time.values)
+            if np.any(keep):
+                precip_parts.append(precip.isel(Time=np.flatnonzero(keep)))
+
+    flux_series = {
+        name: xr.concat(parts, dim="Time")
+        for name, parts in flux_parts.items()
+    }
+    flux_series["precip_latent_release"] = xr.concat(
+        precip_parts, dim="Time"
+    )
+    storage_energy = xr.concat(storage_parts, dim="Time")
+
     dry = storage_tendency(storage_energy.dry_static_energy, "dry_static_storage_tendency")
     latent = storage_tendency(storage_energy.latent_energy, "latent_storage_tendency")
     kinetic = storage_tendency(storage_energy.kinetic_energy, "kinetic_storage_tendency")
@@ -380,6 +477,8 @@ def derive_budget_series(ds):
             "residual_no_storage": residual_no_storage,
         }
     )
+    if log_progress:
+        progress(f"{progress_label}: bounded energy reduction complete")
     return series, storage_energy
 
 
@@ -423,10 +522,11 @@ def energy_budget_uncertainty(entries):
     """Return independent-climate intervals from cached energy time series."""
 
     entry_by_name = {entry["simulation"]: entry for entry in entries}
-    comparisons = (
-        (sim_names[1], sim_names[0]),
-        (sim_names[2], sim_names[0]),
-        (sim_names[1], sim_names[2]),
+    comparisons = [
+        (simulation, sim_names[0]) for simulation in sim_names[1:]
+    ]
+    comparisons.extend(
+        (sim_names[1], simulation) for simulation in sim_names[2:]
     )
     rows = []
     block_days = BLOCK_LENGTH_DAYS["energy_budget"]
@@ -775,21 +875,17 @@ def energy_cache_is_current(path, expected_manifest, *, validate_sources=True):
 
 
 def write_energy_cache(path, series, storage_energy, manifest):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     dataset = xr.Dataset({**series, **dict(storage_energy.data_vars)})
     dataset.attrs.update(
         cache_schema=ENERGY_CACHE_SCHEMA,
         manifest_sha256=manifest["manifest_sha256"],
         cache_manifest=json.dumps(manifest, sort_keys=True),
     )
-    temporary = path + ".tmp"
-    netcdf_safe_dataset(dataset).to_netcdf(temporary)
-    os.replace(temporary, path)
+    write_netcdf_atomic(dataset, path)
 
 
 def read_energy_cache(path):
-    with xr.open_dataset(path) as cached:
-        dataset = cached.load()
+    dataset = load_netcdf(path)
     series = {name: dataset[name] for name in SERIES_NAMES if name in dataset}
     storage_energy = dataset[list(STORAGE_NAMES)]
     return series, storage_energy
@@ -814,7 +910,7 @@ def prepare_energy_entry(
         path, manifest, validate_sources=not figures_only
     )
     if current and not rebuild_cache:
-        print(f"{simulation}: using energy-budget cache {path}")
+        progress(f"{simulation}: using energy-budget cache {path}")
         series, storage_energy = read_energy_cache(path)
     elif figures_only:
         raise FileNotFoundError(
@@ -822,6 +918,7 @@ def prepare_energy_entry(
             f"{path}"
         )
     else:
+        progress(f"{simulation}: opening the latitude-longitude archive")
         ds = load_latlon_dataset(
             os.path.join(root_dir, data_loc),
             latlon_pattern=LATLON_PATTERN,
@@ -831,9 +928,19 @@ def prepare_energy_entry(
             ds = standardize_latlon_dataset(ds, needed_vars)
             if test_times is not None:
                 ds = ds.isel(Time=slice(0, int(test_times)))
-            series, storage_energy = derive_budget_series(ds)
+            with dask.config.set(
+                scheduler="threads", num_workers=ENERGY_DASK_WORKERS
+            ):
+                if "Time" not in ds.zgrid.dims:
+                    progress(f"{simulation}: loading static layer geometry")
+                    ds["zgrid"] = ds.zgrid.load()
+                series, storage_energy = derive_budget_series(
+                    ds, progress_label=simulation
+                )
+            progress(f"{simulation}: writing energy-budget cache {path}")
             write_energy_cache(path, series, storage_energy, manifest)
             series, storage_energy = read_energy_cache(path)
+            progress(f"{simulation}: energy-budget cache is complete")
         finally:
             ds.close()
     origin = storage_energy.Time.values[0]
@@ -880,6 +987,7 @@ def parse_args(argv=None):
 def main(argv=None):
     global ENERGY_CACHE_ROOT, figures_to_run, save_loc, should_run_figure
     args = parse_args(argv)
+    progress("Starting global atmospheric energy-budget diagnostics")
     if args.test:
         test_label = f"all_{args.test_times:03d}times"
         ENERGY_CACHE_ROOT = diagnostic_cache_dir(
@@ -925,16 +1033,22 @@ def main(argv=None):
         print("Test mode omits formal energy-budget uncertainty intervals")
     if save:
         summary_df.to_csv(
-            os.path.join(save_loc, "global_atmospheric_energy_budget_summary.csv"),
+            os.path.join(
+                figsave.save_loc,
+                "global_atmospheric_energy_budget_summary.csv",
+            ),
             index=False,
         )
         timeseries_df.to_csv(
-            os.path.join(save_loc, "global_atmospheric_energy_budget_timeseries.csv"),
+            os.path.join(
+                figsave.save_loc,
+                "global_atmospheric_energy_budget_timeseries.csv",
+            ),
             index=False,
         )
         uncertainty_df.to_csv(
             os.path.join(
-                save_loc,
+                figsave.save_loc,
                 "global_atmospheric_energy_budget_uncertainty.csv",
             ),
             index=False,
@@ -944,6 +1058,7 @@ def main(argv=None):
     plot_timeseries(entries, figsave)
     plot_cumulative(entries, figsave)
     plot_decomposition(entries, figsave)
+    progress("Completed global atmospheric energy-budget diagnostics")
 
 
 if __name__ == "__main__":

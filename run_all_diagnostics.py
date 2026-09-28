@@ -11,18 +11,24 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
 
 from diagnostics.analysis_config import (
+    DEFAULT_FIGURE_ROOT,
+    DEFAULT_SIMULATION_PROFILE,
     DIAGNOSTIC_FIGURE_VERSION_ENV,
     DIAGNOSTIC_OUTPUT_ROOT_ENV,
+    SIMULATION_PROFILE_ENV,
+    SIMULATION_PROFILES,
     SIMULATION_ROOT,
 )
 
@@ -30,6 +36,7 @@ from diagnostics.analysis_config import (
 ANALYSIS_DIR = Path(__file__).resolve().parent
 DIAGNOSTICS_DIR = ANALYSIS_DIR / "diagnostics"
 DEFAULT_LOG_DIR = ANALYSIS_DIR / "diagnostic_logs"
+LOG_HEARTBEAT_SECONDS = 300
 DEFAULT_SIMULATION_ROOT = SIMULATION_ROOT
 MODULE_SEARCH_DIRS = [
     ANALYSIS_DIR,
@@ -53,7 +60,7 @@ DEFAULT_SCRIPT_ORDER = [
 # is a dependency contract, not just a preferred presentation order:
 #
 # * tracking consumes the shared high-cloud classification;
-# * wave Figure 14 consumes the saved primary LPO tracks;
+# * wave Figures 14 and 15 consume the saved primary LPO tracks;
 # * lifecycle consumes wave Figures 13 and 14 products.
 CONVECTION_WORKFLOW_ORDER = [
     "convection/refined_high_cloud_classification_diagnostics.py",
@@ -68,6 +75,7 @@ CONVECTION_ARGUMENTS_BY_SCRIPT = {
         "11",
         "13",
         "14",
+        "15",
     ),
 }
 
@@ -164,11 +172,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Print the commands without running them.",
     )
     parser.add_argument(
+        "--profile",
+        choices=tuple(SIMULATION_PROFILES),
+        default=DEFAULT_SIMULATION_PROFILE,
+        help="Select the simulation set used by every diagnostic.",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help=(
             "Build every selected diagnostic from isolated, bounded subsets "
-            "of all three simulations. Formal uncertainty is omitted."
+            "of the selected simulations. Formal uncertainty is omitted."
         ),
     )
     parser.add_argument(
@@ -263,8 +277,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--figure-version",
         metavar="NAME",
         help=(
-            "Save figures beneath this release directory instead of the "
-            "default v1 directory."
+            "Place diagnostic figure directories beneath one named release "
+            "parent instead of their default v1 directories."
         ),
     )
     parser.add_argument(
@@ -499,6 +513,7 @@ def child_environment(args: argparse.Namespace) -> dict[str, str]:
     env["PYTHONUNBUFFERED"] = "1"
     env.pop("MPAS_SIMULATION_ROOT", None)
     env.pop("MPAS_DIAGNOSTIC_CACHE_ROOT", None)
+    env[SIMULATION_PROFILE_ENV] = args.profile
     env.setdefault("MPLCONFIGDIR", str(Path("/tmp") / f"matplotlib-{os.getuid()}"))
     env.setdefault("XDG_CACHE_HOME", str(Path("/tmp") / f"mpas-xdg-cache-{os.getuid()}"))
     # These diagnostics run serially.  MPICH otherwise selects an unavailable
@@ -550,9 +565,10 @@ def script_environment_overrides(
 ) -> dict[str, str]:
     """Return explicit environment overrides for one diagnostic process."""
 
-    if not args.rebuild_convection_caches:
-        return {}
-    return dict(CONVECTION_REBUILD_ENV_BY_SCRIPT.get(script, {}))
+    overrides = {SIMULATION_PROFILE_ENV: args.profile}
+    if args.rebuild_convection_caches:
+        overrides.update(CONVECTION_REBUILD_ENV_BY_SCRIPT.get(script, {}))
+    return overrides
 
 
 def script_command(script: str, args: argparse.Namespace) -> list[str]:
@@ -573,6 +589,36 @@ def display_command(script: str, args: argparse.Namespace) -> str:
             *command,
         ]
     return shlex.join(command)
+
+
+def process_memory_summary(process_id: int) -> str:
+    """Return the available Linux memory counters for one diagnostic process."""
+
+    try:
+        status = Path(f"/proc/{process_id}/status").read_text(encoding="utf-8")
+    except OSError:
+        return "memory counters unavailable"
+
+    counters = {}
+    for line in status.splitlines():
+        name, separator, value = line.partition(":")
+        if separator and name in {"VmRSS", "VmHWM", "VmSwap"}:
+            counters[name] = value.strip()
+    return ", ".join(
+        f"{label}={counters[key]}"
+        for key, label in (("VmRSS", "RSS"), ("VmHWM", "peak"), ("VmSwap", "swap"))
+        if key in counters
+    ) or "memory counters unavailable"
+
+
+def _read_process_output(stream, output_queue):
+    """Read child output without blocking workflow heartbeat messages."""
+
+    try:
+        for line in stream:
+            output_queue.put(line)
+    finally:
+        output_queue.put(None)
 
 
 def run_script(script: str, args: argparse.Namespace) -> int:
@@ -609,13 +655,38 @@ def run_script(script: str, args: argparse.Namespace) -> int:
         )
 
         assert process.stdout is not None
-        for line in process.stdout:
+        output_queue = queue.Queue()
+        reader = threading.Thread(
+            target=_read_process_output,
+            args=(process.stdout, output_queue),
+            daemon=True,
+        )
+        reader.start()
+
+        while True:
+            try:
+                line = output_queue.get(timeout=LOG_HEARTBEAT_SECONDS)
+            except queue.Empty:
+                now = datetime.now()
+                heartbeat = (
+                    f"[{now:%Y-%m-%d %H:%M:%S}] {script} is still running "
+                    f"after {now - start}; {process_memory_summary(process.pid)}"
+                )
+                print(heartbeat, flush=True)
+                if log_file:
+                    log_file.write(heartbeat + "\n")
+                    log_file.flush()
+                continue
+
+            if line is None:
+                break
             print(line, end="", flush=True)
             if log_file:
                 log_file.write(line)
                 log_file.flush()
 
         return_code = process.wait()
+        reader.join(timeout=1.0)
     finally:
         end = datetime.now()
         elapsed = end - start
@@ -658,6 +729,7 @@ def main() -> int:
 
     print("Diagnostics to run:")
     print_script_list(scripts)
+    print(f"Simulation profile: {args.profile}")
     if args.convection_workflow:
         print("Mode: complete dependency-ordered convection workflow.")
     if args.rebuild_convection_caches:
@@ -674,6 +746,16 @@ def main() -> int:
         print(f"Logs will be written to: {args.log_dir}")
     if args.figure_root:
         print(f"Figures/output will be written under: {args.figure_root.expanduser().resolve()}")
+    if args.figure_version:
+        figure_root = (
+            args.figure_root.expanduser().resolve()
+            if args.figure_root
+            else DEFAULT_FIGURE_ROOT
+        )
+        print(
+            "Figure release will be written under: "
+            f"{figure_root / 'final' / args.figure_version}"
+        )
     if args.notify_email:
         if local_mail_command() is None:
             print(

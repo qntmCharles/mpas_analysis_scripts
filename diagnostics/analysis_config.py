@@ -10,13 +10,31 @@ import os
 from pathlib import Path
 
 
-# The workflow serves these existing archives.  Canonical names remain stable
-# in caches.  Labels preserve the wording used by current publication figures.
+# The workflow serves these archives. Canonical names remain stable in caches.
+# The environment selects an ordered profile before diagnostic modules import
+# these mappings. Direct diagnostic runs therefore use the same configuration
+# as ``run_all_diagnostics.py``.
 SIMULATION_ROOT = Path("/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on")
-SIMULATION_ARCHIVES = {
+SIMULATION_PROFILE_ENV = "MPAS_SIMULATION_PROFILE"
+DEFAULT_SIMULATION_PROFILE = "legacy"
+ALL_SIMULATION_ARCHIVES = {
     "control": "control_new",
     "nudged-u": "u_nudge",
     "nudged-T": "T_nudge",
+    "nudged-T-from-u": "T_nudge_from_u",
+}
+# Stable filename tokens for caches that store one simulation per file.
+# These values must not depend on plot labels or profile selection.
+ALL_SIMULATION_CACHE_NAMES = {
+    "control": "control",
+    "nudged-u": "nudged_u",
+    "nudged-T": "nudged_T",
+    "nudged-T-from-u": "nudged_T_from_u",
+}
+SIMULATION_PROFILES = {
+    "legacy": ("control", "nudged-u", "nudged-T"),
+    "from-u": ("control", "nudged-u", "nudged-T-from-u"),
+    "both": ("control", "nudged-u", "nudged-T", "nudged-T-from-u"),
 }
 
 # All reusable calculation products live below one data-storage directory.
@@ -37,20 +55,23 @@ CACHE_DIRECTORIES = {
     "vapour_transport_data": "vapour_transport_data",
     "waves": "waves",
 }
-SIMULATION_LABELS = {
+ALL_SIMULATION_LABELS = {
     "control": "control",
     "nudged-u": "nudged u",
     "nudged-T": "nudged T",
+    "nudged-T-from-u": "nudged T from u",
 }
-SIMULATION_PUBLICATION_LABELS = {
+ALL_SIMULATION_PUBLICATION_LABELS = {
     "control": "control",
     "nudged-u": r"$u$-nudged",
     "nudged-T": r"$T$-nudged",
+    "nudged-T-from-u": r"$T$-nudged from $u$",
 }
-SIMULATION_COLOURS = {
+ALL_SIMULATION_COLOURS = {
     "control": "#222222",
     "nudged-u": "#1f77b4",
     "nudged-T": "#d62728",
+    "nudged-T-from-u": "#9467bd",
 }
 SIMULATION_ALIASES = {
     "control": "control",
@@ -60,7 +81,51 @@ SIMULATION_ALIASES = {
     "nudged-t": "nudged-T",
     "t-nudged": "nudged-T",
     "nudged t": "nudged-T",
+    "nudged-t-from-u": "nudged-T-from-u",
+    "t-nudged-from-u": "nudged-T-from-u",
+    "nudged t from u": "nudged-T-from-u",
 }
+SIMULATION_ALIASES.update(
+    {
+        str(label).strip().lower(): simulation
+        for labels in (ALL_SIMULATION_LABELS, ALL_SIMULATION_PUBLICATION_LABELS)
+        for simulation, label in labels.items()
+    }
+)
+
+
+def simulation_profile_name(value: str | None = None) -> str:
+    """Return one validated simulation profile name."""
+
+    profile = value or os.environ.get(
+        SIMULATION_PROFILE_ENV, DEFAULT_SIMULATION_PROFILE
+    )
+    try:
+        SIMULATION_PROFILES[profile]
+    except KeyError as exc:
+        choices = ", ".join(SIMULATION_PROFILES)
+        raise ValueError(
+            f"Unknown simulation profile {profile!r}; choose one of: {choices}"
+        ) from exc
+    return profile
+
+
+ACTIVE_SIMULATION_PROFILE = simulation_profile_name()
+ACTIVE_SIMULATION_NAMES = SIMULATION_PROFILES[ACTIVE_SIMULATION_PROFILE]
+
+
+def _selected(mapping: dict[str, str]) -> dict[str, str]:
+    """Return one ordered mapping for the active profile."""
+
+    return {name: mapping[name] for name in ACTIVE_SIMULATION_NAMES}
+
+
+SIMULATION_ARCHIVES = _selected(ALL_SIMULATION_ARCHIVES)
+SIMULATION_LABELS = _selected(ALL_SIMULATION_LABELS)
+SIMULATION_PUBLICATION_LABELS = _selected(
+    ALL_SIMULATION_PUBLICATION_LABELS
+)
+SIMULATION_COLOURS = _selected(ALL_SIMULATION_COLOURS)
 
 ANALYSIS_START = "2000-05-05 06:00:00"
 ANALYSIS_END = "2000-11-21 00:00:00"
@@ -151,16 +216,24 @@ def canonical_simulation_name(name: str) -> str:
         raise KeyError(f"Unknown simulation name {name!r}") from exc
 
 
+def simulation_cache_name(name: str) -> str:
+    """Return the stable filename token for one simulation."""
+
+    return ALL_SIMULATION_CACHE_NAMES[canonical_simulation_name(name)]
+
+
 def simulation_directory(name: str) -> Path:
     """Return the fixed archive directory for one simulation."""
 
-    return SIMULATION_ROOT / SIMULATION_ARCHIVES[canonical_simulation_name(name)]
+    return SIMULATION_ROOT / ALL_SIMULATION_ARCHIVES[
+        canonical_simulation_name(name)
+    ]
 
 
 def simulation_colour(name: str) -> str:
     """Return the publication colour for one simulation name or label."""
 
-    return SIMULATION_COLOURS[canonical_simulation_name(name)]
+    return ALL_SIMULATION_COLOURS[canonical_simulation_name(name)]
 
 
 def cache_root() -> Path:
@@ -177,6 +250,20 @@ def cache_directory(family: str, *parts: str) -> Path:
     except KeyError as exc:
         raise KeyError(f"Unknown cache family {family!r}") from exc
     return CACHE_ROOT.joinpath(directory, *parts)
+
+
+def profile_cache_directory(
+    family: str,
+    *parts: str,
+    profile: str | None = None,
+) -> Path:
+    """Return a cache path for products that combine simulations."""
+
+    selected_profile = simulation_profile_name(profile)
+    root = cache_directory(family)
+    if selected_profile != DEFAULT_SIMULATION_PROFILE:
+        root = root / "profiles" / selected_profile
+    return root.joinpath(*parts)
 
 
 def figure_root() -> Path:

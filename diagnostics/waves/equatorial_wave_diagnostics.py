@@ -34,7 +34,10 @@ figures are written below ``~/tmp``.
 """
 
 import argparse
-import os, sys, numbers, json, uuid
+import gc
+import hashlib
+import os, sys, numbers, json
+import shutil
 from functools import partial
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -60,21 +63,23 @@ from diagnostics.diagnostic_helpers import (
     add_symmetric_colorbar,
     annotate_panel_label,
     binned_mean_1d, configured_label, cosine_weighted_power_input,
-    diagnostic_cache_dir,
+    diagnostic_cache_dir, diagnostic_profile_cache_dir,
     diagnostic_output_dir, difference_cmap, figure_should_run,
     figure_should_run_any, jsonable_value,
-    load_latlon_dataset, make_spectrum_cmap, netcdf_safe_dataset,
+    load_latlon_dataset, make_spectrum_cmap,
     mpas_moist_air_density, native_midlevel_height,
     numbered_figure_saver, precip_rate_from_accum, read_json_file,
     pressure_to_pa, progress, safe_name, simulation_colour,
     standardize_latlon_dataset, symmetric_levels,
-    total_precip_accum, vertical_dim, write_json_file,
+    total_precip_accum, vertical_dim, write_csv_atomic, write_json_file,
+    write_netcdf_atomic,
 )
 from diagnostics.analysis_config import (
     SIMULATION_ARCHIVES,
     SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
     SIMULATION_ROOT,
     WAVE_RESPONSE_BLOCK_LENGTH_DAYS,
+    simulation_cache_name,
 )
 from diagnostics.waves.equatorial_wave_config import (
     ALL_CACHED_FILTERS,
@@ -105,6 +110,8 @@ from diagnostics.convection.lpo_tracking import (
     PRODUCT_VERSION as LPO_TRACKING_PRODUCT_VERSION,
     SIMULATION_DIRS as LPO_SIMULATION_DIRS,
     TROPICAL_CENTROID_LIMIT_DEG,
+    equatorial_envelope_for_plot,
+    periodic_longitude_field,
     require_actual_test_products,
     require_publication_products,
 )
@@ -121,6 +128,7 @@ from diagnostics.convection.lpo_lifecycle_sections import (
 from diagnostics.waves.wave_metrics import (
     METRICS_VERSION as WAVE_METRICS_VERSION,
     block_bootstrap_filtered_wave_metrics,
+    blockwise_buoyancy_frequency_squared,
     buoyancy_frequency_squared,
     circular_time_block_indices,
     common_vertical_motion_eofs,
@@ -186,7 +194,7 @@ def parse_command_line(argv=None):
         "--figures",
         nargs="+",
         type=int,
-        choices=range(1, 15),
+        choices=range(1, 16),
         default=None,
         help="Build only these numbered figures.",
     )
@@ -275,10 +283,11 @@ save_loc = diagnostic_output_dir(
 #   12: Sakaeda/Inoue two-EOF top-heaviness
 #   13: Lim-Son Kelvin reference energy dispersion
 #   14: compact LPO-following wave sections (explicit prerequisite)
+#   15: eastward-intraseasonal precipitation with LPO outlines
 #
 # LPO lifecycle composites live in ``lpo_lifecycle_analysis.py`` and reuse
 # these wave caches. Wave-response regressions are owned by this script.
-figures_to_run = runtime_args.figures or [1, 2, 6, 7, 11, 12, 13, 14]
+figures_to_run = runtime_args.figures or [1, 2, 6, 7, 11, 12, 13, 14, 15]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 # Restart/resume controls.  With the default full run, existing figure files are
@@ -298,6 +307,33 @@ root_dir = str(SIMULATION_ROOT)
 data_locs = list(SIMULATION_ARCHIVES.values())
 sim_names = list(PROJECT_SIMULATION_LABELS.values())
 cols = [simulation_colour(name) for name in sim_names]
+_contrast_tokens = {
+    "nudged-u": ("U", "u-nudged"),
+    "nudged-T": ("T", "T-nudged"),
+    "nudged-T-from-u": ("T_from_U", "T-nudged from u"),
+}
+_simulation_ids = tuple(SIMULATION_ARCHIVES)
+WAVE_RESPONSE_CONTRASTS = [
+    (
+        f"{_contrast_tokens[simulation][0]}_minus_control",
+        f"{_contrast_tokens[simulation][1]} - control",
+        sim_names[index],
+        sim_names[0],
+        cols[index],
+    )
+    for index, simulation in enumerate(_simulation_ids[1:], start=1)
+]
+WAVE_RESPONSE_CONTRASTS.extend(
+    (
+        f"U_minus_{_contrast_tokens[simulation][0]}",
+        f"u-nudged - {_contrast_tokens[simulation][1]}",
+        sim_names[1],
+        sim_names[index],
+        "0.35",
+    )
+    for index, simulation in enumerate(_simulation_ids[2:], start=2)
+)
+WAVE_RESPONSE_CONTRASTS = tuple(WAVE_RESPONSE_CONTRASTS)
 
 dt = 6
 obs_per_day = int(round(24 / dt))
@@ -411,6 +447,10 @@ LPO_SECTION_PRESSURE_HPA = np.asarray(
 LPO_SECTION_TEST_NATIVE_LEVEL_COUNT = 25
 LPO_SECTION_VERTICAL_FIELDS = ("T", "w", "qv", "RH", "u", "N2")
 LPO_SECTION_SURFACE_FIELDS = ("Precip", "PW", "OLR")
+LPO_SECTION_NATIVE_LEVEL_BLOCK_SIZE = 5
+LPO_SECTION_LATITUDE_BATCH_SIZE = 2
+LPO_HOVMOLLER_FIGURE_NUMBER = 15
+LPO_HOVMOLLER_PANEL_DAYS = 100
 
 # Figure 8 keeps latitude resolved and applies each wave box directly.
 eddy_flux_waves = list(EDDY_FLUX_FILTERS)
@@ -469,12 +509,17 @@ cache_dir = diagnostic_cache_dir(
     *(("testing",) if test_mode else ()),
 )
 input_cache_dir = os.path.join(cache_dir, "filter_inputs")
-derived_cache_dir = os.path.join(cache_dir, "derived")
-product_output_dir = os.path.join(cache_dir, "products")
-os.makedirs(cache_dir, exist_ok=True)
-os.makedirs(input_cache_dir, exist_ok=True)
-os.makedirs(derived_cache_dir, exist_ok=True)
-os.makedirs(product_output_dir, exist_ok=True)
+profile_cache_dir = diagnostic_profile_cache_dir(
+    "waves",
+    *(("testing",) if test_mode else ()),
+)
+derived_cache_dir = os.path.join(profile_cache_dir, "derived")
+product_output_dir = os.path.join(profile_cache_dir, "products")
+if not runtime_args.figures_only:
+    os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(input_cache_dir, exist_ok=True)
+    os.makedirs(derived_cache_dir, exist_ok=True)
+    os.makedirs(product_output_dir, exist_ok=True)
 if test_mode:
     progress(f"Wave test cache root: {cache_dir}")
     progress(f"Wave test data products: {product_output_dir}")
@@ -677,9 +722,7 @@ def load_cached_table(cache_name, signature, output_filename=None, required_colu
 def write_cached_table(cache_name, df, signature):
     csv_path = derived_cache_path(cache_name, "csv")
     metadata_path = derived_cache_path(cache_name, "metadata.json")
-    tmp = csv_path + ".tmp"
-    df.to_csv(tmp, index=False)
-    os.replace(tmp, csv_path)
+    write_csv_atomic(df, csv_path, index=False)
     write_cache_metadata(metadata_path, signature)
 
 
@@ -722,9 +765,7 @@ def load_cached_dataset(cache_name, signature):
 def write_cached_dataset(cache_name, ds, signature):
     nc_path = derived_cache_path(cache_name, "nc")
     metadata_path = derived_cache_path(cache_name, "metadata.json")
-    tmp = nc_path + ".tmp"
-    netcdf_safe_dataset(ds).to_netcdf(tmp)
-    os.replace(tmp, nc_path)
+    write_netcdf_atomic(ds, nc_path)
     write_cache_metadata(metadata_path, signature)
 
 
@@ -1078,7 +1119,11 @@ def filter_input_cache_matches(fname, field_name):
 
 def write_filter_input_if_needed(ds, sim_index, field_name):
     """Create a restartable intermediate NetCDF input for kf_filter."""
-    fname = os.path.join(input_cache_dir, f"{safe_name(sim_names[sim_index])}_{safe_name(field_name)}.nc")
+    fname = os.path.join(
+        input_cache_dir,
+        f"{simulation_cache_name(_simulation_ids[sim_index])}_"
+        f"{safe_name(field_name)}.nc",
+    )
     force_this_path = (
         force_recompute_caches
         and fname not in _rebuilt_filter_input_paths
@@ -1093,7 +1138,10 @@ def write_filter_input_if_needed(ds, sim_index, field_name):
     da = get_filter_field(ds, field_name).sel(
         latitude=slice(*filter_input_lat_bounds)
     )
-    fds = to_filter_input_dataset(da, obs_var="x")
+    # Finish source reads before opening the output file. The default lazy
+    # NetCDF write mixes source reads and target writes through one process-wide
+    # netCDF4 lock. That path can deadlock on the Ceph cache filesystem.
+    fds = to_filter_input_dataset(da, obs_var="x").load()
     fds.attrs.update(
         source_field=field_name,
         source_simulation=sim_names[sim_index],
@@ -1120,13 +1168,7 @@ def write_filter_input_if_needed(ds, sim_index, field_name):
             TTL_BASE_PRESSURE_HPA
         )
     encoding = {"x": {"dtype": "float32"}}
-    tmp_fname = f"{fname}.{uuid.uuid4().hex}.tmp"
-    try:
-        fds.to_netcdf(tmp_fname, encoding=encoding)
-        os.replace(tmp_fname, fname)
-    finally:
-        if os.path.exists(tmp_fname):
-            os.remove(tmp_fname)
+    write_netcdf_atomic(fds, fname, encoding=encoding)
     _rebuilt_filter_input_paths.add(fname)
     _used_filter_input_paths.add(fname)
     return fname
@@ -1234,7 +1276,8 @@ def filtered_wave_cache_path(sim_index, field_name, wave_name, lat_bounds, avgLa
     lat_tag = lat_bounds_cache_tag(lat_bounds)
     avg_tag = "avgLat" if avgLat else "allLat"
     cache_name = (
-        f"{safe_name(sim_names[sim_index])}_{safe_name(field_name)}_{safe_name(wave_name)}_"
+        f"{simulation_cache_name(_simulation_ids[sim_index])}_"
+        f"{safe_name(field_name)}_{safe_name(wave_name)}_"
         f"{lat_tag}_{avg_tag}_{safe_name(projection)}.nc"
     )
     return os.path.join(cache_dir, cache_name)
@@ -1298,20 +1341,24 @@ def read_cached_wave(cache_path, field_name, wave_name, avgLat, lat_bounds, proj
     )
     if force_this_path or not os.path.exists(cache_path):
         return None
-    cached = xr.open_dataset(cache_path)
-    wave_cached = cached["wave"]
-    if wave_cache_matches(wave_cached, field_name, wave_name, avgLat, lat_bounds, projection):
-        print(f"Using cached filtered wave {cache_path}")
-        return wave_cached
+    with xr.open_dataset(cache_path) as cached:
+        wave_cached = cached["wave"]
+        if wave_cache_matches(
+            wave_cached,
+            field_name,
+            wave_name,
+            avgLat,
+            lat_bounds,
+            projection,
+        ):
+            print(f"Using cached filtered wave {cache_path}")
+            return wave_cached.load()
     print(f"Regenerating stale cached wave file {cache_path}")
-    cached.close()
     return None
 
 
 def write_wave_cache(wave, cache_path):
-    tmp_cache_path = cache_path + ".tmp"
-    netcdf_safe_dataset(wave.to_dataset()).to_netcdf(tmp_cache_path)
-    os.replace(tmp_cache_path, cache_path)
+    write_netcdf_atomic(wave.to_dataset(), cache_path)
     _rebuilt_wave_cache_paths.add(cache_path)
 
 
@@ -1440,7 +1487,7 @@ def direct_filtered_wave(ds, sim_index, field_name, wave_name, avgLat, lat_bound
             TTL_BASE_PRESSURE_HPA
         )
     write_wave_cache(wave, cache_path)
-    return xr.open_dataset(cache_path)["wave"]
+    return wave
 
 
 def projected_filtered_wave(ds, sim_index, field_name, wave_name, lat_bounds, projection, force=False):
@@ -1508,7 +1555,7 @@ def projected_filtered_wave(ds, sim_index, field_name, wave_name, lat_bounds, pr
     }:
         wave.attrs["classification_cache_version"] = CLASSIFICATION_CACHE_VERSION
     write_wave_cache(wave, cache_path)
-    return xr.open_dataset(cache_path)["wave"]
+    return wave
 
 
 def get_filtered_wave(ds, sim_index, field_name, wave_name, avgLat=True, lat_bounds=None, projection=None, force=False):
@@ -1537,12 +1584,12 @@ def get_filtered_wave(ds, sim_index, field_name, wave_name, avgLat=True, lat_bou
     raise ValueError(f"Unhandled latitude projection {projection!r}")
 
 
-def _lpo_wave_tracking_steps(
+def _lpo_tracking_mode_directory(
     *, test=False, allow_stale_products=False
 ):
-    """Read only the stable tracking tables needed for compact wave caches."""
+    """Return the validated LPO product root for the selected run mode."""
 
-    mode_directory = (
+    return (
         require_actual_test_products(
             start=runtime_args.test_start,
             days=DEFAULT_LPO_TEST_DAYS,
@@ -1552,6 +1599,17 @@ def _lpo_wave_tracking_steps(
         else require_publication_products(
             allow_stale_product_version=allow_stale_products
         )
+    )
+
+
+def _lpo_wave_tracking_steps(
+    *, test=False, allow_stale_products=False
+):
+    """Read only the stable tracking tables needed for compact wave caches."""
+
+    mode_directory = _lpo_tracking_mode_directory(
+        test=test,
+        allow_stale_products=allow_stale_products,
     )
     tables = {}
     for simulation in LPO_SIMULATION_DIRS:
@@ -1604,6 +1662,73 @@ def _lpo_wave_tracking_steps(
             )
         tables[simulation] = selected.reset_index(drop=True)
     return tables
+
+
+def _lpo_hovmoller_time_bounds(standard, filtered_precipitation):
+    """Return the common wave and LPO diagnostic interval."""
+
+    start = max(
+        pd.Timestamp(ANALYSIS_START),
+        pd.Timestamp(filtered_precipitation.Time.values[0]),
+    )
+    end = min(
+        pd.Timestamp(ANALYSIS_END),
+        pd.Timestamp(filtered_precipitation.Time.values[-1]),
+    )
+    if test_mode:
+        metadata = read_cache_metadata(
+            standard / "lpt_configuration.json"
+        )
+        test_subset = metadata.get("test_subset", {})
+        start = max(start, pd.Timestamp(test_subset["diagnostic_start"]))
+        end = min(end, pd.Timestamp(test_subset["diagnostic_end"]))
+    if start >= end:
+        raise RuntimeError(
+            f"{standard}: LPO products and eastward-intraseasonal wave "
+            "products do not overlap"
+        )
+    return start, end
+
+
+def _load_lpo_hovmoller_envelopes(standard, start, end):
+    """Load tropical LPO masks projected across the wave-filter band."""
+
+    events_path = standard / "lpt_events.csv"
+    index_path = standard / "lpt_event_mask_index.csv"
+    events = pd.read_csv(
+        events_path,
+        usecols=["event_id", "primary_tropical_sample"],
+    )
+    primary = (
+        events.primary_tropical_sample.astype(str).str.casefold().eq("true")
+    )
+    event_ids = events.loc[primary, "event_id"].astype(str).tolist()
+    mask_index = pd.read_csv(index_path).set_index("event_id")
+    missing = sorted(set(event_ids) - set(mask_index.index.astype(str)))
+    if missing:
+        raise RuntimeError(
+            f"{standard}: LPO mask index lacks {missing[:5]}"
+        )
+
+    latitude_limit = max(abs(value) for value in filter_lat_bounds)
+    envelopes = []
+    for event_id in event_ids:
+        mask_path = standard / mask_index.loc[event_id, "mask_file"]
+        with xr.open_dataset(mask_path) as product:
+            if "lpt_envelope_mask" not in product:
+                raise RuntimeError(
+                    f"{mask_path}: missing lpt_envelope_mask"
+                )
+            mask = product.lpt_envelope_mask.sel(Time=slice(start, end))
+            if mask.sizes.get("Time", 0) < 2:
+                continue
+            envelope = equatorial_envelope_for_plot(
+                mask,
+                latitude_limit_degrees=latitude_limit,
+            ).load()
+        if bool(envelope.any().item()):
+            envelopes.append(envelope)
+    return envelopes
 
 
 def _filter_2d_wave(values, wave_name):
@@ -1983,7 +2108,7 @@ def _latitude_mean_native_lpo_wave_values(
     steps,
     wave_names,
     *,
-    block_size=25,
+    block_size=LPO_SECTION_NATIVE_LEVEL_BLOCK_SIZE,
     progress_label="native field",
     relative_longitude=LPO_SECTION_RELATIVE_LONGITUDE_DEGREES,
     latitude_column="precip_weighted_centroid_lat",
@@ -2050,24 +2175,59 @@ def _latitude_mean_native_lpo_wave_values(
                 ].transpose(1, 0, 2)
                 output[:, start:stop, :, wave_index] = sampled
                 continue
-            for centre_index in np.unique(centre_indices):
-                positions = np.flatnonzero(centre_indices == centre_index)
-                centre = latitude[centre_index]
-                source = np.asarray(
-                    cosine_latitude_mean(
-                        slab.where(
-                            np.abs(slab.latitude - centre) <= 10.0,
-                            drop=True,
-                        )
+            unique_centres = np.unique(centre_indices)
+            for batch_start in range(
+                0,
+                len(unique_centres),
+                LPO_SECTION_LATITUDE_BATCH_SIZE,
+            ):
+                batch_centres = unique_centres[
+                    batch_start:
+                    batch_start + LPO_SECTION_LATITUDE_BATCH_SIZE
+                ]
+                sources = np.stack(
+                    [
+                        np.asarray(
+                            cosine_latitude_mean(
+                                slab.where(
+                                    np.abs(
+                                        slab.latitude
+                                        - latitude[centre_index]
+                                    )
+                                    <= 10.0,
+                                    drop=True,
+                                )
+                            ),
+                            dtype="f",
+                        ).transpose(2, 0, 1)
+                        for centre_index in batch_centres
+                    ]
+                )
+                centre_count, level_batch, time_count, longitude_count = (
+                    sources.shape
+                )
+                filtered_batch = _filter_2d_wave_batch(
+                    sources.reshape(
+                        centre_count * level_batch,
+                        time_count,
+                        longitude_count,
                     ),
-                    dtype="f",
-                ).transpose(2, 0, 1)
-                filtered = _filter_2d_wave_batch(source, wave_name)
-                sampled = filtered[
-                    :, time_indices[positions, None],
-                    longitude_indices[positions]
-                ].transpose(1, 0, 2)
-                output[positions, start:stop, :, wave_index] = sampled
+                    wave_name,
+                ).reshape(sources.shape)
+                for batch_index, centre_index in enumerate(batch_centres):
+                    positions = np.flatnonzero(
+                        centre_indices == centre_index
+                    )
+                    sampled = filtered_batch[batch_index][
+                        :, time_indices[positions, None],
+                        longitude_indices[positions]
+                    ].transpose(1, 0, 2)
+                    output[
+                        positions, start:stop, :, wave_index
+                    ] = sampled
+                del sources, filtered_batch, sampled
+        del slab
+        gc.collect()
     return output
 
 
@@ -2075,7 +2235,7 @@ def _latitude_mean_native_lpo_values(
     field,
     steps,
     *,
-    block_size=25,
+    block_size=LPO_SECTION_NATIVE_LEVEL_BLOCK_SIZE,
     relative_longitude=LPO_SECTION_RELATIVE_LONGITUDE_DEGREES,
     latitude_column="precip_weighted_centroid_lat",
     longitude_column="precip_weighted_centroid_lon",
@@ -2135,6 +2295,8 @@ def _latitude_mean_native_lpo_values(
                 longitude_indices[positions]
             ].transpose(1, 0, 2)
             output[positions, start:stop, :] = sampled
+        del slab, source, sampled
+        gc.collect()
     return output
 
 
@@ -2167,17 +2329,12 @@ def _native_lpo_vertical_fields(ds):
         )
     pressure_pa_all = pressure_to_pa(ds.pressure).sel(Time=time)
     height_all = native_midlevel_height(ds, theta_all)
-    static_stability = xr.apply_ufunc(
-        buoyancy_frequency_squared,
+    static_stability = blockwise_buoyancy_frequency_squared(
         theta_all,
         height_all,
-        kwargs={"mask_nonpositive": False},
-        input_core_dims=[[native_dimension], [native_dimension]],
-        output_core_dims=[[native_dimension]],
-        vectorize=True,
-        dask="parallelized",
-        output_dtypes=[float],
-        dask_gufunc_kwargs={"allow_rechunk": True},
+        native_dimension,
+        block_size=LPO_SECTION_NATIVE_LEVEL_BLOCK_SIZE,
+        mask_nonpositive=False,
     ).isel({native_dimension: native_level_indices})
     theta = theta_all.isel({native_dimension: native_level_indices})
     pressure_pa = pressure_pa_all.isel(
@@ -2461,7 +2618,87 @@ def _random_reference_steps(field, steps, simulation):
     return output
 
 
-def build_compact_lpo_wave_sections(ds, simulation, steps):
+def _lpo_section_steps_signature(steps):
+    """Return a stable identity for one selected lifecycle table."""
+
+    columns = [
+        "event_id", "Time", "lag_hours",
+        "precip_weighted_centroid_lon",
+        "precip_weighted_centroid_lat", "centroid_lon", "centroid_lat",
+    ]
+    table = steps[columns].copy()
+    table["Time"] = pd.to_datetime(table.Time).map(
+        lambda value: value.isoformat()
+    )
+    payload = table.to_csv(index=False, float_format="%.17g").encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _prepare_lpo_section_checkpoint(
+    directory, simulation, steps, native_level_count
+):
+    """Validate one restart directory and return its completion state."""
+
+    signature = {
+        "cache_version": LPO_WAVE_SECTION_CACHE_VERSION,
+        "wave_config_version": WAVE_CONFIG_VERSION,
+        "tracking_product_version": LPO_TRACKING_PRODUCT_VERSION,
+        "source_simulation": simulation,
+        "test_subset": int(test_mode),
+        "event_step_count": len(steps),
+        "native_level_count": native_level_count,
+        "wave_bands": list(LPO_LIFECYCLE_FILTERS),
+        "steps_sha256": _lpo_section_steps_signature(steps),
+    }
+    manifest_path = os.path.join(directory, "manifest.json")
+    status_path = os.path.join(directory, "status.json")
+    existing = read_json_file(manifest_path)
+    if force_recompute_caches or existing != signature:
+        if os.path.isdir(directory):
+            shutil.rmtree(directory)
+        os.makedirs(directory, exist_ok=True)
+        write_json_file(manifest_path, signature)
+        write_json_file(status_path, {"complete": []})
+        return set(), status_path
+    os.makedirs(directory, exist_ok=True)
+    status = read_json_file(status_path) or {}
+    return set(status.get("complete", [])), status_path
+
+
+def _lpo_checkpoint_array(
+    directory, label, shape, completed, *, dtype=float, fill_value=np.nan
+):
+    """Open a completed array or initialize an incomplete array."""
+
+    path = os.path.join(directory, f"{safe_name(label)}.npy")
+    if label in completed:
+        try:
+            output = np.lib.format.open_memmap(path, mode="r+")
+            if output.shape == shape and output.dtype == np.dtype(dtype):
+                return output, True
+        except (OSError, ValueError):
+            pass
+        completed.discard(label)
+    output = np.lib.format.open_memmap(
+        path, mode="w+", dtype=dtype, shape=shape
+    )
+    output[...] = fill_value
+    output.flush()
+    return output, False
+
+
+def _mark_lpo_checkpoint_complete(labels, completed, status_path):
+    """Record complete fields after their arrays reach disk."""
+
+    if isinstance(labels, str):
+        labels = (labels,)
+    completed.update(labels)
+    write_json_file(status_path, {"complete": sorted(completed)})
+
+
+def build_compact_lpo_wave_sections(
+    ds, simulation, steps, *, checkpoint_directory
+):
     """Build the compact prefiltered interface consumed by LPO lifecycle."""
 
     wave_names = tuple(LPO_LIFECYCLE_FILTERS)
@@ -2482,77 +2719,252 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
         len(LPO_SECTION_RELATIVE_LONGITUDE_DEGREES),
         len(wave_names),
     )
-    surface = {
-        name: np.full(surface_shape, np.nan)
-        for name in LPO_SECTION_SURFACE_FIELDS
-    }
-    vertical = {
-        name: np.full(vertical_shape, np.nan)
-        for name in LPO_SECTION_VERTICAL_FIELDS
-    }
-    precipitation_rms = np.full(len(wave_names), np.nan)
-    phase_angle = np.full((step_count, len(wave_names)), np.nan)
-    phase_number = np.full((step_count, len(wave_names)), np.nan)
-    normalized_amplitude = np.full((step_count, len(wave_names)), np.nan)
-    strong_amplitude = np.zeros((step_count, len(wave_names)), dtype=bool)
-    random_phase_angle = np.full((step_count, len(wave_names)), np.nan)
-    random_phase_number = np.full((step_count, len(wave_names)), np.nan)
-    random_normalized_amplitude = np.full(
-        (step_count, len(wave_names)), np.nan
+    completed, status_path = _prepare_lpo_section_checkpoint(
+        checkpoint_directory, simulation, steps, native_level_count
     )
-    random_strong_amplitude = np.zeros(
-        (step_count, len(wave_names)), dtype=bool
+    surface = {}
+    surface_complete = {}
+    for name in LPO_SECTION_SURFACE_FIELDS:
+        surface[name], surface_complete[name] = _lpo_checkpoint_array(
+            checkpoint_directory,
+            f"surface_{name}",
+            surface_shape,
+            completed,
+        )
+    vertical = {}
+    vertical_complete = {}
+    for name in LPO_SECTION_VERTICAL_FIELDS:
+        vertical[name], vertical_complete[name] = _lpo_checkpoint_array(
+            checkpoint_directory,
+            f"vertical_{name}",
+            vertical_shape,
+            completed,
+        )
+    phase_shape = (step_count, len(wave_names))
+    precipitation_rms, precipitation_rms_complete = _lpo_checkpoint_array(
+        checkpoint_directory,
+        "precipitation_rms",
+        (len(wave_names),),
+        completed,
     )
-    random_reference_speed = np.nan
+    phase_angle, phase_angle_complete = _lpo_checkpoint_array(
+        checkpoint_directory, "phase_angle", phase_shape, completed
+    )
+    phase_number, phase_number_complete = _lpo_checkpoint_array(
+        checkpoint_directory, "phase_number", phase_shape, completed
+    )
+    normalized_amplitude, normalized_amplitude_complete = _lpo_checkpoint_array(
+        checkpoint_directory, "normalized_amplitude", phase_shape, completed
+    )
+    strong_amplitude, strong_amplitude_complete = _lpo_checkpoint_array(
+        checkpoint_directory,
+        "strong_amplitude",
+        phase_shape,
+        completed,
+        dtype=bool,
+        fill_value=False,
+    )
+    random_phase_angle, random_phase_angle_complete = _lpo_checkpoint_array(
+        checkpoint_directory, "random_phase_angle", phase_shape, completed
+    )
+    random_phase_number, random_phase_number_complete = _lpo_checkpoint_array(
+        checkpoint_directory, "random_phase_number", phase_shape, completed
+    )
+    (
+        random_normalized_amplitude,
+        random_normalized_amplitude_complete,
+    ) = _lpo_checkpoint_array(
+        checkpoint_directory,
+        "random_normalized_amplitude",
+        phase_shape,
+        completed,
+    )
+    (
+        random_strong_amplitude,
+        random_strong_amplitude_complete,
+    ) = _lpo_checkpoint_array(
+        checkpoint_directory,
+        "random_strong_amplitude",
+        phase_shape,
+        completed,
+        dtype=bool,
+        fill_value=False,
+    )
+    random_reference_speed, random_reference_speed_complete = (
+        _lpo_checkpoint_array(
+            checkpoint_directory,
+            "random_reference_speed",
+            (1,),
+            completed,
+        )
+    )
+    precipitation_auxiliary_complete = all(
+        (
+            precipitation_rms_complete,
+            phase_angle_complete,
+            phase_number_complete,
+            normalized_amplitude_complete,
+            strong_amplitude_complete,
+            random_phase_angle_complete,
+            random_phase_number_complete,
+            random_normalized_amplitude_complete,
+            random_strong_amplitude_complete,
+            random_reference_speed_complete,
+        )
+    )
+    surface_complete["Precip"] = (
+        surface_complete["Precip"] and precipitation_auxiliary_complete
+    )
 
     for field_name in LPO_SECTION_SURFACE_FIELDS:
+        checkpoint_label = f"surface_{field_name}"
+        if surface_complete[field_name]:
+            progress(
+                f"{simulation}: reusing compact LPO {field_name} checkpoint"
+            )
+            continue
         progress(
             f"{simulation}: compact LPO latitude sections for {field_name}"
         )
         field = get_filter_field(ds, field_name)
-        surface[field_name] = _latitude_resolved_lpo_wave_values(
+        surface_values = _latitude_resolved_lpo_wave_values(
             field, steps, wave_names
         )
+        surface[field_name][...] = surface_values
+        surface[field_name].flush()
+        del surface_values
         if field_name == "Precip":
             (
-                phase_angle,
-                phase_number,
-                normalized_amplitude,
-                strong_amplitude,
-                precipitation_rms,
+                phase_angle_values,
+                phase_number_values,
+                normalized_amplitude_values,
+                strong_amplitude_values,
+                precipitation_rms_values,
             ) = _precipitation_phase_at_lpo(
                 field,
                 steps,
                 wave_names,
             )
+            phase_angle[...] = phase_angle_values
+            phase_number[...] = phase_number_values
+            normalized_amplitude[...] = normalized_amplitude_values
+            strong_amplitude[...] = strong_amplitude_values
+            precipitation_rms[...] = precipitation_rms_values
             random_steps = _random_reference_steps(
                 field, steps, simulation
             )
-            random_reference_speed = random_steps.attrs[
+            random_reference_speed[0] = random_steps.attrs[
                 "mean_lpo_speed_degrees_per_hour"
             ]
             (
-                random_phase_angle,
-                random_phase_number,
-                random_normalized_amplitude,
-                random_strong_amplitude,
+                random_phase_angle_values,
+                random_phase_number_values,
+                random_normalized_amplitude_values,
+                random_strong_amplitude_values,
                 _random_precipitation_rms,
             ) = _precipitation_phase_at_lpo(
                 field,
                 random_steps,
                 wave_names,
             )
+            random_phase_angle[...] = random_phase_angle_values
+            random_phase_number[...] = random_phase_number_values
+            random_normalized_amplitude[...] = (
+                random_normalized_amplitude_values
+            )
+            random_strong_amplitude[...] = random_strong_amplitude_values
+            auxiliary_arrays = (
+                precipitation_rms,
+                phase_angle,
+                phase_number,
+                normalized_amplitude,
+                strong_amplitude,
+                random_phase_angle,
+                random_phase_number,
+                random_normalized_amplitude,
+                random_strong_amplitude,
+                random_reference_speed,
+            )
+            for array in auxiliary_arrays:
+                array.flush()
+            auxiliary_labels = (
+                "precipitation_rms",
+                "phase_angle",
+                "phase_number",
+                "normalized_amplitude",
+                "strong_amplitude",
+                "random_phase_angle",
+                "random_phase_number",
+                "random_normalized_amplitude",
+                "random_strong_amplitude",
+                "random_reference_speed",
+            )
+            _mark_lpo_checkpoint_complete(
+                (checkpoint_label, *auxiliary_labels),
+                completed,
+                status_path,
+            )
+            del (
+                phase_angle_values,
+                phase_number_values,
+                normalized_amplitude_values,
+                strong_amplitude_values,
+                precipitation_rms_values,
+                random_phase_angle_values,
+                random_phase_number_values,
+                random_normalized_amplitude_values,
+                random_strong_amplitude_values,
+            )
+        else:
+            _mark_lpo_checkpoint_complete(
+                checkpoint_label, completed, status_path
+            )
+        gc.collect()
 
     for field_name in LPO_SECTION_VERTICAL_FIELDS:
-        vertical[field_name] = _latitude_mean_native_lpo_wave_values(
+        checkpoint_label = f"vertical_{field_name}"
+        if vertical_complete[field_name]:
+            progress(
+                f"{simulation}: reusing compact LPO {field_name} checkpoint"
+            )
+            continue
+        vertical_values = _latitude_mean_native_lpo_wave_values(
             native_fields[field_name],
             steps,
             wave_names,
             progress_label=f"{simulation}: compact LPO {field_name}",
         )
-    native_pressure = _latitude_mean_native_lpo_values(
-        native_fields["pressure_hpa"], steps
+        vertical[field_name][...] = vertical_values
+        vertical[field_name].flush()
+        del vertical_values
+        _mark_lpo_checkpoint_complete(
+            checkpoint_label, completed, status_path
+        )
+        gc.collect()
+    native_pressure_shape = (
+        step_count,
+        native_level_count,
+        len(LPO_SECTION_RELATIVE_LONGITUDE_DEGREES),
     )
+    native_pressure, native_pressure_complete = _lpo_checkpoint_array(
+        checkpoint_directory,
+        "native_pressure",
+        native_pressure_shape,
+        completed,
+    )
+    if native_pressure_complete:
+        progress(f"{simulation}: reusing compact LPO pressure checkpoint")
+    else:
+        native_pressure_values = _latitude_mean_native_lpo_values(
+            native_fields["pressure_hpa"], steps
+        )
+        native_pressure[...] = native_pressure_values
+        native_pressure.flush()
+        del native_pressure_values
+        _mark_lpo_checkpoint_complete(
+            "native_pressure", completed, status_path
+        )
+        gc.collect()
 
     coords = {
         "event_step": np.arange(step_count),
@@ -2721,7 +3133,7 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
                 "simulation mean LPO zonal speed"
             ),
             "random_reference_mean_lpo_speed_degrees_per_hour": (
-                random_reference_speed
+                float(random_reference_speed[0])
             ),
         },
     )
@@ -2748,9 +3160,30 @@ def build_compact_lpo_wave_sections(ds, simulation, steps):
     dataset.filtered_upward_pressure_velocity.attrs[
         "sign_convention"
     ] = "positive values represent ascent (-omega)"
-    ray_sections = _peak_filtered_temperature_ray_sections(
-        native_fields, steps
+    ray_checkpoint_path = os.path.join(
+        checkpoint_directory, "ray_sections.nc"
     )
+    ray_sections = None
+    if "ray_sections" in completed:
+        try:
+            with xr.open_dataset(ray_checkpoint_path) as existing:
+                required_ray_variables = {
+                    "ray_filtered_temperature", "peak_event_id"
+                }
+                if required_ray_variables <= set(existing.data_vars):
+                    ray_sections = existing.load()
+        except (OSError, ValueError):
+            ray_sections = None
+    if ray_sections is None:
+        ray_sections = _peak_filtered_temperature_ray_sections(
+            native_fields, steps
+        )
+        write_netcdf_atomic(ray_sections, ray_checkpoint_path)
+        _mark_lpo_checkpoint_complete(
+            "ray_sections", completed, status_path
+        )
+    else:
+        progress(f"{simulation}: reusing compact LPO ray checkpoint")
     dataset = xr.merge([dataset, ray_sections], compat="no_conflicts")
     dataset.attrs.update(ray_sections.attrs)
     return dataset
@@ -3263,26 +3696,7 @@ def wave_response_direct_contrasts(table):
         )
         for index, values in pivot.iterrows():
             common = dict(zip(index_columns, index))
-            for key, label, lhs, rhs in (
-                (
-                    "U_minus_control",
-                    "u-nudged - control",
-                    sim_names[1],
-                    sim_names[0],
-                ),
-                (
-                    "T_minus_control",
-                    "T-nudged - control",
-                    sim_names[2],
-                    sim_names[0],
-                ),
-                (
-                    "U_minus_T",
-                    "u-nudged - T-nudged",
-                    sim_names[1],
-                    sim_names[2],
-                ),
-            ):
+            for key, label, lhs, rhs, _colour in WAVE_RESPONSE_CONTRASTS:
                 bootstrap = {
                     "ci_low": np.nan,
                     "ci_high": np.nan,
@@ -3454,12 +3868,9 @@ def plot_wave_response_metrics(table, contrasts):
         "wave_precipitation_cloud_olr_response",
     )
 
-    contrast_keys = ("U_minus_control", "T_minus_control", "U_minus_T")
-    contrast_labels = (
-        r"$u$-nudged − control",
-        r"$T$-nudged − control",
-        r"$u$-nudged − $T$-nudged",
-    )
+    contrast_keys = tuple(item[0] for item in WAVE_RESPONSE_CONTRASTS)
+    contrast_labels = tuple(item[1] for item in WAVE_RESPONSE_CONTRASTS)
+    contrast_colours = tuple(item[4] for item in WAVE_RESPONSE_CONTRASTS)
     fig, axes = plt.subplots(
         len(WAVE_RESPONSE_FILTERS),
         len(metrics),
@@ -3489,7 +3900,7 @@ def plot_wave_response_metrics(table, contrasts):
             axis.bar(
                 np.arange(len(contrast_keys)),
                 values.values,
-                color=(cols[1], cols[2], "0.35"),
+                color=contrast_colours,
                 width=0.72,
             )
             if contrast_metric == "regression_slope":
@@ -3592,12 +4003,9 @@ def plot_wave_cloud_class_efficiencies(table, contrasts):
         "wave_precipitation_cloud_class_efficiencies",
     )
 
-    contrast_keys = ("U_minus_control", "T_minus_control", "U_minus_T")
-    contrast_labels = (
-        r"$u$-nudged − control",
-        r"$T$-nudged − control",
-        r"$u$-nudged − $T$-nudged",
-    )
+    contrast_keys = tuple(item[0] for item in WAVE_RESPONSE_CONTRASTS)
+    contrast_labels = tuple(item[1] for item in WAVE_RESPONSE_CONTRASTS)
+    contrast_colours = tuple(item[4] for item in WAVE_RESPONSE_CONTRASTS)
     fig, axes = plt.subplots(
         len(WAVE_RESPONSE_FILTERS),
         len(cloud_responses),
@@ -3620,7 +4028,7 @@ def plot_wave_cloud_class_efficiencies(table, contrasts):
             axis.bar(
                 np.arange(len(contrast_keys)),
                 values,
-                color=(cols[1], cols[2], "0.35"),
+                color=contrast_colours,
                 width=0.72,
             )
             _draw_wave_response_errorbars(
@@ -4114,7 +4522,7 @@ def spectrum_cache_signature(sim_index, field_name=spectrum_field):
 
 
 def spectrum_cache_name(sim_index, field_name):
-    simulation_name = safe_name(sim_names[sim_index])
+    simulation_name = simulation_cache_name(_simulation_ids[sim_index])
     if field_name == spectrum_field:
         return f"normalised_wave_spectrum_{simulation_name}"
     return f"normalised_wave_spectrum_{safe_name(field_name)}_{simulation_name}"
@@ -4817,6 +5225,204 @@ if should_build_figure(1, hovmoller_stems):
         )
         figsave.save(fig, stem, number=1)
         print(f"Done with figure: {stem}")
+
+
+# -----------------------------------------------------------------------------
+# 15. Eastward-intraseasonal precipitation and LPO envelopes
+# -----------------------------------------------------------------------------
+# The precipitation field uses the established symmetric 10S--10N projection.
+# Each purple boundary is a retained tropical LPO envelope intersecting that
+# same latitude band. The projection therefore compares like spatial support.
+
+lpo_hovmoller_stem = "eastward_intraseasonal_precipitation_lpo_outlines"
+if should_build_figure(LPO_HOVMOLLER_FIGURE_NUMBER, lpo_hovmoller_stem):
+    lpo_mode_directory = _lpo_tracking_mode_directory(
+        test=test_mode,
+        allow_stale_products=runtime_args.allow_stale_lpo_products,
+    )
+    lpo_hovmoller_fields = {}
+    lpo_hovmoller_envelopes = {}
+    lpo_hovmoller_bounds = {}
+    vmax = 0.0
+    for simulation_index, simulation in enumerate(LPO_SIMULATION_DIRS):
+        standard = (
+            lpo_mode_directory / "primary" / simulation / "standard"
+        )
+        filtered_precipitation = periodic_longitude_field(
+            get_filtered_wave(
+                dss[simulation_index],
+                simulation_index,
+                "Precip",
+                EASTWARD_INTRASEASONAL_FILTER,
+                avgLat=True,
+            )
+        )
+        start, end = _lpo_hovmoller_time_bounds(
+            standard, filtered_precipitation
+        )
+        filtered_precipitation = filtered_precipitation.sel(
+            Time=slice(start, end)
+        ).load()
+        if filtered_precipitation.sizes.get("Time", 0) < 2:
+            raise RuntimeError(
+                f"{simulation}: insufficient common times for Figure 15"
+            )
+        lpo_hovmoller_fields[simulation] = filtered_precipitation
+        lpo_hovmoller_bounds[simulation] = (start, end)
+        lpo_hovmoller_envelopes[simulation] = (
+            _load_lpo_hovmoller_envelopes(standard, start, end)
+        )
+        finite = np.abs(
+            np.asarray(filtered_precipitation.values, dtype=float)
+        )
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            raise RuntimeError(
+                f"{simulation}: eastward-intraseasonal precipitation has "
+                "no finite values"
+            )
+        vmax = max(vmax, float(np.percentile(finite, 98)))
+        progress(
+            f"{simulation}: loaded eastward-intraseasonal precipitation "
+            f"and {len(lpo_hovmoller_envelopes[simulation])} LPO envelopes"
+        )
+
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        raise RuntimeError(
+            "Eastward-intraseasonal precipitation has zero or invalid amplitude"
+        )
+    time_origin = min(start for start, _ in lpo_hovmoller_bounds.values())
+    time_end = max(end for _, end in lpo_hovmoller_bounds.values())
+    record_days = max(
+        1,
+        int(np.ceil((time_end - time_origin) / pd.Timedelta(days=1))),
+    )
+    panel_count = max(
+        1, int(np.ceil(record_days / LPO_HOVMOLLER_PANEL_DAYS))
+    )
+    levels = symmetric_levels(vmax, ndiv=20)
+    fig, axes = plt.subplots(
+        len(LPO_SIMULATION_DIRS),
+        panel_count,
+        figsize=(6.0 * panel_count, 2.8 * len(LPO_SIMULATION_DIRS)),
+        constrained_layout=True,
+        sharex=True,
+        squeeze=False,
+    )
+    mappable = None
+    for simulation_index, simulation in enumerate(LPO_SIMULATION_DIRS):
+        field = lpo_hovmoller_fields[simulation]
+        field_days = np.asarray(
+            1.0
+            + (
+                pd.DatetimeIndex(pd.to_datetime(field.Time.values))
+                - time_origin
+            )
+            / pd.Timedelta(days=1),
+            dtype=float,
+        )
+        for panel_index in range(panel_count):
+            axis = axes[simulation_index, panel_index]
+            panel_start = 1.0 + panel_index * LPO_HOVMOLLER_PANEL_DAYS
+            panel_end = min(
+                1.0 + (panel_index + 1) * LPO_HOVMOLLER_PANEL_DAYS,
+                1.0 + record_days,
+            )
+            in_panel = (field_days >= panel_start) & (
+                field_days <= panel_end
+            )
+            selected = field.isel(Time=np.flatnonzero(in_panel))
+            selected_days = field_days[in_panel]
+            if selected.sizes.get("Time", 0) < 2:
+                axis.set_visible(False)
+                continue
+            mappable = axis.contourf(
+                selected.longitude,
+                selected_days,
+                selected.values,
+                levels=levels,
+                cmap=difference_cmap(levels),
+                extend="both",
+            )
+            for envelope in lpo_hovmoller_envelopes[simulation]:
+                envelope_days = np.asarray(
+                    1.0
+                    + (
+                        pd.DatetimeIndex(pd.to_datetime(envelope.Time.values))
+                        - time_origin
+                    )
+                    / pd.Timedelta(days=1),
+                    dtype=float,
+                )
+                envelope_in_panel = (
+                    (envelope_days >= panel_start)
+                    & (envelope_days <= panel_end)
+                )
+                if np.count_nonzero(envelope_in_panel) < 2:
+                    continue
+                panel_envelope = envelope.isel(
+                    Time=np.flatnonzero(envelope_in_panel)
+                )
+                if not bool(panel_envelope.any().item()):
+                    continue
+                for colour, linewidth in (("white", 1.7), ("purple", 0.8)):
+                    axis.contour(
+                        panel_envelope.longitude,
+                        envelope_days[envelope_in_panel],
+                        panel_envelope.values,
+                        levels=[0.5],
+                        colors=colour,
+                        linewidths=linewidth,
+                        zorder=3,
+                    )
+            axis.set_xlim(0.0, 360.0)
+            axis.set_ylim(panel_start, panel_end)
+            axis.set_xticks(np.arange(0.0, 361.0, 60.0))
+            axis.grid(
+                color="black",
+                linestyle="--",
+                linewidth=0.35,
+                alpha=0.25,
+            )
+            if simulation_index == 0:
+                axis.set_title(
+                    f"Simulation days {panel_start:g}–{panel_end:g}"
+                )
+            if panel_index == 0:
+                axis.set_ylabel(f"{sim_names[simulation_index]}\nSimulation day")
+            if simulation_index == len(LPO_SIMULATION_DIRS) - 1:
+                axis.set_xlabel("Longitude (°E)")
+    if mappable is None:
+        raise RuntimeError("Figure 15 contains no drawable time panels")
+    add_symmetric_colorbar(
+        fig,
+        mappable,
+        axes.ravel(),
+        levels,
+        label="Eastward-intraseasonal precipitation anomaly (mm day$^{-1}$)",
+    )
+    fig.legend(
+        handles=[
+            Line2D(
+                [0],
+                [0],
+                color="purple",
+                lw=1.2,
+                label="Tropical LPO envelope within 10°S–10°N",
+            )
+        ],
+        loc="outside lower center",
+        frameon=False,
+    )
+    fig.suptitle(
+        "Eastward-intraseasonal precipitation and tracked LPO envelopes"
+    )
+    figsave.save(
+        fig,
+        lpo_hovmoller_stem,
+        number=LPO_HOVMOLLER_FIGURE_NUMBER,
+    )
+    print(f"Done with figure: {lpo_hovmoller_stem}")
 
 
 # -----------------------------------------------------------------------------
@@ -6244,8 +6850,9 @@ if should_build_figure(12, "two_eof_top_heaviness"):
             os.path.join(product_output_dir, "two_eof_top_heaviness_metrics.csv"),
             index=False,
         )
-        netcdf_safe_dataset(basis_dataset).to_netcdf(
-            os.path.join(product_output_dir, "vertical_motion_eof_basis.nc")
+        write_netcdf_atomic(
+            basis_dataset,
+            os.path.join(product_output_dir, "vertical_motion_eof_basis.nc"),
         )
 
     primary = top_table[
@@ -6418,8 +7025,9 @@ if should_build_figure(13, "kelvin_reference_energy_dispersion"):
             kelvin_summary, kelvin_signature,
         )
     if save:
-        netcdf_safe_dataset(kelvin_dataset).to_netcdf(
-            os.path.join(product_output_dir, "kelvin_reference_energy_dispersion.nc")
+        write_netcdf_atomic(
+            kelvin_dataset,
+            os.path.join(product_output_dir, "kelvin_reference_energy_dispersion.nc"),
         )
         kelvin_summary.to_csv(
             os.path.join(
@@ -6505,6 +7113,7 @@ if 14 in figures_to_run:
         output_path = lpo_wave_section_cache_path(
             simulation, test=test_mode
         )
+        checkpoint_directory = output_path + ".work"
         reuse = False
         if os.path.exists(output_path) and not force_recompute_caches:
             try:
@@ -6535,16 +7144,21 @@ if 14 in figures_to_run:
                 reuse = False
         if reuse:
             progress(f"Reusing compact LPO wave sections: {output_path}")
+            if os.path.isdir(checkpoint_directory):
+                shutil.rmtree(checkpoint_directory)
             continue
         sections = build_compact_lpo_wave_sections(
             dataset,
             simulation,
             tracking_steps[simulation],
+            checkpoint_directory=checkpoint_directory,
         )
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        temporary_path = output_path + ".tmp"
-        netcdf_safe_dataset(sections).to_netcdf(temporary_path)
-        os.replace(temporary_path, output_path)
+        write_netcdf_atomic(sections, output_path)
+        sections.close()
+        del sections
+        gc.collect()
+        shutil.rmtree(checkpoint_directory)
         progress(f"Wrote compact LPO wave sections: {output_path}")
 
 if not runtime_args.figures_only:

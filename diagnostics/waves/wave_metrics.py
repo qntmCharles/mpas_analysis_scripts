@@ -601,12 +601,120 @@ def buoyancy_frequency_squared(
 
     theta = np.asarray(theta, dtype=float)
     height = np.asarray(height_m, dtype=float)
-    gradient = np.gradient(theta, height, axis=axis)
-    n_squared = gravity_m_s2 * gradient / theta
+    axis = np.core.numeric.normalize_axis_index(axis, theta.ndim)
+    if height.ndim == 1:
+        if height.size != theta.shape[axis]:
+            raise ValueError(
+                "One-dimensional height must match the selected theta axis"
+            )
+        shape = [1] * theta.ndim
+        shape[axis] = height.size
+        height = height.reshape(shape)
+    theta, height = np.broadcast_arrays(theta, height)
+    theta = np.moveaxis(theta, axis, -1)
+    height = np.moveaxis(height, axis, -1)
+    if theta.shape[-1] < 2:
+        raise ValueError("N² requires at least two vertical levels")
+
+    gradient = np.empty_like(theta, dtype=float)
+    lower_spacing = height[..., 1:-1] - height[..., :-2]
+    upper_spacing = height[..., 2:] - height[..., 1:-1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lower_weight = -upper_spacing / (
+            lower_spacing * (lower_spacing + upper_spacing)
+        )
+        centre_weight = (upper_spacing - lower_spacing) / (
+            lower_spacing * upper_spacing
+        )
+        upper_weight = lower_spacing / (
+            upper_spacing * (lower_spacing + upper_spacing)
+        )
+        gradient[..., 1:-1] = (
+            lower_weight * theta[..., :-2]
+            + centre_weight * theta[..., 1:-1]
+            + upper_weight * theta[..., 2:]
+        )
+        gradient[..., 0] = (
+            theta[..., 1] - theta[..., 0]
+        ) / (height[..., 1] - height[..., 0])
+        gradient[..., -1] = (
+            theta[..., -1] - theta[..., -2]
+        ) / (height[..., -1] - height[..., -2])
+        n_squared = gravity_m_s2 * gradient / theta
+    n_squared = np.moveaxis(n_squared, -1, axis)
     valid = np.isfinite(n_squared)
     if mask_nonpositive:
         valid &= n_squared > 0.0
     return np.where(valid, n_squared, np.nan)
+
+
+def blockwise_buoyancy_frequency_squared(
+    theta: xr.DataArray,
+    height_m: xr.DataArray,
+    vertical_dimension: str,
+    *,
+    block_size: int = 5,
+    mask_nonpositive: bool = True,
+) -> xr.DataArray:
+    """Return exact N² using small vertical blocks with one-level halos.
+
+    The halos preserve the centred finite differences at block boundaries.
+    They also avoid rechunking every model column into one large Dask task.
+    """
+
+    theta, height_m = xr.align(theta, height_m, join="exact")
+    if vertical_dimension not in theta.dims:
+        raise ValueError(
+            f"Missing vertical dimension {vertical_dimension!r} in theta"
+        )
+    if vertical_dimension not in height_m.dims:
+        raise ValueError(
+            f"Missing vertical dimension {vertical_dimension!r} in height"
+        )
+    if block_size < 1:
+        raise ValueError("block_size must be positive")
+    level_count = theta.sizes[vertical_dimension]
+    if level_count < 2:
+        raise ValueError("N² requires at least two vertical levels")
+
+    blocks: list[xr.DataArray] = []
+    for start in range(0, level_count, block_size):
+        stop = min(start + block_size, level_count)
+        halo_start = max(0, start - 1)
+        halo_stop = min(level_count, stop + 1)
+        selector = {vertical_dimension: slice(halo_start, halo_stop)}
+        halo_n2 = xr.apply_ufunc(
+            buoyancy_frequency_squared,
+            theta.isel(selector),
+            height_m.isel(selector),
+            kwargs={"mask_nonpositive": mask_nonpositive},
+            input_core_dims=[
+                [vertical_dimension],
+                [vertical_dimension],
+            ],
+            output_core_dims=[[vertical_dimension]],
+            vectorize=False,
+            dask="parallelized",
+            output_dtypes=[float],
+            dask_gufunc_kwargs={"allow_rechunk": True},
+        )
+        blocks.append(
+            halo_n2.isel(
+                {
+                    vertical_dimension: slice(
+                        start - halo_start,
+                        stop - halo_start,
+                    )
+                }
+            )
+        )
+    output = xr.concat(blocks, dim=vertical_dimension)
+    output = output.assign_coords(
+        {vertical_dimension: theta[vertical_dimension]}
+    )
+    output.name = "buoyancy_frequency_squared"
+    output.attrs.update(units="s-2")
+    return output
 
 
 def kelvin_group_velocities(

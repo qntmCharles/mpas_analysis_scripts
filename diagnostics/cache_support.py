@@ -1,14 +1,17 @@
-"""Shared cache manifests, validation, and atomic metadata writes."""
+"""Shared cache validation, loading, materialisation, and atomic writes."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import uuid
 from pathlib import Path
 
+import dask
 import numpy as np
 import pandas as pd
+import xarray as xr
 
 
 def jsonable_value(value):
@@ -45,11 +48,15 @@ def write_json_file(path, payload):
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(jsonable_value(payload), handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.replace(temporary, path)
+    temporary = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(jsonable_value(payload), handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 
 def source_file_signature(paths):
@@ -119,3 +126,112 @@ def metadata_writer(path_resolver, enabled=True):
     if not enabled:
         return lambda name, payload: None
     return lambda name, payload: write_json_file(path_resolver(name), payload)
+
+
+def netcdf_safe_attribute(value):
+    """Convert metadata to values accepted by NetCDF backends."""
+
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bool):
+        return np.int8(value)
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return json.dumps(jsonable_value(value), sort_keys=True)
+    if isinstance(value, (list, tuple, np.ndarray)):
+        array = np.asarray(value)
+        if array.dtype.kind == "b":
+            return array.astype(np.int8)
+        if array.dtype.kind in "SUif":
+            return array
+        return json.dumps(jsonable_value(value), sort_keys=True)
+    if isinstance(value, (str, int, float)):
+        return value
+    return str(value)
+
+
+def netcdf_safe_attrs(attrs):
+    """Return metadata containing only NetCDF-compatible values."""
+
+    return {key: netcdf_safe_attribute(value) for key, value in attrs.items()}
+
+
+def netcdf_safe_dataset(dataset):
+    """Return a shallow copy with NetCDF-compatible metadata."""
+
+    output = dataset.copy(deep=False)
+    output.attrs = netcdf_safe_attrs(dataset.attrs)
+    for name in output.variables:
+        output[name].attrs = netcdf_safe_attrs(dataset[name].attrs)
+    return output
+
+
+def materialize(value, *, scheduler="threads", num_workers=2):
+    """Finish a deferred calculation before an output file is opened."""
+
+    settings = {"scheduler": scheduler}
+    if scheduler in {"threads", "processes"} and num_workers is not None:
+        settings["num_workers"] = int(num_workers)
+    with dask.config.set(settings):
+        return value.load()
+
+
+def load_netcdf(path, **open_kwargs):
+    """Load one NetCDF file into memory and close the file immediately."""
+
+    with xr.open_dataset(path, **open_kwargs) as dataset:
+        return dataset.load()
+
+
+def write_netcdf_atomic(
+    dataset,
+    path,
+    *,
+    encoding=None,
+    unlimited_dims=None,
+    materialize_first=True,
+    scheduler="threads",
+    num_workers=2,
+):
+    """Write one complete NetCDF file without exposing partial output."""
+
+    path = os.fspath(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if materialize_first:
+        dataset = materialize(
+            dataset,
+            scheduler=scheduler,
+            num_workers=num_workers,
+        )
+    dataset = netcdf_safe_dataset(dataset)
+    temporary = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        dataset.to_netcdf(
+            temporary,
+            encoding=encoding,
+            unlimited_dims=unlimited_dims,
+        )
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return dataset
+
+
+def write_csv_atomic(table, path, **to_csv_kwargs):
+    """Write one complete CSV file without exposing partial output."""
+
+    path = os.fspath(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    temporary = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        table.to_csv(temporary, **to_csv_kwargs)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)

@@ -40,22 +40,28 @@ import dask
 from diagnostics.diagnostic_helpers import (
     FigureSaver, LATLON_PATTERN,
     annotate_panel_label, cache_manifest, cache_manifest_matches,
-    diagnostic_cache_dir, diagnostic_output_dir,
+    diagnostic_cache_dir, diagnostic_output_dir, diagnostic_profile_cache_dir,
     difference_cmap, figure_should_run, figure_should_run_any,
     latitude_weights, load_latlon_dataset,
     pressure_layer_weights, safe_name, set_latpres_axis,
-    simulation_colour, standardize_latlon_dataset, subset_between, symmetric_levels,
+    progress, simulation_colour, standardize_latlon_dataset,
+    subset_between, symmetric_levels,
     time_block_slices, time_step_days, read_json_file,
-    write_json_file,
+    write_csv_atomic, write_json_file, write_netcdf_atomic,
 )
 from diagnostics.analysis_config import (
+    ALL_SIMULATION_ARCHIVES,
+    ALL_SIMULATION_LABELS,
     BLOCK_LENGTH_DAYS,
     BOOTSTRAP_REPLICATES,
     BOOTSTRAP_SEED,
     CONFIDENCE_PERCENTILES,
     SIMULATION_ARCHIVES,
     SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
+    SIMULATION_PROFILES,
     SIMULATION_ROOT,
+    canonical_simulation_name,
+    profile_cache_directory,
 )
 from diagnostics.uncertainty import independent_bootstrap_difference
 
@@ -98,6 +104,7 @@ def parse_args(argv=None):
 
 
 runtime_args = parse_args()
+progress("Starting jet-variability diagnostics")
 save = True
 save_loc = diagnostic_output_dir("/home/cwp29/tmp/mpas/crf_on/final/jet_variability/")
 if runtime_args.test:
@@ -154,18 +161,33 @@ eof_min_valid_fraction = 0.95
 TEST_LATITUDE_STRIDE = 4
 TEST_LONGITUDE_BOUNDS = (60.0, 180.0)
 
-latlon_chunks = {"Time": -1, "latitude": 60, "longitude": 120}
+latlon_chunks = {"Time": 8, "latitude": 180, "longitude": 360}
 needed_vars = ["uzonal_isobaric"]
 
-dask.config.set({"array.slicing.split_large_chunks": True})
+dask.config.set(
+    {
+        "array.slicing.split_large_chunks": True,
+        "scheduler": "threads",
+        "num_workers": 2,
+    }
+)
 
-JET_CACHE_ROOT = diagnostic_cache_dir(
+JET_CACHE_ROOT = diagnostic_profile_cache_dir(
     "jet_variability",
     *(
         ("testing", f"all_{runtime_args.test_times:03d}times")
         if runtime_args.test
         else ()
     ),
+)
+JET_SIMULATION_CACHE_ROOT = diagnostic_cache_dir(
+    "jet_variability",
+    *(
+        ("testing", f"all_{runtime_args.test_times:03d}times")
+        if runtime_args.test
+        else ()
+    ),
+    "simulations",
 )
 JET_CACHE_SCHEMA = "jet-variability-v1"
 if not runtime_args.figures_only:
@@ -186,6 +208,10 @@ JET_CACHE_FILES = {
         "annular_mode_zonal_indices.csv",
     ),
 }
+JET_SIMULATION_CACHE_FILES = {
+    "fixed": JET_CACHE_FILES["fixed"][:-1],
+    "annular": JET_CACHE_FILES["annular"],
+}
 
 
 def requested_cache_families():
@@ -198,18 +224,44 @@ def requested_cache_families():
     return families
 
 
-def jet_source_paths(family):
+def jet_source_paths(
+    family,
+    simulation_indices=None,
+    *,
+    source_data_locs=None,
+):
+    locations = data_locs if source_data_locs is None else source_data_locs
+    indices = (
+        range(len(locations))
+        if simulation_indices is None
+        else simulation_indices
+    )
     return [
         path
-        for data_loc in data_locs
+        for index in indices
+        for data_loc in [locations[index]]
         for path in sorted(glob.glob(os.path.join(root_dir, data_loc, LATLON_PATTERN)))
     ]
 
 
-def jet_cache_manifest(family, *, include_sources=True):
+def jet_cache_manifest(
+    family,
+    *,
+    include_sources=True,
+    simulation_indices=None,
+    source_sim_names=None,
+    source_data_locs=None,
+):
+    names = sim_names if source_sim_names is None else source_sim_names
+    locations = data_locs if source_data_locs is None else source_data_locs
+    indices = list(
+        range(len(names))
+        if simulation_indices is None
+        else simulation_indices
+    )
     configuration = {
         "family": family,
-        "simulations": list(sim_names),
+        "simulations": [names[index] for index in indices],
         "fixed_pressure_level_hpa": fixed_pressure_level,
         "time_average_days": time_average_days,
         "max_autocorr_lag_days": max_autocorr_lag_days,
@@ -232,7 +284,15 @@ def jet_cache_manifest(family, *, include_sources=True):
         "jet_variability_diagnostics.py",
         schema=JET_CACHE_SCHEMA,
         configuration=configuration,
-        source_paths=jet_source_paths(family) if include_sources else None,
+        source_paths=(
+            jet_source_paths(
+                family,
+                indices,
+                source_data_locs=locations,
+            )
+            if include_sources
+            else None
+        ),
     )
 
 
@@ -244,16 +304,30 @@ def jet_manifest_path(family):
     return jet_cache_path(f"{family}.manifest.json")
 
 
-def jet_cache_is_current(family):
-    if runtime_args.rebuild_cache:
+def jet_cache_is_current(
+    family,
+    *,
+    root=JET_CACHE_ROOT,
+    files=None,
+    simulation_indices=None,
+    source_sim_names=None,
+    source_data_locs=None,
+    respect_rebuild=True,
+):
+    if respect_rebuild and runtime_args.rebuild_cache:
         return False
-    if not all(os.path.isfile(jet_cache_path(name)) for name in JET_CACHE_FILES[family]):
+    selected_files = files or JET_CACHE_FILES[family]
+    if not all(os.path.isfile(os.path.join(root, name)) for name in selected_files):
         return False
     try:
         expected = jet_cache_manifest(
-            family, include_sources=not runtime_args.figures_only
+            family,
+            include_sources=not runtime_args.figures_only,
+            simulation_indices=simulation_indices,
+            source_sim_names=source_sim_names,
+            source_data_locs=source_data_locs,
         )
-        saved = read_json_file(jet_manifest_path(family))
+        saved = read_json_file(os.path.join(root, f"{family}.manifest.json"))
     except (OSError, ValueError):
         return False
     return cache_manifest_matches(
@@ -263,16 +337,105 @@ def jet_cache_is_current(family):
     )
 
 
+def jet_simulation_cache_root(simulation):
+    return os.path.join(
+        JET_SIMULATION_CACHE_ROOT,
+        canonical_simulation_name(simulation),
+    )
+
+
+def aggregate_jet_cache_root(profile):
+    parts = (
+        ("testing", f"all_{runtime_args.test_times:03d}times")
+        if runtime_args.test
+        else ()
+    )
+    return os.fspath(
+        profile_cache_directory("jet_variability", *parts, profile=profile)
+    )
+
+
+def migrate_jet_simulation_cache(family, target_index):
+    """Seed one simulation cache from a current aggregate profile cache."""
+
+    target_name = canonical_simulation_name(sim_names[target_index])
+    target_label = sim_names[target_index]
+    for profile, canonical_names in SIMULATION_PROFILES.items():
+        if target_name not in canonical_names:
+            continue
+        profile_labels = [ALL_SIMULATION_LABELS[name] for name in canonical_names]
+        profile_data_locs = [ALL_SIMULATION_ARCHIVES[name] for name in canonical_names]
+        aggregate_root = aggregate_jet_cache_root(profile)
+        if not jet_cache_is_current(
+            family,
+            root=aggregate_root,
+            simulation_indices=range(len(profile_labels)),
+            source_sim_names=profile_labels,
+            source_data_locs=profile_data_locs,
+            respect_rebuild=False,
+        ):
+            continue
+        target_root = jet_simulation_cache_root(target_label)
+        for filename in JET_SIMULATION_CACHE_FILES[family]:
+            source = os.path.join(aggregate_root, filename)
+            target = os.path.join(target_root, filename)
+            if filename.endswith(".nc"):
+                with xr.open_dataset(source) as cached:
+                    if "simulation" in cached.dims:
+                        selected = cached.sel(simulation=[target_label]).load()
+                    elif "mode_member" in cached.dims and "simulation" in cached.coords:
+                        member_indices = np.flatnonzero(
+                            np.asarray(cached.simulation.values) == target_label
+                        )
+                        selected = cached.isel(mode_member=member_indices).load()
+                    else:
+                        selected = cached.load()
+                write_netcdf_atomic(selected, target)
+            else:
+                table = pd.read_csv(source)
+                if "simulation" in table:
+                    table = table[table.simulation == target_label]
+                write_csv_atomic(table, target, index=False)
+        manifest = jet_cache_manifest(
+            family,
+            simulation_indices=[target_index],
+        )
+        write_json_file(
+            os.path.join(target_root, f"{family}.manifest.json"),
+            manifest,
+        )
+        progress(
+            f"Migrated {family} jet products for {target_label} from {profile}"
+        )
+        return True
+    return False
+
+
 requested_families = requested_cache_families()
-current_cache_families = {
-    family for family in requested_families if jet_cache_is_current(family)
-}
-stale_cache_families = requested_families - current_cache_families
-if runtime_args.figures_only and stale_cache_families:
-    stale = ", ".join(sorted(stale_cache_families))
+stale_simulation_indices = {family: set() for family in requested_families}
+for family in requested_families:
+    for index, simulation in enumerate(sim_names):
+        simulation_root = jet_simulation_cache_root(simulation)
+        current = jet_cache_is_current(
+            family,
+            root=simulation_root,
+            files=JET_SIMULATION_CACHE_FILES[family],
+            simulation_indices=[index],
+        )
+        if not current and not runtime_args.rebuild_cache:
+            current = migrate_jet_simulation_cache(family, index)
+        if not current:
+            stale_simulation_indices[family].add(index)
+
+if runtime_args.figures_only and any(stale_simulation_indices.values()):
+    stale = ", ".join(
+        f"{family}/{sim_names[index]}"
+        for family, indices in sorted(stale_simulation_indices.items())
+        for index in sorted(indices)
+    )
     raise RuntimeError(
         f"Figure-only mode requires current jet caches for: {stale}. "
-        "Run without --figures-only to rebuild them."
+        "Run without --figures-only to build them."
     )
 
 
@@ -443,20 +606,14 @@ def longest_same_sign_run_days(values, step_days):
     return max(longest_boolean_run(pos), longest_boolean_run(neg)) * step_days
 
 
-def save_dataset(ds, filename):
+def save_dataset(ds, filename, root=JET_CACHE_ROOT):
     if save:
-        path = jet_cache_path(filename)
-        temporary = path + ".tmp"
-        ds.to_netcdf(temporary)
-        os.replace(temporary, path)
+        write_netcdf_atomic(ds, os.path.join(root, filename))
 
 
-def save_table(table, filename):
+def save_table(table, filename, root=JET_CACHE_ROOT):
     if save:
-        path = jet_cache_path(filename)
-        temporary = path + ".tmp"
-        table.to_csv(temporary, index=False)
-        os.replace(temporary, path)
+        write_csv_atomic(table, os.path.join(root, filename), index=False)
 
 
 # -----------------------------------------------------------------------------
@@ -464,8 +621,13 @@ def save_table(table, filename):
 # -----------------------------------------------------------------------------
 
 dss = [None] * len(data_locs)
-if stale_cache_families & {"fixed", "annular"}:
+if any(stale_simulation_indices.values()):
     for i, d in enumerate(data_locs):
+        if not any(
+            i in indices for indices in stale_simulation_indices.values()
+        ):
+            continue
+        progress(f"{sim_names[i]}: opening jet-variability inputs")
         ds = load_latlon_dataset(
             os.path.join(root_dir, d),
             latlon_pattern=LATLON_PATTERN,
@@ -577,10 +739,11 @@ def jet_latitude_uncertainty(tracks_by_simulation):
                 dtype=float,
             )
 
-    comparisons = (
-        (sim_names[1], sim_names[0]),
-        (sim_names[2], sim_names[0]),
-        (sim_names[1], sim_names[2]),
+    comparisons = [
+        (simulation, sim_names[0]) for simulation in sim_names[1:]
+    ]
+    comparisons.extend(
+        (sim_names[1], simulation) for simulation in sim_names[2:]
     )
     rows = []
     for hemisphere_index, hemisphere in enumerate(hemisphere_jet_bounds):
@@ -650,36 +813,66 @@ jet_latitudes = {}
 fixed_summary_rows = []
 jet_summary_rows = []
 
-if "fixed" in current_cache_families:
-    with xr.open_dataset(
-        jet_cache_path(
-            f"u{pressure_name(fixed_pressure_level)}_zonal_mean_timeseries.nc"
-        )
-    ) as cached:
-        fixed_cache = cached.load()
-    with xr.open_dataset(
-        jet_cache_path(
-            f"u{pressure_name(fixed_pressure_level)}_zonal_mean_autocorrelation.nc"
-        )
-    ) as cached:
-        autocorr_cache = cached.load()
+if "fixed" in requested_families:
+    stale_fixed = stale_simulation_indices["fixed"]
     for i, simulation in enumerate(sim_names):
-        if simulation not in fixed_cache.simulation.values:
+        if i in stale_fixed:
             continue
-        fixed_level[i] = fixed_cache.u_zonal_mean.sel(simulation=simulation)
-        fixed_level_anomaly[i] = fixed_cache.u_anomaly.sel(simulation=simulation)
+        simulation_root = jet_simulation_cache_root(simulation)
+        with xr.open_dataset(
+            os.path.join(
+                simulation_root,
+                f"u{pressure_name(fixed_pressure_level)}_zonal_mean_timeseries.nc",
+            )
+        ) as cached:
+            fixed_cache = cached.load()
+        with xr.open_dataset(
+            os.path.join(
+                simulation_root,
+                f"u{pressure_name(fixed_pressure_level)}_zonal_mean_autocorrelation.nc",
+            )
+        ) as cached:
+            autocorr_cache = cached.load()
+        fixed_level[i] = fixed_cache.u_zonal_mean.sel(
+            simulation=simulation,
+            drop=True,
+        )
+        fixed_level_anomaly[i] = fixed_cache.u_anomaly.sel(
+            simulation=simulation,
+            drop=True,
+        )
         fixed_level_autocorr[i] = autocorr_cache.autocorrelation.sel(
-            simulation=simulation
+            simulation=simulation,
+            drop=True,
         )
         fixed_level_efold[i] = autocorr_cache.efolding_time_days.sel(
-            simulation=simulation
+            simulation=simulation,
+            drop=True,
         )
         jet_latitudes[i] = hemisphere_jet_latitudes(fixed_level[i])
-    print(f"Using current fixed-level jet cache in {JET_CACHE_ROOT}")
+        fixed_summary_rows.extend(
+            pd.read_csv(
+                os.path.join(
+                    simulation_root,
+                    f"u{pressure_name(fixed_pressure_level)}_persistence_summary.csv",
+                )
+            ).to_dict("records")
+        )
+        jet_summary_rows.extend(
+            pd.read_csv(
+                os.path.join(
+                    simulation_root,
+                    f"u{pressure_name(fixed_pressure_level)}_jet_latitude_summary.csv",
+                )
+            ).to_dict("records")
+        )
+        progress(f"Using current fixed-level jet cache for {simulation}")
 
-if should_run_any([1, 2]) and "fixed" in stale_cache_families:
-    for i, ds in enumerate(dss):
+if should_run_any([1, 2]) and "fixed" in requested_families:
+    for i in sorted(stale_simulation_indices["fixed"]):
+        ds = dss[i]
         try:
+            progress(f"{sim_names[i]}: calculating fixed-level jet diagnostics")
             u700 = zonal_mean_u_at_level(ds)
             anomaly = u700 - u700.mean(dim="Time", skipna=True)
             ac = autocorrelation_by_latitude(anomaly)
@@ -715,12 +908,57 @@ if should_run_any([1, 2]) and "fixed" in stale_cache_families:
             )
 
             step_days = time_step_days(u700)
+            simulation_jet_rows = []
             for hemisphere, track in tracks.items():
-                jet_summary_rows.append(jet_latitude_summary(sim_names[i], hemisphere, track, step_days))
-        except Exception as exc:
-            print(f"Skipping fixed-level jet diagnostics for {sim_names[i]}: {exc}")
+                row = jet_latitude_summary(
+                    sim_names[i], hemisphere, track, step_days
+                )
+                jet_summary_rows.append(row)
+                simulation_jet_rows.append(row)
 
-    if save and fixed_level:
+            simulation_root = jet_simulation_cache_root(sim_names[i])
+            fixed_ds = xr.Dataset(
+                {
+                    "u_zonal_mean": u700,
+                    "u_anomaly": anomaly,
+                }
+            ).expand_dims(simulation=[sim_names[i]])
+            ac_ds = xr.Dataset(
+                {
+                    "autocorrelation": ac,
+                    "efolding_time_days": tau,
+                }
+            ).expand_dims(simulation=[sim_names[i]])
+            save_dataset(
+                fixed_ds,
+                f"u{pressure_name(fixed_pressure_level)}_zonal_mean_timeseries.nc",
+                simulation_root,
+            )
+            save_dataset(
+                ac_ds,
+                f"u{pressure_name(fixed_pressure_level)}_zonal_mean_autocorrelation.nc",
+                simulation_root,
+            )
+            save_table(
+                pd.DataFrame([fixed_summary_rows[-1]]),
+                f"u{pressure_name(fixed_pressure_level)}_persistence_summary.csv",
+                simulation_root,
+            )
+            save_table(
+                pd.DataFrame(simulation_jet_rows),
+                f"u{pressure_name(fixed_pressure_level)}_jet_latitude_summary.csv",
+                simulation_root,
+            )
+            write_json_file(
+                os.path.join(simulation_root, "fixed.manifest.json"),
+                jet_cache_manifest("fixed", simulation_indices=[i]),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Fixed-level jet diagnostics failed for {sim_names[i]}"
+            ) from exc
+
+    if save and fixed_level and not runtime_args.figures_only:
         fixed_simulations = [sim_names[i] for i in fixed_level]
         fixed_ds = xr.concat(
             [
@@ -761,19 +999,16 @@ if should_run_any([1, 2]) and "fixed" in stale_cache_families:
             pd.DataFrame(jet_summary_rows),
             f"u{pressure_name(fixed_pressure_level)}_jet_latitude_summary.csv",
         )
-if "fixed" in stale_cache_families and fixed_level:
+if "fixed" in requested_families and fixed_level:
     uncertainty_tracks = {
         sim_names[index]: tracks for index, tracks in jet_latitudes.items()
     }
     jet_uncertainty = jet_latitude_uncertainty(uncertainty_tracks)
     if jet_uncertainty.empty:
         raise RuntimeError("Jet-latitude uncertainty produced no results")
-    save_table(jet_uncertainty, "jet_latitude_response_uncertainty.csv")
-    write_json_file(jet_manifest_path("fixed"), jet_cache_manifest("fixed"))
-elif "fixed" in current_cache_families:
-    jet_uncertainty = pd.read_csv(
-        jet_cache_path("jet_latitude_response_uncertainty.csv")
-    )
+    if not runtime_args.figures_only:
+        save_table(jet_uncertainty, "jet_latitude_response_uncertainty.csv")
+        write_json_file(jet_manifest_path("fixed"), jet_cache_manifest("fixed"))
 
 
 # -----------------------------------------------------------------------------
@@ -889,49 +1124,105 @@ annular_results = {}
 annular_summary_rows = []
 annular_index_rows = []
 
-if "annular" in current_cache_families:
-    with xr.open_dataset(jet_cache_path("annular_mode_eof_patterns.nc")) as cached:
-        pattern_cache = cached.load()
-    with xr.open_dataset(
-        jet_cache_path("annular_mode_indices_autocorrelation.nc")
-    ) as cached:
-        index_cache = cached.load()
-    for member in pattern_cache.mode_member.values:
-        pattern_member = pattern_cache.sel(mode_member=member)
-        simulation = str(pattern_member.simulation.item())
-        hemisphere = str(pattern_member.hemisphere.item())
-        if simulation not in sim_names:
-            continue
-        i = sim_names.index(simulation)
-        index_member = index_cache.sel(mode_member=member)
-        eof = pattern_member.eof.drop_vars(
-            ["mode_member", "simulation", "hemisphere"], errors="ignore"
-        )
-        index = index_member.zonal_index.drop_vars(
-            ["mode_member", "simulation", "hemisphere"], errors="ignore"
-        )
-        autocorrelation = index_member.autocorrelation.drop_vars(
-            ["mode_member", "simulation", "hemisphere"], errors="ignore"
-        )
-        annular_results[(i, hemisphere)] = {
-            "eof": eof,
-            "index": index,
-            "autocorrelation": autocorrelation,
-            "efolding_time_days": float(efolding_time(autocorrelation).values),
-            "variance_fraction": float(eof.attrs["variance_fraction"]),
-        }
-    print(f"Using current annular-mode jet cache in {JET_CACHE_ROOT}")
+def annular_cache_datasets(results, members):
+    mode_member = xr.IndexVariable("mode_member", np.arange(len(members)))
+    member_simulations = [sim_names[i] for i, _hemisphere in members]
+    member_hemispheres = [hemisphere for _i, hemisphere in members]
+    pattern_da = xr.concat(
+        [results[member]["eof"].rename("eof") for member in members],
+        dim=mode_member,
+        join="outer",
+    )
+    pattern_ds = pattern_da.to_dataset().assign_coords(
+        simulation=("mode_member", member_simulations),
+        hemisphere=("mode_member", member_hemispheres),
+    )
+    index_da = xr.concat(
+        [results[member]["index"].rename("zonal_index") for member in members],
+        dim=mode_member,
+        join="outer",
+    )
+    autocorr_da = xr.concat(
+        [results[member]["autocorrelation"].rename("autocorrelation") for member in members],
+        dim=mode_member,
+        join="outer",
+    )
+    index_ds = xr.Dataset(
+        {"zonal_index": index_da, "autocorrelation": autocorr_da}
+    ).assign_coords(
+        simulation=("mode_member", member_simulations),
+        hemisphere=("mode_member", member_hemispheres),
+    )
+    return pattern_ds, index_ds
 
-if should_run_any([3, 4]) and "annular" in stale_cache_families:
-    for i, ds in enumerate(dss):
+
+if "annular" in requested_families:
+    stale_annular = stale_simulation_indices["annular"]
+    for i, simulation in enumerate(sim_names):
+        if i in stale_annular:
+            continue
+        simulation_root = jet_simulation_cache_root(simulation)
+        with xr.open_dataset(
+            os.path.join(simulation_root, "annular_mode_eof_patterns.nc")
+        ) as cached:
+            pattern_cache = cached.load()
+        with xr.open_dataset(
+            os.path.join(
+                simulation_root,
+                "annular_mode_indices_autocorrelation.nc",
+            )
+        ) as cached:
+            index_cache = cached.load()
+        for position, member in enumerate(pattern_cache.mode_member.values):
+            pattern_member = pattern_cache.sel(mode_member=member)
+            hemisphere = str(pattern_member.hemisphere.item())
+            index_member = index_cache.isel(mode_member=position)
+            eof = pattern_member.eof.drop_vars(
+                ["mode_member", "simulation", "hemisphere"], errors="ignore"
+            )
+            index = index_member.zonal_index.drop_vars(
+                ["mode_member", "simulation", "hemisphere"], errors="ignore"
+            )
+            autocorrelation = index_member.autocorrelation.drop_vars(
+                ["mode_member", "simulation", "hemisphere"], errors="ignore"
+            )
+            annular_results[(i, hemisphere)] = {
+                "eof": eof,
+                "index": index,
+                "autocorrelation": autocorrelation,
+                "efolding_time_days": float(
+                    efolding_time(autocorrelation).values
+                ),
+                "variance_fraction": float(eof.attrs["variance_fraction"]),
+            }
+        annular_summary_rows.extend(
+            pd.read_csv(
+                os.path.join(simulation_root, "annular_mode_summary.csv")
+            ).to_dict("records")
+        )
+        annular_index_rows.extend(
+            pd.read_csv(
+                os.path.join(simulation_root, "annular_mode_zonal_indices.csv")
+            ).to_dict("records")
+        )
+        progress(f"Using current annular-mode jet cache for {simulation}")
+
+if should_run_any([3, 4]) and "annular" in requested_families:
+    for i in sorted(stale_simulation_indices["annular"]):
+        ds = dss[i]
         try:
+            progress(f"{sim_names[i]}: calculating zonal-mean wind profiles")
             zm_u = zonal_mean_u_profile(ds)
         except Exception as exc:
-            print(f"Skipping annular-mode diagnostics for {sim_names[i]}: {exc}")
-            continue
+            raise RuntimeError(
+                f"Zonal-mean jet diagnostics failed for {sim_names[i]}"
+            ) from exc
 
         for hemisphere, lat_bounds in hemisphere_lat_bounds.items():
             try:
+                progress(
+                    f"{sim_names[i]} {hemisphere}: calculating annular mode"
+                )
                 eof, index, variance_fraction = leading_annular_mode(zm_u, hemisphere, lat_bounds)
                 ac = autocorrelation_timeseries(index)
                 tau = efolding_time(ac)
@@ -970,41 +1261,55 @@ if should_run_any([3, 4]) and "annular" in stale_cache_families:
                         }
                     )
             except Exception as exc:
-                print(f"Skipping {hemisphere} annular-mode diagnostics for {sim_names[i]}: {exc}")
+                raise RuntimeError(
+                    f"{hemisphere} annular-mode diagnostics failed for "
+                    f"{sim_names[i]}"
+                ) from exc
 
-    if save and annular_results:
-        members = list(annular_results)
-        mode_member = xr.IndexVariable("mode_member", np.arange(len(members)))
-        member_simulations = [sim_names[i] for i, hemisphere in members]
-        member_hemispheres = [hemisphere for i, hemisphere in members]
-
-        pattern_da = xr.concat(
-            [annular_results[member]["eof"].rename("eof") for member in members],
-            dim=mode_member,
-            join="outer",
+        simulation_members = [
+            member for member in annular_results if member[0] == i
+        ]
+        pattern_ds, index_ds = annular_cache_datasets(
+            annular_results,
+            simulation_members,
         )
-        pattern_ds = pattern_da.to_dataset()
-        pattern_ds = pattern_ds.assign_coords(
-            simulation=("mode_member", member_simulations),
-            hemisphere=("mode_member", member_hemispheres),
+        simulation_root = jet_simulation_cache_root(sim_names[i])
+        save_dataset(
+            pattern_ds,
+            "annular_mode_eof_patterns.nc",
+            simulation_root,
+        )
+        save_dataset(
+            index_ds,
+            "annular_mode_indices_autocorrelation.nc",
+            simulation_root,
+        )
+        save_table(
+            pd.DataFrame(
+                [row for row in annular_summary_rows if row["simulation"] == sim_names[i]]
+            ),
+            "annular_mode_summary.csv",
+            simulation_root,
+        )
+        save_table(
+            pd.DataFrame(
+                [row for row in annular_index_rows if row["simulation"] == sim_names[i]]
+            ),
+            "annular_mode_zonal_indices.csv",
+            simulation_root,
+        )
+        write_json_file(
+            os.path.join(simulation_root, "annular.manifest.json"),
+            jet_cache_manifest("annular", simulation_indices=[i]),
+        )
+
+    if save and annular_results and not runtime_args.figures_only:
+        members = list(annular_results)
+        pattern_ds, ac_ds = annular_cache_datasets(
+            annular_results,
+            members,
         )
         save_dataset(pattern_ds, "annular_mode_eof_patterns.nc")
-
-        index_da = xr.concat(
-            [annular_results[member]["index"].rename("zonal_index") for member in members],
-            dim=mode_member,
-            join="outer",
-        )
-        autocorr_da = xr.concat(
-            [annular_results[member]["autocorrelation"].rename("autocorrelation") for member in members],
-            dim=mode_member,
-            join="outer",
-        )
-        ac_ds = xr.Dataset({"zonal_index": index_da, "autocorrelation": autocorr_da})
-        ac_ds = ac_ds.assign_coords(
-            simulation=("mode_member", member_simulations),
-            hemisphere=("mode_member", member_hemispheres),
-        )
         save_dataset(ac_ds, "annular_mode_indices_autocorrelation.nc")
 
         save_table(pd.DataFrame(annular_summary_rows), "annular_mode_summary.csv")
@@ -1166,3 +1471,8 @@ if should_run_figure(4) and annular_results:
     tight_layout_with_right_margin(fig, right=0.98)
     figsave.save(fig, "annular_mode_indices_and_autocorrelation", number=4)
     print("Done with figure: annular_mode_indices_and_autocorrelation")
+
+for dataset in dss:
+    if dataset is not None:
+        dataset.close()
+progress("Completed jet-variability diagnostics")

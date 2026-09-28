@@ -21,7 +21,7 @@ preserved below each run's ``upstream_lpt`` directory.
 
 Large and regenerable products are kept below the central ``cache/lpt`` location.
 Only rendered figures are written below the
-usual ``~/tmp/mpas/crf_on/final/organisation_lpt`` figure tree. The tracking
+usual ``~/tmp/mpas/crf_on/final/lpo_tracking`` figure tree. The tracking
 script does not expose an alternative data-location option.
 
 Publication Figure 1 writes one envelope-evolution file for every retained LPO.
@@ -30,7 +30,8 @@ per simulation with side-by-side 100-day panels. It shows every threshold and
 size-qualified candidate envelope, but only retained LPOs receive centroid
 tracks. A 15-day sliding-window MP4 uses the same presentation. Test mode uses
 one panel for its short subset. Figure 3 separates property CDFs from compact
-population summaries. All figures use saved standard products.
+population summaries. Figure 4 maps every retained LPO track within 10°S–10°N.
+All figures use saved standard products.
 
 Publication mode is the default. It applies one configuration to all three
 simulations: six-hourly precipitation, a complete 72-hour running mean,
@@ -45,7 +46,7 @@ merger/split settings. The primary run supplies every shared reference value.
 
 ``--test`` is a quick visual check on a short, contiguous subset of the actual
 MPAS records. It retains the publication threshold, filters, grid-cell
-criterion, periodic geometry, and linking method. Tracking Figures 1--3 use
+criterion, periodic geometry, and linking method. Tracking Figures 1--4 use
 the complete saved test population; the envelope gallery and tracking overview
 show every retained test track. Test products are isolated below
 ``testing/actual_subset_*`` and cannot be consumed as definitive publication
@@ -98,11 +99,13 @@ for _parent in (
 import numpy as np
 import pandas as pd
 import xarray as xr
+import cartopy.crs as ccrs
 from matplotlib import animation, pyplot as plt
 from matplotlib.colors import BoundaryNorm, ListedColormap
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.ticker import FuncFormatter, MaxNLocator
+from cartopy.mpl.ticker import LatitudeFormatter, LongitudeFormatter
 from scipy import ndimage
 
 from diagnostics.diagnostic_helpers import (
@@ -122,9 +125,12 @@ from diagnostics.diagnostic_helpers import (
     progress,
     read_json_file,
     standardize_latlon_dataset,
+    write_csv_atomic,
     write_json_file,
+    write_netcdf_atomic,
 )
 from diagnostics.analysis_config import (
+    ACTIVE_SIMULATION_PROFILE,
     BOOTSTRAP_REPLICATES,
     BOOTSTRAP_SEED,
     SIMULATION_ARCHIVES,
@@ -176,7 +182,7 @@ CENTROID_TRACK_COLOUR = "black"
 LPO_ENVELOPE_COLOUR = "purple"
 CENTROID_TRACK_LINEWIDTH = 2.4
 
-TRACKING_FIGURES = (1, 2, 3)
+TRACKING_FIGURES = (1, 2, 3, 4)
 PUBLICATION_FIGURES = TRACKING_FIGURES
 VALIDATION_FIGURES = (8,)
 VALIDATION_RUN_NAMES = (
@@ -236,10 +242,11 @@ TRACKING_MOVIE_WINDOW_DAYS = 15
 TRACKING_MOVIE_FRAME_STEP_HOURS = 24
 TRACKING_MOVIE_FRAMES_PER_SECOND = 6
 TROPICAL_CENTROID_LIMIT_DEG = 20.0
+TRACK_MAP_LATITUDE_LIMIT_DEG = 10.0
 TROPICAL_MIN_CONSECUTIVE_HOURS = 24.0
 DEFAULT_ROOT = str(SIMULATION_ROOT)
 DEFAULT_LPT_CACHE_ROOT = os.fspath(cache_directory("lpt"))
-DEFAULT_LPT_FIGURE_ROOT = "/home/cwp29/tmp/mpas/crf_on/final/organisation_lpt"
+DEFAULT_LPT_FIGURE_ROOT = "/home/cwp29/tmp/mpas/crf_on/final"
 DEFAULT_TRACKING_DOMAIN = (-50.0, 50.0)
 
 
@@ -1286,7 +1293,8 @@ def write_upstream_precipitation_files(
         )
         field.attrs.update(units="mm h-1", long_name="MPAS total precipitation rate")
         output = xr.Dataset({"rain": field.expand_dims(time=[time_value])})
-        output.to_netcdf(
+        write_netcdf_atomic(
+            output,
             destination / f"mpas_rain_{time_value:%Y%m%d%H}.nc",
             encoding={"rain": {"zlib": True, "complevel": 2, "dtype": "float32"}},
         )
@@ -2173,10 +2181,9 @@ def postprocess_event_masks(
             f"{specification.name}/{event.simulation}: materialising "
             f"{event.event_id} event-context fields"
         )
-        event_dataset.load()
-        temporary_output = output_path.with_suffix(".nc.tmp")
-        event_dataset.to_netcdf(
-            temporary_output,
+        write_netcdf_atomic(
+            event_dataset,
+            output_path,
             encoding={
                 "lpt_envelope_mask": {
                     "dtype": "int8",
@@ -2223,7 +2230,6 @@ def postprocess_event_masks(
                 ),
             },
         )
-        os.replace(temporary_output, output_path)
         event_dataset.close()
         mask_index_rows.append(
             {
@@ -2245,7 +2251,8 @@ def postprocess_event_masks(
             f"{specification.name}/{event.simulation}: completed "
             f"{event.event_id} in {time.perf_counter() - event_start:.1f} s"
         )
-    pd.DataFrame(mask_index_rows).to_csv(
+    write_csv_atomic(
+        pd.DataFrame(mask_index_rows),
         standard_directory / "lpt_event_mask_index.csv", index=False
     )
     tropical_limit = (
@@ -2304,7 +2311,7 @@ def postprocess_event_masks(
     equatorial_candidates = equatorial_envelope_for_plot(
         candidate_envelopes
     )
-    xr.Dataset(
+    overview_dataset = xr.Dataset(
         {
             "equatorial_raw_precipitation_mm_day": tropical_raw.weighted(
                 raw_latitude_weights
@@ -2353,7 +2360,9 @@ def postprocess_event_masks(
                 "require later track retention"
             ),
         },
-    ).to_netcdf(
+    )
+    write_netcdf_atomic(
+        overview_dataset,
         standard_directory / "lpt_time_longitude_overview.nc",
         encoding={
             "equatorial_raw_precipitation_mm_day": {
@@ -2827,12 +2836,20 @@ def write_standard_products(
         json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
     )
-    track_steps.to_csv(directory / "lpt_track_steps.csv", index=False)
-    events.to_csv(directory / "lpt_events.csv", index=False)
+    write_csv_atomic(track_steps, directory / "lpt_track_steps.csv", index=False)
+    write_csv_atomic(events, directory / "lpt_events.csv", index=False)
     if lifecycle is not None:
-        lifecycle.to_csv(directory / "lpt_event_relative_diagnostics.csv", index=False)
+        write_csv_atomic(
+            lifecycle,
+            directory / "lpt_event_relative_diagnostics.csv",
+            index=False,
+        )
     if lifecycle_summary is not None:
-        lifecycle_summary.to_csv(directory / "lpt_event_lifecycle_summary.csv", index=False)
+        write_csv_atomic(
+            lifecycle_summary,
+            directory / "lpt_event_lifecycle_summary.csv",
+            index=False,
+        )
 
 
 def _simulation_paths(mode_directory: Path, simulation: str) -> dict[str, Path]:
@@ -3240,9 +3257,18 @@ def run_specification(
             )
         dataset.close()
     if stage in {"all", "postprocess"}:
-        event_files = sorted(
-            mode_directory.glob("*/standard/lpt_events.csv")
+        selected_simulations = (
+            VALIDATION_SIMULATIONS
+            if specification.record_subset == "first_100_days"
+            else tuple(SIMULATION_DIRS)
         )
+        event_files = [
+            mode_directory / simulation / "standard" / "lpt_events.csv"
+            for simulation in selected_simulations
+            if (
+                mode_directory / simulation / "standard" / "lpt_events.csv"
+            ).is_file()
+        ]
         expected_file_count = (
             len(VALIDATION_SIMULATIONS)
             if specification.record_subset == "first_100_days"
@@ -3252,7 +3278,7 @@ def run_specification(
             progress(
                 f"{specification.name}: selective postprocessing complete; "
                 "cross-simulation population summary is deferred until all "
-                "three standard event products exist"
+                "selected standard event products exist"
             )
             return
         combined_events = pd.concat(
@@ -3260,8 +3286,14 @@ def run_specification(
             ignore_index=True,
         )
         population = lpo_population_summary(combined_events)
-        population.to_csv(
-            mode_directory / "lpo_population_summary.csv",
+        profile_suffix = (
+            ""
+            if ACTIVE_SIMULATION_PROFILE == "legacy"
+            else f".{ACTIVE_SIMULATION_PROFILE}"
+        )
+        write_csv_atomic(
+            population,
+            mode_directory / f"lpo_population_summary{profile_suffix}.csv",
             index=False,
         )
         if tracking_figure_test:
@@ -3271,8 +3303,10 @@ def run_specification(
             )
         else:
             uncertainty = lpo_event_property_uncertainty(combined_events)
-            uncertainty.to_csv(
-                mode_directory / "lpo_event_property_uncertainty.csv",
+            write_csv_atomic(
+                uncertainty,
+                mode_directory
+                / f"lpo_event_property_uncertainty{profile_suffix}.csv",
                 index=False,
             )
             progress(
@@ -3420,7 +3454,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             minimum_duration_hours=test_minimum_duration_hours,
         )
         if args.test
-        else figure_root / args.mode
+        else figure_root
     )
     cache_output.mkdir(parents=True, exist_ok=True)
     if args.test:
@@ -3482,14 +3516,34 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def read_standard_event_tables(
     mode_directory: str | os.PathLike[str],
+    simulations: Sequence[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read the project-standard event and lifecycle tables for one run root."""
 
     mode_directory = Path(mode_directory)
-    event_files = sorted(mode_directory.glob("*/standard/lpt_events.csv"))
-    lifecycle_files = sorted(
-        mode_directory.glob("*/standard/lpt_event_relative_diagnostics.csv")
+    selected_simulations = tuple(
+        SIMULATION_DIRS if simulations is None else simulations
     )
+    event_files = [
+        mode_directory / simulation / "standard" / "lpt_events.csv"
+        for simulation in selected_simulations
+        if (
+            mode_directory / simulation / "standard" / "lpt_events.csv"
+        ).is_file()
+    ]
+    lifecycle_files = [
+        mode_directory
+        / simulation
+        / "standard"
+        / "lpt_event_relative_diagnostics.csv"
+        for simulation in selected_simulations
+        if (
+            mode_directory
+            / simulation
+            / "standard"
+            / "lpt_event_relative_diagnostics.csv"
+        ).is_file()
+    ]
     events = (
         pd.concat([pd.read_csv(path) for path in event_files], ignore_index=True)
         if event_files
@@ -3724,9 +3778,8 @@ def build_tracking_figures_from_saved_outputs(
         )
     )
     figure_saver = FigureSaver(
-        str(Path(figure_output or output)),
+        str(Path(figure_output or output) / "lpo_tracking"),
         enabled=True,
-        figures_to_run=figures,
     )
 
     def save(number: int, stem: str, figure) -> None:
@@ -3741,10 +3794,10 @@ def build_tracking_figures_from_saved_outputs(
     if mode == "validation":
         if 8 in figures:
             _require_validation_figure_products(output)
-            progress("Starting Figure 8: LPO validation sensitivities")
-            save(8, "lpo_validation_sensitivity", _plot_validation_figure(output))
+            progress("Starting lpo_tracking Figure 5: validation sensitivities")
+            save(5, "lpo_validation_sensitivity", _plot_validation_figure(output))
             for stem, figure in _plot_validation_track_figures(output):
-                save(8, stem, figure)
+                save(5, stem, figure)
         return
     primary = output / "primary"
     _require_primary_figure_product_versions(primary)
@@ -3844,6 +3897,13 @@ def build_tracking_figures_from_saved_outputs(
                 "lpo_event_property_uncertainty",
                 _plot_event_property_uncertainty(events),
             )
+    if 4 in figures and not events.empty:
+        progress("Starting lpo_tracking Figure 4: all LPO tracks")
+        save(
+            4,
+            "all_lpo_tracks_tropical_map",
+            _plot_all_lpo_tracks_map(primary, events),
+        )
 
 
 def _event_product_path(primary: Path, simulation: str, event_id: str) -> Path:
@@ -4730,6 +4790,44 @@ def periodic_track_segments(
     return segments
 
 
+def tropical_track_segments(
+    longitude: Sequence[float],
+    latitude: Sequence[float],
+    *,
+    latitude_limit: float = TROPICAL_CENTROID_LIMIT_DEG,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Split visible tropical track segments at gaps and map seams."""
+
+    lon = np.mod(np.asarray(longitude, dtype=float), 360.0)
+    lat = np.asarray(latitude, dtype=float)
+    if lon.shape != lat.shape:
+        raise ValueError("Track longitude and latitude shapes differ")
+    valid = (
+        np.isfinite(lon)
+        & np.isfinite(lat)
+        & (np.abs(lat) <= float(latitude_limit))
+    )
+    valid_indices = np.flatnonzero(valid)
+    if not len(valid_indices):
+        return []
+    boundaries = (
+        np.flatnonzero(
+            (np.diff(valid_indices) > 1)
+            | (np.abs(np.diff(lon[valid_indices])) > 180.0)
+        )
+        + 1
+    )
+    segments = []
+    for start, end in zip(
+        np.r_[0, boundaries],
+        np.r_[boundaries, len(valid_indices)],
+    ):
+        indices = valid_indices[start:end]
+        if len(indices):
+            segments.append((lon[indices], lat[indices]))
+    return segments
+
+
 def _read_plot_track_steps(standard: Path) -> pd.DataFrame:
     """Read upstream geometric centroids for tracking-overview plots."""
 
@@ -5141,6 +5239,114 @@ def _plot_tracking_overview(
     return fig
 
 
+def _plot_all_lpo_tracks_map(primary: Path, events: pd.DataFrame):
+    """Plot all retained geometric-centroid tracks in the tropical belt."""
+
+    data_crs = ccrs.PlateCarree()
+    projection = ccrs.PlateCarree(central_longitude=180.0)
+    fig, axes = plt.subplots(
+        len(SIMULATION_DIRS),
+        1,
+        figsize=(13.5, 7.2),
+        constrained_layout=True,
+        subplot_kw={"projection": projection},
+        squeeze=False,
+    )
+    for row, simulation in enumerate(SIMULATION_DIRS):
+        axis = axes[row, 0]
+        standard = primary / simulation / "standard"
+        steps = _read_plot_track_steps(standard)
+        simulation_events = events[events.simulation == simulation]
+        visible_count = 0
+        for event_id in simulation_events.event_id.astype(str):
+            track = steps[steps.event_id.astype(str) == event_id].sort_values(
+                "Time"
+            )
+            if track.empty:
+                raise RuntimeError(
+                    f"{standard}: event {event_id} has no track steps"
+                )
+            segments = tropical_track_segments(
+                track.plot_centroid_lon,
+                track.plot_centroid_lat,
+                latitude_limit=TRACK_MAP_LATITUDE_LIMIT_DEG,
+            )
+            if segments:
+                visible_count += 1
+            for longitude, latitude in segments:
+                axis.plot(
+                    longitude,
+                    latitude,
+                    color=SIMULATION_COLOURS[simulation],
+                    lw=0.85,
+                    marker=".",
+                    markersize=1.8,
+                    alpha=0.62,
+                    solid_capstyle="round",
+                    transform=data_crs,
+                    zorder=2,
+                )
+        axis.set_extent(
+            [
+                0.001,
+                359.999,
+                -TRACK_MAP_LATITUDE_LIMIT_DEG,
+                TRACK_MAP_LATITUDE_LIMIT_DEG,
+            ],
+            crs=data_crs,
+        )
+        axis.set_xticks(np.arange(0.0, 360.0, 60.0), crs=data_crs)
+        axis.set_yticks(
+            np.arange(
+                -TRACK_MAP_LATITUDE_LIMIT_DEG,
+                TRACK_MAP_LATITUDE_LIMIT_DEG + 1.0,
+                10.0,
+            ),
+            crs=data_crs,
+        )
+        axis.xaxis.set_major_formatter(
+            LongitudeFormatter(zero_direction_label=True)
+        )
+        axis.yaxis.set_major_formatter(LatitudeFormatter())
+        axis.gridlines(
+            crs=data_crs,
+            xlocs=np.arange(0.0, 360.0, 60.0),
+            ylocs=np.arange(
+                -TRACK_MAP_LATITUDE_LIMIT_DEG,
+                TRACK_MAP_LATITUDE_LIMIT_DEG + 1.0,
+                10.0,
+            ),
+            color="0.5",
+            linewidth=0.35,
+            linestyle="--",
+            alpha=0.35,
+        )
+        axis.set_title(
+            f"{SIMULATION_LABELS[simulation]}: "
+            f"{visible_count} of {len(simulation_events)} tracks intersect "
+            "10°S–10°N",
+            loc="left",
+        )
+        if row == len(SIMULATION_DIRS) - 1:
+            axis.set_xlabel("Longitude")
+    axes[0, 0].legend(
+        handles=[
+            Line2D(
+                [0],
+                [0],
+                color="0.3",
+                lw=1.2,
+                label="Retained LPO geometric-centroid track",
+            )
+        ],
+        loc="lower left",
+        frameon=True,
+        fontsize=8,
+    )
+    fig.suptitle("Full-record aquaplanet LPO tracks within 10°S–10°N")
+    return fig
+
+
 def _tracking_movie_times(
     primary: Path,
     simulation: str,
@@ -5383,11 +5589,23 @@ LPO_UNCERTAINTY_METRICS = (
     ("zonal_speed_m_s", "m s-1"),
     ("total_zonal_displacement_km", "km"),
 )
-LPO_UNCERTAINTY_COMPARISONS = (
-    ("nudged-u", "control", "nudged u - control"),
-    ("nudged-T", "control", "nudged T - control"),
-    ("nudged-u", "nudged-T", "nudged u - nudged T"),
+LPO_UNCERTAINTY_COMPARISONS = [
+    (
+        simulation,
+        "control",
+        f"{SIMULATION_LABELS[simulation]} - {SIMULATION_LABELS['control']}",
+    )
+    for simulation in tuple(SIMULATION_DIRS)[1:]
+]
+LPO_UNCERTAINTY_COMPARISONS.extend(
+    (
+        "nudged-u",
+        simulation,
+        f"{SIMULATION_LABELS['nudged-u']} - {SIMULATION_LABELS[simulation]}",
+    )
+    for simulation in tuple(SIMULATION_DIRS)[2:]
 )
+LPO_UNCERTAINTY_COMPARISONS = tuple(LPO_UNCERTAINTY_COMPARISONS)
 
 
 def lpo_event_property_uncertainty(events: pd.DataFrame) -> pd.DataFrame:
@@ -5463,7 +5681,10 @@ def _plot_event_property_uncertainty(events: pd.DataFrame):
         "zonal_speed_m_s": r"Zonal speed response (m s$^{-1}$)",
         "total_zonal_displacement_km": "Net zonal displacement response (km)",
     }
-    colours = {"nudged-u": SIMULATION_COLOURS["nudged-u"], "nudged-T": SIMULATION_COLOURS["nudged-T"]}
+    colours = {
+        simulation: SIMULATION_COLOURS[simulation]
+        for simulation in tuple(SIMULATION_DIRS)[1:]
+    }
     figure, axes = plt.subplots(5, 1, figsize=(8.5, 9.0), constrained_layout=True)
     y_positions = np.arange(len(LPO_UNCERTAINTY_COMPARISONS))
     for axis, (metric, _units) in zip(axes, LPO_UNCERTAINTY_METRICS):
@@ -5665,7 +5886,10 @@ def _read_validation_events(output: Path) -> pd.DataFrame:
 
     rows = []
     for run_name in VALIDATION_RUN_NAMES:
-        events, _ = read_standard_event_tables(output / run_name)
+        events, _ = read_standard_event_tables(
+            output / run_name,
+            simulations=VALIDATION_SIMULATIONS,
+        )
         events["run_name"] = run_name
         if "primary_tropical_sample" in events:
             events = events[events.primary_tropical_sample.astype(bool)]

@@ -209,7 +209,7 @@ The phase–pressure presentation should follow [Rios-Berrios et al. (2023)](htt
 
 **Recommended implementation**
 
-Use the existing phase definition based on normalized filtered precipitation and its tendency. Retain normalized phase-space amplitude >= 1 as the strong-wave threshold.
+Use the existing phase definition based on normalized filtered precipitation and its tendency. Retain normalized phase-space amplitude > 1 as the strong-wave threshold.
 
 For each wave band, create a phase–pressure figure with eight wave phases on the horizontal axis and pressure on the vertical axis. Use three columns:
 
@@ -230,7 +230,7 @@ The existing LPO-lag filtered composites remain the primary lifecycle view. The 
 
 **Recommended implementation**
 
-At each LPO lag, condition the phase histogram and circular concentration on the same amplitude >= 1 strong-wave sample. Normalize the eight phase probabilities so that they sum to one at every lag. Use the identical calculation for matched random tropical trajectories. Advect each random trajectory with the simulation mean LPO speed. Calculate circular concentration as
+At each LPO lag, condition the phase histogram and circular concentration on the same amplitude > 1 strong-wave sample. Normalize the eight phase probabilities so that they sum to one at every lag. Use the identical calculation for matched random tropical trajectories. Advect each random trajectory with the simulation mean LPO speed. Calculate circular concentration as
 
 \[
 R = \left|\sum_j w_j e^{i\theta_j}\right| / \sum_j w_j,

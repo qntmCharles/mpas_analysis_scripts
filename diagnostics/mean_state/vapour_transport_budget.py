@@ -48,6 +48,7 @@ from diagnostics.diagnostic_helpers import (
     SPECIFIC_HUMIDITY_CMAP,
     cache_manifest,
     diagnostic_cache_dir,
+    diagnostic_profile_cache_dir,
     diagnostic_output_dir,
     finite_or_nan,
     hemispheric_fold,
@@ -55,13 +56,14 @@ from diagnostics.diagnostic_helpers import (
     load_latlon_dataset,
     native_layer_interfaces,
     native_midlevel_height,
-    netcdf_safe_dataset,
     progress,
     spherical_flux_divergence,
     spherical_horizontal_advection,
     simulation_colour,
     standardize_latlon_dataset,
     total_precip_accum,
+    write_csv_atomic,
+    write_netcdf_atomic,
 )
 from diagnostics.analysis_config import (
     SIMULATION_ARCHIVES,
@@ -85,7 +87,6 @@ TEST_LATITUDE_BOUNDS = (-42.0, 42.0)
 
 BOUNDARIES = ("fixed_200hpa", "cold_point")
 MOVING_BOUNDARIES = ("cold_point",)
-COMPARISON_NAMES = ("u_nudge_minus_control", "T_nudge_minus_control")
 COMPONENT_NAMES = (
     "temperature",
     "relative_humidity",
@@ -100,12 +101,20 @@ ROOT_DIR = str(SIMULATION_ROOT)
 DATA_LOCS = tuple(SIMULATION_ARCHIVES.values())
 SIM_NAMES = tuple(PROJECT_SIMULATION_LABELS.values())
 SIM_COLORS = tuple(simulation_colour(name) for name in SIM_NAMES)
+COMPARISON_NAMES = tuple(
+    f"{directory}_minus_control" for directory in DATA_LOCS[1:]
+)
+COMPARISON_LABELS = tuple(
+    f"{simulation} - {SIM_NAMES[0]}" for simulation in SIM_NAMES[1:]
+)
 COMPARISON_COLORS = SIM_COLORS[1:]
 SAVE_LOC = diagnostic_output_dir(
     "/home/cwp29/tmp/mpas/crf_on/final/vapour_transport_budget/"
 )
 CACHE_ROOT = diagnostic_cache_dir("vapour_transport")
+PROFILE_CACHE_ROOT = diagnostic_profile_cache_dir("vapour_transport")
 DATA_LOC = diagnostic_cache_dir("vapour_transport_data")
+PROFILE_DATA_LOC = diagnostic_profile_cache_dir("vapour_transport_data")
 
 NEEDED_VARS = (
     "theta", "pressure", "zgrid", "rho", "qv", "relhum", "w",
@@ -1069,7 +1078,7 @@ def state_cache_path(simulation, test=False):
 def attribution_cache_path(test=False):
     suffix = "_test" if test else ""
     return os.path.join(
-        CACHE_ROOT, f"vapour_transport_attribution{suffix}.nc"
+        PROFILE_CACHE_ROOT, f"vapour_transport_attribution{suffix}.nc"
     )
 
 
@@ -1153,18 +1162,12 @@ def cache_is_current(
 
 
 def write_dataset_cache(dataset, path, description):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    temporary = path + ".tmp"
     progress(f"writing {description} cache {path}")
-    pending_write = netcdf_safe_dataset(dataset).to_netcdf(
-        temporary, compute=False
-    )
-    bounded_compute(pending_write)
-    os.replace(temporary, path)
+    write_netcdf_atomic(dataset, path, num_workers=DASK_NUM_WORKERS)
 
 
 def write_final_data_products(
-    attribution, products, data_loc=DATA_LOC, test=False
+    attribution, products, data_loc=PROFILE_DATA_LOC, test=False
 ):
     """Write retained data products below the central cache root."""
     os.makedirs(data_loc, exist_ok=True)
@@ -1178,8 +1181,8 @@ def write_final_data_products(
     write_dataset_cache(
         attribution, attribution_path, "vapour-transport attribution"
     )
-    summary_table(products, attribution).to_csv(
-        summary_path, index=False
+    write_csv_atomic(
+        summary_table(products, attribution), summary_path, index=False
     )
     progress(f"writing vapour-budget summary {summary_path}")
     return attribution_path, summary_path
@@ -2437,25 +2440,29 @@ def direct_budget_responses(products):
         term_arrays = []
         for term in terms:
             control = products[0][term]
-            u_experiment = products[1][term]
-            t_experiment = products[2][term]
             if "boundary" in control.dims:
                 control = control.sel(boundary=boundary, drop=True)
-                u_experiment = u_experiment.sel(boundary=boundary, drop=True)
-                t_experiment = t_experiment.sel(boundary=boundary, drop=True)
-            delta_u = u_experiment - control
-            delta_t = t_experiment - control
+            deltas = []
+            for experiment in products[1:]:
+                experiment_field = experiment[term]
+                if "boundary" in experiment_field.dims:
+                    experiment_field = experiment_field.sel(
+                        boundary=boundary, drop=True
+                    )
+                deltas.append(experiment_field - control)
+            response_fields = list(deltas)
+            response_fields.extend(
+                deltas[0] - delta for delta in deltas[1:]
+            )
+            response_names = list(COMPARISON_NAMES)
+            response_names.extend(
+                f"{DATA_LOCS[1]}_minus_{directory}"
+                for directory in DATA_LOCS[2:]
+            )
             term_arrays.append(
                 xr.concat(
-                    [delta_u, delta_t, delta_u - delta_t],
-                    dim=xr.IndexVariable(
-                        "response",
-                        [
-                            "u_nudge_change",
-                            "T_nudge_change",
-                            "u_nudge_minus_T_nudge",
-                        ],
-                    ),
+                    response_fields,
+                    dim=xr.IndexVariable("response", response_names),
                 )
             )
         boundary_arrays.append(
@@ -2499,13 +2506,9 @@ def summary_table(products, attribution):
                 )
 
     budget_responses = direct_budget_responses(products)
-    response_labels = {
-        "u_nudge_change": "u_nudge_minus_control",
-        "T_nudge_change": "T_nudge_minus_control",
-        "u_nudge_minus_T_nudge": "u_nudge_minus_T_nudge",
-    }
+    response_labels = list(budget_responses.response.values)
     for boundary in BOUNDARIES:
-        for response, label in response_labels.items():
+        for response in response_labels:
             for term in terms:
                 response_field = budget_responses.sel(
                     boundary=boundary,
@@ -2514,7 +2517,7 @@ def summary_table(products, attribution):
                 )
                 rows.append(
                     {
-                        "simulation": label,
+                        "simulation": response,
                         "boundary": boundary,
                         "term": f"{term}_response",
                         "global_mean_mm_day": float(
@@ -2536,17 +2539,19 @@ def summary_table(products, attribution):
                         )
                     )
                 )
-                for comparison in COMPARISON_NAMES[:2]
+                for comparison in COMPARISON_NAMES
             }
-            for comparison, value in (
-                (COMPARISON_NAMES[0], values[COMPARISON_NAMES[0]]),
-                (COMPARISON_NAMES[1], values[COMPARISON_NAMES[1]]),
+            comparison_values = list(values.items())
+            comparison_values.extend(
                 (
-                    "u_nudge_minus_T_nudge",
-                    values[COMPARISON_NAMES[0]]
-                    - values[COMPARISON_NAMES[1]],
-                ),
-            ):
+                    f"{DATA_LOCS[1]}_minus_{directory}",
+                    values[COMPARISON_NAMES[0]] - values[comparison],
+                )
+                for directory, comparison in zip(
+                    DATA_LOCS[2:], COMPARISON_NAMES[1:], strict=True
+                )
+            )
+            for comparison, value in comparison_values:
                 rows.append(
                     {
                         "simulation": comparison,
@@ -2831,12 +2836,14 @@ def budget_change_colour_limit(products, boundaries=BOUNDARIES):
 def plot_budget_changes(
     products, figsave, boundary, number, shared_vmax=None,
 ):
+    comparison_count = len(COMPARISON_NAMES)
     fig, axes = plt.subplots(
-        4, 6, figsize=(18, 12), constrained_layout=True,
+        2 * comparison_count, 6,
+        figsize=(18, 6.0 * comparison_count), constrained_layout=True,
         sharey=True,
         gridspec_kw={"width_ratios": (3.6, 1.0, 3.6, 1.0, 3.6, 1.0)},
     )
-    comparison_labels = ("nudged u - control", "nudged T - control")
+    comparison_labels = COMPARISON_LABELS
     change_fields = budget_change_fields(products, boundary)
     all_fields = [
         field for fields in change_fields.values() for field in fields
@@ -2847,7 +2854,7 @@ def plot_budget_changes(
     shared_image = None
     for column, (term, sign, symbol, description) in enumerate(BUDGET_PLOT_TERMS):
         block_row, block_column = divmod(column, 3)
-        first_row = 2 * block_row
+        first_row = comparison_count * block_row
         map_column = 2 * block_column
         fields = change_fields[term]
         profile_limit = _symmetric_limit(
@@ -2905,7 +2912,7 @@ def plot_budget_changes(
                 profile_axis.tick_params(labelbottom=False)
             else:
                 profile_axis.set_xlabel("mm day$^{-1}$")
-        for row in range(2):
+        for row in range(comparison_count):
             axes[first_row + row, map_column + 1].set_xlim(
                 -profile_limit, profile_limit
             )
@@ -2940,17 +2947,18 @@ def plot_attribution(attribution, figsave):
         ("geometry", r"$C_{rem}$", "geometry + interaction remainder"),
         ("total", r"$\Delta C$", "actual total change"),
     )
+    comparison_count = len(COMPARISON_NAMES)
     fig, axes = plt.subplots(
-        4,
+        2 * comparison_count,
         8,
-        figsize=(20, 11.5),
+        figsize=(20, 5.75 * comparison_count),
         constrained_layout=True,
         sharey=True,
         gridspec_kw={
             "width_ratios": (3.6, 1.0, 3.6, 1.0, 3.6, 1.0, 3.6, 1.0)
         },
     )
-    comparison_labels = ("nudged u - control", "nudged T - control")
+    comparison_labels = COMPARISON_LABELS
     component_fields = {
         component: [
             plot_latitude_subset(
@@ -2975,7 +2983,7 @@ def plot_attribution(attribution, figsave):
     shared_image = None
     for column, (component, symbol, description) in enumerate(component_specs):
         block_row, block_column = divmod(column, 4)
-        first_row = 2 * block_row
+        first_row = comparison_count * block_row
         map_column = 2 * block_column
         fields = component_fields[component]
         profile_limit = _symmetric_limit(
@@ -3038,11 +3046,11 @@ def plot_attribution(attribution, figsave):
             else:
                 axis.set_xlabel("Longitude")
                 profile_axis.set_xlabel("mm day$^{-1}$")
-        for row in range(2):
+        for row in range(comparison_count):
             axes[first_row + row, map_column + 1].set_xlim(
                 -profile_limit, profile_limit
             )
-    for row in (2, 3):
+    for row in range(comparison_count, 2 * comparison_count):
         for column in (6, 7):
             axes[row, column].set_visible(False)
     fig.colorbar(
@@ -3157,7 +3165,7 @@ def plot_deep_tropical_summary(products, figsave):
     terms = BUDGET_PLOT_TERMS
     fig, axes = plt.subplots(1, len(BOUNDARIES), figsize=(13, 4), constrained_layout=True)
     x = np.arange(len(terms))
-    width = 0.24
+    width = 0.8 / len(SIM_NAMES)
     for ax, boundary in zip(axes, BOUNDARIES):
         for index, (simulation, color, product) in enumerate(
             zip(SIM_NAMES, SIM_COLORS, products)
@@ -3171,7 +3179,8 @@ def plot_deep_tropical_summary(products, figsave):
                 for term, sign, _symbol, _description in terms
             ]
             ax.bar(
-                x + (index - 1) * width, values, width,
+                x + (index - (len(SIM_NAMES) - 1) / 2.0) * width,
+                values, width,
                 color=color, label=simulation,
             )
         ax.axhline(0.0, color="0.3", lw=0.8)
@@ -3263,13 +3272,13 @@ def plot_ivt_component_overview(
         raise ValueError(f"unsupported IVT component: {component}")
 
     fig, axes = plt.subplots(
-        3, 2 * len(BOUNDARIES),
-        figsize=(16, 10),
+        len(SIM_NAMES), 2 * len(BOUNDARIES),
+        figsize=(16, 3.3 * len(SIM_NAMES)),
         constrained_layout=True,
         sharey=True,
         gridspec_kw={"width_ratios": (3.6, 1.0, 3.6, 1.0)},
     )
-    row_labels = ("control", "nudged u - control", "nudged T - control")
+    row_labels = (SIM_NAMES[0], *COMPARISON_LABELS)
     stride_lat = max(products[0].sizes["latitude"] // 24, 1)
     stride_lon = max(products[0].sizes["longitude"] // 36, 1)
     for row, row_label in enumerate(row_labels):
@@ -3486,7 +3495,7 @@ def main(argv=None):
 
     os.makedirs(SAVE_LOC, exist_ok=True)
     attribution.attrs["response_comparison"] = (
-        "direct experiment-minus-control and u-nudged-minus-T-nudged "
+        "direct experiment-minus-control and u-nudged-minus-T-nudged-family "
         "differences; no scalar thermal-residual attribution"
     )
     if not args.no_save:

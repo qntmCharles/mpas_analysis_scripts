@@ -25,10 +25,15 @@ from diagnostics.diagnostic_helpers import (
     mpas_moist_air_density,
     native_midlevel_height,
     pressure_to_pa,
+    progress,
     vertical_dim,
 )
-from diagnostics.waves.equatorial_wave_config import LPO_LIFECYCLE_FILTERS
+from diagnostics.waves.equatorial_wave_config import (
+    EASTWARD_INTRASEASONAL_FILTER,
+    LPO_LIFECYCLE_FILTERS,
+)
 from diagnostics.waves.wave_metrics import (
+    blockwise_buoyancy_frequency_squared,
     buoyancy_frequency_squared,
     kelvin_group_velocities,
     mrg_group_velocities,
@@ -37,7 +42,7 @@ from diagnostics.waves.wave_metrics import (
 
 SECTION_CACHE_VERSION = "lpo-lifecycle-sections-v10-moist-density"
 COMPOSITE_CACHE_VERSION = (
-    "lpo-lifecycle-2d-composites-v13-background-rays"
+    "lpo-lifecycle-2d-composites-v19-phase-coupling-responses"
 )
 
 DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES = 5.0
@@ -67,6 +72,13 @@ DEEP_TROPICAL_LATITUDE_BOUNDS = (-10.0, 10.0)
 AVERAGING_SENSITIVITY_LATITUDE_BOUNDS = (-2.5, 2.5)
 BOOTSTRAP_RESAMPLES = 1000
 BOOTSTRAP_SEED = 20260731
+PHASE_ALIGNMENT_WINDOWS_HOURS = {
+    EASTWARD_INTRASEASONAL_FILTER: (-12, -6, 0, 6, 12),
+    "Kelvin": (-12, -6, 0, 6, 12),
+    "MRG": (-6, 0, 6),
+    "Easterly": (0,),
+    "ER": (-6, 0, 6),
+}
 
 
 def cosine_weighted_latitude_mean(
@@ -1068,6 +1080,7 @@ def build_unfiltered_event_sections(
         "unfiltered_olr": dataset.olrtoa,
     }
     for name, source in surface_sources.items():
+        progress(f"{simulation}: sampling lifecycle sections for {name}")
         variables[name] = sample_event_relative_surface(source, steps)
     pressure_pa = pressure_to_pa(dataset.pressure)
     theta = dataset.theta
@@ -1077,17 +1090,11 @@ def build_unfiltered_event_sections(
     vapour_specific_humidity = dataset.qv / (1.0 + dataset.qv)
     height = native_midlevel_height(dataset, theta)
     zdim = vertical_dim(theta)
-    native_n2 = xr.apply_ufunc(
-        buoyancy_frequency_squared,
+    native_n2 = blockwise_buoyancy_frequency_squared(
         theta,
         height,
-        kwargs={"mask_nonpositive": False},
-        input_core_dims=[[zdim], [zdim]],
-        output_core_dims=[[zdim]],
-        vectorize=True,
-        dask="parallelized",
-        output_dtypes=[float],
-        dask_gufunc_kwargs={"allow_rechunk": True},
+        zdim,
+        mask_nonpositive=False,
     )
     native_sources = {
         "unfiltered_temperature": native_temperature,
@@ -1103,18 +1110,22 @@ def build_unfiltered_event_sections(
         "unfiltered_cloud_fraction": dataset.cldfrac,
         "unfiltered_static_stability": native_n2,
     }
+    progress(f"{simulation}: sampling native pressure lifecycle sections")
     variables["native_pressure_hpa"] = (
         sample_centroid_latitude_native_sections(
             pressure_pa / 100.0, steps
         )
     )
     for name, source in native_sources.items():
+        progress(f"{simulation}: sampling lifecycle sections for {name}")
         variables[name] = sample_centroid_latitude_native_sections(
             source, steps
         )
+    progress(f"{simulation}: sampling background ray environments")
     background_u, background_n = native_background_sections(dataset, steps)
     variables["background_zonal_wind"] = background_u
     variables["buoyancy_frequency"] = background_n
+    progress(f"{simulation}: sampling lifecycle cloud context")
     cloud_classes, envelope, coverage = cloud_context_sections(
         primary, simulation, steps
     )
@@ -1612,6 +1623,11 @@ def _phase_composites(
         dim=xr.IndexVariable("wave_phase", phase_numbers),
     ).transpose("lag_hours", "wave_band", "wave_phase")
     strong_valid = strong & valid_phase
+    valid_event_count = valid_phase.sum("event")
+    strong_fraction = (
+        strong_valid.sum("event")
+        / valid_event_count.where(valid_event_count > 0)
+    )
     strong_occurrence = xr.concat(
         [
             ((phase == value) & strong_valid).sum("event")
@@ -1746,10 +1762,9 @@ def _phase_composites(
             "wave_normalized_amplitude_q75": (
                 ("lag_hours", "wave_band"), amplitude_quartiles[1]
             ),
-            "strong_wave_fraction": strong_valid.sum("event")
-            / valid_phase.sum("event").where(valid_phase.sum("event") > 0),
+            "strong_wave_fraction": strong_fraction,
             "strong_wave_event_count": strong_valid.sum("event"),
-            "all_wave_event_count": valid_phase.sum("event"),
+            "all_wave_event_count": valid_event_count,
             "strong_wave_phase_occurrence_ci_low": (
                 ("lag_hours", "wave_band", "wave_phase"),
                 occurrence_interval[0],
@@ -1805,6 +1820,216 @@ def _phase_composites(
                 output.strong_wave_phase_excess_over_random_ci_high < 0.0
             )
         )
+        phase_excess = strong_occurrence - random_occurrence
+        alignment_strength = (
+            0.5 * np.abs(phase_excess).sum("wave_phase")
+        ).where(np.isfinite(phase_excess).any("wave_phase"))
+        bootstrap_alignment_strength = 0.5 * np.abs(
+            bootstrap_reference_difference
+        ).sum(axis=-1)
+        no_bootstrap_phase = ~np.isfinite(
+            bootstrap_reference_difference
+        ).any(axis=-1)
+        bootstrap_alignment_strength[no_bootstrap_phase] = np.nan
+        alignment_bootstrap_centre = _finite_axis0_mean(
+            bootstrap_alignment_strength
+        )
+        alignment_residual_interval = _finite_axis0_percentiles(
+            bootstrap_alignment_strength - alignment_bootstrap_centre,
+            [2.5, 97.5],
+        )
+        alignment_strength_interval = np.clip(
+            np.asarray(alignment_strength)[None, ...]
+            + alignment_residual_interval,
+            0.0,
+            1.0,
+        )
+        output["wave_phase_alignment_strength"] = alignment_strength
+        output["wave_phase_alignment_strength_ci_low"] = (
+            ("lag_hours", "wave_band"), alignment_strength_interval[0]
+        )
+        output["wave_phase_alignment_strength_ci_high"] = (
+            ("lag_hours", "wave_band"), alignment_strength_interval[1]
+        )
+        lag_values = np.asarray(lags, dtype=int)
+        wave_names = wave_sections.wave_band.values.astype(str)
+        missing_windows = sorted(
+            set(wave_names) - set(PHASE_ALIGNMENT_WINDOWS_HOURS)
+        )
+        if missing_windows:
+            raise RuntimeError(
+                "Phase-alignment summary lacks lag windows for "
+                f"{missing_windows}"
+            )
+        summary_excess = np.full(
+            (len(wave_names), len(phase_numbers)), np.nan
+        )
+        bootstrap_summary_excess = np.full(
+            (BOOTSTRAP_RESAMPLES, len(wave_names), len(phase_numbers)),
+            np.nan,
+            dtype=np.float32,
+        )
+        summary_alignment_strength = np.full(len(wave_names), np.nan)
+        bootstrap_summary_alignment_strength = np.full(
+            (BOOTSTRAP_RESAMPLES, len(wave_names)),
+            np.nan,
+            dtype=np.float32,
+        )
+        summary_phase_locking_strength = np.full(len(wave_names), np.nan)
+        bootstrap_summary_phase_locking_strength = np.full(
+            (BOOTSTRAP_RESAMPLES, len(wave_names)),
+            np.nan,
+            dtype=np.float32,
+        )
+        phase_vectors = np.exp(
+            2.0j * np.pi * (phase_numbers - 1.0) / len(phase_numbers)
+        )
+        strong_values = np.asarray(strong_occurrence, dtype=float)
+        random_values = np.asarray(random_occurrence, dtype=float)
+        bootstrap_random_occurrence = (
+            bootstrap_occurrence - bootstrap_reference_difference
+        )
+        excess_values = np.asarray(
+            strong_occurrence - random_occurrence, dtype=float
+        )
+        for wave_index, wave_name in enumerate(wave_names):
+            window = PHASE_ALIGNMENT_WINDOWS_HOURS[wave_name]
+            missing_lags = sorted(set(window) - set(lag_values))
+            if missing_lags:
+                raise RuntimeError(
+                    f"{wave_name} phase-alignment window lacks lags "
+                    f"{missing_lags}"
+                )
+            lag_indices = np.flatnonzero(np.isin(lag_values, window))
+            summary_excess[wave_index] = _finite_axis0_mean(
+                excess_values[lag_indices, wave_index]
+            )
+            bootstrap_summary_excess[:, wave_index] = _finite_axis0_mean(
+                bootstrap_reference_difference[
+                    :, lag_indices, wave_index, :
+                ].transpose(1, 0, 2)
+            )
+            summary_alignment_strength[wave_index] = 0.5 * np.sum(
+                np.abs(summary_excess[wave_index])
+            )
+            bootstrap_summary_alignment_strength[:, wave_index] = (
+                0.5 * np.sum(
+                    np.abs(bootstrap_summary_excess[:, wave_index]),
+                    axis=-1,
+                )
+            )
+            summary_strong = _finite_axis0_mean(
+                strong_values[lag_indices, wave_index]
+            )
+            summary_random = _finite_axis0_mean(
+                random_values[lag_indices, wave_index]
+            )
+            if (
+                np.isfinite(summary_strong).all()
+                and np.isfinite(summary_random).all()
+            ):
+                summary_phase_locking_strength[wave_index] = (
+                    np.abs(np.sum(summary_strong * phase_vectors))
+                    - np.abs(np.sum(summary_random * phase_vectors))
+                )
+            bootstrap_summary_strong = _finite_axis0_mean(
+                bootstrap_occurrence[
+                    :, lag_indices, wave_index, :
+                ].transpose(1, 0, 2)
+            )
+            bootstrap_summary_random = _finite_axis0_mean(
+                bootstrap_random_occurrence[
+                    :, lag_indices, wave_index, :
+                ].transpose(1, 0, 2)
+            )
+            valid_bootstrap = (
+                np.isfinite(bootstrap_summary_strong).all(axis=-1)
+                & np.isfinite(bootstrap_summary_random).all(axis=-1)
+            )
+            bootstrap_summary_phase_locking_strength[
+                valid_bootstrap, wave_index
+            ] = (
+                np.abs(
+                    np.sum(
+                        bootstrap_summary_strong[valid_bootstrap]
+                        * phase_vectors,
+                        axis=-1,
+                    )
+                )
+                - np.abs(
+                    np.sum(
+                        bootstrap_summary_random[valid_bootstrap]
+                        * phase_vectors,
+                        axis=-1,
+                    )
+                )
+            )
+        summary_interval = _finite_axis0_percentiles(
+            bootstrap_summary_excess, [2.5, 97.5]
+        )
+        summary_alignment_bootstrap_centre = _finite_axis0_mean(
+            bootstrap_summary_alignment_strength
+        )
+        summary_alignment_residual_interval = _finite_axis0_percentiles(
+            bootstrap_summary_alignment_strength
+            - summary_alignment_bootstrap_centre,
+            [2.5, 97.5],
+        )
+        summary_alignment_strength_interval = np.clip(
+            summary_alignment_strength[None, ...]
+            + summary_alignment_residual_interval,
+            0.0,
+            1.0,
+        )
+        phase_locking_bootstrap_centre = _finite_axis0_mean(
+            bootstrap_summary_phase_locking_strength
+        )
+        phase_locking_residual_interval = _finite_axis0_percentiles(
+            bootstrap_summary_phase_locking_strength
+            - phase_locking_bootstrap_centre,
+            [2.5, 97.5],
+        )
+        phase_locking_strength_interval = np.clip(
+            summary_phase_locking_strength[None, ...]
+            + phase_locking_residual_interval,
+            -1.0,
+            1.0,
+        )
+        output["phase_window_excess_over_random"] = (
+            ("wave_band", "wave_phase"), summary_excess
+        )
+        output["phase_window_excess_over_random_ci_low"] = (
+            ("wave_band", "wave_phase"), summary_interval[0]
+        )
+        output["phase_window_excess_over_random_ci_high"] = (
+            ("wave_band", "wave_phase"), summary_interval[1]
+        )
+        output["phase_window_alignment_strength"] = (
+            ("wave_band",), summary_alignment_strength
+        )
+        output["phase_window_alignment_strength_ci_low"] = (
+            ("wave_band",), summary_alignment_strength_interval[0]
+        )
+        output["phase_window_alignment_strength_ci_high"] = (
+            ("wave_band",), summary_alignment_strength_interval[1]
+        )
+        output["phase_window_phase_locking_strength"] = (
+            ("wave_band",), summary_phase_locking_strength
+        )
+        output["phase_window_phase_locking_strength_ci_low"] = (
+            ("wave_band",), phase_locking_strength_interval[0]
+        )
+        output["phase_window_phase_locking_strength_ci_high"] = (
+            ("wave_band",), phase_locking_strength_interval[1]
+        )
+        output["phase_window_alignment_strength_bootstrap"] = (
+            ("phase_bootstrap_sample", "wave_band"),
+            bootstrap_summary_alignment_strength,
+        )
+        output["phase_window_phase_locking_strength_bootstrap"] = (
+            ("phase_bootstrap_sample", "wave_band"),
+            bootstrap_summary_phase_locking_strength,
+        )
         output.attrs["random_phase_reference"] = (
             "matched tropical trajectories moving at the simulation mean "
             "LPO zonal speed"
@@ -1813,7 +2038,106 @@ def _phase_composites(
             "the same strong-wave phase-versus-lag probability as the LPO "
             "panel, evaluated on matched random trajectories"
         )
+        output.attrs["phase_alignment_windows_hours"] = json.dumps(
+            PHASE_ALIGNMENT_WINDOWS_HOURS
+        )
+        output.attrs["phase_window_average"] = (
+            "equal-weight mean of lag-specific strong-wave phase probability "
+            "minus its matched-random probability"
+        )
+        output.attrs["phase_alignment_strength"] = (
+            "total variation distance between the strong-wave LPO and "
+            "matched-random eight-phase probability distributions; equals "
+            "half the sum of absolute phase-probability differences"
+        )
+        output.attrs["phase_locking_strength"] = (
+            "circular resultant length of the temporally averaged strong-wave "
+            "LPO phase distribution minus the corresponding matched-random "
+            "resultant length; positive values indicate additional phase "
+            "concentration at LPOs"
+        )
+        output.attrs["phase_window_bootstrap"] = (
+            f"{BOOTSTRAP_RESAMPLES} complete-LPO-trajectory resamples; phase "
+            "probabilities, alignment strengths, phase-locking strengths, and "
+            "temporal means are recalculated in every draw; nonlinear "
+            "strength intervals use bias-centred bootstrap deviations"
+        )
     return output
+
+
+def _independent_bootstrap_metric_response(
+    experiment_point: xr.DataArray,
+    control_point: xr.DataArray,
+    experiment_bootstrap: xr.DataArray,
+    control_bootstrap: xr.DataArray,
+    *,
+    seed: int,
+) -> xr.Dataset:
+    """Contrast nonlinear metrics using independently paired bootstrap draws."""
+
+    experiment_point, control_point = xr.align(
+        experiment_point, control_point, join="exact"
+    )
+    dimensions = experiment_point.dims
+    bootstrap_dimension = "phase_bootstrap_sample"
+    expected_dimensions = (bootstrap_dimension, *dimensions)
+    experiment_bootstrap = experiment_bootstrap.transpose(
+        *expected_dimensions
+    )
+    control_bootstrap = control_bootstrap.transpose(*expected_dimensions)
+    if experiment_bootstrap.shape != control_bootstrap.shape:
+        raise ValueError("Phase-metric bootstrap shapes do not match")
+    sample_count = experiment_bootstrap.sizes[bootstrap_dimension]
+    rng = np.random.default_rng(seed)
+    experiment_order = rng.permutation(sample_count)
+    control_order = rng.permutation(sample_count)
+    bootstrap_difference = (
+        np.asarray(experiment_bootstrap, dtype=float)[experiment_order]
+        - np.asarray(control_bootstrap, dtype=float)[control_order]
+    )
+    point = np.asarray(experiment_point - control_point, dtype=float)
+    interval = _finite_axis0_percentiles(
+        bootstrap_difference, [2.5, 97.5]
+    )
+    valid = np.isfinite(bootstrap_difference)
+    denominator = valid.sum(axis=0)
+    nonpositive = np.divide(
+        ((bootstrap_difference <= 0.0) & valid).sum(axis=0),
+        denominator,
+        out=np.full(denominator.shape, np.nan),
+        where=denominator > 0,
+    )
+    nonnegative = np.divide(
+        ((bootstrap_difference >= 0.0) & valid).sum(axis=0),
+        denominator,
+        out=np.full(denominator.shape, np.nan),
+        where=denominator > 0,
+    )
+    p_value = np.minimum(
+        1.0, 2.0 * np.minimum(nonpositive, nonnegative)
+    )
+    pointwise = (interval[0] > 0.0) | (interval[1] < 0.0)
+    coordinates = {
+        dimension: experiment_point[dimension] for dimension in dimensions
+    }
+    return xr.Dataset(
+        {
+            "mean": (dimensions, point),
+            "ci_low": (dimensions, interval[0]),
+            "ci_high": (dimensions, interval[1]),
+            "pointwise_significant": (dimensions, pointwise),
+            "fdr_significant": (
+                dimensions, _benjamini_hochberg_mask(p_value)
+            ),
+            "bootstrap_p_value": (dimensions, p_value),
+        },
+        coords=coordinates,
+        attrs={
+            "bootstrap_resamples": int(sample_count),
+            "sampling_unit": "independent complete LPO trajectory",
+            "interval": "two-sided 95% percentile interval",
+        },
+    )
 
 
 def _phase_pressure_event_cube(
@@ -2676,7 +3000,8 @@ def build_review_response_composites(
     try:
         contrasts = [
             simulation
-            for simulation in ("nudged-u", "nudged-T")
+            for simulation in sections
+            if simulation != "control"
             if simulation in sections and "control" in sections
         ]
         response_variables = (
@@ -2834,6 +3159,39 @@ def combine_simulation_composites(
     )
     if result.sizes.get("lag_hours", 0) == 0:
         raise ValueError("Simulation composites have no common test lags")
+    phase_metric_stems = (
+        "phase_window_alignment_strength",
+        "phase_window_phase_locking_strength",
+    )
+    contrast_names = [name for name in ordered if name != "control"]
+    phase_bootstraps_available = "control" in ordered and all(
+        stem in result and f"{stem}_bootstrap" in result
+        for stem in phase_metric_stems
+    )
+    if phase_bootstraps_available and contrast_names:
+        for metric_index, stem in enumerate(phase_metric_stems):
+            responses = {
+                simulation: _independent_bootstrap_metric_response(
+                    result[stem].sel(simulation=simulation),
+                    result[stem].sel(simulation="control"),
+                    result[f"{stem}_bootstrap"].sel(
+                        simulation=simulation
+                    ),
+                    result[f"{stem}_bootstrap"].sel(
+                        simulation="control"
+                    ),
+                    seed=(
+                        BOOTSTRAP_SEED
+                        + 600
+                        + 10 * metric_index
+                        + contrast_index
+                    ),
+                )
+                for contrast_index, simulation in enumerate(contrast_names)
+            }
+            _store_contrast_results(
+                result, f"response_{stem}", responses
+            )
     result.attrs.update(
         {
             "cache_version": COMPOSITE_CACHE_VERSION,
@@ -2847,6 +3205,11 @@ def combine_simulation_composites(
                 "lag-latitude and lag-pressure adaptations of Lim-and-Son "
                 "and Rios-Berrios phase/vertical-section conventions; LPO "
                 "lag is not interpreted as filtered-wave phase"
+            ),
+            "phase_metric_response_bootstrap": (
+                f"{BOOTSTRAP_RESAMPLES} independently paired complete-LPO-"
+                "trajectory bootstrap draws; two-sided 95% percentile "
+                "intervals"
             ),
         }
     )
