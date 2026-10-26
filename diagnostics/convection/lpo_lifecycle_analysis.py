@@ -12,6 +12,12 @@ that stable interface and owns every downstream lifecycle calculation:
   eastward-intraseasonal fields sampled along the saved LPO path;
 * event summaries, independent-event composites and lifecycle figure selectors.
 
+Local model means and vertical velocity statistics use envelope pixels with
+concurrent unsmoothed precipitation above 1 mm/day. Cloud statistics,
+condensate integrals, rainfall totals and native cloud profiles use the
+complete envelope. Unfiltered surface and thermodynamic sections use the
+same rain mask. Cloud and wave maps retain their surrounding context.
+
 No tracking is performed here and no upstream-LPT internal file is read.
 Lifecycle tables, profiles and composite datasets are written beside the
 saved LPO products in the fixed data repository. Only rendered figures are
@@ -30,6 +36,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
+import dask
 import pandas as pd
 import xarray as xr
 from matplotlib import pyplot as plt
@@ -125,11 +132,13 @@ from diagnostics.convection.lpo_lifecycle_sections import (
     CLOUD_CLASS_NAMES,
     COMPOSITE_CACHE_VERSION,
     DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES,
+    LIFECYCLE_RAIN_THRESHOLD_MM_DAY,
     LONGITUDE_HALF_WIDTH_SENSITIVITY_DEGREES,
     PHASE_ALIGNMENT_WINDOWS_HOURS,
     SECTION_CACHE_VERSION,
     SURFACE_VARIABLES,
     VERTICAL_VARIABLES,
+    _default_window_event_cube,
     _event_cube,
     build_review_response_composites,
     build_simulation_composites,
@@ -137,12 +146,20 @@ from diagnostics.convection.lpo_lifecycle_sections import (
     combine_simulation_composites,
     event_equal_statistics,
     independent_event_contrast,
-    longitude_window_mean,
 )
 
 
 LIFECYCLE_ANALYSIS_VERSION = (
-    "lpo-lifecycle-analysis-v11-native-z-profiles"
+    "lpo-lifecycle-analysis-v12-rain-conditioned"
+)
+# Intensive local model statistics use raining columns. Extensive quantities
+# and cloud population statistics retain the complete envelope.
+ENVELOPE_MODEL_FIELDS = {"high_cloud_ice_mass", "high_cloud_snow_mass"}
+LOCAL_SAMPLING_DEFINITION = (
+    "local model means and vertical velocity statistics: LPO envelope with "
+    "concurrent unsmoothed precipitation > 1 mm/day; cloud statistics, "
+    "condensate integrals and rainfall totals: complete LPO envelope; "
+    "unfiltered surface and thermodynamic sections use the same rain mask"
 )
 LIFECYCLE_FIGURES = (*range(4, 46), "45a", *range(46, 54))
 WAVE_PHASE_PROFILE_FIGURE = 51
@@ -225,6 +242,7 @@ WAVE_LIFECYCLE_FIELDS = {
 LIFECYCLE_COMPOSITE_VARIABLES = (
     "area_integrated_24h_precip_km2_mm",
     "envelope_area_km2",
+    "raining_area_fraction_of_envelope",
     "total_high_cloud_area_km2",
     "active_deep_convective_area_km2",
     "stratiform_precipitating_high_cloud_area_km2",
@@ -484,8 +502,13 @@ def diagnose_event_steps(
     for time_value in pd.to_datetime(event_mask.Time.values):
         mask = event_mask.sel(Time=time_value)
         precip = precipitation.sel(Time=time_value)
+        rain_mask = mask & (precip > LIFECYCLE_RAIN_THRESHOLD_MM_DAY)
         row = dict(envelope_rows[pd.Timestamp(time_value)])
         envelope_area = row["envelope_area_km2"]
+        row["raining_area_fraction_of_envelope"] = (
+            _area_sum(rain_mask, area) / envelope_area
+            if envelope_area > 0 else np.nan
+        )
         precip_volume = row["area_integrated_precip_km2_mm_day"]
         for short_name, variable_name in CLASS_MASKS.items():
             class_mask = classification[variable_name].sel(Time=time_value) & mask
@@ -520,17 +543,17 @@ def diagnose_event_steps(
             Time=time_value
         )
         row["mean_cloud_top_height"] = sample_masked_field(
-            cloud_top_height, high_mask, area
+            cloud_top_height, mask, area
         )["mean"]
         row["maximum_cloud_top_height"] = float(
-            cloud_top_height.where(high_mask).max(skipna=True)
+            cloud_top_height.where(mask).max(skipna=True)
         )
         cloud_top_pressure = classification["cloud_top_pressure"].sel(
             Time=time_value
         )
         pressure_statistics = sample_masked_field(
             cloud_top_pressure,
-            high_mask,
+            mask,
             area,
             quantiles=(0.1, 0.5),
         )
@@ -588,9 +611,7 @@ def diagnose_event_steps(
             if "Time" in field.dims:
                 field = field.sel(Time=time_value)
             sampling_mask = (
-                conv_mask
-                if variable_name == "w"
-                else mask
+                mask if variable_name in ENVELOPE_MODEL_FIELDS else rain_mask
             )
             if statistic == "mean":
                 value = sample_masked_field(
@@ -719,11 +740,31 @@ def _ttl_layer_mean_n2(
         for dimension in in_layer.dims
         if dimension != vertical_dimension
     ]
-    level_support = (
-        in_layer.any(reduction_dimensions).load()
-        if reduction_dimensions
-        else in_layer.load()
-    )
+    # Scan the height support in bounded time batches. A whole-record
+    # reduction can schedule many native columns concurrently before the
+    # first environmental baseline starts.
+    level_support = None
+    time_count = in_layer.sizes.get("Time", 1)
+    batch_size = LIFECYCLE_VERTICAL_BASELINE_TIME_BATCH_SIZE
+    for start in range(0, time_count, batch_size):
+        stop = min(start + batch_size, time_count)
+        progress(
+            f"{progress_label}: scanning TTL height support "
+            f"{start + 1}-{stop}/{time_count}"
+        )
+        block = (
+            in_layer.isel(Time=slice(start, stop))
+            if "Time" in in_layer.dims else in_layer
+        )
+        support = (
+            block.any(reduction_dimensions)
+            if reduction_dimensions else block
+        ).compute(scheduler="synchronous")
+        level_support = (
+            support if level_support is None else level_support | support
+        )
+    if level_support is None:
+        raise RuntimeError("No times are available for TTL height support")
     selected_levels = np.flatnonzero(
         np.asarray(level_support.values, dtype=bool)
     )
@@ -2209,7 +2250,8 @@ def _write_lifecycle_metadata(
             "longitude stencil; wave filtering does not alter tracking or "
             "event selection"
         ),
-        "local_sampling_geometry": "saved LPO envelope mask",
+        "local_sampling_geometry": LOCAL_SAMPLING_DEFINITION,
+        "rain_condition_threshold_mm_day": LIFECYCLE_RAIN_THRESHOLD_MM_DAY,
         "section_cache_version": SECTION_CACHE_VERSION,
         "composite_2d_cache_version": COMPOSITE_CACHE_VERSION,
         "section_default_longitude_half_width_degrees": (
@@ -2308,6 +2350,8 @@ def _write_run_composite(
                 sort_keys=True,
             ),
             "event_weighting": "one equal weight per LPO event",
+            "local_sampling_geometry": LOCAL_SAMPLING_DEFINITION,
+            "rain_condition_threshold_mm_day": LIFECYCLE_RAIN_THRESHOLD_MM_DAY,
             "test_partial_sequences_allowed": bool(test),
         }
     )
@@ -4060,18 +4104,8 @@ def _near_peak_event_profiles(sections: xr.Dataset) -> xr.Dataset:
     )
     cubes = {}
     for variable in variables:
-        windowed = longitude_window_mean(
-            sections[variable], DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES
-        )
-        temporary = xr.Dataset(
-            {
-                variable: windowed,
-                "event_id": sections.event_id,
-                "lag_hours": sections.lag_hours,
-            }
-        )
-        cubes[variable] = _event_cube(
-            temporary, variable, lags=NEAR_PEAK_LAGS_HOURS
+        cubes[variable] = _default_window_event_cube(
+            sections, variable, lags=NEAR_PEAK_LAGS_HOURS
         )
     pressure = cubes["native_pressure_hpa"]
     complete = pressure.notnull().any("native_level").all("lag_hours")
@@ -4182,7 +4216,11 @@ def _plot_near_peak_vertical_profiles(primary: Path):
         response_axis.axvline(0.0, color="0.45", lw=0.7)
         if variable == "unfiltered_upward_pressure_velocity":
             absolute_axis.axvline(0.0, color="0.45", lw=0.7)
-        absolute_axis.set_title(title)
+        absolute_axis.set_title(
+            f"{title}\n"
+            + ("LPO envelope" if variable == "unfiltered_cloud_fraction"
+               else "Raining LPO columns (>1 mm/day)")
+        )
         response_axis.set_xlabel(
             "Difference" if not unit else f"Difference ({unit})"
         )
@@ -4773,7 +4811,7 @@ def _plot_surface_sections(
         )
     context = (
         WAVE_BOXES[wave_name].get("label", wave_name)
-        if wave_name else "Unfiltered"
+        if wave_name else "Unfiltered; raining LPO columns (>1 mm/day)"
     )
     fig.suptitle(
         f"{context}; ±{DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES:g}° "
@@ -5052,7 +5090,7 @@ def _plot_vertical_sections(
         )
     context = (
         WAVE_BOXES[wave_name].get("label", wave_name)
-        if wave_name else "Unfiltered"
+        if wave_name else "Unfiltered; raining LPO columns (>1 mm/day)"
     )
     if has_envelope_precipitation:
         precipitation = composite.lpo_envelope_precipitation
@@ -5235,7 +5273,9 @@ def _plot_unfiltered_vertical_response(
         if significance_variable == "pointwise_significant"
         else "5% FDR"
     )
-    fig.suptitle(f"Vertical response ({mask_label})")
+    fig.suptitle(
+        f"Vertical response ({mask_label}); raining LPO columns (>1 mm/day)"
+    )
     return fig
 
 
@@ -5528,7 +5568,9 @@ def _plot_averaging_sensitivity(composite: xr.Dataset):
         axis.grid(alpha=0.2)
         axis.set(title=title, xlabel="Lag (h)", ylabel=unit)
     axes[0].legend(frameon=False, fontsize=8)
-    fig.suptitle("Longitude-averaging sensitivity")
+    fig.suptitle(
+        "Longitude-averaging sensitivity; raining LPO columns (>1 mm/day)"
+    )
     return fig
 
 
@@ -7517,7 +7559,7 @@ def parse_command_line(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _main(argv: Sequence[str] | None = None) -> int:
     global TEST_MODE
     args = parse_command_line(argv)
     TEST_MODE = bool(args.test)
@@ -7615,6 +7657,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     progress("LPO lifecycle analysis complete")
     return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run lifecycle calculations with bounded Dask task concurrency."""
+
+    with dask.config.set(scheduler="synchronous"):
+        return _main(argv)
 
 
 if __name__ == "__main__":

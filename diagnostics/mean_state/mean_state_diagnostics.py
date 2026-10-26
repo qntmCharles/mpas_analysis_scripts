@@ -45,12 +45,16 @@ from diagnostics.mean_state.mean_state_cache import (
     prepare_products,
     split_simulations,
 )
+from diagnostics.mean_state.publication_profiles import (
+    PROFILE_VARIANTS, environment_profile_figure, prepare_profile_inputs,
+)
 from diagnostics.analysis_config import BOOTSTRAP_SEED, FIELD_BOOTSTRAP_REPLICATES
 from diagnostics.uncertainty import independent_bootstrap_field_difference
 from diagnostics.analysis_config import (
     SIMULATION_ARCHIVES,
     SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
     SIMULATION_ROOT,
+    ACTIVE_SIMULATION_NAMES,
 )
 
 
@@ -578,7 +582,7 @@ cached_products = prepare_products(
     root_dir,
     data_locs,
     sim_names,
-    figures_to_run,
+    ([number for number in figures_to_run if number != 2] or [0]) if figures_to_run else [],
     latlon_vars,
     zonal_mean_vars,
     latlon_chunks,
@@ -634,51 +638,25 @@ if should_run_figure(1):
 
 
 if should_run_figure(2):
-    # Deep-tropical-mean potential-temperature and zonal-wind profiles.
-
-    fig, ax = plt.subplots(1, 4, figsize=(8, 4), sharey=True, constrained_layout=True)
-
-    for i, (ds, zds) in enumerate(zip(dss, dss_zm)):
-        theta = lat_mean(
-            zds.theta.sel(latitude=slice(-10, 10)).mean(dim="Time")
-        )
-        pressure = lat_mean(
-            zds.pressure.sel(latitude=slice(-10, 10)).mean(dim="Time")
-        )
-        u = lat_mean(
-            zds.uReconstructZonal.sel(latitude=slice(-10, 10)).mean(dim="Time")
-        )
-
-        T = theta * (pressure / P0_PA) ** (RD / CP)
-
-        z = zds.z.values
-
-        # Brunt-Väisälä frequency squared: N^2 = (g/theta) dtheta/dz
-        g = 9.80665
-        dtheta_dz = np.gradient(theta.values, z)
-        N2 = g / theta.values * dtheta_dz
-
-        ttp, ptp, ztp, _ = tropopause_profile_single(T.values, pressure.values, z)
-
-        for a in ax:
-            a.axhline(ztp/1000., color=cols[i], ls=':')
-
-        ax[0].plot(theta.values, z/1000., color=cols[i], label=sim_names[i])
-        ax[1].plot(T.values, z/1000., color=cols[i])
-        ax[2].plot(u.values, z/1000., color=cols[i])
-        ax[3].plot(N2 * 1e4, z/1000., color=cols[i])
-
-    ax[0].set_xlabel(r'Potential temperature $\theta$ (K)')
-    ax[1].set_xlabel(r'Temperature $T$ (K)')
-    ax[1].set_xlim(150, 300)
-    ax[2].set_xlabel(r'Zonal mean wind $u$ (m s$^{-1}$)')
-    ax[3].set_xlabel(r'$N^2$ ($10^{-4}$ s$^{-2}$)')
-    ax[3].axvline(0, color='grey', lw=0.5, ls='--')
-    ax[0].set_ylabel('Height (km)')
-
-    fig.legend(loc='outside lower center', ncol=len(dss))
-
-    save_figure(fig, "profiles", number=2)
+    profile_products, _profile_sources = prepare_profile_inputs(
+        ACTIVE_SIMULATION_NAMES, figures_only=runtime_args.figures_only,
+        rebuild=runtime_args.rebuild_cache,
+        time_count=min(runtime_args.test_times, 40) if runtime_args.test else None,
+    )
+    with plt.rc_context({"font.size": 8, "axes.titlesize": 8.5, "axes.labelsize": 8,
+                         "xtick.labelsize": 7, "ytick.labelsize": 7, "pdf.fonttype": 42}):
+        for suffix, include_lpo, lower, caption in PROFILE_VARIANTS:
+            if runtime_args.test and include_lpo:
+                continue
+            fig = environment_profile_figure(profile_products, include_lpo=include_lpo, lower=lower)
+            if runtime_args.test:
+                fig.suptitle("TEST: bounded profile inputs; intervals are not publication estimates")
+                caption = "Bounded test rendering only; short blocks do not establish production uncertainty.\n"
+            path = figsave.save(fig, "profiles" + suffix, number=2)
+            fig.savefig(os.path.splitext(path)[0] + ".pdf")
+            with open(os.path.splitext(path)[0] + "_caption.txt", "w", encoding="utf-8") as stream:
+                stream.write(caption)
+            plt.close(fig)
     print("Done with figure: comp_profiles")
 
 

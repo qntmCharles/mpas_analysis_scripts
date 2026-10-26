@@ -65,7 +65,10 @@ from diagnostics.analysis_config import (
     SIMULATION_ARCHIVES,
     SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
     SIMULATION_ROOT,
+    simulation_cache_name,
+    simulation_cache_label,
 )
+from diagnostics.cache_support import relabel_cached_simulations
 from diagnostics.convection.high_cloud_classification import (
     CLASSIFICATION_CACHE_VERSION,
     HighCloudThresholds,
@@ -137,6 +140,7 @@ classification_cache_dir = diagnostic_cache_dir("classification")
 DERIVED_CACHE_VERSION = (
     "high-cloud-derived-diagnostics-v7-control-selected-complete-blocks"
 )
+VERTICAL_PROFILE_BLOCK_SCHEMA = "cloud-contribution-block-sums-v2-canonical-native-heights"
 derived_cache_dir = diagnostic_profile_cache_dir("high_cloud")
 DERIVED_CACHE_SIGNATURE = None
 REBUILD_DERIVED_CACHE = False
@@ -174,7 +178,8 @@ RAIN_RATE_BINS_MM_H = np.array(
 SNAPSHOT_LON_WINDOW_DEG = 90.0
 SNAPSHOT_Z_MAX_KM = 19.0
 PROFILE_COMPUTE_Z_BOUNDS_KM = (5.0, 20.0)
-latlon_chunks = {"Time": 8, "latitude": 90, "longitude": 180}
+# Match archive chunks so each HDF5 spatial chunk is read once per time batch.
+latlon_chunks = {"Time": 8, "nVertLevels": 25, "latitude": 120, "longitude": 240}
 dask.config.set({"array.slicing.split_large_chunks": True})
 
 latlon_vars = [
@@ -567,7 +572,7 @@ def derived_cache_configuration():
             "derived_cache_version": DERIVED_CACHE_VERSION,
             "classification_cache_version": CLASSIFICATION_CACHE_VERSION,
             "test_mode": bool(TEST_MODE),
-            "simulations": list(sim_names),
+            "simulations": [simulation_cache_label(name) for name in sim_names],
             "tropical_latitude_bounds": TROPICAL_LAT_BOUNDS,
             "cloud_structure_domains": CLOUD_STRUCTURE_DOMAIN_SPECS,
             "cloud_top_height_bin_width_km": CLOUD_TOP_HEIGHT_BIN_WIDTH_KM,
@@ -599,7 +604,7 @@ def initialise_derived_cache_signature(dss):
     time_axes = {}
     for sim_name, ds in zip(sim_names, dss):
         values = np.asarray(ds.Time.values)
-        time_axes[sim_name] = {
+        time_axes[simulation_cache_label(sim_name)] = {
             "count": int(values.size),
             "first": format_time_value(values[0]),
             "last": format_time_value(values[-1]),
@@ -607,7 +612,7 @@ def initialise_derived_cache_signature(dss):
     DERIVED_CACHE_SIGNATURE = derived_cache_configuration()
     DERIVED_CACHE_SIGNATURE["time_axes"] = time_axes
     DERIVED_CACHE_SIGNATURE["source_archives"] = {
-        sim_name: ds.attrs.get("classification_source_sha256")
+        simulation_cache_label(sim_name): ds.attrs.get("classification_source_sha256")
         for sim_name, ds in zip(sim_names, dss)
     }
     os.makedirs(derived_cache_dir, exist_ok=True)
@@ -664,7 +669,10 @@ def initialise_derived_cache_signature_from_products(products):
                 f"Incomplete derived high-cloud cache metadata {metadata_path}: "
                 "missing " + ", ".join(missing_dependencies)
             )
-        DERIVED_CACHE_SIGNATURE = signature
+        DERIVED_CACHE_SIGNATURE = {
+            key: value for key, value in signature.items()
+            if key != "product_configuration"
+        }
         progress(
             "Validated derived high-cloud cache directly from "
             f"{metadata_path}"
@@ -685,12 +693,13 @@ def _derived_product_paths(stem, suffix):
     return product, metadata
 
 
-def _read_current_derived_metadata(metadata_path):
+def _read_current_derived_metadata(metadata_path, expected=None):
     if REBUILD_DERIVED_CACHE or not os.path.isfile(metadata_path):
         return None
     with open(metadata_path, encoding="utf-8") as stream:
         metadata = json.load(stream)
-    return metadata if metadata == DERIVED_CACHE_SIGNATURE else None
+    expected = DERIVED_CACHE_SIGNATURE if expected is None else expected
+    return metadata if metadata == expected else None
 
 
 def _write_json_atomic(path, payload):
@@ -707,7 +716,7 @@ def load_or_compute_derived_table(stem, compute):
     path, metadata_path = _derived_product_paths(stem, "csv")
     if os.path.isfile(path) and _read_current_derived_metadata(metadata_path):
         progress(f"Using cached high-cloud table {path}")
-        return pd.read_csv(path)
+        return relabel_cached_simulations(pd.read_csv(path))
     if FIGURES_ONLY:
         raise RuntimeError(
             f"Missing or stale derived high-cloud table {path}; run without "
@@ -723,13 +732,16 @@ def load_or_compute_derived_table(stem, compute):
     return table
 
 
-def load_or_compute_derived_dataset(stem, compute):
+def load_or_compute_derived_dataset(stem, compute, *, product_configuration=None):
     """Load a current NetCDF diagnostic product or compute it exactly once."""
 
     path, metadata_path = _derived_product_paths(stem, "nc")
-    if os.path.isfile(path) and _read_current_derived_metadata(metadata_path):
+    signature = dict(DERIVED_CACHE_SIGNATURE)
+    if product_configuration is not None:
+        signature["product_configuration"] = product_configuration
+    if os.path.isfile(path) and _read_current_derived_metadata(metadata_path, signature):
         progress(f"Using cached high-cloud dataset {path}")
-        return load_netcdf(path)
+        return relabel_cached_simulations(load_netcdf(path))
     if FIGURES_ONLY:
         raise RuntimeError(
             f"Missing or stale derived high-cloud dataset {path}; run without "
@@ -743,11 +755,11 @@ def load_or_compute_derived_dataset(stem, compute):
     dataset.attrs.update(
         derived_cache_version=DERIVED_CACHE_VERSION,
         derived_cache_signature=json.dumps(
-            DERIVED_CACHE_SIGNATURE, sort_keys=True
+            signature, sort_keys=True
         ),
     )
     dataset = write_netcdf_atomic(dataset, path)
-    _write_json_atomic(metadata_path, DERIVED_CACHE_SIGNATURE)
+    _write_json_atomic(metadata_path, signature)
     progress(f"Wrote derived high-cloud dataset {path}")
     return dataset
 
@@ -1353,7 +1365,7 @@ def open_cached_classification(
 
 
 def classification_product_path(sim_name):
-    filename = f"{sim_name.replace(' ', '_')}_classified_high_cloud.nc"
+    filename = f"{simulation_cache_name(sim_name)}_classified_high_cloud.nc"
     return os.path.join(classification_cache_dir, filename)
 
 
@@ -2810,9 +2822,13 @@ def compute_vertical_contribution_profiles(
     dss,
     classifications,
     time_batch=VERTICAL_PROFILE_TIME_BATCH,
+    *,
+    return_block_statistics=False,
+    block_days=BOOTSTRAP_BLOCK_DAYS,
 ):
     """Domain means of cloud fraction after selecting each column class."""
     profiles = {}
+    block_products = {}
     rows = []
     summary_rows = []
     class_keys = [key for key, _label, _color in REGIME_SPECS]
@@ -2826,6 +2842,7 @@ def compute_vertical_contribution_profiles(
         full_cf = standardize_cloud_fraction(ds.cldfrac)
         full_pressure = standardize_pressure_hpa(ds.pressure, full_cf)
         domain_profiles = []
+        domain_blocks = []
         for domain_key, latitude_bounds, domain_label in (
             CLOUD_STRUCTURE_DOMAIN_SPECS
         ):
@@ -2864,6 +2881,17 @@ def compute_vertical_contribution_profiles(
             ]
 
             ntime = cf_aligned.sizes["Time"]
+            if return_block_statistics:
+                statistical_slices = time_block_slices(
+                    cf_aligned, block_days, complete=True, min_blocks=2
+                )
+                sample_block = np.full(ntime, -1, dtype=int)
+                for index, slc in enumerate(statistical_slices):
+                    sample_block[slc] = index
+                block_numerators = np.zeros(
+                    (len(statistical_slices), len(class_keys), cf_aligned.sizes["z"])
+                )
+                block_denominators = np.zeros_like(block_numerators)
             time_slices = [
                 slice(start, min(start + time_batch, ntime))
                 for start in range(0, ntime, time_batch)
@@ -2930,20 +2958,27 @@ def compute_vertical_contribution_profiles(
                     )[:, None, :, :]
                     contribution = np.where(mask, cloud_fraction, 0.0)
                     finite = np.isfinite(contribution)
-                    numerators[iclass] += np.sum(
+                    time_numerator = np.sum(
                         np.where(
                             finite,
                             contribution * sample_weights,
                             0.0,
                         ),
-                        axis=(0, 2, 3),
+                        axis=(2, 3),
                         dtype=np.float64,
                     )
-                    denominators[iclass] += np.sum(
+                    time_denominator = np.sum(
                         np.where(finite, sample_weights, 0.0),
-                        axis=(0, 2, 3),
+                        axis=(2, 3),
                         dtype=np.float64,
                     )
+                    numerators[iclass] += time_numerator.sum(axis=0)
+                    denominators[iclass] += time_denominator.sum(axis=0)
+                    if return_block_statistics:
+                        indices = sample_block[time_slice]
+                        valid = indices >= 0
+                        np.add.at(block_numerators[:, iclass], indices[valid], time_numerator[valid])
+                        np.add.at(block_denominators[:, iclass], indices[valid], time_denominator[valid])
                     del contribution, finite, mask
 
                 del block, cloud_fraction, pressure_values, sample_weights
@@ -3003,6 +3038,21 @@ def compute_vertical_contribution_profiles(
                 data_scope="cloud-radiation-on simulations only",
             )
             domain_profiles.append(profile)
+            if return_block_statistics:
+                domain_blocks.append(xr.Dataset(
+                    {
+                        "cloud_fraction_numerator_blocks": (
+                            ("block", "class_key", "z"), block_numerators
+                        ),
+                        "cloud_fraction_denominator_blocks": (
+                            ("block", "class_key", "z"), block_denominators
+                        ),
+                        "block_start": ("block", [cf_aligned.Time.values[s.start] for s in statistical_slices]),
+                        "block_end": ("block", [cf_aligned.Time.values[s.stop - 1] for s in statistical_slices]),
+                    },
+                    coords={"block": np.arange(len(statistical_slices)),
+                            "class_key": class_keys, "z": cf_aligned.z},
+                ).expand_dims(latitude_domain=[domain_key]))
 
             for key in class_keys:
                 class_profile = profile.sel(
@@ -3058,6 +3108,8 @@ def compute_vertical_contribution_profiles(
         profiles[sim_name] = xr.concat(
             domain_profiles, dim="latitude_domain", join="exact"
         )
+        if return_block_statistics:
+            block_products[sim_name] = xr.concat(domain_blocks, dim="latitude_domain", join="exact")
 
     if sim_names and sim_names[0] in profiles:
         control_name = sim_names[0]
@@ -3124,7 +3176,7 @@ def compute_vertical_contribution_profiles(
     save_table(pd.DataFrame(rows), "high_cloud_vertical_contribution_profiles")
     save_table(pd.DataFrame(summary_rows), "utls_high_cloud_contribution_summary")
     progress("Domain-mean vertical cloud profiles ready")
-    return profiles
+    return (profiles, block_products) if return_block_statistics else profiles
 
 
 def vertical_profiles_to_dataset(profiles):
@@ -3153,12 +3205,122 @@ def vertical_profiles_from_dataset(dataset):
     }
 
 
+def compute_vertical_contribution_blocks(
+    dss, classifications, *, time_batch=VERTICAL_PROFILE_TIME_BATCH,
+    domain_specs=CLOUD_STRUCTURE_DOMAIN_SPECS,
+):
+    """Extend current profiles in one cloud-only pass across all latitude domains."""
+    class_keys = [key for key, _label, _colour in REGIME_SPECS]
+    products = []
+    for source, sim_name in zip(dss, sim_names):
+        cloud = standardize_cloud_fraction(source.cldfrac).sel(
+            z=slice(1000 * PROFILE_COMPUTE_Z_BOUNDS_KM[0], 1000 * PROFILE_COMPUTE_Z_BOUNDS_KM[1])
+        )
+        cloud = select_absolute_latitude_band(cloud, (0.0, max(spec[1][1] for spec in domain_specs)))
+        masks = [classifications[sim_name][key].sel(latitude=cloud.latitude) for key in class_keys]
+        aligned = xr.align(cloud, *masks, join="inner")
+        cloud, masks = aligned[0].transpose("Time", "z", "latitude", "longitude"), aligned[1:]
+        slices = time_block_slices(cloud, BOOTSTRAP_BLOCK_DAYS, complete=True, min_blocks=2)
+        sample_block = np.full(cloud.sizes["Time"], -1, dtype=int)
+        for index, slc in enumerate(slices):
+            sample_block[slc] = index
+        shape = (len(domain_specs), len(slices), len(class_keys), cloud.sizes["z"])
+        numerator, denominator = np.zeros(shape), np.zeros(shape)
+        latitude = cloud.latitude.values
+        weights = [np.cos(np.deg2rad(latitude)) *
+                   ((np.abs(latitude) >= bounds[0]) & (np.abs(latitude) <= bounds[1]))
+                   for _name, bounds, _label in domain_specs]
+        started = time.monotonic()
+        ntime = cloud.sizes["Time"]
+        for start in range(0, ntime, time_batch):
+            slc = slice(start, min(start + time_batch, ntime))
+            batch = xr.Dataset({"cloud_fraction": cloud.isel(Time=slc), **{
+                key: mask.isel(Time=slc) for key, mask in zip(class_keys, masks)
+            }}).load(scheduler="synchronous")
+            cf = batch.cloud_fraction.values
+            indices = sample_block[slc]
+            complete = indices >= 0
+            for iclass, key in enumerate(class_keys):
+                mask = batch[key].transpose("Time", "latitude", "longitude").values[:, None]
+                contribution = np.where(mask, cf, 0.0)
+                finite = np.isfinite(contribution)
+                for idomain, weight in enumerate(weights):
+                    spatial_weight = weight[None, None, :, None]
+                    sums = np.sum(np.where(finite, contribution * spatial_weight, 0.0), axis=(2, 3), dtype=np.float64)
+                    counts = np.sum(np.where(finite, spatial_weight, 0.0), axis=(2, 3), dtype=np.float64)
+                    np.add.at(numerator[idomain, :, iclass], indices[complete], sums[complete])
+                    np.add.at(denominator[idomain, :, iclass], indices[complete], counts[complete])
+            elapsed = time.monotonic() - started
+            progress(f"{sim_name}: cloud uncertainty {slc.stop}/{ntime} times; "
+                     f"elapsed {format_duration(elapsed)}, ETA {format_duration(elapsed / slc.stop * (ntime - slc.stop))}")
+        products.append(xr.Dataset({
+            "cloud_fraction_numerator_blocks": (("latitude_domain", "block", "class_key", "z"), numerator),
+            "cloud_fraction_denominator_blocks": (("latitude_domain", "block", "class_key", "z"), denominator),
+            "block_start": ("block", [cloud.Time.values[s.start] for s in slices]),
+            "block_end": ("block", [cloud.Time.values[s.stop - 1] for s in slices]),
+        }, coords={"latitude_domain": [spec[0] for spec in domain_specs],
+                   "block": np.arange(len(slices)), "class_key": class_keys, "z": cloud.z}
+        ).expand_dims(simulation=[sim_name]))
+    return xr.concat(products, dim="simulation", join="exact")
+
+
+def align_vertical_profile_block_heights(statistics, reference):
+    """Use cached native-level labels after checking millimetre-scale roundoff."""
+    if statistics.sizes["z"] != reference.sizes["z"] or not np.allclose(
+        statistics.z.values, reference.z.values, rtol=0.0, atol=0.01,
+    ):
+        raise ValueError("Cloud block heights differ from the cached native model levels")
+    return statistics.assign_coords(z=reference.z)
+
+
 def get_or_compute_vertical_profiles(dss, classifications):
+    def compute():
+        path, metadata = _derived_product_paths("high_cloud_vertical_contribution_profiles", "nc")
+        previous_signature = dict(DERIVED_CACHE_SIGNATURE, product_configuration={
+            "vertical_profile_block_schema": "cloud-contribution-block-sums-v1"
+        })
+        if os.path.isfile(path) and _read_current_derived_metadata(metadata, previous_signature):
+            progress("Aligning existing uncertainty blocks to the cached native-height coordinates")
+            previous = load_netcdf(path)
+            valid_mean = np.isfinite(previous.pressure_hpa).any(("simulation", "latitude_domain"))
+            valid_block = previous.cloud_fraction_denominator_blocks.sel(latitude_domain="tropical").notnull().any(
+                ("simulation", "block", "class_key")
+            )
+            dataset = previous[["domain_mean_cldfrac_contribution"]].isel(z=np.flatnonzero(valid_mean.values))
+            statistics = previous[["cloud_fraction_numerator_blocks", "cloud_fraction_denominator_blocks",
+                                   "block_start", "block_end"]].reset_coords(drop=True).isel(
+                z=np.flatnonzero(valid_block.values)
+            )
+        elif os.path.isfile(path) and _read_current_derived_metadata(metadata):
+            progress("Extending current cloud profiles without rereading pressure fields")
+            dataset = load_netcdf(path)
+            statistics = compute_vertical_contribution_blocks(
+                dss, classifications,
+                domain_specs=tuple(spec for spec in CLOUD_STRUCTURE_DOMAIN_SPECS if spec[0] == "tropical"),
+            )
+        else:
+            profiles, blocks = compute_vertical_contribution_profiles(
+                dss, classifications, return_block_statistics=True
+            )
+            dataset = vertical_profiles_to_dataset(profiles)
+            statistics = xr.concat(
+                [value.expand_dims(simulation=[name]) for name, value in blocks.items()],
+                dim="simulation", join="exact",
+            )
+        statistics = align_vertical_profile_block_heights(statistics, dataset)
+        dataset = xr.merge([dataset, statistics], join="outer")
+        dataset.attrs.update(
+            vertical_profile_block_schema=VERTICAL_PROFILE_BLOCK_SCHEMA,
+            block_days=BOOTSTRAP_BLOCK_DAYS,
+            block_sampling="complete contiguous blocks; all classes resampled jointly",
+            uncertainty_latitude_domains="tropical; other domains can omit block statistics",
+        )
+        return dataset
+
     dataset = load_or_compute_derived_dataset(
         "high_cloud_vertical_contribution_profiles",
-        lambda: vertical_profiles_to_dataset(
-            compute_vertical_contribution_profiles(dss, classifications)
-        ),
+        compute,
+        product_configuration={"vertical_profile_block_schema": VERTICAL_PROFILE_BLOCK_SCHEMA},
     )
     return vertical_profiles_from_dataset(dataset)
 
@@ -4498,7 +4660,7 @@ def plot_literature_high_cloud_structure(
     progress("Done with Figures 2–3 cloud structure and OLR distributions")
 
 
-def main(argv=None):
+def _main(argv=None):
     global figsave
     args = parse_command_line(argv)
     configure_run(args)
@@ -4627,5 +4789,13 @@ def main(argv=None):
     )
 
     progress("Refined high-cloud classification diagnostics complete")
+
+
+def main(argv=None):
+    """Keep NetCDF reads serial inside each memory-bounded calculation."""
+    with dask.config.set(scheduler="synchronous"):
+        return _main(argv)
+
+
 if __name__ == "__main__":
     main()

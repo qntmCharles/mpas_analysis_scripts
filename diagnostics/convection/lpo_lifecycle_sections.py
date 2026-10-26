@@ -40,9 +40,15 @@ from diagnostics.waves.wave_metrics import (
 )
 
 
-SECTION_CACHE_VERSION = "lpo-lifecycle-sections-v10-moist-density"
+SECTION_CACHE_VERSION = "lpo-lifecycle-sections-v11-raining-properties"
 COMPOSITE_CACHE_VERSION = (
-    "lpo-lifecycle-2d-composites-v19-phase-coupling-responses"
+    "lpo-lifecycle-2d-composites-v20-raining-properties"
+)
+LIFECYCLE_RAIN_THRESHOLD_MM_DAY = 1.0
+PROPERTY_SAMPLING_DEFINITION = (
+    "unfiltered surface and thermodynamic sections: saved LPO envelope "
+    "with concurrent unsmoothed precipitation > 1 mm/day; cloud fraction: "
+    "complete saved envelope; cloud and wave context retain surrounding fields"
 )
 
 DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES = 5.0
@@ -184,7 +190,9 @@ def sample_centroid_latitude_native_sections(
     relative_longitude=RELATIVE_LONGITUDE_DEGREES,
     latitude_column="precip_weighted_centroid_lat",
     longitude_column="precip_weighted_centroid_lon",
-) -> xr.DataArray:
+    horizontal_mask: xr.DataArray | None = None,
+    return_weights: bool = False,
+) -> xr.DataArray | tuple[xr.DataArray, xr.DataArray]:
     """Sample native profiles within 10 degrees of each LPO latitude."""
 
     zdim = vertical_dim(field)
@@ -234,22 +242,38 @@ def sample_centroid_latitude_native_sections(
             dims=("event_step", "relative_longitude"),
         ),
     )
-    sampled = cosine_weighted_latitude_mean(
-        sampled,
-        xr.DataArray(
-            target_latitude,
-            dims=("event_step", "relative_latitude"),
-        ),
-        "relative_latitude",
-    )
-    sampled = sampled.transpose(
-        "event_step", zdim, "relative_longitude"
-    ).reset_coords(drop=True).load()
-    return sampled.rename({zdim: "native_level"}).assign_coords(
+    sampled = sampled.reset_coords(drop=True).assign_coords(
         event_step=np.arange(len(steps)),
-        native_level=np.arange(source.sizes[zdim]),
+        relative_latitude=np.asarray(relative_latitude, dtype=float),
         relative_longitude=np.asarray(relative_longitude, dtype=float),
     )
+    if horizontal_mask is not None:
+        sampled = sampled.where(horizontal_mask)
+    latitude_weights = xr.DataArray(
+        np.clip(np.cos(np.deg2rad(target_latitude)), 0.0, None),
+        dims=("event_step", "relative_latitude"),
+        coords={
+            "event_step": sampled.event_step,
+            "relative_latitude": sampled.relative_latitude,
+        },
+    )
+    mean = sampled.weighted(latitude_weights).mean(
+        "relative_latitude", skipna=True
+    )
+    reduced = xr.Dataset({"mean": mean})
+    if return_weights:
+        # Keep the contributing area for the later longitude mean.
+        reduced["weight"] = latitude_weights.where(
+            sampled.notnull(), 0.0
+        ).sum("relative_latitude")
+    reduced = reduced.transpose(
+        "event_step", zdim, "relative_longitude"
+    ).rename({zdim: "native_level"}).assign_coords(
+        native_level=np.arange(source.sizes[zdim])
+    ).load()
+    if return_weights:
+        return reduced["mean"], reduced["weight"]
+    return reduced["mean"]
 
 
 def sample_event_relative_surface(
@@ -1022,6 +1046,39 @@ def select_section_steps(steps: pd.DataFrame, *, test=False) -> pd.DataFrame:
     return selected
 
 
+def property_envelope_sections(
+    primary: Path, simulation: str, steps: pd.DataFrame
+) -> xr.DataArray:
+    """Sample saved envelopes without loading the broad cloud context."""
+
+    values = np.zeros(
+        (len(steps), len(RELATIVE_LATITUDE_DEGREES),
+         len(RELATIVE_LONGITUDE_DEGREES)), dtype=bool,
+    )
+    for event_id, event_steps in steps.groupby("event_id", sort=False):
+        with xr.open_dataset(_event_product_path(primary, simulation, event_id)) as product:
+            for row in event_steps.itertuples():
+                envelope = _centred_context_field(
+                    product.lpt_envelope_mask.sel(Time=row.Time),
+                    float(row.precip_weighted_centroid_lon),
+                    float(row.precip_weighted_centroid_lat),
+                ).reindex(
+                    cloud_relative_latitude=RELATIVE_LATITUDE_DEGREES,
+                    cloud_relative_longitude=RELATIVE_LONGITUDE_DEGREES,
+                    fill_value=0.0,
+                )
+                values[int(row.event_step)] = np.asarray(envelope) > 0.5
+    return xr.DataArray(
+        values,
+        dims=("event_step", "relative_latitude", "relative_longitude"),
+        coords={
+            "event_step": np.arange(len(steps)),
+            "relative_latitude": RELATIVE_LATITUDE_DEGREES,
+            "relative_longitude": RELATIVE_LONGITUDE_DEGREES,
+        },
+    )
+
+
 def build_unfiltered_event_sections(
     dataset: xr.Dataset,
     precipitation: xr.DataArray,
@@ -1074,14 +1131,22 @@ def build_unfiltered_event_sections(
             variables[flag] = (
                 ("event_step",), steps[flag].astype(bool).values
             )
+    progress(f"{simulation}: sampling lifecycle property envelope")
+    property_envelope = property_envelope_sections(primary, simulation, steps)
+    sampled_precipitation = sample_event_relative_surface(precipitation, steps)
+    rain_mask = property_envelope & (
+        sampled_precipitation > LIFECYCLE_RAIN_THRESHOLD_MM_DAY
+    )
+    variables["property_envelope_mask"] = property_envelope
+    variables["property_rain_mask"] = rain_mask
     surface_sources = {
-        "unfiltered_precipitation": precipitation,
         "unfiltered_precipitable_water": dataset.precipw,
         "unfiltered_olr": dataset.olrtoa,
     }
+    variables["unfiltered_precipitation"] = sampled_precipitation.where(rain_mask)
     for name, source in surface_sources.items():
         progress(f"{simulation}: sampling lifecycle sections for {name}")
-        variables[name] = sample_event_relative_surface(source, steps)
+        variables[name] = sample_event_relative_surface(source, steps).where(rain_mask)
     pressure_pa = pressure_to_pa(dataset.pressure)
     theta = dataset.theta
     native_temperature = theta * (pressure_pa / 100_000.0) ** (
@@ -1111,16 +1176,19 @@ def build_unfiltered_event_sections(
         "unfiltered_static_stability": native_n2,
     }
     progress(f"{simulation}: sampling native pressure lifecycle sections")
-    variables["native_pressure_hpa"] = (
-        sample_centroid_latitude_native_sections(
-            pressure_pa / 100.0, steps
-        )
-    )
+    native_sources["native_pressure_hpa"] = pressure_pa / 100.0
     for name, source in native_sources.items():
         progress(f"{simulation}: sampling lifecycle sections for {name}")
-        variables[name] = sample_centroid_latitude_native_sections(
-            source, steps
+        sampling_mask = (
+            property_envelope if name == "unfiltered_cloud_fraction" else rain_mask
         )
+        mean, weight = sample_centroid_latitude_native_sections(
+            source, steps, horizontal_mask=sampling_mask, return_weights=True
+        )
+        weight_name = f"{name}_latitude_weight"
+        mean.attrs["longitude_sample_weight"] = weight_name
+        variables[name] = mean
+        variables[weight_name] = weight
     progress(f"{simulation}: sampling background ray environments")
     background_u, background_n = native_background_sections(dataset, steps)
     variables["background_zonal_wind"] = background_u
@@ -1161,11 +1229,15 @@ def build_unfiltered_event_sections(
                 "native MPAS levels with sampled pressure in hPa"
             ),
             "composite_field_definition": "absolute sampled model values",
+            "property_sampling_definition": PROPERTY_SAMPLING_DEFINITION,
+            "local_precipitation_threshold_mm_day": LIFECYCLE_RAIN_THRESHOLD_MM_DAY,
             "cloud_sampling_region": (
                 "broad event-centred context; never truncated by the LPO "
                 "envelope; unavailable saved context is NaN"
             ),
-            "lpo_envelope_role": "context contour only",
+            "lpo_envelope_role": (
+                "sampling mask for unfiltered properties; contour for broad context"
+            ),
             "literature_geometry": (
                 "5-degree centroid-relative zonal half-width follows the "
                 "Lim-and-Son composite profile radius; point, 2.5, 3.75 and "
@@ -1189,6 +1261,11 @@ def build_unfiltered_event_sections(
     }
     for name, unit in units.items():
         output[name].attrs["units"] = unit
+    for name in (*SURFACE_VARIABLES, *VERTICAL_VARIABLES, "native_pressure_hpa"):
+        output[name].attrs["sampling_region"] = (
+            "complete LPO envelope" if name == "unfiltered_cloud_fraction"
+            else "LPO envelope with concurrent precipitation > 1 mm/day"
+        )
     output.unfiltered_relative_humidity.attrs[
         "source_variable"
     ] = "relhum"
@@ -1209,7 +1286,10 @@ def build_unfiltered_event_sections(
 def longitude_window_mean(
     field: xr.DataArray,
     half_width_degrees: float,
-) -> xr.DataArray:
+    *,
+    sample_weights: xr.DataArray | None = None,
+    return_weights: bool = False,
+) -> xr.DataArray | tuple[xr.DataArray, xr.DataArray]:
     """Mean one cached stencil with reproducible box-cell weighting."""
 
     if "relative_longitude" not in field.dims:
@@ -1235,8 +1315,26 @@ def longitude_window_mean(
         dims="relative_longitude",
         coords={"relative_longitude": field.relative_longitude},
     )
-    return field.weighted(weights).mean(
+    if sample_weights is not None:
+        weights = weights * sample_weights.fillna(0.0)
+    mean = field.weighted(weights).mean(
         "relative_longitude", skipna=True
+    )
+    if return_weights:
+        return mean, weights.where(field.notnull(), 0.0).sum("relative_longitude")
+    return mean
+
+
+def _section_window_mean(
+    dataset: xr.Dataset, variable: str, half_width_degrees: float
+) -> xr.DataArray:
+    """Combine native latitude and longitude weights before event averaging."""
+
+    field = dataset[variable]
+    weight_name = field.attrs.get("longitude_sample_weight")
+    return longitude_window_mean(
+        field, half_width_degrees,
+        sample_weights=dataset[weight_name] if weight_name else None,
     )
 
 
@@ -1521,7 +1619,7 @@ def _mean_for_windows(
     means = []
     default_cube = None
     for half_width in LONGITUDE_HALF_WIDTH_SENSITIVITY_DEGREES:
-        windowed = longitude_window_mean(dataset[variable], half_width)
+        windowed = _section_window_mean(dataset, variable, half_width)
         temporary = xr.Dataset(
             {variable: windowed},
             coords={
@@ -1555,25 +1653,27 @@ def _event_latitude_mean_for_windows(
     latitude_bounds: tuple[float, float],
 ) -> xr.DataArray:
     """Reduce relative latitude per event before the equal-event mean."""
-    centre_latitude = _event_cube(
-        dataset, "precip_weighted_centroid_lat", lags=lags
-    )
     means = []
     lower, upper = sorted(map(float, latitude_bounds))
     for half_width in LONGITUDE_HALF_WIDTH_SENSITIVITY_DEGREES:
-        windowed = longitude_window_mean(dataset[variable], half_width)
+        windowed, longitude_weight = longitude_window_mean(
+            dataset[variable], half_width, return_weights=True
+        )
+        latitude = dataset.precip_weighted_centroid_lat + windowed.relative_latitude
+        weights = np.cos(np.deg2rad(latitude)).clip(min=0.0) * longitude_weight
+        windowed = windowed.sel(relative_latitude=slice(lower, upper))
+        per_step = windowed.weighted(
+            weights.sel(relative_latitude=slice(lower, upper)).fillna(0.0)
+        ).mean("relative_latitude", skipna=True)
         temporary = xr.Dataset(
-            {variable: windowed},
+            {variable: per_step},
             coords={
                 "event_id": dataset.event_id,
                 "lag_hours": dataset.lag_hours,
             },
         )
-        cube = _event_cube(temporary, variable, lags=lags).sel(
-            relative_latitude=slice(lower, upper)
-        )
-        per_event = event_relative_latitude_mean(cube, centre_latitude)
-        means.append(per_event.mean("event", skipna=True))
+        cube = _event_cube(temporary, variable, lags=lags)
+        means.append(cube.mean("event", skipna=True))
     return xr.concat(
         means,
         dim=xr.IndexVariable(
@@ -2794,6 +2894,8 @@ def build_simulation_composites(
             "default_longitude_half_width_degrees": (
                 DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES
             ),
+            "property_sampling_definition": PROPERTY_SAMPLING_DEFINITION,
+            "local_precipitation_threshold_mm_day": LIFECYCLE_RAIN_THRESHOLD_MM_DAY,
             "kelvin_reference_method": (
                 "Lim-and-Son dry Kelvin reference using event-local U and N; "
                 "not a generic moist-mode group velocity"
@@ -2831,8 +2933,8 @@ def _default_window_event_cube(
     *,
     lags: Sequence[int],
 ) -> xr.DataArray:
-    windowed = longitude_window_mean(
-        dataset[variable], DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES
+    windowed = _section_window_mean(
+        dataset, variable, DEFAULT_LONGITUDE_HALF_WIDTH_DEGREES
     )
     temporary = xr.Dataset(
         {variable: windowed},
