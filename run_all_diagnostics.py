@@ -56,6 +56,11 @@ DEFAULT_SCRIPT_ORDER = [
     "convection/lpo_lifecycle_analysis.py",
 ]
 
+OPTIONAL_SCRIPT_ORDER = [
+    "mean_state/circulation_spinup.py",
+    "convection/convection_summary.py",
+]
+
 # Complete publication workflow for the convection/LPO analysis.  The ordering
 # is a dependency contract, not just a preferred presentation order:
 #
@@ -98,6 +103,7 @@ FIGURES_ONLY_ARGUMENTS_BY_SCRIPT = {
     "mean_state/vapour_transport_budget.py": ("--figures-only",),
     "mean_state/thermal_wind.py": ("--figures-only",),
     "mean_state/circulation_diagnostics.py": ("--figures-only",),
+    "mean_state/circulation_spinup.py": ("--figures-only",),
     "mean_state/jet_variability_diagnostics.py": ("--figures-only",),
     "convection/refined_high_cloud_classification_diagnostics.py": (
         "--figures-only",
@@ -105,6 +111,7 @@ FIGURES_ONLY_ARGUMENTS_BY_SCRIPT = {
     "convection/lpo_tracking.py": ("--stage", "figures"),
     "waves/equatorial_wave_diagnostics.py": ("--figures-only",),
     "convection/lpo_lifecycle_analysis.py": ("--figures-only",),
+    "convection/convection_summary.py": ("--figures-only",),
 }
 
 REBUILD_ARGUMENTS_BY_SCRIPT = {
@@ -113,6 +120,7 @@ REBUILD_ARGUMENTS_BY_SCRIPT = {
     "mean_state/vapour_transport_budget.py": ("--rebuild-cache",),
     "mean_state/thermal_wind.py": ("--rebuild-cache",),
     "mean_state/circulation_diagnostics.py": ("--rebuild-cache",),
+    "mean_state/circulation_spinup.py": ("--rebuild-cache",),
     "mean_state/jet_variability_diagnostics.py": ("--rebuild-cache",),
     "convection/refined_high_cloud_classification_diagnostics.py": (
         "--rebuild-derived-cache",
@@ -120,6 +128,7 @@ REBUILD_ARGUMENTS_BY_SCRIPT = {
     "convection/lpo_tracking.py": ("--rebuild-cache",),
     "waves/equatorial_wave_diagnostics.py": ("--rebuild-cache",),
     "convection/lpo_lifecycle_analysis.py": ("--rebuild-cache",),
+    "convection/convection_summary.py": ("--rebuild-cache",),
 }
 
 QC_ARGUMENTS_BY_SCRIPT = {
@@ -336,14 +345,15 @@ def normalise_name(name: str) -> str:
 
 
 def discover_diagnostic_scripts() -> list[str]:
-    """Return the fixed workflow, failing if a configured script is missing."""
+    """Return configured default and optional diagnostics."""
+    configured = [*DEFAULT_SCRIPT_ORDER, *OPTIONAL_SCRIPT_ORDER]
     missing = [
-        script for script in DEFAULT_SCRIPT_ORDER
+        script for script in configured
         if not (DIAGNOSTICS_DIR / script).is_file()
     ]
     if missing:
         raise SystemExit(f"Configured diagnostic scripts are missing: {', '.join(missing)}")
-    return list(DEFAULT_SCRIPT_ORDER)
+    return configured
 
 
 def resolve_script_name(name: str, available: list[str]) -> str:
@@ -372,7 +382,7 @@ def selected_scripts(args: argparse.Namespace) -> list[str]:
             resolve_script_name(name, diagnostic_scripts) for name in args.only
         ]
     else:
-        selected = list(diagnostic_scripts)
+        selected = list(DEFAULT_SCRIPT_ORDER)
     skipped = {resolve_script_name(name, diagnostic_scripts) for name in args.skip}
 
     unknown = sorted((set(selected) | skipped) - available)

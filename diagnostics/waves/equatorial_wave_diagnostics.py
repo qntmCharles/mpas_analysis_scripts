@@ -71,16 +71,20 @@ from diagnostics.diagnostic_helpers import (
     numbered_figure_saver, precip_rate_from_accum, read_json_file,
     pressure_to_pa, progress, safe_name, simulation_colour,
     standardize_latlon_dataset, symmetric_levels,
+    symmetric_percentile_levels_for_fields,
     total_precip_accum, vertical_dim, write_csv_atomic, write_json_file,
     write_netcdf_atomic,
 )
 from diagnostics.analysis_config import (
+    ALL_SIMULATION_LABELS,
     SIMULATION_ARCHIVES,
     SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
     SIMULATION_ROOT,
     WAVE_RESPONSE_BLOCK_LENGTH_DAYS,
     simulation_cache_name,
+    simulation_cache_label,
 )
+from diagnostics.cache_support import relabel_cached_simulations
 from diagnostics.waves.equatorial_wave_config import (
     ALL_CACHED_FILTERS,
     EASTWARD_INTRASEASONAL_FILTER,
@@ -132,6 +136,7 @@ from diagnostics.waves.wave_metrics import (
     buoyancy_frequency_squared,
     circular_time_block_indices,
     common_vertical_motion_eofs,
+    configured_wave_filter_batch,
     complex_top_heaviness,
     filtered_wave_metrics,
     filtered_wave_phase_diagnostics,
@@ -143,6 +148,7 @@ from diagnostics.waves.wave_metrics import (
     spectral_coefficients_for_box,
     upward_pressure_velocity,
 )
+from diagnostics.waves.wave_forcing_figures import run_wave_forcing_figures
 from diagnostics.ttl import TTL_BASE_PRESSURE_HPA
 from wavenumber_frequency_functions import spacetime_power, smooth_wavefreq
 from waveFilter import kf_filter
@@ -194,10 +200,11 @@ def parse_command_line(argv=None):
         "--figures",
         nargs="+",
         type=int,
-        choices=range(1, 16),
+        choices=range(1, 25),
         default=None,
         help="Build only these numbered figures.",
     )
+    parser.add_argument("--tem-archive-root", help="Root of stored upstream geometric-height TEM simulation archives")
     cache_mode = parser.add_mutually_exclusive_group()
     cache_mode.add_argument(
         "--rebuild-cache",
@@ -284,10 +291,19 @@ save_loc = diagnostic_output_dir(
 #   13: Lim-Son Kelvin reference energy dispersion
 #   14: compact LPO-following wave sections (explicit prerequisite)
 #   15: eastward-intraseasonal precipitation with LPO outlines
+#   16: Pahlavan-style momentum- and heat-flux forcing decomposition
+#   17: regional forcing budget and phase-speed distributions
+#   18: wind, momentum transport, and forcing mechanisms
+#   19: broad-sector horizontal wind variance
+#   20: total, meridional, and vertical EPFd changes with absolute U EP flux
+#   21: Control and anomaly variance and wave-energy flux
+#   22: forcing and variance anomalies, with wave-energy flux anomaly vectors
+#   23: phase-speed EPFd anomalies
+#   24: isentropic dry Ertel PV gradient of the native-height mean state
 #
 # LPO lifecycle composites live in ``lpo_lifecycle_analysis.py`` and reuse
 # these wave caches. Wave-response regressions are owned by this script.
-figures_to_run = runtime_args.figures or [1, 2, 6, 7, 11, 12, 13, 14, 15]
+figures_to_run = runtime_args.figures or [1, 2, 6, 7, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
 figsave = FigureSaver(save_loc, enabled=save, figures_to_run=figures_to_run)
 
 # Restart/resume controls.  With the default full run, existing figure files are
@@ -308,9 +324,9 @@ data_locs = list(SIMULATION_ARCHIVES.values())
 sim_names = list(PROJECT_SIMULATION_LABELS.values())
 cols = [simulation_colour(name) for name in sim_names]
 _contrast_tokens = {
-    "nudged-u": ("U", "u-nudged"),
-    "nudged-T": ("T", "T-nudged"),
-    "nudged-T-from-u": ("T_from_U", "T-nudged from u"),
+    "nudged-u": ("U", ALL_SIMULATION_LABELS["nudged-u"]),
+    "nudged-T": ("T", ALL_SIMULATION_LABELS["nudged-T"]),
+    "nudged-T-from-u": ("T_from_U", ALL_SIMULATION_LABELS["nudged-T-from-u"]),
 }
 _simulation_ids = tuple(SIMULATION_ARCHIVES)
 WAVE_RESPONSE_CONTRASTS = [
@@ -326,7 +342,7 @@ WAVE_RESPONSE_CONTRASTS = [
 WAVE_RESPONSE_CONTRASTS.extend(
     (
         f"U_minus_{_contrast_tokens[simulation][0]}",
-        f"u-nudged - {_contrast_tokens[simulation][1]}",
+        f"{PROJECT_SIMULATION_LABELS['nudged-u']} - {_contrast_tokens[simulation][1]}",
         sim_names[1],
         sim_names[index],
         "0.35",
@@ -607,7 +623,7 @@ def cache_signature(kind, extra=None):
         kind=kind,
         root_dir=os.path.abspath(root_dir),
         data_locs=list(data_locs),
-        sim_names=list(sim_names),
+        sim_names=[simulation_cache_label(name) for name in sim_names],
         latlon_pattern=LATLON_PATTERN,
         zonal_mean_pattern=ZONAL_MEAN_PATTERN,
         analysis_start_date=ANALYSIS_START,
@@ -709,7 +725,7 @@ def load_cached_table(cache_name, signature, output_filename=None, required_colu
 
     if cache_metadata_matches(metadata_path, signature, cache_name) and os.path.exists(csv_path):
         try:
-            df = pd.read_csv(csv_path)
+            df = relabel_cached_simulations(pd.read_csv(csv_path))
             if required_columns.issubset(df.columns):
                 print(f"Using cached table {csv_path}")
                 return df
@@ -756,7 +772,7 @@ def load_cached_dataset(cache_name, signature):
         # semantics, then close the backing file immediately. Large filtered
         # wave caches are handled separately and remain lazy.
         with xr.open_dataset(nc_path) as cached:
-            return cached.load()
+            return relabel_cached_simulations(cached.load())
     except Exception as exc:
         print(f"Ignoring cached dataset {nc_path}: {exc}")
         return None
@@ -782,7 +798,7 @@ def load_wave_cloud_responses(simulation):
     """Load the current shared cloud product as float occurrence fields."""
     path = os.path.join(
         classification_cache_dir,
-        f"{simulation.replace(' ', '_')}_classified_high_cloud.nc",
+        f"{simulation_cache_name(simulation)}_classified_high_cloud.nc",
     )
     if not os.path.exists(path):
         raise FileNotFoundError(
@@ -839,10 +855,14 @@ def load_wave_cloud_responses(simulation):
 
 dss = []
 dss_zm = []
-if runtime_args.figures_only:
+epfd_only = set(figures_to_run).issubset(set(range(16, 25)))
+if runtime_args.figures_only or epfd_only:
     dss = [None] * len(data_locs)
     dss_zm = [None] * len(data_locs)
-    progress("Figure-only mode: raw model histories remain closed.")
+    if runtime_args.figures_only:
+        progress("Figure-only mode: raw model histories remain closed.")
+    else:
+        progress("EPFd and variance figures: reuse compact caches; calculate missing products.")
 else:
     for i, d in enumerate(data_locs):
         ds = load_latlon_dataset(
@@ -1144,7 +1164,7 @@ def write_filter_input_if_needed(ds, sim_index, field_name):
     fds = to_filter_input_dataset(da, obs_var="x").load()
     fds.attrs.update(
         source_field=field_name,
-        source_simulation=sim_names[sim_index],
+        source_simulation=simulation_cache_label(sim_names[sim_index]),
         cache_version=FILTER_INPUT_CACHE_VERSION,
         wave_config_version=WAVE_CONFIG_VERSION,
         analysis_start=ANALYSIS_START,
@@ -1449,7 +1469,7 @@ def direct_filtered_wave(ds, sim_index, field_name, wave_name, avgLat, lat_bound
         field=field_name,
         wave_name=wave_name,
         filter_name=WAVE_BOXES[wave_name]["filter_name"],
-        source_simulation=sim_names[sim_index],
+        source_simulation=simulation_cache_label(sim_names[sim_index]),
         filter_lat_min=lat_bounds[0],
         filter_lat_max=lat_bounds[1],
         filter_lat_bounds=lat_bounds_attr(lat_bounds),
@@ -1519,7 +1539,7 @@ def projected_filtered_wave(ds, sim_index, field_name, wave_name, lat_bounds, pr
         field=field_name,
         wave_name=wave_name,
         filter_name=WAVE_BOXES[wave_name]["filter_name"],
-        source_simulation=sim_names[sim_index],
+        source_simulation=simulation_cache_label(sim_names[sim_index]),
         filter_lat_min=lat_bounds[0],
         filter_lat_max=lat_bounds[1],
         filter_lat_bounds=lat_bounds_attr(lat_bounds),
@@ -1749,55 +1769,11 @@ def _filter_2d_wave(values, wave_name):
     return np.asarray(filtered[: np.shape(values)[0]], dtype=float)
 
 
-_BATCH_FILTER_MASKS = {}
-
-
 def _filter_2d_wave_batch(values, wave_name):
     """Apply the configured filter to a batch of time-longitude fields."""
-
-    values = np.asarray(values, dtype="f")
-    if values.ndim != 3:
-        raise ValueError("Batch wave filters require level, time, longitude")
-    batch_count, time_count, longitude_count = values.shape
-    key = (time_count, longitude_count, wave_name)
-    mask = _BATCH_FILTER_MASKS.get(key)
-    if mask is None:
-        rng = np.random.default_rng(20260804)
-        reference = rng.standard_normal(
-            (time_count, longitude_count), dtype=np.float32
-        )
-        box = WAVE_BOXES[wave_name]
-        _filtered, mask = kf_filter(
-            reference,
-            obs_per_day,
-            box["period"][0],
-            box["period"][1],
-            box["k"][0],
-            box["k"][1],
-            box["depth"][0],
-            box["depth"][1],
-            box["filter_name"],
-            debug=True,
-        )
-        mask = np.asarray(mask, dtype=bool)
-        _BATCH_FILTER_MASKS[key] = mask
-    original = values[:, :, ::-1].transpose(0, 2, 1)
-    detrended = signal.detrend(original, axis=-1, type="linear")
-    taper = signal.windows.tukey(time_count, 0.05, True)
-    spectrum = fft.rfft2(
-        detrended * taper[None, None, :],
-        axes=(-2, -1),
-        workers=4,
+    return configured_wave_filter_batch(
+        values, wave_name, observations_per_day=obs_per_day,
     )
-    spectrum *= mask[None, :, :]
-    reconstructed = fft.irfft2(
-        spectrum,
-        s=(longitude_count, time_count),
-        axes=(-2, -1),
-        workers=4,
-    )
-    output = reconstructed.transpose(0, 2, 1)[:, :, ::-1]
-    return np.asarray(output[:batch_count], dtype=float)
 
 
 def _tracking_time_indices(source_time, steps):
@@ -4510,7 +4486,7 @@ def spectrum_cache_signature(sim_index, field_name=spectrum_field):
         "normalised_wave_spectrum",
         extra=dict(
             cache_version=SPECTRUM_CACHE_VERSION,
-            simulation=sim_names[sim_index],
+            simulation=simulation_cache_label(sim_names[sim_index]),
             spectrum_field=field_name,
             spectrum_lat_bounds=jsonable_value(spectrum_lat_bounds),
             spectrum_segment_days=spectrum_segment_days,
@@ -7160,6 +7136,15 @@ if 14 in figures_to_run:
         gc.collect()
         shutil.rmtree(checkpoint_directory)
         progress(f"Wrote compact LPO wave sections: {output_path}")
+
+if should_run_any(range(16, 25)):
+    run_wave_forcing_figures(
+        cache_dir=cache_dir, output_dir=figsave.save_loc, archive_root=root_dir,
+        archives=SIMULATION_ARCHIVES, pattern=LATLON_PATTERN,
+        start=ANALYSIS_START, end=ANALYSIS_END, selected=figures_to_run,
+        save_figure=save_figure, should_build=should_build_figure,
+        figures_only=runtime_args.figures_only, rebuild=force_recompute_caches,
+        tem_root=runtime_args.tem_archive_root)
 
 if not runtime_args.figures_only:
     cleanup_filter_input_caches(_used_filter_input_paths)

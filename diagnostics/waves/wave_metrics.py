@@ -17,6 +17,84 @@ from scipy import signal
 METRICS_VERSION = "wave-metrics-v6-response-block-bootstrap"
 PREDICTOR_VARIANCE_EPS = 1.0e-12
 
+_BATCH_FILTER_MASKS = {}
+
+
+def configured_wave_filter_mask(time_count, longitude_count, wave_name, observations_per_day=4):
+    """Return the canonical directional mask without filtering a data batch."""
+    from waveFilter import kf_filter
+    from diagnostics.waves.equatorial_wave_config import WAVE_BOXES
+
+    key = (time_count, longitude_count, wave_name, observations_per_day)
+    mask = _BATCH_FILTER_MASKS.get(key)
+    if mask is None:
+        reference = np.random.default_rng(20260804).standard_normal(
+            (time_count, longitude_count), dtype=np.float32)
+        box = WAVE_BOXES[wave_name]
+        _, mask = kf_filter(reference, observations_per_day, *box["period"],
+                            *box["k"], *box["depth"], box["filter_name"], debug=True)
+        mask = np.asarray(mask, dtype=bool)
+        _BATCH_FILTER_MASKS[key] = mask
+    return mask
+
+
+def configured_wave_filter_batch(values, wave_name, *, observations_per_day=4, dtype=np.float32):
+    """Apply the owner's established directional filter to a batch of fields.
+
+    Each field retains its complete time-longitude record. The masks come
+    directly from ``kf_filter`` and preserve its dispersion boundaries.
+    """
+    from scipy import fft
+    values = np.asarray(values, dtype=dtype)
+    if values.ndim != 3:
+        raise ValueError("Batch wave filters require level, time, longitude")
+    batch_count, time_count, longitude_count = values.shape
+    mask = configured_wave_filter_mask(time_count, longitude_count, wave_name, observations_per_day)
+    original = values[:, :, ::-1].transpose(0, 2, 1)
+    detrended = signal.detrend(original, axis=-1, type="linear")
+    taper = signal.windows.tukey(time_count, 0.05, True)
+    spectrum = fft.rfft2(
+        detrended * taper[None, None, :], axes=(-2, -1), workers=4,
+    )
+    spectrum *= mask[None, :, :]
+    reconstructed = fft.irfft2(
+        spectrum, s=(longitude_count, time_count), axes=(-2, -1), workers=4,
+    )
+    output = reconstructed.transpose(0, 2, 1)[:, :, ::-1]
+    return np.asarray(output[:batch_count], dtype=float)
+
+
+def configured_wave_filter_spectrum(values, wave_name, longitude_count, modes):
+    """Filter positive spatial modes of the owner's reversed-longitude input.
+
+    The final axes are time and spatial mode. Negative temporal frequencies
+    use the conjugate partner's directional mask. No spatial reconstruction
+    is necessary for subsequent Parseval covariances.
+    """
+    from scipy import fft
+
+    values = np.asarray(values, dtype=np.complex128)
+    time_count = values.shape[-2]
+    modes = np.asarray(modes, dtype=int)
+    mask = configured_wave_filter_mask(time_count, longitude_count, wave_name)
+    frequencies = np.arange(time_count)
+    positive = frequencies <= time_count // 2
+    full_mask = np.empty((time_count, modes.size), dtype=float)
+    full_mask[positive] = mask[modes[:, None], frequencies[positive]].T
+    full_mask[~positive] = mask[(-modes[:, None]) % longitude_count,
+                               time_count - frequencies[~positive]].T
+    # irfft2 takes the real part at self-conjugate temporal frequencies.
+    # Match that operation when a directional mask includes the DC bin.
+    self_conjugate = [0] + ([time_count//2] if time_count % 2 == 0 else [])
+    for frequency in self_conjugate:
+        full_mask[frequency] = .5*(mask[modes, frequency].astype(float)
+                                   + mask[(-modes) % longitude_count, frequency])
+    detrended = signal.detrend(values, axis=-2, type="linear")
+    detrended *= signal.windows.tukey(time_count, .05, True)[:, None]
+    spectrum = fft.fft(detrended, axis=-2, workers=2)
+    spectrum *= full_mask
+    return fft.ifft(spectrum, axis=-2, workers=2)
+
 
 def wave_filter_field_units(field_name: str) -> str:
     """Return the canonical units for a named wave-filter input field."""
