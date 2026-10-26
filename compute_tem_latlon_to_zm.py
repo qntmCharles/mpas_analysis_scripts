@@ -1,32 +1,47 @@
 #!/usr/bin/env python
-"""Compute height-coordinate TEM diagnostics from latlon files and append to zm files.
+"""Calculate versioned, unfolded TEM fields before downstream analysis caches.
 
-This is an xarray/dask translation of
-/data/phh1-hosted/cwp29/mpas-a/analysis/TEM/compute_tem_new.py.
-The formulas are kept aligned with the PyGeode script, while derivatives use
-xarray's nonuniform-coordinate finite differences.
+Store mass-flux HPE(z) TEM in simulation-local companion files.
+Retain the pressure producer only for explicit legacy archive work. See diagnostics/tem_core.py for equations.
 """
 
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import glob
+import os
 from pathlib import Path
+from time import perf_counter
+import uuid
 import warnings
 
+if __name__ == "__main__":
+    print("TEM producer: loading numerical libraries and archive helpers", flush=True)
+    # Avoid background stack inspection during numerical and NetCDF operations.
+    # Keep a traceback for an actual fatal error in the failing thread.
+    faulthandler.enable(all_threads=False)
+
 import numpy as np
-from scipy.interpolate import CubicSpline
+from dask.diagnostics import ProgressBar
 import xarray as xr
 
 
-R = 8.31447215
-CP_DRY_AIR = 1005.7
-M_AIR = 0.0289644
-EARTH_RADIUS = 6371229.0
-OMEGA = 2.0 * np.pi / ((23 * 60 + 56) * 60 + 4.1)
-RD = R / M_AIR
-KAPPA = RD / CP_DRY_AIR
-P0_PA = 100000.0
+from diagnostics.tem_core import (
+    R, CP_DRY_AIR, M_AIR, EARTH_RADIUS, OMEGA, RD, KAPPA, P0_PA,
+    TEM_FORMULATION, TEM_VERSION, ISOBARIC_FIELDS, PRESSURE_REQUIRED, compute_height_tem, compute_pressure_tem,
+    differentiate_wrt,
+)
+from diagnostics.cache_support import (
+    cache_manifest, cache_manifest_matches, materialize, read_json_file,
+    write_json_file, write_netcdf_atomic,
+)
+from diagnostics.archive_coordinates import standardize_latlon_dataset
+from diagnostics.analysis_config import LATLON_PATTERN
+from diagnostics.tem_native import (
+    model_level_field, zfull_from_latlon, midlevel_vertical_velocity, native_tem_fields,
+    open_native_dataset, iter_native_frames, NATIVE_FIELDS, WATER_SPECIES, PREPARED_FIELDS,
+)
 
 REFERENCE_SCRIPT = "/data/phh1-hosted/cwp29/mpas-a/analysis/TEM/compute_tem_new.py"
 TEM_VARIABLES = (
@@ -36,6 +51,10 @@ TEM_VARIABLES = (
     "upwp",
     "vptp",
     "vpthp",
+    "u_bar", "v_bar", "w_bar", "theta_bar", "u_z", "theta_z", "absolute_vorticity",
+    "momentum_meridional", "momentum_vertical", "heat_meridional", "heat_vertical",
+    "EPFd_momentum", "EPFd_heat", "density_wind_covariance", "rho_dry_zm",
+    "uv", "uw", "vtheta", "valid_zonal_sample",
     "Fy",
     "Fz",
     "EPFd",
@@ -64,36 +83,6 @@ def time_dim(obj: xr.Dataset | xr.DataArray) -> str:
         if dim in obj.dims:
             return dim
     raise ValueError(f"No known time dimension found in {obj.dims!r}")
-
-
-def differentiate_wrt(
-    da: xr.DataArray,
-    dim: str,
-    coordinate_values: np.ndarray | xr.DataArray,
-    edge_order: int = 2,
-) -> xr.DataArray:
-    """Differentiate with respect to a 1D coordinate expressed in physical units."""
-    if dim not in da.dims:
-        raise ValueError(f"Cannot differentiate {da.name!r}; missing dimension {dim!r}")
-
-    coord = np.asarray(coordinate_values, dtype=np.float64)
-    if coord.ndim != 1 or coord.size != da.sizes[dim]:
-        raise ValueError(
-            f"Derivative coordinate for {dim!r} must be one-dimensional with "
-            f"{da.sizes[dim]} values; got shape {coord.shape!r}"
-        )
-    if da.sizes[dim] <= edge_order:
-        raise ValueError(
-            f"Need more than edge_order={edge_order} points along {dim!r} to differentiate"
-        )
-
-    original_coord = da[dim]
-    if hasattr(da.data, "chunks"):
-        da = da.chunk({dim: -1})
-    out = da.assign_coords({dim: coord}).differentiate(dim, edge_order=edge_order)
-    out = out.assign_coords({dim: original_coord})
-    out.name = f"d{da.name}" if da.name else None
-    return out.transpose(*da.dims)
 
 
 def latitude_is_hemispherically_symmetric(latitude, rtol: float = 1e-7, atol: float = 1e-8) -> bool:
@@ -148,6 +137,8 @@ def require_matching_coord(ds: xr.Dataset, target: xr.DataArray, dim: str) -> xr
 
 def open_dataset(path: str | Path, **kwargs) -> xr.Dataset:
     """Open a dataset, falling back to raw time values if CF time decoding fails."""
+    # Later Dask rechunking must read slices, not retain whole monthly arrays.
+    kwargs.setdefault("cache", False)
     try:
         return xr.open_dataset(path, **kwargs)
     except ValueError as exc:
@@ -156,225 +147,111 @@ def open_dataset(path: str | Path, **kwargs) -> xr.Dataset:
         return xr.open_dataset(path, decode_times=False, **kwargs)
 
 
-def model_level_field(ds: xr.Dataset, name: str, z_coord: xr.DataArray) -> xr.DataArray:
-    if name not in ds:
-        raise ValueError(f"Missing required variable {name!r}")
-
-    da = finite_or_nan(ds[name])
-    lev_dim = vertical_dim(da)
-    if lev_dim == "nVertLevelsP1":
-        raise ValueError(f"{name!r} is on interface levels; expected model levels")
-    if da.sizes[lev_dim] != z_coord.size:
-        raise ValueError(
-            f"{name!r} has {da.sizes[lev_dim]} vertical levels, expected {z_coord.size}"
-        )
-
-    if lev_dim != "z":
-        da = da.rename({lev_dim: "z"})
-    da = da.assign_coords(z=z_coord)
-    return da.transpose(time_dim(da), "z", "latitude", "longitude")
-
-
-def zfull_from_latlon(ds: xr.Dataset) -> np.ndarray:
-    if "zgrid" not in ds:
-        raise ValueError("Missing required variable 'zgrid' for vertical interpolation of w")
-    zgrid = finite_or_nan(ds["zgrid"])
-    if "latitude" in zgrid.dims:
-        zgrid = zgrid.sel(latitude=0.0, method="nearest")
-    if "longitude" in zgrid.dims:
-        zgrid = zgrid.sel(longitude=0.0, method="nearest")
-    zgrid = zgrid.squeeze()
-    z_dim = vertical_dim(zgrid)
-    if zgrid.sizes[z_dim] < 4:
-        raise ValueError("Need at least four interface levels for cubic-spline w interpolation")
-    return np.asarray(zgrid.values, dtype=np.float64)
-
-
-def _natural_cubic_interp(values: np.ndarray, x_in: np.ndarray, x_out: np.ndarray) -> np.ndarray:
-    return CubicSpline(x_in, values, axis=-1, bc_type="natural", extrapolate=False)(x_out)
-
-
-def midlevel_vertical_velocity(ds: xr.Dataset, z_coord: xr.DataArray) -> xr.DataArray:
-    if "w" not in ds:
-        raise ValueError("Missing required variable 'w'")
-
-    w = finite_or_nan(ds["w"])
-    lev_dim = vertical_dim(w)
-    if w.sizes[lev_dim] == z_coord.size + 1:
-        z_full = zfull_from_latlon(ds)
-        if z_full.size != w.sizes[lev_dim]:
-            raise ValueError(
-                f"zgrid has {z_full.size} interface levels, but 'w' has {w.sizes[lev_dim]}"
-            )
-        if hasattr(w.data, "chunks"):
-            w = w.chunk({lev_dim: -1})
-        w = xr.apply_ufunc(
-            _natural_cubic_interp,
-            w,
-            xr.DataArray(z_full, dims=(lev_dim,)),
-            xr.DataArray(np.asarray(z_coord.values, dtype=np.float64), dims=("z",)),
-            input_core_dims=[[lev_dim], [lev_dim], ["z"]],
-            output_core_dims=[["z"]],
-            dask="parallelized",
-            output_dtypes=[np.float64],
-            dask_gufunc_kwargs={"output_sizes": {"z": z_coord.size}, "allow_rechunk": True},
-        )
-    elif w.sizes[lev_dim] != z_coord.size:
-        raise ValueError(f"'w' has {w.sizes[lev_dim]} levels, expected {z_coord.size} or {z_coord.size + 1}")
-
-    if lev_dim in w.dims and lev_dim != "z":
-        w = w.rename({lev_dim: "z"})
-    w = w.assign_coords(z=z_coord)
-    w.name = "w"
-    return w.transpose(time_dim(w), "z", "latitude", "longitude")
-
-
 def compute_tem_dataset(
     latlon_ds: xr.Dataset,
     zm_coords: dict[str, xr.DataArray],
-    hemispheric_fold_fields: bool = True,
+    hemispheric_fold_fields: bool = False,
 ) -> xr.Dataset:
-    """Compute the variables written by compute_tem_new.py on height levels."""
+    """Calculate mass-flux HPE(z) TEM before any presentation folding."""
     target_time_dim = "Time" if "Time" in zm_coords else "time"
     source_time_dim = time_dim(latlon_ds)
     if source_time_dim != target_time_dim:
         latlon_ds = latlon_ds.rename({source_time_dim: target_time_dim})
-
-    time = zm_coords[target_time_dim]
-    latitude = zm_coords["latitude"]
+    latlon_ds = latlon_ds.sel({target_time_dim: zm_coords[target_time_dim]})
+    latlon_ds = require_matching_coord(latlon_ds, zm_coords["latitude"], "latitude")
     z = zm_coords["z"]
+    fields = native_tem_fields(latlon_ds, z)
+    fields["rho_dry_zm"] = model_level_field(latlon_ds, "rho", z).mean("longitude", skipna=False)
+    return tem_from_prepared_fields(fields, hemispheric_fold_fields)
 
-    latlon_ds = latlon_ds.sel({target_time_dim: time})
-    latlon_ds = require_matching_coord(latlon_ds, latitude, "latitude")
 
-    u = model_level_field(latlon_ds, "uReconstructZonal", z)
-    v = model_level_field(latlon_ds, "uReconstructMeridional", z)
-    theta = model_level_field(latlon_ds, "theta", z)
-    rho = model_level_field(latlon_ds, "rho", z)
-    pressure = model_level_field(latlon_ds, "pressure", z)
-    w = midlevel_vertical_velocity(latlon_ds, z)
-
-    temperature = theta * (pressure / P0_PA) ** KAPPA
-    temperature.name = "t"
-
-    print("  Computing zonal means")
-    u_zm_raw = u.mean("longitude", skipna=True)
-    v_zm_raw = v.mean("longitude", skipna=True)
-    theta_zm_raw = theta.mean("longitude", skipna=True)
-    t_zm_raw = temperature.mean("longitude", skipna=True)
-    w_zm_raw = w.mean("longitude", skipna=True)
-    rho_zm_raw = rho.mean("longitude", skipna=True)
-
-    print("  Computing eddy fluxes")
-    upvp = ((u - u_zm_raw) * (v - v_zm_raw)).mean("longitude", skipna=True)
-    upwp = ((u - u_zm_raw) * (w - w_zm_raw)).mean("longitude", skipna=True)
-    vptp = ((temperature - t_zm_raw) * (v - v_zm_raw)).mean("longitude", skipna=True)
-    vpthp = ((theta - theta_zm_raw) * (v - v_zm_raw)).mean("longitude", skipna=True)
-
+def tem_from_prepared_fields(fields, hemispheric_fold_fields=False):
+    """Compute TEM eagerly from one prepared sample or a small reference dataset."""
+    out = compute_height_tem(*(fields[name] for name in PREPARED_FIELDS))
+    out["rho_dry_zm"] = fields.rho_dry_zm
+    out.rho_dry_zm.attrs.update(units="kg m-3", long_name="Zonal mean dry-air density",
+                               tem_version=TEM_VERSION, tem_formulation="geometric-height")
+    out.attrs["density_convention"] = fields.attrs["density_convention"]
     if hemispheric_fold_fields:
-        print("  Applying hemispheric paired averages")
-        u_zm = hemispheric_fold(u_zm_raw, parity="even")
-        v_zm = hemispheric_fold(v_zm_raw, parity="odd")
-        theta_zm = hemispheric_fold(theta_zm_raw, parity="even")
-        t_zm = hemispheric_fold(t_zm_raw, parity="even")
-        w_zm = hemispheric_fold(w_zm_raw, parity="even")
-        rho_zm = hemispheric_fold(rho_zm_raw, parity="even")
-        upvp = hemispheric_fold(upvp, parity="odd")
-        upwp = hemispheric_fold(upwp, parity="even")
-        vptp = hemispheric_fold(vptp, parity="odd")
-        vpthp = hemispheric_fold(vpthp, parity="odd")
-    else:
-        u_zm = u_zm_raw
-        v_zm = v_zm_raw
-        theta_zm = theta_zm_raw
-        t_zm = t_zm_raw
-        w_zm = w_zm_raw
-        rho_zm = rho_zm_raw
-
-    print("  Computing TEM derivatives and EP fluxes")
-    z_values = np.asarray(z.values, dtype=np.float64)
-    phi_values = np.deg2rad(np.asarray(latitude.values, dtype=np.float64))
-    phi = xr.DataArray(phi_values, dims=("latitude",), coords={"latitude": latitude})
-
-    u_dz = differentiate_wrt(u_zm, "z", z_values)
-    theta_dz = differentiate_wrt(theta_zm, "z", z_values)
-    u_dphi = differentiate_wrt(u_zm, "latitude", phi_values)
-
-    h_flux = vpthp / theta_dz
-    h_flux.name = "h_flux"
-
-    m_dy = 2.0 * OMEGA * np.sin(phi) - (u_dphi - np.tan(phi) * u_zm) / EARTH_RADIUS
-    m_eddy = u_dz * h_flux - upvp
-    v_eddy = m_dy * h_flux - upwp
-
-    cos_phi = np.cos(phi)
-    fy = rho_zm * EARTH_RADIUS * cos_phi * m_eddy
-    fz = rho_zm * EARTH_RADIUS * cos_phi * v_eddy
-
-    dfy = (
-        differentiate_wrt(m_eddy, "latitude", phi_values)
-        - 2.0 * np.tan(phi) * m_eddy
-    ) / EARTH_RADIUS
-    dfz = differentiate_wrt(v_eddy, "z", z_values)
-    epfd = dfy + dfz
-
-    vres = v_zm - differentiate_wrt(h_flux, "z", z_values)
-    wres = w_zm + (
-        differentiate_wrt(h_flux, "latitude", phi_values)
-        - np.tan(phi) * h_flux
-    ) / EARTH_RADIUS
-
-    out = xr.Dataset(
-        {
-            "t": t_zm,
-            "rho_zm": rho_zm,
-            "upvp": upvp,
-            "upwp": upwp,
-            "vptp": vptp,
-            "vpthp": vpthp,
-            "Fy": fy,
-            "Fz": fz,
-            "EPFd": epfd,
-            "EPFd_y": dfy,
-            "EPFd_z": dfz,
-            "vres": vres,
-            "wres": wres,
-        }
-    )
-
-    for name in out.data_vars:
-        out[name] = out[name].transpose(target_time_dim, "z", "latitude")
-
-    out["t"].attrs.update(long_name="Zonal mean temperature", units="K")
-    out["rho_zm"].attrs.update(
-        long_name="Zonal mean dry-air density",
-        units="kg m-3",
-    )
-    out["upvp"].attrs.update(long_name="Meridional momentum flux", units="m2 s-2")
-    out["upwp"].attrs.update(long_name="Vertical momentum flux", units="m2 s-2")
-    out["vptp"].attrs.update(long_name="Meridional temperature flux", units="K m s-1")
-    out["vpthp"].attrs.update(long_name="Meridional potential temperature flux", units="K m s-1")
-    out["Fy"].attrs.update(long_name="Meridional EP flux", units="kg s-2")
-    out["Fz"].attrs.update(long_name="Vertical EP flux", units="kg s-2")
-    out["EPFd"].attrs.update(long_name="Acceleration due to EP flux convergence", units="m s-2")
-    out["EPFd_y"].attrs.update(
-        long_name="Meridional component of acceleration due to EP flux convergence",
-        units="m s-2",
-    )
-    out["EPFd_z"].attrs.update(
-        long_name="Vertical component of acceleration due to EP flux convergence",
-        units="m s-2",
-    )
-    out["vres"].attrs.update(long_name="Meridional residual velocity", units="m s-1")
-    out["wres"].attrs.update(long_name="Vertical residual velocity", units="m s-1")
-
-    out.attrs.update(
-        description="Height-coordinate TEM diagnostics computed from latlon files",
-        reference_script=REFERENCE_SCRIPT,
-        hemispheric_fold="enabled" if hemispheric_fold_fields else "disabled",
-    )
+        odd = {"v_bar", "vres", "Fy", "uv", "vtheta", "upvp", "vpthp", "vptp", "absolute_vorticity"}
+        for name in out:
+            out[name] = hemispheric_fold(out[name], parity="odd" if name in odd else "even")
+        out.attrs["hemispheric_fold"] = "completed diagnostics"
+    out.attrs["legacy_reference_script"] = REFERENCE_SCRIPT
     return out
 
+
+def write_height_tem_companion(latlon_path, output_path, args, zm_coords):
+    """Read, calculate, and append each time sample once, then publish atomically."""
+    from netCDF4 import Dataset
+    from xarray.coding.times import encode_cf_datetime
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.tmp")
+    manifest = producer_manifest(latlon_path, args)
+    target_time = "Time" if "Time" in zm_coords else "time"
+    writer = None
+    try:
+        with open_native_dataset(latlon_path) as raw:
+            names = [*NATIVE_FIELDS, *[name for name in WATER_SPECIES if name in raw]]
+            source = standardize_latlon_dataset(raw, names)
+            if "zgrid" in raw:
+                source["zgrid"] = xr.DataArray(zfull_from_latlon(raw), dims="nVertLevelsP1")
+            if target_time != "Time":
+                source = source.rename(Time=target_time)
+            time_indices = source.get_index(target_time).get_indexer(zm_coords[target_time].values)
+            if not time_indices.size or np.any(time_indices < 0):
+                raise ValueError("Native TEM source lacks requested time samples")
+            if np.all(np.diff(time_indices) == 1):
+                source = source.isel({target_time: slice(int(time_indices[0]), int(time_indices[-1])+1)})
+            else:
+                source = source.isel({target_time: time_indices})
+            source = require_matching_coord(source, zm_coords["latitude"], "latitude")
+            if not source.sizes[target_time]:
+                raise ValueError("Native TEM source has no requested time samples")
+            print(f"  Sequential TEM calculation: {source.sizes[target_time]} samples; complete height columns", flush=True)
+            frames = iter(iter_native_frames(source, zm_coords["z"], scheduler=args.scheduler))
+            for index in range(source.sizes[target_time]):
+                started = perf_counter()
+                print(f"  Native read {index+1}/{source.sizes[target_time]}", flush=True)
+                fields = next(frames)
+                read_seconds = perf_counter()-started
+                calculation_start = perf_counter()
+                result = tem_from_prepared_fields(fields, getattr(args, "hemispheric_fold", False))
+                result.attrs["manifest_sha256"] = manifest["manifest_sha256"]
+                if writer is None:
+                    encoding = output_encoding(result, args.output_dtype)
+                    if np.issubdtype(result[target_time].dtype, np.datetime64):
+                        encoding[target_time] = {"dtype": "float64"}
+                    write_netcdf_atomic(result, temporary, encoding=encoding,
+                                        unlimited_dims=[target_time], materialize_first=False)
+                    writer = Dataset(temporary, "a")
+                else:
+                    for name, field in result.data_vars.items():
+                        variable = writer[name]
+                        key = tuple(slice(index, index+1) if dim == target_time else slice(None)
+                                    for dim in variable.dimensions)
+                        variable[key] = field.transpose(*variable.dimensions).values
+                    time_variable = writer[target_time]
+                    times = result[target_time].values
+                    if np.issubdtype(times.dtype, np.datetime64):
+                        times = encode_cf_datetime(times, time_variable.units,
+                                                   getattr(time_variable, "calendar", "standard"),
+                                                   dtype=np.float64)[0]
+                    time_variable[index:index+1] = times
+                del result, fields
+                print(f"  TEM sample {index+1}/{source.sizes[target_time]}: read {read_seconds:.1f} s; "
+                      f"calculate and store {perf_counter()-calculation_start:.1f} s", flush=True)
+        writer.close()
+        writer = None
+        os.replace(temporary, output_path)
+        write_json_file(str(output_path)+".metadata.json", manifest)
+    finally:
+        if writer is not None:
+            writer.close()
+        if temporary.exists():
+            temporary.unlink()
+    print(f"Stored native-height TEM: {output_path}", flush=True)
 
 def load_zm_coords(zm_path: str | Path) -> tuple[dict[str, xr.DataArray], set[str]]:
     with open_dataset(zm_path) as zds:
@@ -396,6 +273,7 @@ def chunks_for(ds: xr.Dataset, args: argparse.Namespace) -> dict[str, int]:
         "nVertLevels": -1,
         "nVertLevelsP1": -1,
         "z": -1,
+        "nIsoLevelsT": -1, "nIsoLevelsU": -1, "nIsoLevelsZ": -1,
     }
     return {dim: chunk for dim, chunk in requested.items() if dim in ds.dims and chunk is not None}
 
@@ -407,6 +285,8 @@ def output_encoding(ds: xr.Dataset, dtype: str | None) -> dict[str, dict[str, ob
         if dtype:
             enc["dtype"] = dtype
         encoding[name] = enc
+    if "valid_zonal_sample" in encoding:
+        encoding["valid_zonal_sample"] = {"dtype": "int8", "_FillValue": None}
     return encoding
 
 
@@ -443,6 +323,15 @@ def ensure_tem_variables(zm_path: Path, tem_ds: xr.Dataset, dtype: str, overwrit
     from netCDF4 import Dataset
 
     with Dataset(zm_path, "a") as nc:
+        # NetCDF cannot change an existing variable's type during append.
+        for name, da in tem_ds.data_vars.items():
+            if name not in nc.variables:
+                continue
+            var = nc.variables[name]
+            expected_dtype = np.dtype("int8" if name == "valid_zonal_sample" else dtype)
+            if np.dtype(var.dtype) != expected_dtype:
+                raise ValueError(f"Existing {name!r} uses {var.dtype}; requested {expected_dtype}. "
+                                 "Use --output-dir to write a corrected copy with the requested precision.")
         for name, da in tem_ds.data_vars.items():
             dims = tuple(da.dims)
             missing_dims = [dim for dim in dims if dim not in nc.dimensions]
@@ -456,7 +345,7 @@ def ensure_tem_variables(zm_path: Path, tem_ds: xr.Dataset, dtype: str, overwrit
                 if tuple(var.dimensions) != dims:
                     raise ValueError(f"Existing {name!r} has dimensions {var.dimensions}, expected {dims}")
             else:
-                var = nc.createVariable(name, dtype, dims)
+                var = nc.createVariable(name, "int8" if name == "valid_zonal_sample" else dtype, dims)
 
             for attr, value in da.attrs.items():
                 var.setncattr(attr, value)
@@ -493,7 +382,7 @@ def append_tem_to_zm_by_time_blocks(
         tem_block = compute_tem_dataset(
             latlon_ds,
             block_coords,
-            hemispheric_fold_fields=not args.no_hemispheric_fold,
+            hemispheric_fold_fields=getattr(args, "hemispheric_fold", False),
         )
         tem_block = variables_to_write(tem_block, existing, args.overwrite)
 
@@ -516,7 +405,15 @@ def append_tem_to_zm(
     zm_path = Path(zm_path)
     output_path = Path(output_path) if output_path is not None else zm_path
 
+    if getattr(args, "resume", False) and completed_tem_output(latlon_path, output_path, args):
+        print(f"Reusing completed native-height TEM: {output_path}", flush=True)
+        return
+
+    if output_path != zm_path and output_path.exists() and not (args.overwrite or args.dry_run):
+        raise FileExistsError(f"{output_path} already exists; rerun with --overwrite")
+
     print(f"Processing {latlon_path.name} -> {output_path}")
+    metadata_path = Path(str(output_path) + ".metadata.json")
     zm_coords, existing = load_zm_coords(zm_path)
 
     if args.dry_run:
@@ -525,7 +422,14 @@ def append_tem_to_zm(
             print(f"  Existing TEM variables: {', '.join(conflicts)}")
         return
 
-    latlon_ds = open_dataset(latlon_path, chunks={})
+    if output_path != zm_path:
+        write_height_tem_companion(latlon_path, output_path, args, zm_coords)
+        return
+
+    if metadata_path.exists():
+        metadata_path.unlink()
+
+    latlon_ds = open_dataset(latlon_path, chunks=None)
     try:
         latlon_ds = latlon_ds.chunk(chunks_for(latlon_ds, args))
         if output_path == zm_path:
@@ -535,9 +439,10 @@ def append_tem_to_zm(
                 tem_ds = compute_tem_dataset(
                     latlon_ds,
                     zm_coords,
-                    hemispheric_fold_fields=not args.no_hemispheric_fold,
+                    hemispheric_fold_fields=getattr(args, "hemispheric_fold", False),
                 )
                 tem_ds = variables_to_write(tem_ds, existing, args.overwrite)
+                ensure_tem_variables(zm_path, tem_ds, args.output_dtype, args.overwrite)
                 encoding = output_encoding(tem_ds, args.output_dtype)
                 # Do not rewrite coordinate variables or global attributes when appending.
                 to_write = tem_ds.drop_vars(
@@ -553,30 +458,91 @@ def append_tem_to_zm(
                     encoding=encoding,
                     compute=True,
                 )
-        else:
-            tem_ds = compute_tem_dataset(
-                latlon_ds,
-                zm_coords,
-                hemispheric_fold_fields=not args.no_hemispheric_fold,
-            )
-            tem_ds = variables_to_write(tem_ds, existing, args.overwrite)
-            encoding = output_encoding(tem_ds, args.output_dtype)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            if output_path.exists() and not args.overwrite:
-                raise FileExistsError(f"{output_path} already exists; rerun with --overwrite")
-            with open_dataset(zm_path, chunks={}) as zds:
-                merged = xr.merge([zds, tem_ds], compat="override")
-                to_netcdf_with_scheduler(
-                    merged,
-                    args.scheduler,
-                    output_path,
-                    mode="w",
-                    engine="netcdf4",
-                    encoding=encoding,
-                    compute=True,
-                )
     finally:
         latlon_ds.close()
+    write_json_file(metadata_path, producer_manifest(latlon_path, args))
+
+
+def producer_manifest(path, args):
+    return cache_manifest(
+        "compute_tem_latlon_to_zm", schema=TEM_VERSION,
+        configuration={"formulation": args.tem_formulation,
+                       "hemispheric_fold": getattr(args, "hemispheric_fold", False),
+                       "output_dtype": args.output_dtype,
+                       "start": getattr(args, "start", None), "end": getattr(args, "end", None)},
+        source_paths=[path],
+    )
+
+
+def completed_tem_output(source_path, output_path, args):
+    """Reuse only a complete archive with the current inputs and scientific settings."""
+    if not output_path.is_file():
+        return False
+    expected = producer_manifest(source_path, args)
+    try:
+        saved = read_json_file(str(output_path) + ".metadata.json")
+        if not cache_manifest_matches(saved, expected):
+            return False
+        with open_dataset(output_path, chunks=None) as stored:
+            required = set(PRESSURE_REQUIRED)
+            if args.tem_formulation == "geometric-height":
+                required.add("density_wind_covariance")
+            if not required.issubset(stored):
+                return False
+            if stored.attrs.get("manifest_sha256") != expected["manifest_sha256"]:
+                return False
+            return (
+                stored.EPFd.attrs.get("tem_version") == TEM_VERSION
+                and stored.EPFd.attrs.get("tem_formulation") == args.tem_formulation
+                and all(stored[name].dtype == np.dtype(args.output_dtype)
+                        for name in required if name != "valid_zonal_sample")
+            )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def write_pressure_tem(path, output_path, args):
+    if args.output_dtype != "float64":
+        raise ValueError("Pressure TEM requires --output-dtype float64 for decomposition closure")
+    if args.hemispheric_fold:
+        raise ValueError("Pressure TEM archives require unfolded hemispheres")
+    if getattr(args, "resume", False) and completed_tem_output(path, output_path, args):
+        print(f"Reusing completed pressure TEM: {output_path}", flush=True)
+        return
+    if output_path.exists() and not args.overwrite:
+        raise FileExistsError(f"{output_path} exists; use --overwrite")
+    print(f"Pressure TEM: {path} -> {output_path}", flush=True)
+    if args.dry_run:
+        return
+    metadata_path = Path(str(output_path) + ".metadata.json")
+    if metadata_path.exists():
+        metadata_path.unlink()
+    print("  Opening source NetCDF", flush=True)
+    with open_dataset(path, chunks=None) as raw:
+        print("  Preparing pressure coordinates and time selection", flush=True)
+        dataset = standardize_latlon_dataset(raw, ISOBARIC_FIELDS)
+        if args.start or args.end:
+            dataset = dataset.sel(Time=slice(args.start, args.end))
+        if dataset.sizes["Time"] == 0:
+            print("  No records in the requested period; skipping", flush=True)
+            return
+        dataset = dataset.chunk({"Time": args.time_chunk, "latitude": args.latitude_chunk,
+                                 "longitude": args.longitude_chunk, "pres": -1})
+        print(f"  Building TEM computation: {dataset.sizes['Time']} records, "
+              f"{dataset.sizes['pres']} levels, {dataset.sizes['latitude']} latitudes", flush=True)
+        result = compute_pressure_tem(dataset)
+        manifest = producer_manifest(path, args)
+        result.attrs["manifest_sha256"] = manifest["manifest_sha256"]
+        encoding = output_encoding(result, args.output_dtype)
+        encoding["valid_zonal_sample"] = {"dtype": "int8", "_FillValue": None}
+        print(f"  Computing pressure TEM (scheduler: {args.scheduler})", flush=True)
+        with ProgressBar(dt=10):
+            result = materialize(result, scheduler=args.scheduler, num_workers=1)
+        print("  Writing completed fields to NetCDF", flush=True)
+        write_netcdf_atomic(result, output_path, encoding=encoding, materialize_first=False,
+                            scheduler=args.scheduler, num_workers=1)
+    write_json_file(metadata_path, manifest)
+    print(f"Stored pressure TEM: {output_path}", flush=True)
 
 
 def infer_zm_path(latlon_path: str | Path, zm_pattern: str | None = None) -> Path | None:
@@ -614,26 +580,28 @@ def find_pairs(data_dir: str | Path, latlon_pattern: str, zm_pattern: str | None
     return pairs
 
 
-def output_path_for(zm_path: Path, data_dir: Path, output_dir: str | Path | None) -> Path | None:
-    if output_dir is None:
-        return None
-    output_dir = Path(output_dir)
+def output_path_for(zm_path: Path, data_dir: Path, output_dir: str | Path | None) -> Path:
+    output_dir = Path(output_dir) if output_dir is not None else data_dir
     try:
         rel = zm_path.relative_to(data_dir)
     except ValueError:
         rel = Path(zm_path.name)
+    if output_dir.absolute() == data_dir.absolute():
+        rel = rel.with_name("tem_geometric_height" + rel.name[len("zm_latlon"):])
     return output_dir / rel
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compute TEM diagnostics from MPAS latlon files and append the "
-            "resulting zonal-mean variables to matching zm_latlon files."
+            "Calculate and store native-height TEM from MPAS latlon histories."
         )
     )
-    parser.add_argument("data_dir", help="Directory containing paired latlon and zm_latlon files")
-    parser.add_argument("--latlon-pattern", default="latlon*.nc", help="Glob for source latlon files")
+    parser.add_argument("data_dir", help="Source latlon directory; native-height mode also requires matching zm_latlon files")
+    parser.add_argument(
+        "--latlon-pattern", default=LATLON_PATTERN,
+        help="Glob for source latlon files; default: dated production files. Select spin-up files explicitly.",
+    )
     parser.add_argument(
         "--zm-pattern",
         default=None,
@@ -642,18 +610,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Write augmented zm files to this directory instead of appending in place",
+        help="Write TEM files to this directory; default: the source simulation directory",
     )
     parser.add_argument("--overwrite", action="store_true", help="Allow replacement of existing TEM variables/output files")
+    parser.add_argument("--resume", action="store_true", help="Reuse completed output with matching source provenance and scientific settings")
     parser.add_argument("--dry-run", action="store_true", help="List matched files without computing")
     parser.add_argument(
         "--no-hemispheric-fold",
         action="store_true",
-        help="Keep raw hemispheres instead of applying parity-aware paired-hemisphere averages",
+        help="Store unfolded hemispheres (the default).",
     )
-    parser.add_argument("--time-chunk", type=int, default=1, help="Dask chunk length for Time")
-    parser.add_argument("--latitude-chunk", type=int, default=30, help="Dask chunk length for latitude")
-    parser.add_argument("--longitude-chunk", type=int, default=180, help="Dask chunk length for longitude")
+    parser.add_argument("--hemispheric-fold", action="store_true", help="Fold completed diagnostics; analysis owners require unfolded archives.")
+    parser.add_argument("--tem-formulation", choices=("log-pressure", "geometric-height"), default=TEM_FORMULATION,
+                        help="Use geometric-height for current analyses; log-pressure serves legacy archive work")
+    parser.add_argument("--start", help="First time for log-pressure output")
+    parser.add_argument("--end", help="Last time for log-pressure output")
+    parser.add_argument("--time-chunk", type=int, default=1, help="Legacy pressure/in-place Dask chunk length for Time")
+    parser.add_argument("--latitude-chunk", type=int, default=30, help="Legacy pressure/in-place Dask chunk length for latitude")
+    parser.add_argument("--longitude-chunk", type=int, default=180, help="Legacy pressure/in-place Dask chunk length for longitude")
     parser.add_argument(
         "--time-block-size",
         type=int,
@@ -674,17 +648,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dtype",
         choices=("float32", "float64"),
-        default="float32",
-        help="NetCDF dtype for appended TEM variables; calculations remain xarray/dask expressions",
+        default="float64",
+        help="NetCDF dtype for TEM variables; float64 preserves decomposition closure",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.hemispheric_fold and args.no_hemispheric_fold:
+        raise ValueError("Choose only one hemispheric-fold option")
     if args.full_file_write:
         args.time_block_size = None
     data_dir = Path(args.data_dir)
+    print(f"Scanning source directory: {data_dir}", flush=True)
+    if args.tem_formulation == "log-pressure":
+        output_dir = Path(args.output_dir) if args.output_dir is not None else data_dir
+        paths = sorted(data_dir.glob(args.latlon_pattern))
+        if not paths:
+            raise FileNotFoundError(f"No files match {args.latlon_pattern} in {data_dir}")
+        print(f"Found {len(paths)} pressure-source file(s)", flush=True)
+        for path in paths:
+            name = "tem_log_pressure" + path.name[len("latlon"):]
+            write_pressure_tem(path, output_dir / name, args)
+        return
     pairs = find_pairs(data_dir, args.latlon_pattern, args.zm_pattern)
     print(f"Found {len(pairs)} latlon/zm pair(s)")
     for latlon_path, zm_path in pairs:

@@ -13,6 +13,13 @@ import scipy.interpolate as intp
 import xarray as xr
 
 from diagnostics.ttl import TTL_HEIGHT_BOUNDS_M
+from diagnostics.archive_coordinates import (
+    ISOBARIC_DIM_LEVEL_VAR,
+    lat_mean,
+    pressure_values_from_dataset,
+    standardize_cldfrac_vertical_coordinate,
+    standardize_latlon_dataset,
+)
 from diagnostics.analysis_config import (
     ANALYSIS_END,
     ANALYSIS_START,
@@ -121,62 +128,6 @@ def figure_release_directory(target_dir, version):
     return os.path.join(target_dir, version)
 
 
-ISOBARIC_DIM_LEVEL_VAR = {
-    "nIsoLevelsT": "t_iso_levels",
-    "nIsoLevelsU": "u_iso_levels",
-    "nIsoLevelsZ": "z_iso_levels",
-}
-
-
-def standardize_cldfrac_vertical_coordinate(ds):
-    """Give cldfrac a representative geometric-height ``z`` coordinate."""
-    if "cldfrac" not in ds.data_vars:
-        return ds
-
-    cldfrac = ds["cldfrac"]
-    if "nVertLevels" in cldfrac.dims:
-        cldfrac = cldfrac.rename({"nVertLevels": "z"})
-    elif "nVertLevelsP1" in cldfrac.dims:
-        raise ValueError("cldfrac appears to be on interface levels, not mid-levels")
-    elif "z" not in cldfrac.dims:
-        raise ValueError(f"Could not find vertical dimension in cldfrac dims {cldfrac.dims}")
-
-    if "zgrid" not in ds.data_vars:
-        if "z" in cldfrac.coords:
-            return ds.assign(cldfrac=cldfrac)
-        raise ValueError(
-            "Cannot assign geometric z coordinate to cldfrac: zgrid is missing"
-        )
-
-    zgrid_mean = ds.zgrid
-    for dimension in ("Time", "longitude"):
-        if dimension in zgrid_mean.dims:
-            zgrid_mean = zgrid_mean.mean(dimension, skipna=True)
-    if "latitude" in zgrid_mean.dims:
-        zgrid_mean = lat_mean(zgrid_mean)
-    remaining = [
-        dimension
-        for dimension in zgrid_mean.dims
-        if dimension != "nVertLevelsP1"
-    ]
-    if remaining:
-        zgrid_mean = zgrid_mean.mean(remaining, skipna=True)
-    zmid = 0.5 * (
-        zgrid_mean.isel(nVertLevelsP1=slice(0, -1)).values
-        + zgrid_mean.isel(nVertLevelsP1=slice(1, None)).values
-    )
-    if cldfrac.sizes["z"] != zmid.size:
-        raise ValueError(
-            f"cldfrac has {cldfrac.sizes['z']} vertical levels, "
-            f"but zgrid implies {zmid.size} mid-levels"
-        )
-    cldfrac = cldfrac.assign_coords(z=("z", zmid))
-    cldfrac["z"].attrs["units"] = "m"
-    cldfrac["z"].attrs["long_name"] = (
-        "time-horizontal-mean geometric height of layer midpoints"
-    )
-    return ds.assign(cldfrac=cldfrac)
-
 
 def load_latlon_dataset(
     data_dir,
@@ -185,19 +136,52 @@ def load_latlon_dataset(
     direct_chunks=False,
     start=ANALYSIS_START,
     end=ANALYSIS_END,
+    chunk_after_open=False,
+    source_paths=None,
 ):
-    latlon_files = sorted(glob.glob(os.path.join(data_dir, latlon_pattern)))
+    """Load complete six-hourly histories with optional lazy per-file rechunking.
+
+    ``chunk_after_open`` keeps backend slicing lazy when computation chunks
+    split stored chunks. Apply chunks before combining files to bound reads.
+    ``source_paths`` supplies the exact files selected by an archive reader.
+    """
+    latlon_files = (
+        sorted(glob.glob(os.path.join(data_dir, latlon_pattern)))
+        if source_paths is None else list(source_paths)
+    )
     if not latlon_files:
         raise FileNotFoundError(f"No files match {latlon_pattern!r} in {data_dir}")
     print(data_dir, latlon_pattern)
-    ds = xr.open_mfdataset(
-        latlon_files,
-        combine="by_coords",
-        chunks=chunks if direct_chunks else {},
-        data_vars="minimal",
-        coords="minimal",
-        compat="override",
-    )
+    if chunk_after_open:
+        sources = []
+
+        def close_sources():
+            for source in sources:
+                source.close()
+
+        try:
+            for path in latlon_files:
+                sources.append(xr.open_dataset(path, chunks=None))
+            ds = xr.combine_by_coords(
+                [source.chunk(chunks) for source in sources],
+                data_vars="minimal",
+                coords="minimal",
+                compat="override",
+                combine_attrs="override",
+            )
+        except Exception:
+            close_sources()
+            raise
+        ds.set_close(close_sources)
+    else:
+        ds = xr.open_mfdataset(
+            latlon_files,
+            combine="by_coords",
+            chunks=chunks if direct_chunks else {},
+            data_vars="minimal",
+            coords="minimal",
+            compat="override",
+        )
     if not np.issubdtype(ds.Time.dtype, np.datetime64):
         raise TypeError(f"Expected decoded datetime Time coordinate, got {ds.Time.dtype}")
     expected_time = pd.date_range(
@@ -208,7 +192,7 @@ def load_latlon_dataset(
     ds = ds.sel(Time=expected_time)
     if not ds.Time.to_index().equals(expected_time):
         raise ValueError("Input does not have the expected complete 6-hourly Time axis")
-    return ds if direct_chunks else ds.chunk(chunks)
+    return ds if direct_chunks or chunk_after_open else ds.chunk(chunks)
 
 
 def get_time_values(ds):
@@ -571,70 +555,6 @@ def N2_latheight(zds, g=9.80665):
     return hemispheric_fold(n2, parity="even")
 
 
-def pressure_values_from_dataset(ds):
-    """Return the fixed 22-level pressure coordinate, checking exact agreement."""
-    if "pres" in ds.dims:
-        return np.asarray(ds.pres.values, dtype=float)
-
-    axes = []
-    for dim, level_var in ISOBARIC_DIM_LEVEL_VAR.items():
-        if dim in ds.dims:
-            values = np.asarray(ds[level_var].values, dtype=float)
-            if values.shape != (ds.sizes[dim],):
-                raise ValueError(f"{level_var} must be one-dimensional on {dim}")
-            axes.append(values)
-
-    if not axes:
-        return None
-
-    if any(not np.array_equal(axes[0], values) for values in axes[1:]):
-        raise ValueError("In-file isobaric pressure axes disagree")
-    return axes[0]
-
-
-def standardize_latlon_dataset(ds, needed_vars=None):
-    if needed_vars is not None:
-        missing = [name for name in needed_vars if name not in ds.data_vars]
-        if missing:
-            raise KeyError(f"Required variables are missing: {missing}")
-        source = ds
-        selected = ds[list(needed_vars)]
-        level_vars = [
-            level_var
-            for dim, level_var in ISOBARIC_DIM_LEVEL_VAR.items()
-            if dim in selected.dims and level_var not in needed_vars
-        ]
-        ds = source[list(needed_vars) + level_vars]
-    file_pres_values = pressure_values_from_dataset(ds)
-    rename_map = {}
-    for dim in ISOBARIC_DIM_LEVEL_VAR:
-        if dim in ds.dims:
-            rename_map[dim] = "pres"
-    if rename_map:
-        ds = ds.rename(rename_map)
-    if "pres" in ds.dims:
-        if file_pres_values is None:
-            raise ValueError("Dataset has isobaric dimensions but no trustworthy in-file pressure axis")
-        if ds.sizes["pres"] != len(file_pres_values):
-            raise ValueError(f"Unexpected pressure axis length: {ds.sizes['pres']} (expected {len(file_pres_values)})")
-        ds = ds.assign_coords(pres=("pres", file_pres_values))
-        ds["pres"].attrs.update(units="hPa", positive="down", axis="Z")
-    if "rh_isobaric" in ds.data_vars:
-        relative_humidity = ds.rh_isobaric.copy(deep=False)
-        archived_units = relative_humidity.attrs.get("units")
-        if archived_units and archived_units not in {"%", "percent"}:
-            relative_humidity.attrs["archived_units"] = archived_units
-        relative_humidity.attrs["units"] = "%"
-        relative_humidity.attrs["quantity"] = "relative humidity"
-        ds = ds.assign(rh_isobaric=relative_humidity)
-    return standardize_cldfrac_vertical_coordinate(ds)
-
-
-def lat_mean(da, lat_dim="latitude"):
-    return da.weighted(np.cos(np.deg2rad(da[lat_dim]))).mean(
-        dim=lat_dim, skipna=True
-    )
-
 
 def cosine_weighted_latitude_coarsen(
     da,
@@ -842,10 +762,27 @@ def symmetric_colorbar_ticks(levels, nticks=5):
     return ticks if ticks.size >= 3 else np.array([-max_abs, 0.0, max_abs])
 
 
-def add_symmetric_colorbar(fig, mappable, ax, levels, label, location="right", nticks=5, **kwargs):
-    ticks = symmetric_colorbar_ticks(levels, nticks=nticks)
+def add_symmetric_colorbar(
+    fig, mappable, ax, levels, label, location="right", nticks=5,
+    ticks_at_boundaries=False, **kwargs,
+):
+    if ticks_at_boundaries:
+        boundaries = np.asarray(levels, dtype=float)
+        count = min(max(int(nticks) + 1, 2), boundaries.size)
+        # An even number of boundaries has no central boundary at zero.
+        # Keep paired labels rather than labelling one side of the central box.
+        if boundaries.size % 2 == 0 and count % 2 == 1:
+            count -= 1
+        indices = np.rint(np.linspace(0, boundaries.size - 1, count)).astype(int)
+        ticks = boundaries[indices]
+    else:
+        ticks = symmetric_colorbar_ticks(levels, nticks=nticks)
     cbar = fig.colorbar(mappable, ax=ax, location=location, label=label, ticks=ticks, **kwargs)
-    cbar.set_ticklabels([format_colorbar_tick(tick) for tick in ticks])
+    cbar.set_ticks(ticks, labels=[format_colorbar_tick(tick) for tick in ticks])
+    # BoundaryNorm adds unlabelled minor ticks at every colour boundary.
+    # Keep only the labelled reference ticks to make their positions unambiguous.
+    cbar.minorticks_off()
+    cbar.ax.tick_params(which="major", length=3.0, width=0.6)
     return cbar
 
 
@@ -914,13 +851,15 @@ def high_cloud_class_legend_handles():
     ]
 
 
-def difference_cmap(levels, cmap="bwr"):
+def difference_cmap(levels, cmap="bwr", white_zero_boundary=False):
     """Discrete diverging colormap with the zero-containing interval in white."""
     levels = np.asarray(levels, dtype=float)
     base = plt.get_cmap(cmap)
     n_intervals = len(levels) - 1
     rgba = base(np.linspace(0.0, 1.0, n_intervals))
     centre = np.flatnonzero((levels[:-1] < 0.0) & (levels[1:] > 0.0))
+    if white_zero_boundary:
+        centre = np.flatnonzero((levels[:-1] <= 0.0) & (levels[1:] >= 0.0))
     if centre.size:
         rgba[centre] = (1.0, 1.0, 1.0, 1.0)
     out = colors.ListedColormap(rgba, name=f"{base.name}_white_zero")

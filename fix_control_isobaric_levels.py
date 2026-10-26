@@ -1454,6 +1454,7 @@ def detect_latlon_pressure_levels(path, args):
             stated_levels=stated_latlon_levels(lat_src),
             sample_label=sample,
         )
+        return candidates, var_scores
 
 
 def detect_zm_pressure_levels(latlon_path, zm_path, args):
