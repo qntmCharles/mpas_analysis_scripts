@@ -62,7 +62,9 @@ from diagnostics.analysis_config import (
     SIMULATION_ROOT,
     canonical_simulation_name,
     profile_cache_directory,
+    simulation_cache_label,
 )
+from diagnostics.cache_support import relabel_cached_simulations
 from diagnostics.uncertainty import independent_bootstrap_difference
 
 
@@ -261,7 +263,7 @@ def jet_cache_manifest(
     )
     configuration = {
         "family": family,
-        "simulations": [names[index] for index in indices],
+        "simulations": [simulation_cache_label(names[index]) for index in indices],
         "fixed_pressure_level_hpa": fixed_pressure_level,
         "time_average_days": time_average_days,
         "max_autocorr_lag_days": max_autocorr_lag_days,
@@ -381,6 +383,7 @@ def migrate_jet_simulation_cache(family, target_index):
             target = os.path.join(target_root, filename)
             if filename.endswith(".nc"):
                 with xr.open_dataset(source) as cached:
+                    cached = relabel_cached_simulations(cached)
                     if "simulation" in cached.dims:
                         selected = cached.sel(simulation=[target_label]).load()
                     elif "mode_member" in cached.dims and "simulation" in cached.coords:
@@ -392,7 +395,7 @@ def migrate_jet_simulation_cache(family, target_index):
                         selected = cached.load()
                 write_netcdf_atomic(selected, target)
             else:
-                table = pd.read_csv(source)
+                table = relabel_cached_simulations(pd.read_csv(source))
                 if "simulation" in table:
                     table = table[table.simulation == target_label]
                 write_csv_atomic(table, target, index=False)
@@ -825,14 +828,14 @@ if "fixed" in requested_families:
                 f"u{pressure_name(fixed_pressure_level)}_zonal_mean_timeseries.nc",
             )
         ) as cached:
-            fixed_cache = cached.load()
+            fixed_cache = relabel_cached_simulations(cached.load())
         with xr.open_dataset(
             os.path.join(
                 simulation_root,
                 f"u{pressure_name(fixed_pressure_level)}_zonal_mean_autocorrelation.nc",
             )
         ) as cached:
-            autocorr_cache = cached.load()
+            autocorr_cache = relabel_cached_simulations(cached.load())
         fixed_level[i] = fixed_cache.u_zonal_mean.sel(
             simulation=simulation,
             drop=True,
@@ -856,7 +859,7 @@ if "fixed" in requested_families:
                     simulation_root,
                     f"u{pressure_name(fixed_pressure_level)}_persistence_summary.csv",
                 )
-            ).to_dict("records")
+            ).pipe(relabel_cached_simulations).to_dict("records")
         )
         jet_summary_rows.extend(
             pd.read_csv(
@@ -864,7 +867,7 @@ if "fixed" in requested_families:
                     simulation_root,
                     f"u{pressure_name(fixed_pressure_level)}_jet_latitude_summary.csv",
                 )
-            ).to_dict("records")
+            ).pipe(relabel_cached_simulations).to_dict("records")
         )
         progress(f"Using current fixed-level jet cache for {simulation}")
 
@@ -1165,14 +1168,14 @@ if "annular" in requested_families:
         with xr.open_dataset(
             os.path.join(simulation_root, "annular_mode_eof_patterns.nc")
         ) as cached:
-            pattern_cache = cached.load()
+            pattern_cache = relabel_cached_simulations(cached.load())
         with xr.open_dataset(
             os.path.join(
                 simulation_root,
                 "annular_mode_indices_autocorrelation.nc",
             )
         ) as cached:
-            index_cache = cached.load()
+            index_cache = relabel_cached_simulations(cached.load())
         for position, member in enumerate(pattern_cache.mode_member.values):
             pattern_member = pattern_cache.sel(mode_member=member)
             hemisphere = str(pattern_member.hemisphere.item())
@@ -1198,12 +1201,12 @@ if "annular" in requested_families:
         annular_summary_rows.extend(
             pd.read_csv(
                 os.path.join(simulation_root, "annular_mode_summary.csv")
-            ).to_dict("records")
+            ).pipe(relabel_cached_simulations).to_dict("records")
         )
         annular_index_rows.extend(
             pd.read_csv(
                 os.path.join(simulation_root, "annular_mode_zonal_indices.csv")
-            ).to_dict("records")
+            ).pipe(relabel_cached_simulations).to_dict("records")
         )
         progress(f"Using current annular-mode jet cache for {simulation}")
 

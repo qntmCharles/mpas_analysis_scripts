@@ -66,9 +66,12 @@ from diagnostics.diagnostic_helpers import (
     write_netcdf_atomic,
 )
 from diagnostics.analysis_config import (
+    canonical_simulation_name,
     SIMULATION_ARCHIVES,
     SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
     SIMULATION_ROOT,
+    simulation_cache_name,
+    simulation_cache_label,
 )
 
 
@@ -1065,13 +1068,13 @@ def derive_products(ds, simulation):
 
 def cache_path(simulation, test=False):
     suffix = "_test" if test else ""
-    safe = simulation.replace(" ", "_")
+    safe = simulation_cache_name(simulation)
     return os.path.join(CACHE_ROOT, f"{safe}{suffix}_mean_products.nc")
 
 
 def state_cache_path(simulation, test=False):
     suffix = "_test" if test else ""
-    safe = simulation.replace(" ", "_")
+    safe = simulation_cache_name(simulation)
     return os.path.join(CACHE_ROOT, f"{safe}{suffix}_native_mean_state.nc")
 
 
@@ -1125,7 +1128,8 @@ def simulation_cache_manifest(data_loc, simulation, test=False, test_times=5):
         "vapour_transport_budget.simulation_products",
         schema=f"{SCHEMA_VERSION}.{EXECUTION_LAYOUT_VERSION}",
         configuration={
-            "simulation": simulation,
+            # Retain the historical manifest identity when plot labels change.
+            "simulation": simulation_cache_label(simulation),
             "data_loc": data_loc,
             "analysis_start": ANALYSIS_START,
             "analysis_end": ANALYSIS_END,
@@ -1147,7 +1151,11 @@ def cache_is_current(
         with xr.open_dataset(path) as cached:
             return (
                 int(cached.attrs.get("schema_version", -1)) == SCHEMA_VERSION
-                and cached.attrs.get("simulation") == simulation
+                and (
+                    cached.attrs.get("simulation") == simulation
+                    or canonical_simulation_name(cached.attrs.get("simulation"))
+                    == canonical_simulation_name(simulation)
+                )
                 and cached.attrs.get("analysis_start") == ANALYSIS_START
                 and cached.attrs.get("analysis_end") == ANALYSIS_END
                 and cached.attrs.get("cache_kind") == cache_kind
@@ -1157,7 +1165,7 @@ def cache_is_current(
                     == expected_manifest_sha256
                 )
             )
-    except (OSError, ValueError):
+    except (OSError, ValueError, KeyError):
         return False
 
 
@@ -1925,7 +1933,11 @@ def build_simulation_caches_on_disk(
         product_path if need_products else state_path
     )
     os.makedirs(working_root, exist_ok=True)
-    safe_simulation = simulation.replace(" ", "_")
+    try:
+        safe_simulation = simulation_cache_name(simulation)
+    except KeyError:
+        # Synthetic datasets also use this bounded disk-backed calculation.
+        safe_simulation = simulation.replace(" ", "_")
     product_parts = []
     state_parts = []
     number_of_batches = (

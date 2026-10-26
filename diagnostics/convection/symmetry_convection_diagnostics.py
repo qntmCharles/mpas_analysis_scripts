@@ -17,6 +17,7 @@ from scipy.ndimage import uniform_filter1d
 import xarray as xr
 import dask
 from tropopause import tropopause_profile
+from diagnostics.analysis_config import ALL_SIMULATION_LABELS, simulation_cache_name
 from diagnostics.diagnostic_helpers import (
     FigureSaver, LATLON_PATTERN, N2_latheight, ZONAL_MEAN_PATTERN,
     add_symmetric_colorbar, annotate_panel_label, control_diff_label,
@@ -82,14 +83,15 @@ dask.config.set({'array.slicing.split_large_chunks': True})
 
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
 data_locs = ['control_new', 'u_nudge', 'T_nudge']
-sim_names = ['control', 'nudged u', 'nudged T']
+simulation_ids = ('control', 'nudged-u', 'nudged-T')
+sim_names = [ALL_SIMULATION_LABELS[name] for name in simulation_ids]
 
 CF_THRESH = 0.05
 P_HIGH_HPA = 440.0
 P_PRECIP_MIN = 12.0  # 0.5 mm h-1 PF threshold (Feng et al. 2021)
 classification_cache_dir = diagnostic_cache_dir("classification")
 
-cols = [simulation_colour(name) for name in sim_names]
+cols = [simulation_colour(name) for name in simulation_ids]
 
 
 
@@ -269,7 +271,7 @@ def shared_high_cloud_classification(ds):
 
     path = os.path.join(
         classification_cache_dir,
-        f"{sim_names[index].replace(' ', '_')}_classified_high_cloud.nc",
+        f"{simulation_cache_name(simulation_ids[index])}_classified_high_cloud.nc",
     )
     if not os.path.exists(path):
         raise FileNotFoundError(

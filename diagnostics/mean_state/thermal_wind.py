@@ -89,7 +89,9 @@ from diagnostics.analysis_config import (
     SIMULATION_PUBLICATION_LABELS,
     SIMULATION_ROOT,
     profile_cache_directory,
+    simulation_cache_label,
 )
+from diagnostics.cache_support import relabel_cached_simulations
 from diagnostics.uncertainty import independent_bootstrap_difference
 
 
@@ -495,7 +497,7 @@ def thermal_wind_manifest(
         "analysis_start": ANALYSIS_START,
         "analysis_end": ANALYSIS_END,
         "simulations": [
-            simulation[:2]
+            (simulation_cache_label(simulation[0], publication=True), simulation[1])
             for simulation in simulations
             if directory is None or simulation[1] == directory
         ],
@@ -689,14 +691,14 @@ def migrate_realised_simulation_cache(
             compare_sources=validate_sources,
         ):
             continue
-        table = pd.read_csv(table_path)
+        table = relabel_cached_simulations(pd.read_csv(table_path))
         table = table[table.simulation == label].copy()
         if table.empty:
             continue
         blocks = (
             pd.DataFrame()
             if skip_uncertainty
-            else pd.read_csv(blocks_path)
+            else relabel_cached_simulations(pd.read_csv(blocks_path))
         )
         if not blocks.empty:
             blocks = blocks[blocks.simulation == label].copy()
@@ -760,9 +762,9 @@ def prepare_realised_state_summary(
             )
         if current:
             progress(f"{label}: using realised-state simulation cache")
-            simulation_tables.append(pd.read_csv(sim_table_path))
+            simulation_tables.append(relabel_cached_simulations(pd.read_csv(sim_table_path)))
             if not skip_uncertainty:
-                simulation_blocks.append(pd.read_csv(sim_blocks_path))
+                simulation_blocks.append(relabel_cached_simulations(pd.read_csv(sim_blocks_path)))
             continue
         if figures_only:
             raise FileNotFoundError(
@@ -1596,7 +1598,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             _blocks_path, uncertainty_path = realised_block_cache_paths()
             try:
-                uncertainty = pd.read_csv(uncertainty_path)
+                uncertainty = relabel_cached_simulations(pd.read_csv(uncertainty_path))
             except pd.errors.EmptyDataError:
                 uncertainty = pd.DataFrame()
             uncertainty.to_csv(

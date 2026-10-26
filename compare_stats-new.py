@@ -19,6 +19,7 @@ import xarray as xr
 from wavenumber_frequency_functions import *
 from matplotlib import colors
 from tropopause import *
+from diagnostics.analysis_config import ALL_SIMULATION_LABELS, simulation_colour
 from diagnostics.diagnostic_helpers import (
     FigureSaver,
     all_figures_requested,
@@ -64,9 +65,10 @@ def run_all_figures():
 root_dir = '/store/atmos-adk33/cwp29/mpas-a/data/trop_ref/crf_on/'
 data_locs = ['control_new', 'u_nudge', 'T_nudge']
 latlon_file = ['latlon.2000-*.nc', 'latlon.2000-*.nc', 'latlon.2000-*.nc']
-sim_names = ['control', 'nudged u', 'nudged T']
+simulation_ids = ('control', 'nudged-u', 'nudged-T')
+sim_names = [ALL_SIMULATION_LABELS[name] for name in simulation_ids]
 
-cols = ['k', 'b', 'r']
+cols = [simulation_colour(name) for name in simulation_ids]
 
 # Use ndays of data ending at a fixed analysis date
 ndays = 200
@@ -776,7 +778,7 @@ fig, ax = plt.subplots(len(dss), 2, figsize=(10, 3.5*len(dss)), constrained_layo
 if len(dss) == 1:
     ax = [ax]
 
-cols = ['b', 'r']
+cols = [simulation_colour(name) for name in simulation_ids]
 bins = np.linspace(100, 350, 80)
 
 for i, ds in enumerate(dss):

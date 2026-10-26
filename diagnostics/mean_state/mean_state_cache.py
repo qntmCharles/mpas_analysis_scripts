@@ -44,7 +44,9 @@ from diagnostics.analysis_config import (
     SIMULATION_PROFILES,
     canonical_simulation_name,
     profile_cache_directory,
+    simulation_cache_label,
 )
+from diagnostics.cache_support import relabel_cached_simulations
 from wavenumber_frequency_functions import smooth_wavefreq, spacetime_power
 
 
@@ -144,7 +146,7 @@ def family_manifest(
 ):
     configuration = {
         "family": family,
-        "simulations": list(sim_names),
+        "simulations": [simulation_cache_label(name) for name in sim_names],
     }
     test_time_count = _family_time_count(family)
     if test_time_count is not None:
@@ -327,7 +329,7 @@ def _load_simulation_family(sim_name, family):
     loaded = []
     for filename in FAMILY_FILES[family]:
         with xr.open_dataset(_simulation_cache_path(sim_name, filename)) as cached:
-            loaded.append(cached.load())
+            loaded.append(relabel_cached_simulations(cached.load()))
     return loaded[0] if len(loaded) == 1 else tuple(loaded)
 
 
@@ -735,6 +737,7 @@ def _migrate_simulation_family_from_aggregate(
         products = []
         for filename in FAMILY_FILES[family]:
             with xr.open_dataset(os.path.join(aggregate_root, filename)) as cached:
+                cached = relabel_cached_simulations(cached)
                 if "simulation" not in cached.dims:
                     products.append(cached.load())
                 else:

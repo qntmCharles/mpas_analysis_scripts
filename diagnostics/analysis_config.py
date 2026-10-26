@@ -57,21 +57,16 @@ CACHE_DIRECTORIES = {
 }
 ALL_SIMULATION_LABELS = {
     "control": "control",
-    "nudged-u": "nudged u",
-    "nudged-T": "nudged T",
-    "nudged-T-from-u": "nudged T from u",
+    "nudged-u": "U",
+    "nudged-T": "T (old)",
+    "nudged-T-from-u": "T",
 }
-ALL_SIMULATION_PUBLICATION_LABELS = {
-    "control": "control",
-    "nudged-u": r"$u$-nudged",
-    "nudged-T": r"$T$-nudged",
-    "nudged-T-from-u": r"$T$-nudged from $u$",
-}
+ALL_SIMULATION_PUBLICATION_LABELS = dict(ALL_SIMULATION_LABELS)
 ALL_SIMULATION_COLOURS = {
     "control": "#222222",
     "nudged-u": "#1f77b4",
-    "nudged-T": "#d62728",
-    "nudged-T-from-u": "#9467bd",
+    "nudged-T": "#9467bd",
+    "nudged-T-from-u": "#d62728",
 }
 SIMULATION_ALIASES = {
     "control": "control",
@@ -84,6 +79,13 @@ SIMULATION_ALIASES = {
     "nudged-t-from-u": "nudged-T-from-u",
     "t-nudged-from-u": "nudged-T-from-u",
     "nudged t from u": "nudged-T-from-u",
+    # Historical display names retain their original archive identities.
+    r"$u$-nudged": "nudged-u",
+    r"$t$-nudged": "nudged-T",
+    r"$t$-nudged from $u$": "nudged-T-from-u",
+    "t-nudged (old)": "nudged-T",
+    "t-nudged from u": "nudged-T-from-u",
+    "t from u": "nudged-T-from-u",
 }
 SIMULATION_ALIASES.update(
     {
@@ -131,6 +133,18 @@ ANALYSIS_START = "2000-05-05 06:00:00"
 ANALYSIS_END = "2000-11-21 00:00:00"
 LATLON_PATTERN = "latlon.2000-*.nc"
 ZONAL_MEAN_PATTERN = "zm_latlon.2000-*.nc"
+
+# Spin-up uses the same simulation root, archive mapping, and selected profile.
+# Numeric spin-up Time counts six-hour samples from SPINUP_FIRST_TIME.
+SPINUP_START = "2000-04-25 00:00:00"
+SPINUP_END = "2000-05-05 00:00:00"
+SPINUP_FIRST_TIME = "2000-04-25 06:00:00"
+# An empty subdirectory keeps spin-up products in each simulation's main folder.
+SPINUP_SUBDIRECTORY = ""
+SPINUP_LATLON_FILENAME = "latlon_spinup.nc"
+SPINUP_TEM_FILENAME = "tem_geometric_height_spinup.nc"
+# T from U uses the same prescribed spin-up timescale history as nudged U.
+SPINUP_NUDGING_TIMESCALE_SOURCES = {"nudged-T-from-u": "nudged-u"}
 
 DEFAULT_FIGURE_ROOT = Path("/home/cwp29/tmp/mpas/crf_on")
 DIAGNOSTIC_OUTPUT_ROOT_ENV = "MPAS_DIAGNOSTIC_OUTPUT_ROOT"
@@ -222,12 +236,45 @@ def simulation_cache_name(name: str) -> str:
     return ALL_SIMULATION_CACHE_NAMES[canonical_simulation_name(name)]
 
 
+def simulation_plot_label(name: str) -> str:
+    """Apply current display names while retaining unrelated experiment labels."""
+
+    try:
+        return ALL_SIMULATION_LABELS[canonical_simulation_name(name)]
+    except KeyError:
+        return name
+
+
+def simulation_cache_label(name: str, *, publication: bool = False) -> str:
+    """Preserve historical manifest labels independently of current plot names."""
+
+    try:
+        canonical = canonical_simulation_name(name)
+    except KeyError:
+        return name
+    if publication:
+        return {
+            "control": "control",
+            "nudged-u": r"$u$-nudged",
+            "nudged-T": r"$T$-nudged",
+            "nudged-T-from-u": r"$T$-nudged from $u$",
+        }[canonical]
+    return ALL_SIMULATION_CACHE_NAMES[canonical].replace("_", " ")
+
+
 def simulation_directory(name: str) -> Path:
     """Return the fixed archive directory for one simulation."""
 
     return SIMULATION_ROOT / ALL_SIMULATION_ARCHIVES[
         canonical_simulation_name(name)
     ]
+
+
+def spinup_directory(name: str) -> Path:
+    """Return the explicitly configured spin-up location for one simulation."""
+
+    root = SIMULATION_ROOT / SIMULATION_ARCHIVES[canonical_simulation_name(name)]
+    return root / SPINUP_SUBDIRECTORY
 
 
 def simulation_colour(name: str) -> str:

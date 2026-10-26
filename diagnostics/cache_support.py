@@ -13,6 +13,36 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from diagnostics.analysis_config import simulation_plot_label
+
+
+def relabel_cached_simulations(product):
+    """Apply current plot labels to a compact cached table or dataset."""
+
+    def display(value):
+        if not isinstance(value, str):
+            return value
+        for separator in (" - ", " − "):
+            if separator in value:
+                return separator.join(simulation_plot_label(part) for part in value.split(separator))
+        return simulation_plot_label(value)
+
+    names = ("simulation", "simulation_a", "simulation_b", "source_simulation", "comparison")
+    if isinstance(product, pd.DataFrame):
+        product = product.copy()
+        for name in names:
+            if name in product.columns:
+                product[name] = product[name].map(display)
+        return product
+    coordinates = {}
+    for name in names:
+        if name in product.coords:
+            coordinate = product.coords[name]
+            values = np.asarray(coordinate.values)
+            renamed = np.asarray([display(value) for value in values.ravel()]).reshape(values.shape)
+            coordinates[name] = coordinate.copy(data=renamed)
+    return product.assign_coords(coordinates) if coordinates else product
+
 
 def jsonable_value(value):
     """Convert numpy and pandas values into stable JSON values."""

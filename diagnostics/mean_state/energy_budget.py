@@ -50,6 +50,8 @@ from diagnostics.analysis_config import (
     SIMULATION_ARCHIVES,
     SIMULATION_LABELS as PROJECT_SIMULATION_LABELS,
     SIMULATION_ROOT,
+    simulation_cache_name,
+    simulation_cache_label,
 )
 from diagnostics.uncertainty import independent_bootstrap_difference
 
@@ -819,7 +821,7 @@ def plot_decomposition(entries, figsave):
 
 
 def energy_cache_path(simulation):
-    safe = simulation.replace(" ", "_")
+    safe = simulation_cache_name(simulation)
     return os.path.join(ENERGY_CACHE_ROOT, f"{safe}_energy_budget.nc")
 
 
@@ -834,7 +836,8 @@ def energy_cache_manifest(
         "mean_state.energy_budget",
         schema=ENERGY_CACHE_SCHEMA,
         configuration={
-            "simulation": simulation,
+            # Retain the historical manifest identity when plot labels change.
+            "simulation": simulation_cache_label(simulation),
             "analysis_start": ANALYSIS_START,
             "analysis_end": ANALYSIS_END,
             "test_times": test_times,
